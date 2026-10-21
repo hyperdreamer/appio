@@ -848,7 +848,8 @@ def aggregate_tick(
     # Build app coverage from all current identities plus apps that need to
     # disclose unapplied credit. Cgroup state is computed independently of T.
     apps = (
-        set(process.app_key for process in staged.values())
+        set(process.app_key for process in old_processes.values())
+        | set(process.app_key for process in staged.values())
         | set(unapplied_by_app)
         | set(reset_by_app)
         | set(incomplete_by_app)

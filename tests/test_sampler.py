@@ -448,6 +448,18 @@ def test_multiple_attributed_timestamps_keep_one_observed_frame_coverage() -> No
     assert frame.coverage[0].spans_suspend_intervals == 1
 
 
+def test_clean_disappearance_keeps_one_zero_coverage_receipt_for_the_app() -> None:
+    """Falsified if an app vanishing without T is omitted from frame coverage."""
+    _, state = aggregate_tick(None, tick(0, T0, [proc(79, 1, 1, (0, 0, 0, 0))]))
+
+    frame, next_state = aggregate_tick(state, tick(1, T1, []))
+
+    assert not next_state.processes
+    assert frame.deltas == ()
+    assert len(frame.coverage) == 1
+    assert frame.coverage[0].app_key == "unit:app-chromium@fixture.service"
+
+
 def test_frame_sequence_is_rejected_without_mutating_checkpoint_state() -> None:
     """Falsified if duplicate/stale sequence handling advances a baseline."""
     _, state = aggregate_tick(None, tick(0, T0, [proc(80, 1, 1, (0, 0, 10, 0))]))
