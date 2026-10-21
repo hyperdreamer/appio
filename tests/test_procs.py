@@ -18,6 +18,7 @@ from appio.procs import (
     ProcReader,
     ProcessIdentity,
     ProcessStat,
+    ProcessVanished,
     StableProcRecord,
     parse_io,
     parse_stat,
@@ -98,6 +99,13 @@ def test_parse_io_returns_rchar_wchar_read_and_write_bytes_in_order() -> None:
     assert parse_io(text) == (1000, 500, 100, 70)
 
 
+def test_parse_io_ignores_unknown_kernel_lines_but_still_requires_the_seven() -> None:
+    text = IO_LINES.format(rchar=1, wchar=2, read_bytes=3, write_bytes=4)
+    text += "future_counter: 99\n"
+
+    assert parse_io(text) == (1, 2, 3, 4)
+
+
 def _io_text(**overrides: str) -> str:
     values = {"rchar": "10", "wchar": "20", "read_bytes": "3", "write_bytes": "4"}
     values.update(overrides)
@@ -115,7 +123,6 @@ def _io_text(**overrides: str) -> str:
         _io_text(rchar="1x"),  # malformed
         _io_text(rchar="+10"),  # malformed sign
         _io_text(rchar=""),  # empty value
-        _io_text() + "device: 1\n",  # unknown kernel line
     ],
 )
 def test_parse_io_rejects_missing_duplicate_negative_boolean_and_malformed(
@@ -301,7 +308,7 @@ def test_enoent_during_any_logical_read_is_an_esrch_outcome(
 
     assert record is not None
     assert record.identity == ProcessIdentity(boot_id=BOOT_ID, pid=410, start_ticks=100)
-    assert record.io_outcome.status == "esrsh"
+    assert record.io_outcome.status == "esrch"
     assert record.io_outcome.counters is None
     assert record.io_outcome.errno_name == "ENOENT"
 
@@ -332,12 +339,28 @@ def test_start_time_change_between_stat_reads_returns_no_accepted_sample(
     assert calls[0] == 2
 
 
-def test_disappearance_before_the_first_stat_read_has_no_identity(
+def test_disappearance_before_the_first_stat_read_is_an_explicit_esrch(
     tmp_path: Path,
 ) -> None:
     reader = ProcReader(make_tree(tmp_path))
 
-    assert reader.read_stable(9999) is None
+    with pytest.raises(ProcessVanished) as raised:
+        reader.read_stable(9999)
+
+    assert raised.value.pid == 9999
+    assert raised.value.errno_name == "ENOENT"
+
+
+def test_malformed_stat_is_unstable_and_not_reported_as_vanished(
+    tmp_path: Path,
+) -> None:
+    root = make_tree(tmp_path)
+    (root / "410" / "stat").write_text("410 (app) S 1\n", encoding="utf-8")
+    reader = ProcReader(root)
+
+    # None means "identity not stable"; ProcessVanished means "PID is gone".
+    # The sampler needs different behavior for those two conditions.
+    assert reader.read_stable(410) is None
 
 
 def test_disappearance_between_stat_reads_is_esrch(
@@ -360,7 +383,7 @@ def test_disappearance_between_stat_reads_is_esrch(
 
     assert record is not None
     assert record.identity == ProcessIdentity(boot_id=BOOT_ID, pid=410, start_ticks=100)
-    assert record.io_outcome.status == "esrsh"
+    assert record.io_outcome.status == "esrch"
     assert calls[0] == 2
 
 

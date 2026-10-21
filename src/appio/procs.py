@@ -10,9 +10,15 @@ IO outcome plus cgroup/exe/status metadata, then stat-after. A start-time change
 between the two stat reads returns ``None``: no partial sample is emitted, and
 the sampler layer keeps the previously open identity. A vanished process
 (``ESRCH``/``ENOENT``) is distinguishable from a permission failure
-(``EACCES``): the former uses ``status="esrsh"`` and the latter
+(``EACCES``): the former uses ``status="esrch"`` and the latter
 ``status="eacces"`` with ``errno_name="EACCES"``. Dumpability is separate
 harness metadata and never synthesizes a permission fact.
+
+A PID that disappears before the first ``stat`` read has no start time and
+therefore no identity; ``read_stable`` raises :class:`ProcessVanished` for it so
+the sampler can close an already-open identity and count the ESRCH reset.
+Returning ``None`` is reserved for an identity that is merely unstable, where the
+sampler must preserve its prior state.
 """
 
 from __future__ import annotations
@@ -33,14 +39,15 @@ __all__ = [
     "ProcReader",
     "ProcessIdentity",
     "ProcessStat",
+    "ProcessVanished",
     "StableProcRecord",
     "parse_io",
     "parse_stat",
     "parse_status_uid",
 ]
 
-IoStatus = Literal["readable", "eacces", "esrsh", "error"]
-_STATUSES = ("readable", "eacces", "esrsh", "error")
+IoStatus = Literal["readable", "eacces", "esrch", "error"]
+_STATUSES = ("readable", "eacces", "esrch", "error")
 
 _KERNEL_IO_NAMES = (
     "rchar",
@@ -228,7 +235,9 @@ def parse_io(text: str) -> CounterVector:
             raise ValueError(f"malformed io line: {line!r}")
         name = name.strip()
         if name not in _KERNEL_IO_NAMES:
-            raise ValueError(f"unknown io counter: {name!r}")
+            # A future kernel counter is not a malformed known counter; the four
+            # accounted counters and their validation are unaffected.
+            continue
         if name in values:
             raise ValueError(f"duplicate io counter: {name!r}")
         values[name] = _decimal(raw.strip(), f"io.{name}")
@@ -271,7 +280,23 @@ def _errno_name(error: OSError) -> str | None:
 
 
 def _esrch_outcome() -> IoReadOutcome:
-    return IoReadOutcome(status="esrsh", counters=None, dumpable=None, errno_name="ENOENT")
+    return IoReadOutcome(status="esrch", counters=None, dumpable=None, errno_name="ENOENT")
+
+
+class ProcessVanished(Exception):
+    """An enumerated PID disappeared before any identity could be established.
+
+    This is deliberately distinguishable from ``read_stable`` returning ``None``:
+    ``None`` means the identity is unstable (a changed start time or a malformed
+    stat record) and the sampler should preserve any previously open identity,
+    while this exception proves the PID is gone and its open identity -- if one
+    exists in the sampler's own state -- must be closed and counted as ESRCH.
+    """
+
+    def __init__(self, pid: int, errno_name: str = "ENOENT") -> None:
+        super().__init__(f"process {pid} vanished during a logical read ({errno_name})")
+        self.pid = pid
+        self.errno_name = errno_name
 
 
 class ProcReader:
@@ -349,7 +374,7 @@ class ProcReader:
             )
         except (FileNotFoundError, NotADirectoryError) as error:
             return IoReadOutcome(
-                status="esrsh",
+                status="esrch",
                 counters=None,
                 dumpable=None,
                 errno_name=_errno_name(error),
@@ -392,10 +417,13 @@ class ProcReader:
         pid_dir = self._pid_dir(pid)
         try:
             stat_before = self.read_stat(pid)
+        except (FileNotFoundError, NotADirectoryError) as error:
+            # The PID is gone rather than merely unstable. The sampler owns the
+            # previously open identity and must be able to close it and count the
+            # ESRCH reset, so this case is signalled, never folded into None.
+            raise ProcessVanished(pid, _errno_name(error) or "ENOENT") from error
         except (OSError, ValueError):
-            # No identity was established, so there is nothing the sampler could
-            # close or count. A vanished already-open identity is the sampler's
-            # concern; this reader never invents a start time.
+            # No identity can be established and the PID was not proven absent.
             return None
 
         io_outcome = self.read_io(pid)
@@ -403,7 +431,7 @@ class ProcReader:
         uid: int | None = None
         exe: str | None = None
         cgroup_path: str | None = None
-        missing = io_outcome.status == "esrsh"
+        missing = io_outcome.status == "esrch"
         metadata_error: str | None = None
 
         try:
@@ -471,7 +499,7 @@ class ProcReader:
         if stat_after.start_ticks != stat_before.start_ticks:
             return None
 
-        if missing or io_outcome.status == "esrsh":
+        if missing or io_outcome.status == "esrch":
             outcome = _esrch_outcome()
         elif metadata_error is not None:
             # A record whose identity metadata cannot be read is not accepted as
