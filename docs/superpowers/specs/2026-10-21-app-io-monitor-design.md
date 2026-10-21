@@ -52,7 +52,7 @@ accounting for units started before setup, and per-access *timestamps* per file
 | --- | --- | --- |
 | Monitoring scope | **C1**: unprivileged GUI *plus* `appio-iod` root daemon shipped in v1, disabled by default | machine-wide reach exists on day one, enabled with consent |
 | Default metric | **Disk I/O** (`read_bytes`/`write_bytes`); all four kernel counters stored | the number that costs SSD wear; logical I/O (`rchar`/`wchar`) available as a toggle |
-| Disk attribution | **systemd cgroup `io.stat`** | same block layer as the headline metric, so the split reconciles; no eBPF dependency |
+| Disk attribution | **systemd cgroup `io.stat`** | per-device bytes from the block layer; no eBPF dependency. It is **not** the same counter as `/proc/<pid>/io` — see "Two accounting points" below |
 | Accumulation window | **Since boot** for the list default; `since launch` and `lifetime` also stored and selectable | every app measured over an identical window; survives browser restarts |
 | Detail view | **Combined A+B**: KPI strip, per-disk timeline lanes (plus a dual-sided TOTAL lane), read/write donut, share-by-disk, hour-of-day heatmap, reconciliation strip | keeps the time axis *and* the composition summary |
 | Tray | mirror `ai-manager` | familiar, already part of the user's workflow |
@@ -202,6 +202,34 @@ disk. Evicted or capped files are reported as part of the
 - **Lifetime** = Σ over all rows for the `app`.
 - **Residual** = launch total − Σ `sample_dev` bytes for that launch, reported for
   the window; never silently merged into the disk split.
+
+### Two accounting points, and the identity that binds them
+
+`/proc/<pid>/io` and cgroup `io.stat` are **different accounting points**, not two
+views of one counter:
+
+- `/proc/<pid>/io` is **task** accounting (`task_io_accounting`): bytes charged to
+the task that submitted the I/O.
+- `io.stat` is **cgroup** accounting: bios charged to the blkcg that owned the
+  page/bio, which includes writeback performed by `kworker` threads on behalf of
+  that cgroup, and excludes I/O issued by a process that has since migrated out.
+
+Therefore equality between them is *not* an invariant and the design does not
+claim one. What is defined and tested is this identity, per window, for the
+total, for reads and for writes independently:
+
+```
+Σ(per-disk bytes) + residual = app total
+```
+
+The residual is **signed**. cgroup accounting can exceed task accounting
+(writeback charged to a cgroup whose tasks exited, or long-lived dirty pages), so
+a negative residual is normal and is displayed as
+`attributed exceeds task total by X GB` rather than clamped to zero or hidden.
+The UI prints the arithmetic (`Σ disks 376.3 GB + residual 6.9 GB = 383.2 GB`) so
+a reader can check it on screen; the earlier mockup showed `371.5 + 11.7 = 383.2`
+and *then* added a 6.9 GB residual, which summed to 390.1 GB — a real arithmetic
+defect, corrected in `assets/2026-10-21-detail-view.png`.
 - Retention: raw `sample*` 24 h at the configured cadence; `rollup` 1-minute
   buckets for 30 days and 1-hour buckets for 365 days; a nightly job prunes in
   one transaction.
@@ -274,7 +302,9 @@ The approved mockups are the specification; reproduce them as drawn.
   (read up, write down) above `nvme0n1` and `nvme1n1` stacked lanes — with
   range chips in the title bar (`1h 6h 24h boot 30d`); read/write donut;
   share-by-disk bars; hour-of-day intensity strip; reconciliation strip
-  (`reconciled … within 1.8%`, `residual …`).
+  (`reconciled … within 1.8%`, `residual …`). A `pytest-qt` test asserts the
+  strip's rendered text contains the three numbers and that they add up, so the
+  on-screen arithmetic cannot rot independently of the model.
 - **Files tab** (beside `Overview`, see `assets/2026-10-21-per-file.png`): search
   field, a sort indicator, and a table of `FILE · DISK · READS · WRITES ·
   BYTES R · BYTES W`, sortable by clicking any column (path sorts
@@ -327,9 +357,11 @@ The approved mockups are the specification; reproduce them as drawn.
   → `nvme0n1` mapping, missing-file returns `[]`.
 - `appio.identity`: `app-chromium@<uuid>.service` → desktop id; exe-path fallback;
   stable keys across restarts.
-- `appio.store`: since-boot/launch/lifetime windows, residual arithmetic
-  (property test: `dev_sum + residual == launch_total`), retention pruning,
-  migration idempotency.
+- `appio.store`: since-boot/launch/lifetime windows, retention pruning,
+  migration idempotency, and the reconciliation identity as a **signed**
+  property: `dev_sum + residual == launch_total`, plus the read-only and
+  write-only variants, plus a negative-residual case (attributed > total) that
+  must serialise, display and round-trip without clamping.
 - `appio.sampler`: cadence drift, first-tick baseline, launch rollover on restart.
 - `appio.iodclient`: NDJSON framing, truncated line, daemon disappearance.
 - UI with `pytest-qt` and `QT_QPA_PLATFORM=offscreen`: list sorting, metric
