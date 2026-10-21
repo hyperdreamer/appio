@@ -1,389 +1,433 @@
-# appio — Per-application disk I/O monitor (design)
+# appio — Per-application disk I/O monitor (design, revision 2)
 
 Date: 2026-10-21
-Status: draft for approval
+Status: revised after design review attempt-3 (FAIL, 15 blockers) — awaiting re-review
 Target: Arch Linux, KDE Plasma 6 / Wayland, Python 3.14 + PyQt6
+
+Revision 2 changes the *measurement model*, not the product. Every blocker from the
+review is answered in "Findings ledger" at the end, with the section that fixes it.
 
 ## Background
 
-Nothing on a stock Arch desktop answers "which application is wearing out my
-NVMe drives, and by how much". `iotop` needs root, is per-process and transient,
-and shows no history. `iostat` shows devices but no applications. This machine has
-two 1.8 TB NVMe devices (`nvme0n1` holding `/` and `/data`, `nvme1n1` holding
-`/vm`), so both "which app" and "which disk" are real questions.
+Nothing on a stock Arch desktop answers "which application is wearing out my NVMe
+drives, and by how much". `iotop` needs root, is per-process and transient, and
+keeps no history. `iostat` shows devices but no applications. This machine has two
+1.8 TB NVMe devices (`nvme0n1` carrying `/` and `/data`, `nvme1n1` carrying `/vm`),
+so both "which app" and "which disk" are real questions.
 
-Measured facts that shape the design (verified on the target machine):
+Verified facts that shape the design:
 
-| Fact | Observed value |
+| Fact | Observed |
 | --- | --- |
-| `/proc/<pid>/io` access | readable for own UID; `PERMISSION DENIED` for root/system PIDs (mode `0400`) |
-| Full sampling pass (351 processes) | 19 ms |
-| Distinguishing user processes / app names | ~726 PIDs / 107 names / 343 user PIDs |
-| User-session systemd app units | 130 |
-| cgroup v2 `io` controller | enabled at root, `system.slice`, `user.slice`; **not delegated** below `user.slice` |
-| Per-service `io.stat` | present and world-readable for system services (`avahi 259:3 rbytes=569344 …`) |
-| Per-app `io.stat` in the user session | absent — `user-1000.slice` exposes only `cpu memory pids` |
-| eBPF tooling / unprivileged BPF | none installed / `unprivileged_bpf_disabled=2` |
-| polkit | `pkexec` present, `polkit-kde-authentication-agent-1` running |
+| `/proc/<pid>/io` for **root-owned** PIDs | denied, mode `0400` |
+| `/proc/<pid>/io` for **own** PIDs | readable **only while the process is dumpable**; own-UID `systemd --user`, `kwin_wayland` and the polkit agent returned `EACCES` |
+| One sampling pass | ~20 ms early in the session, ~53 ms under review conditions at ~730 PIDs — treated as a dated observation, re-measured at build time |
+| User-session systemd units | 130 `app-*` units, a mix of `@<uuid>.service`, `@autostart.service` and `app-<Name>-<pid>.scope` |
+| cgroup v2 `io` controller | enabled at root/`system.slice`/`user.slice`; **absent** below `user.slice` (`DelegateControllers=cpu memory pids`) |
+| Per-service `io.stat` | present, mode `0444` (`avahi 259:3 rbytes=569344 wbytes=0`) |
+| `cgroup_id` ↔ kernfs inode | equal on this kernel (verified ids match) |
+| eBPF prerequisites | clang 23.1.3 BPF backend, libbpf 1.7, `/usr/include/bpf`, readable `/sys/kernel/btf/vmlinux`; **no** `bpftrace`/`bpftool`; `unprivileged_bpf_disabled=2` |
+| Session manager | `loginctl show-user 1000` → **`Linger=yes`**, four sessions, `user@1000.service` up since 2026-10-16 |
+| polkit | `/usr/bin/pkexec` plus a running `polkit-kde-authentication-agent-1` |
+
+The `Linger=yes` and the `EACCES` rows both invalidate claims made in revision 1 and
+drive sections 3.3 and 5 below.
 
 ## Goals
 
-1. Record every application's total disk I/O — reads and writes separately —
-   accumulated since the current boot.
-2. Rank applications by that total, with read/write/total sortable.
-3. Open one application and see its historical I/O as an infographic: per-disk
-   lanes over time, read/write composition, disk share, hour-of-day intensity.
-4. Show explicitly which disk the I/O landed on, with the measurement residual
-   disclosed rather than hidden.
-5. Match the tray behaviour of `ai-manager`, which the user already runs daily.
-6. For any application, list the **files it accessed**, with per-file read/write
-   byte counts and access frequency, sortable by any column.
+1. Record each application's total **task-accounted disk I/O**, reads and writes
+   separately, accumulated since boot.
+2. Rank applications by that total, sortable.
+3. Open one application and see its historical I/O as an infographic.
+4. Show which physical disk the I/O landed on, with the reconciliation residual
+   disclosed and arithmetic visible.
+5. Per-app **file activity** list: which files were read/written, per-file bytes and
+   access frequency, sortable — measured, and labelled as logical file activity.
+6. Tray behaviour matching `ai-manager`; `appio-iod` enabled **and** disabled from
+   the GUI with privilege elevation.
 
 ## Non-goals (v1)
 
-Network I/O, per-process detail below app granularity, alerting/notifications on
-thresholds, remote or multi-machine collection, Windows/macOS, retroactive
-accounting for units started before setup, and per-access *timestamps* per file
-(only the aggregates listed here are retained).
+Per-access timestamps per file, network I/O, per-process detail below app
+granularity, alerting, remote collection, Windows/macOS, retroactive accounting for
+units started before setup, and any claim of byte-exact completeness for processes
+that live shorter than one sampling interval.
 
 ## Decisions taken with the user
 
-| Decision | Choice | Why |
-| --- | --- | --- |
-| Monitoring scope | **C1**: unprivileged GUI *plus* `appio-iod` root daemon shipped in v1, disabled by default | machine-wide reach exists on day one, enabled with consent |
-| Default metric | **Disk I/O** (`read_bytes`/`write_bytes`); all four kernel counters stored | the number that costs SSD wear; logical I/O (`rchar`/`wchar`) available as a toggle |
-| Disk attribution | **systemd cgroup `io.stat`** | per-device bytes from the block layer; no eBPF dependency. It is **not** the same counter as `/proc/<pid>/io` — see "Two accounting points" below |
-| Accumulation window | **Since boot** for the list default; `since launch` and `lifetime` also stored and selectable | every app measured over an identical window; survives browser restarts |
-| Detail view | **Combined A+B**: KPI strip, per-disk timeline lanes (plus a dual-sided TOTAL lane), read/write donut, share-by-disk, hour-of-day heatmap, reconciliation strip | keeps the time axis *and* the composition summary |
-| Tray | mirror `ai-manager` | familiar, already part of the user's workflow |
-| Root enablement | in-app consent dialog listing exact commands, then `pkexec appio-setup <verb>`; the same switch turns the daemon **on and off**, and the UI always shows the probed state | no surprise privilege escalation, and no one-way door: the user can always undo it from the app |
-| Per-file data source | **F1**: eBPF `vfs_read`/`vfs_write` accounting inside `appio-iod` | the only source that yields measured per-file bytes *and* a real access count; clang 23.1.3 + libbpf 1.7 + `/usr/include/bpf` + kernel BTF are already present, so no new package |
-| Per-file scope | ships in **v1** | the requirement is part of the app's purpose, not an add-on |
-
-## Architecture
-
-```
-┌──────────────────────────── appio (unprivileged, PyQt6) ───────────────────────────┐
-│  sampler ──► store (SQLite) ──► model ──► main window (list │ Overview │ Files) ──► tray
-│     │                                    ▲                                          │
-│     └── reads /proc/<pid>/io (own UID) ──┘                                          │
-│     └── reads /sys/fs/cgroup/**/io.stat  (world-readable)                           │
-│     └── reads /run/appio/iod.sock  ──────────┐  (optional, for other-UID apps)      │
-└──────────────────────────────────────────────┼──────────────────────────────────────┘
-                                               │  newline-delimited JSON, read-only
-┌──────────────────────────── appio-iod (root, systemd) ──────────────────────────────┐
-│  samples /proc/<pid>/io for every PID; reads per-unit io.stat; serves snapshots     │
-│  loads appio_fileio.bpf.o (fentry on vfs_read/vfs_write) → LRU map drained ≥1/s     │
-└─────────────────────────────────────────────────────────────────────────────────────┘
-
-setup path (once, with consent):  pkexec appio-setup  ──►  drop-in + daemon-reload
-                                                        ──►  enable --now appio-iod
-```
-
-### Why two processes
-
-`/proc/<pid>/io` is mode `0400`, so other-UID totals require root. Device splits
-are world-readable *once the cgroup controller is delegated*, so per-disk data for
-the user's own apps needs no daemon. `appio-iod` exists for exactly the gap:
-other-UID application totals. It never writes to `/proc`, never accepts commands
-over its socket, and answers one query type.
-
-### Enabling and disabling the root daemon (consented, reversible)
-
-The daemon is **switched on and off from the app**, never by asking the user to
-type systemctl commands. `appio-setup` is a root-owned helper installed by the
-package; it accepts exactly four fixed verbs and nothing else:
-
-| Verb | Effect |
+| Decision | Choice |
 | --- | --- |
-| `pkexec appio-setup install-delegation` | writes `/etc/systemd/system/user@.service.d/10-appio-io.conf` (`Delegate=pids memory cpu io`), writes `/etc/systemd/user.conf.d/10-appio.conf` (`DefaultIOAccounting=yes`), runs `systemctl daemon-reload` |
-| `pkexec appio-setup enable` | `systemctl enable --now appio-iod.service` |
-| `pkexec appio-setup disable` | `systemctl disable --now appio-iod.service` (leaves the delegation drop-ins in place) |
-| `pkexec appio-setup status` | prints `is-enabled`/`is-active`/socket presence as JSON; read-only |
+| Monitoring scope | **C1**: unprivileged GUI plus `appio-iod` root daemon, shipped but disabled |
+| Default metric | **Disk I/O** (`read_bytes`/`write_bytes`) as the headline; all four kernel counters stored |
+| Disk attribution | **cgroup `io.stat`** per app unit, with signed residual |
+| Accumulation window | **Since boot** default; launch and lifetime also stored and selectable |
+| Detail view | Combined timeline + composition, with per-disk lanes and a dual-sided TOTAL lane |
+| Per-file source | **eBPF inside `appio-iod`** (fexit-based, see 4.1) |
+| Per-file scope | ships in **v1** |
+| Switch placement | **Settings owns it**; banner and `Files` empty state deep-link; no tray copy |
+| Root enablement | consent dialog + `pkexec appio-setup <verb>`; enable **and** disable |
 
-Hard rules for the helper:
+## 1. Measurement model — three counters, never merged
 
-- `argv[1]` must match one of those four verbs exactly; anything else exits 2
-  without side effects. No shell, no user-supplied arguments, no globbing.
-- The helper file is root:root mode 0755 and is shipped by the package together
-  with a polkit action, so `pkexec` shows a named prompt rather than a generic one.
-- `disable` never removes the drop-ins; removing them is a separate explicit
-  action (`uninstall-delegation`, out of scope for v1). Turning the service off
-  must not silently undo a system configuration the user approved earlier.
+Revision 1 mixed these; that was blocker B2. They stay separate in the schema, the
+contracts, and the UI.
 
-UI contract for the toggle (`Settings → System services (root)`):
+| Symbol | Name | Source | What it is | What it is **not** |
+| --- | --- | --- | --- | --- |
+| `T` | task-accounted disk I/O | `/proc/<pid>/io` `read_bytes`/`write_bytes` | bytes the task caused to reach the storage layer, plus waited-for children's charges | not SSD wear; includes cancelled/never-flushed writes |
+| `D` | cgroup device bytes | `/sys/fs/cgroup/**/io.stat` | block-layer bytes charged to the cgroup, per device | not per-process; excludes migrated-out I/O, includes kworker writeback |
+| `F` | logical file activity | eBPF `fexit` on VFS read/write | bytes/files a process moved through the VFS, per file | not physical I/O: 1 GB of page-cache reads is 1 GB of `F` and 0 bytes of `T` |
 
-1. On open, and after every toggle, the app reads state **unprivileged** via
-   `systemctl is-enabled appio-iod` + `systemctl is-active appio-iod` + a socket
-   probe, so the switch always reflects reality rather than the last click.
-2. Turning it **on** opens a consent dialog that lists the exact commands above,
-   then runs `pkexec appio-setup enable`. On success the toggle stays on and the
-   status line reports the verification result; on polkit dismissal (exit 126) or
-   any failure the toggle **reverts** and the status line carries the exit code
-   and the first stderr line verbatim.
-3. Turning it **off** opens the same dialog with the `disable` command, then
-   re-probes. If the daemon is still active, the toggle reverts to on and says so.
-4. Success is verified, not assumed: `enable` counts as successful only when the
-   socket answers a `status` request within 5 s. A started-but-unreachable daemon
-   is reported as `enabled, not answering` rather than shown as working.
-5. The toggle is disabled (with an explanation) when `appio-setup` is missing,
-   when the process is not on a systemd host, or inside a container.
-6. **One owner, deep links.** Exactly one surface can change privilege: the
-   `Settings → System services (root)` switch. Everywhere else that reports the
-   degraded state — the main-window banner and the `Files` tab empty state —
-   carries an `Open settings` button that only **navigates** to that row and
-   focuses it. The tray menu carries no copy of the control at all: a quick-action
-   menu is the wrong place to host a slow, root-level, reversible decision. No
-   surface requires a terminal, and no surface duplicates the switch's state or
-   its consent dialog.
+Identities that are defined **and tested**:
 
-Steps 1–3 of `install-delegation` only take effect for **new** user units, so the
-UI states plainly: "log out and back in to activate per-app disk attribution",
-and then verifies by probing for `io.stat` under `app.slice/<unit>/`. Until
-verified, the app renders `nvme*` lanes for system services only and labels user
-apps' device split `unavailable until re-login`.
+```
+Σ(device rows D) + R      = T_window        R is a signed residual
+Σ(device reads  D) + R_r  = T_window.read
+Σ(device writes D) + R_w  = T_window.write
+Σ(file rows F) + F_unknown = F_window       F_unknown is counted, never inferred
+```
 
-## Components
+`R` is signed and its UI text is `attributed exceeds task accounting by X GB` when
+negative. `R` is **not** described as "bytes lost to mmap" — its cause is a mix of
+accounting points, `mmap`, `io_uring`, eviction and writeback ownership, so the UI
+says "difference between accounting points" and shows the number. `F` never enters
+any `T` or `D` computation and is never subtracted from them.
+
+`T`'s UI label is **"task-accounted disk I/O"**, not "disk wear".
+
+## 2. Aggregation algorithm (executable, not hand-waved)
+
+Per sample tick, for every readable PID:
+
+1. **Identity** = `(boot_id, pid, start_ticks)` from `/proc/<pid>/stat`
+   (`starttime`), validated on *every* read. A mismatch means PID reuse → close the
+   old identity, open a new one; never emit a negative delta.
+2. **Delta** = `cur_iocounter − last_iocounter` for each of the four counters,
+   clamped to `≥ 0`. A decrease resets that identity's baseline and increments
+   `resets` (a per-window audit counter), never a negative byte.
+3. **Reaped children (B3).** `/proc/<pid>/io` adds a reaped child's totals into its
+   parent. When a tracked child identity disappears in the same tick a parent's
+   delta exceeds the child's last cumulative total, subtract the child's last
+   cumulative total from the parent delta and add the difference to `R_reap`. The
+   remainder is recorded as the parent's own delta.
+4. **Exit** never reduces a window total, because window totals are sums of emitted
+   deltas, never sums of live snapshots.
+5. **Inaccessible processes (own-UID `EACCES`).** Recorded per app as
+   `inaccessible_pids`; the app's window total is rendered `≥ X` with the count
+   attached. A boot total is never silently presented as complete.
+6. **Short-lived processes (B4).** A process may start and exit between ticks. Each
+   app records `unobserved_starts`; when a first observation shows non-zero
+   counters, those bytes are attributed to the interval but flagged
+   `interval_partial = 1`. Coverage is therefore a first-class stored quantity:
+   `coverage = {inaccessible_pids, unobserved_starts, resets, reap_corrections}`.
+7. **Time (B6).** Record identity is `(source, epoch, seq)`; ordering is
+   `CLOCK_BOOTTIME` nanoseconds, which is monotonic within a boot and survives
+   suspend. Wall-clock time is stored beside it for display only. Bucket assignment
+   uses the monotonic value with a per-insert `monotonic→wall` offset captured at
+   that instant, so an NTP step moves no rows and repeats nothing. Suspend gaps are
+   recorded as gap rows, not interpolated.
+
+## 3. Collection ownership and durability (B4)
+
+Two collectors exist; exactly one is authoritative for a given interval.
+
+| Condition | Collector of record | Durability |
+| --- | --- | --- |
+| `appio-iod` active | daemon | daemon persists to `/var/lib/appio/iod.db` (root, `0600`), flushing at least every 5 s, so closing the GUI loses nothing |
+| daemon absent | GUI | GUI persists to `~/.local/share/appio/history.db` |
+
+- On daemon start/stop, a **handover epoch** is written by both sides. Intervals are
+  attributed to exactly one collector; overlapping ticks are resolved in favour of
+  the daemon, and the discarded interval is counted in `handover_discarded` rather
+  than silently merged.
+- The GUI never writes rows for a window the daemon owns: it reads them over the
+  socket and keeps only a read-through cache.
+- 3.3 **Activation with `Linger=yes` (B13).** On this host the user manager is
+  immune to logout. `install-delegation` therefore ends with an explicit choice:
+  `Restart my user manager now` (destructive: ends the session, saves nothing) or
+  `Activate after reboot`, with a persisted `pending_activation` flag and a banner
+  until the probe passes. Success is verified by reading
+  `user@1000.service/cgroup.controllers` for `io` — not assumed from an exit code.
+
+## 4. Components
 
 | Unit | Responsibility | Depends on |
 | --- | --- | --- |
-| `appio.procs` | enumerate PIDs, read `/proc/<pid>/io`, `/proc/<pid>/stat`, `/proc/<pid>/cgroup`; tolerate `ESRCH`/`EACCES` | `/proc` |
-| `appio.cgroups` | parse `io.stat` for a unit path; map `major:minor` → device name via `/proc/diskstats` + `/sys/block` | `/sys/fs/cgroup` |
-| `appio.identity` | resolve an app key from a cgroup unit (`app-<desktopid>@<uuid>.service`) or executable path; merge that app's processes across PIDs | `appio.procs` |
-| `appio.sampler` | take one snapshot per tick; compute per-launch deltas; append rows; never block the UI thread | `procs`, `cgroups`, `identity`, `store` |
-| `appio.store` | SQLite schema, migrations, insert/rollup/retention, query API for the UI | sqlite3 |
-| `appio.iodclient` | connect to `/run/appio/iod.sock`, parse snapshots, degrade to own-UID when absent | socket |
-| `appio.iod` (daemon) | same snapshot logic for all PIDs, served read-only as NDJSON; loads and drains the per-file BPF map | `procs`, `cgroups`, BPF |
-| `appio_iod/bpf/fileio.bpf.c` | fentry `vfs_read`/`vfs_write` → `bpf_get_current_cgroup_id()`; LRU hash keyed `(cgroup_id, dev, inode)`; value `{reads, writes, bytes_r, bytes_w, name[64]}`; captures the dentry name on first insert | libbpf, kernel BTF |
-| `appio.files` | maps `cgroup_id` → unit path via kernfs inode = cgroup id; resolves inodes to paths; merges map dumps into `file_sample`; enforces top-N caps | `store` |
-| `appio.ui.listview` | sorted application list (proxy model over the query API) | store |
-| `appio.ui.detailview` | approved infographic pane | store |
-| `appio.ui.tray` | `QSystemTrayIcon` mirroring ai-manager | Qt |
-| `appio.ui.settings` | cadence, retention, tray options, system-service toggle | store, `appio.setup_client` |
-| `appio.setup_client` | consent dialog + `pkexec appio-setup <action>` + verification probes | polkit |
+| `appio.procs` | enumerate PIDs; read `io`, `stat`, `cgroup`; tolerate `ESRCH`/`EACCES`; expose `dumpable` failures separately from permission facts | `/proc` |
+| `appio.cgroups` | parse `io.stat`; map `major:minor` → device name; detect controller absence | `/sys/fs/cgroup`, `/proc/diskstats` |
+| `appio.identity` | resolve `app_key` from a unit (`@<uuid>.service`, `@autostart.service`, `app-<Name>-<pid>.scope`, escaped ids) or from executable | `procs` |
+| `appio.sampler` | one tick; identity validation; deltas; reap correction; coverage counters | `procs`, `cgroups`, `identity` |
+| `appio.store` | schema, migrations, insert/rollup/retention, query API | sqlite3 |
+| `appio.iodclient` | socket client: framing, peer verification, capabilities, reconnect with epoch/seq dedupe | socket |
+| `appio.iod` | daemon: all-PID sampling, device stats, BPF drain, persistence, serving | `sampler`, BPF |
+| `appio_iod/bpf/fileio.bpf.c` | fexit accounting, see 4.1 | libbpf, BTF |
+| `appio.files` | file-row ingestion, path states, coverage/loss accounting | `store` |
+| `appio.ui.*` | list, Overview, Files, tray, settings, consent flow | `store`, `appio.setup_client` |
+| `appio.setup_client` | consent dialog, `pkexec` invocation, exit-code mapping, state probe | polkit |
 
-## Data model (SQLite, `~/.local/share/appio/history.db`)
+### 4.1 BPF program contract (B1, B8, B9)
 
-```sql
-boot(boot_id TEXT PRIMARY KEY, started_at REAL NOT NULL);
-app(app_id INTEGER PRIMARY KEY, key TEXT UNIQUE NOT NULL, name TEXT NOT NULL,
-    icon_path TEXT, first_seen REAL NOT NULL, last_seen REAL NOT NULL);
-launch(launch_id INTEGER PRIMARY KEY, app_id INTEGER NOT NULL REFERENCES app(app_id),
-       boot_id TEXT NOT NULL REFERENCES boot(boot_id), started_at REAL NOT NULL,
-       ended_at REAL, proc_count INTEGER NOT NULL DEFAULT 0);
--- cumulative snapshot of a launch, so deltas are trivial and restarts are visible
-sample(launch_id INTEGER NOT NULL REFERENCES launch(launch_id), ts REAL NOT NULL,
-       rchar INTEGER, wchar INTEGER, read_bytes INTEGER, write_bytes INTEGER,
-       PRIMARY KEY (launch_id, ts)) WITHOUT ROWID;
--- per-device cumulative counters from the app's cgroup, when available
-sample_dev(launch_id INTEGER NOT NULL, ts REAL NOT NULL, dev TEXT NOT NULL,
-           rbytes INTEGER, wbytes INTEGER, PRIMARY KEY (launch_id, ts, dev)) WITHOUT ROWID;
-rollup(app_id INTEGER NOT NULL, bucket_start REAL NOT NULL, bucket_secs INTEGER NOT NULL,
-       read_bytes INTEGER, write_bytes INTEGER, rchar INTEGER, wchar INTEGER,
-       PRIMARY KEY (app_id, bucket_start, bucket_secs)) WITHOUT ROWID;
--- per-file access, filled only while the daemon runs (F1)
-path(path_id INTEGER PRIMARY KEY, text TEXT UNIQUE NOT NULL);
-file_sample(app_id INTEGER NOT NULL REFERENCES app(app_id), bucket_start REAL NOT NULL,
-            dev TEXT NOT NULL, inode INTEGER NOT NULL, path_id INTEGER NOT NULL REFERENCES path(path_id),
-            reads INTEGER NOT NULL, writes INTEGER NOT NULL,
-            bytes_r INTEGER NOT NULL, bytes_w INTEGER NOT NULL,
-            PRIMARY KEY (app_id, bucket_start, dev, inode)) WITHOUT ROWID;
-```
-
-Per-file sizing and retention: the BPF LRU map holds at most 65 536 entries
-(≈6 MB), evicting least-recently-used files first; the daemon drains at least
-once per second; the store keeps 1-minute `file_sample` buckets for 24 h and only
-the **top 500 files per app** per bucket, so a pathological app cannot fill the
-disk. Evicted or capped files are reported as part of the
-`not attributable to a file` row rather than dropped silently.
-
-- **Since boot** = Σ deltas whose `boot.boot_id` = the current `/proc/sys/kernel/random/boot_id`.
-- **Since launch** = Σ deltas for the app's current `launch` row.
-- **Lifetime** = Σ over all rows for the `app`.
-- **Residual** = launch total − Σ `sample_dev` bytes for that launch, reported for
-  the window; never silently merged into the disk split.
-
-### Two accounting points, and the identity that binds them
-
-`/proc/<pid>/io` and cgroup `io.stat` are **different accounting points**, not two
-views of one counter:
-
-- `/proc/<pid>/io` is **task** accounting (`task_io_accounting`): bytes charged to
-the task that submitted the I/O.
-- `io.stat` is **cgroup** accounting: bios charged to the blkcg that owned the
-  page/bio, which includes writeback performed by `kworker` threads on behalf of
-  that cgroup, and excludes I/O issued by a process that has since migrated out.
-
-Therefore equality between them is *not* an invariant and the design does not
-claim one. What is defined and tested is this identity, per window, for the
-total, for reads and for writes independently:
+`fexit` — not `fentry` — on all four VFS entry points, because the byte count is
+the **return value**, not the argument:
 
 ```
-Σ(per-disk bytes) + residual = app total
+SEC("fexit/vfs_read")        ssize_t -> bytes if ret > 0
+SEC("fexit/vfs_write")       ssize_t -> bytes if ret > 0
+SEC("fexit/vfs_iter_read")   ssize_t -> bytes if ret > 0   (vectored path)
+SEC("fexit/vfs_iter_write")  ssize_t -> bytes if ret > 0
 ```
 
-The residual is **signed**. cgroup accounting can exceed task accounting
-(writeback charged to a cgroup whose tasks exited, or long-lived dirty pages), so
-a negative residual is normal and is displayed as
-`attributed exceeds task total by X GB` rather than clamped to zero or hidden.
-The UI prints the arithmetic (`Σ disks 376.3 GB + residual 6.9 GB = 383.2 GB`) so
-a reader can check it on screen; the earlier mockup showed `371.5 + 11.7 = 383.2`
-and *then* added a 6.9 GB residual, which summed to 390.1 GB — a real arithmetic
-defect, corrected in `assets/2026-10-21-detail-view.png`.
-- Retention: raw `sample*` 24 h at the configured cadence; `rollup` 1-minute
-  buckets for 30 days and 1-hour buckets for 365 days; a nightly job prunes in
-  one transaction.
-- Timestamps are wall clock for display; deltas are derived from consecutive
-  snapshots so a clock jump cannot create negative or phantom bytes.
+- **Eligible objects only:** `S_ISREG(inode->i_mode)` **and** the superblock has a
+  block device (`sb->s_bdev != NULL`). Pipes, sockets, `/proc`, `/sys`, `tmpfs`,
+  `anon_inode` are excluded and counted in `skipped_nonfile` so the exclusion is
+  visible, not invisible.
+- **Key:** `(cgroup_id, dev, inode, i_generation)`. `i_generation` defeats inode
+  reuse within a bucket (B9).
+- **Value:** `{reads, writes, bytes_r, bytes_w, name_len, name[40]}` — a truncated
+  *basename* captured while the dentry is alive, never a reconstructed path.
+- **Never evict silently (B8):** `BPF_MAP_TYPE_HASH`, `max_entries = 262144`, no LRU.
+  A failed insert increments `overflow_files`; overflowed bytes are added to
+  `overflow_bytes_r/w` in a separate global-counter map, so loss is **counted**.
+  Measured payload: 262144 × (key 32 B + value 88 B) ≈ 31 MB plus hash overhead, and
+  that figure is stated in the settings UI.
+- **Race-safe drain:** `bpf_map_lookup_and_delete_elem`, one call per element, so a
+  concurrent increment is either taken in this drain or lands in the next one.
+- **Failure of load** (no BTF, verifier error) disables only `F`; `T` and `D`
+  continue, and the Files tab states the errno and verifier line.
 
-## Contracts
+### 4.2 Wire protocol (B10, B11)
 
-```python
-# appio.procs
-@dataclass(frozen=True)
-class ProcSample:
-    pid: int; start_ticks: int; uid: int
-    io: dict[str, int]            # rchar, wchar, read_bytes, write_bytes
-    cgroup: str | None            # e.g. app.slice/app-chromium@…​.service
-
-def sample_procs(*, uids: set[int] | None = None) -> Iterator[ProcSample]: ...
-
-# appio.cgroups
-@dataclass(frozen=True)
-class DevStat:
-    dev: str                      # "nvme0n1"; "unattributed" is a caller concept
-    rbytes: int; wbytes: int
-
-def unit_io_stat(cgroup_path: str) -> list[DevStat]: ...   # [] when not delegated
-def dev_name(major_minor: str) -> str: ...                 # "259:3" -> "nvme0n1"
-
-# appio.store
-def record(snapshots: Sequence[LaunchDelta], dev: Mapping[str, Sequence[DevStat]], ts: float) -> None: ...
-def ranking(window: Window, metric: Metric) -> list[AppTotal]: ...
-def series(app_id: int, window: Window, bucket_secs: int) -> list[Bucket]: ...
-def disk_share(app_id: int, window: Window) -> DiskShare: ...   # includes residual
-
-# appio.files
-def record_files(app_id: int, ts: float, stats: Sequence[FileStat]) -> None: ...
-def file_table(app_id: int, window: Window,
-               sort: Literal["reads","writes","bytes_r","bytes_w","path"]) -> list[FileRow]: ...
-def file_residual(app_id: int, window: Window) -> int: ...   # app total - sum(file rows)
-```
-
-Daemon wire format, one JSON object per line, server → client only:
+One length-delimited JSON object per frame, **both directions**, `protocol: 1`.
 
 ```json
-{"ts": 1761000000.0, "pids": 726,
- "procs": [{"pid": 1234, "start_ticks": 88213, "uid": 0,
-            "rchar": 10, "wchar": 20, "read_bytes": 30, "write_bytes": 40,
-            "cgroup": "system.slice/sshd.service"}],
- "devs":  [{"cgroup": "system.slice/sshd.service", "dev": "nvme0n1",
-            "rbytes": 4096, "wbytes": 0}],
- "files": [{"cgroup": "app.slice/app-chromium@x.service", "dev": "nvme0n1",
-            "inode": 412345, "name": "data_1",
-            "reads": 12481, "writes": 3, "bytes_r": 191230771, "bytes_w": 1258291}],
- "files_dropped": 0}
+{"protocol":1,"type":"snapshot","boot_id":"…","iod_epoch":7,"seq":10413,
+ "ts_mono_ns":1761000000123456,"ts_wall":1761000000.1,"source":"iod",
+ "capabilities":{"proc_all":true,"dev_stat":true,"file_io":true,"bpf_loaded":true},
+ "procs":[…],"devs":[…],"files":[…],
+ "coverage":{"inaccessible_pids":3,"unobserved_starts":11,"resets":0,"reap_corrections":2,
+             "skipped_nonfile":90210,"overflow_files":0,"overflow_bytes_r":0,"overflow_bytes_w":0}}
 ```
 
-## UI
+Client → server messages: `{"protocol":1,"type":"status"}` and
+`{"protocol":1,"type":"subscribe","since":{"iod_epoch":7,"seq":10412}}`. Deduplication
+is by `(iod_epoch, seq)`; a reconnect with a stale `since` receives
+`{"type":"gap","from":…,"to":…}` and the client records a gap row instead of
+inventing continuity. The daemon rejects a frame over 1 MiB, and disconnects any
+client that leaves two consecutive snapshots unread.
 
-The approved mockups are the specification; reproduce them as drawn.
+Precedence rule: for a given `(app, window)` the daemon's rows win; the GUI's own
+rows are used only when `iod_epoch` is absent for that interval.
 
-- Detail view (approved): `docs/superpowers/specs/assets/2026-10-21-detail-view.png`
-- Scope and daemon split (approved): `docs/superpowers/specs/assets/2026-10-21-scope-and-daemon.png`
+## 5. Privilege surface (B11, B12)
 
+- `/run/appio/` is `root:appio 0750`; the socket is `root:appio 0660`. The package
+  creates group `appio`; `install-delegation` adds the invoking user to it. This
+  costs no extra login, because delegation already requires activation (3.3).
+- Server-side: `SO_PEERCRED`; accept only `uid 0` or a member of `appio`; log refusals.
+- Client-side: verify the **server** uid is `0` before trusting data.
+- No command surface: the only client messages are `status` and `subscribe`.
+- `appio-setup`: `/usr/bin/appio-setup`, polkit action `io.github.appio.setup`, bound
+  with `org.freedesktop.policykit.exec.path=/usr/bin/appio-setup`, `auth_admin`
+  (not `keep`). It validates `argc == 2`, matches `argv[1]` against the four verbs,
+  uses absolute `/usr/bin/systemctl`, writes config by `tmp → fsync → rename`, and
+  refuses if the target path is a symlink or not root-owned. Interpreter, imported
+  modules and the BPF object are root-owned and not writable by the invoking user.
 
-- **Main window**: left application list (name, "since boot" total, inline bar,
-  search field), right detail pane; window title `appio`. Sorted by total disk
-  bytes descending by default; sortable by read, write, total; a metric switch
-  toggles disk ↔ logical.
-- **Detail pane**, top to bottom: KPI strip (`TOTAL` with lifetime sub-line,
-  `READ`, `WRITE`, `PEAK`); timeline with three lanes — `TOTAL` dual-sided
-  (read up, write down) above `nvme0n1` and `nvme1n1` stacked lanes — with
-  range chips in the title bar (`1h 6h 24h boot 30d`); read/write donut;
-  share-by-disk bars; hour-of-day intensity strip; reconciliation strip
-  (`reconciled … within 1.8%`, `residual …`). A `pytest-qt` test asserts the
-  strip's rendered text contains the three numbers and that they add up, so the
-  on-screen arithmetic cannot rot independently of the model.
-- **Files tab** (beside `Overview`, see `assets/2026-10-21-per-file.png`): search
-  field, a sort indicator, and a table of `FILE · DISK · READS · WRITES ·
-  BYTES R · BYTES W`, sortable by clicking any column (path sorts
-  lexicographically, counters numerically). `READS`/`WRITES` are `read()`/
-  `write()` syscall counts. A footer row states the part of the app total that
-  is **not attributable to a file** (`mmap`, `io_uring`, files evicted from the
-  BPF map), so the table never pretends to sum to the KPI total.
-- **Tray** (mirrors `ai-manager/ui/system_tray.py`): dynamic `Show`/`Hide`
-  item, single-click (`Trigger`) toggles the window, separator-separated
-  domain actions — `Pause sampling`, `Open data folder` — then `⚙ Settings…`,
-  `About appio`, `Quit appio`; `close_to_tray` defaults to true;
-  `start_minimized` supported with `--minimized` / `--tray`; icon is
-  palette-tinted and re-tinted on `paletteChanged`;
-  `app.setQuitOnLastWindowClosed(False)`, `app.setDesktopFileName("appio")`.
-- **Settings**: sampling cadence (1–10 s, default 2), retention, tray options,
-  autostart `.desktop` generation, and the `System services (root)` switch that
-  turns `appio-iod` on or off with a consent dialog and `pkexec` (see above).
-  A status line under the switch always shows the probed reality:
-  `off` · `on, answering` · `enabled, not answering` · `on, delegation needs a re-login`.
+## 6. Data model (SQLite)
 
-## Error handling and degradation
+```sql
+-- one row per machine boot, both collectors write it
+boot(boot_id TEXT PRIMARY KEY, started_mono_ns INTEGER, started_wall REAL, source TEXT);
+app(app_id INTEGER PRIMARY KEY, key TEXT UNIQUE, name TEXT, icon_path TEXT,
+    first_seen REAL, last_seen REAL, scope TEXT);
+launch(launch_id INTEGER PRIMARY KEY, app_id, boot_id, started_mono_ns, ended_mono_ns,
+       proc_count, coverage_json);
+-- raw samples: identity is (source, epoch, seq); monotonic ordering; wall time for display
+sample(source TEXT, epoch INTEGER, seq INTEGER, app_id, launch_id,
+       ts_mono_ns INTEGER, ts_wall REAL,
+       rchar INTEGER, wchar INTEGER, read_bytes INTEGER, write_bytes INTEGER,
+       delta_kind TEXT, interval_partial INTEGER,
+       PRIMARY KEY (source, epoch, seq, app_id)) WITHOUT ROWID;
+sample_dev(source TEXT, epoch INTEGER, seq INTEGER, app_id, ts_mono_ns INTEGER,
+           dev TEXT, rbytes INTEGER, wbytes INTEGER,
+           PRIMARY KEY (source, epoch, seq, app_id, dev)) WITHOUT ROWID;
+path(path_id INTEGER PRIMARY KEY, dev TEXT, inode INTEGER, generation INTEGER,
+     basename TEXT, state TEXT, UNIQUE(dev, inode, generation));
+file_sample(source TEXT, epoch INTEGER, seq INTEGER, app_id, ts_mono_ns INTEGER,
+            dev TEXT, path_id INTEGER, reads INTEGER, writes INTEGER,
+            bytes_r INTEGER, bytes_w INTEGER,
+            PRIMARY KEY (source, epoch, seq, app_id, path_id)) WITHOUT ROWID;
+file_coverage(source TEXT, epoch INTEGER, seq INTEGER, app_id,
+              overflow_files INTEGER, overflow_bytes_r INTEGER, overflow_bytes_w INTEGER,
+              skipped_nonfile INTEGER, PRIMARY KEY (source, epoch, seq, app_id)) WITHOUT ROWID;
+-- rollups: carry boot identity AND device, so the promised windows stay answerable (B5)
+rollup_app(boot_id, app_id, bucket_start_mono_ns, bucket_secs, read_bytes, write_bytes,
+           rchar, wchar, PRIMARY KEY (boot_id, app_id, bucket_start_mono_ns, bucket_secs));
+rollup_dev(boot_id, app_id, bucket_start_mono_ns, bucket_secs, dev, rbytes, wbytes,
+           PRIMARY KEY (boot_id, app_id, bucket_start_mono_ns, bucket_secs, dev));
+-- never pruned: the windows the UI promises
+app_boot_total(boot_id, app_id, read_bytes, write_bytes, rchar, wchar, coverage_json,
+               PRIMARY KEY (boot_id, app_id));
+app_lifetime_total(app_id PRIMARY KEY, read_bytes, write_bytes, rchar, wchar, updated_mono_ns);
+gap(source, epoch, seq, from_mono_ns, to_mono_ns, reason);
+```
+
+**Tier selection is disjoint, never blended (B5):** window ≤ 24 h → `sample`;
+≤ 30 d → `rollup_*` at 60 s; ≤ 365 d → `rollup_*` at 3600 s; longer → totals tables
+only, and the UI says "totals only beyond 365 days".
+
+**Storage budget, with arithmetic (B7):** per-app per-minute top-N files, `N = 200`
+(configurable), gives ≤ 200 × 1440 = 288 000 rows/app/day; the **global** cap is
+`2 000 000` file rows/day across all apps, enforced by quota, not hope; `path` rows
+are garbage-collected when no `file_sample` references them; the DB budget is
+≤ 400 MB for 30 days with `VACUUM` thresholds documented. Selection is deterministic:
+rank by `bytes_r + bytes_w`, tie-break by `reads + writes`, then by `inode`
+ascending; the omitted remainder is stored in `file_coverage` and displayed.
+
+## 7. Contracts
+
+```python
+@dataclass(frozen=True)
+class ProcSample:
+    pid: int; start_ticks: int; uid: int; dumpable: bool; exe: str | None
+    io: dict[str, int]            # rchar, wchar, read_bytes, write_bytes
+    cgroup: str | None
+
+@dataclass(frozen=True)
+class DevStat: dev: str; rbytes: int; wbytes: int
+
+@dataclass(frozen=True)
+class FileStat:
+    dev: str; inode: int; generation: int; basename: str
+    reads: int; writes: int; bytes_r: int; bytes_w: int
+
+# appio.store — every window query takes an explicit window and returns coverage
+def ranking(window: Window, metric: Metric) -> list[AppTotal]        # each carries coverage
+def series(app_id: int, window: Window) -> Series                    # tier chosen per 6
+def disk_share(app_id: int, window: Window) -> DiskShare             # dev rows + signed residual
+def file_table(app_id: int, window: Window, sort: FileSort,
+               direction: Literal["asc","desc"], search: str | None) -> FileTable
+def file_coverage(app_id: int, window: Window) -> FileCoverage       # counted loss, not inferred
+```
+
+`FileSort ∈ {bytes_total, bytes_r, bytes_w, reads, writes, basename, dev}` and the
+default is `bytes_total` descending, matching the mockup's "sorted by traffic".
+
+## 8. UI
+
+**Precedence (B15):** this text is the behavioural authority; the mockups in
+`assets/` are the **layout** authority. Where they disagree, layout follows the
+mockup and behaviour follows this text, and the disagreement is listed here:
+
+- `assets/2026-10-21-scope-and-daemon.png` shows an `Include system services`
+  toggle inside the app window. **Superseded** by the Settings switch (§9).
+- `assets/2026-10-21-detail-view.png` is re-rendered with **three** lanes — a
+  dual-sided `TOTAL` lane above `nvme0n1` and `nvme1n1` — matching the approved
+  combined view.
+- `assets/2026-10-21-per-file.png` gains a footer stating file-activity coverage.
+
+Screens:
+
+- **Main window**: application list (name, since-boot total, inline bar, search),
+  detail pane with `Overview` and `Files` tabs.
+- **Overview**: KPI strip (`TOTAL` with lifetime sub-line, `READ`, `WRITE`, `PEAK`);
+  three timeline lanes (`TOTAL` read-up/write-down, then one per disk); range chips;
+  read/write donut; attributed-share-by-disk with `Σ disks + residual = total`
+  printed; hour-of-day intensity; reconciliation strip carrying the signed residual.
+- **Files**: search, sort indicator, table `FILE · DISK · READS · WRITES ·
+  BYTES R · BYTES W`, sortable on every column. Footer states: file activity is
+  **logical** (page-cache reads count), and how much is unknown
+  (`overflow`, `skipped non-file`, `unobserved`) — never that it is zero.
+- **Settings**: cadence, retention, tray options, autostart, and the single
+  `System services (root)` switch with a probed status line
+  (`off` · `on, answering` · `enabled, not answering` · `on, needs activation`).
+- **Tray parity contract (B14), stated exactly:** `Trigger` toggles; hide only when
+  the window is visible, not minimized, and **active**, otherwise show + raise +
+  activate; `Show`/`Hide` label follows visibility signals; close goes to tray only
+  when a tray is currently available, with a one-time first-close message, and
+  otherwise quits; the `Quit` action bypasses close-to-tray; `--minimized`/`--tray`
+  are runtime-only overrides ORed with the stored preference; autostart `.desktop`
+  is created, updated (including `--minimized`) and removed with the preference;
+  icon is palette-tinted with the style's standard icon as fallback when null.
+
+## 9. Enabling and disabling the daemon
+
+`appio-setup` verbs: `install-delegation`, `enable`, `disable`, `status`. First use
+walks the user through **both** steps in one consent flow — delegation install, then
+enable — because enabling alone cannot produce per-app device data (B13). `disable`
+stops and disables the unit and deliberately keeps the delegation drop-ins; removing
+them is `uninstall-delegation`, out of v1 scope. The switch shows probed state,
+never the last click; success requires the socket to answer within 5 s; polkit
+dismissal (126) reverts the switch with the exit code and first stderr line.
+
+## 10. Error handling and degradation
 
 | Condition | Behaviour |
 | --- | --- |
-| `ESRCH` / process exits mid-scan | skip silently, never a gap error |
-| `EACCES` on `/proc/<pid>/io` | mark app `scope=system, unattributed` when the daemon is off |
-| `io.stat` missing for a unit | device split shows `not delegated`; totals unaffected |
-| `appio-iod` absent or socket refused | main-window banner "system apps are not measured" with an `Open settings` button that focuses the Settings switch; own-UID sampling continues |
-| SQLite write failure | retry once, then pause sampling, keep UI responsive, surface a non-modal banner |
-| DB corruption | move to `history.db.corrupt-<ts>`, recreate schema, notify |
-| `pkexec` dismissed/failed | toggle reverts to the probed state, status line carries the exact exit code (126 = dismissed) and first stderr line |
-| `enable` returns 0 but the socket never answers | status line reads `enabled, not answering`; the switch stays on, the banner keeps saying system apps are unmeasured |
-| daemon enabled outside the app (pacman hook, admin) | next probe reflects it; the UI follows reality and never fights the admin |
-| `disable` while the GUI is sampling | the GUI drops to own-UID mode within one tick, keeps its history, and the `Files` tab explains why per-file rows stopped |
-| `appio-setup` missing or container host | switch is rendered disabled with the reason, instead of failing after a polkit prompt |
-| Delegation installed but not yet re-logged-in | detail view states `unavailable until re-login`, with a probe re-check button |
-| Clock jump / suspend | deltas derived from consecutive snapshots; a gap becomes one bucket, never negative bytes |
-| BPF program fails to load (no BTF, verifier error, old kernel) | `Files` tab shows `unavailable: <errno and verifier line>`; sampling and the Overview tab are unaffected |
-| BPF map full | LRU eviction; evicted files roll into the `not attributable to a file` row, count surfaced in the UI |
-| daemon restarted mid-window | map drains are cumulative-only in the store; a restart starts a fresh drain sequence, never a negative delta |
-| unprivileged user, daemon disabled | `Files` tab explains that per-file data requires the daemon and offers the same `Open settings` button, so the empty state leads somewhere instead of dead-ending |
+| `ESRCH` mid-scan | skip, counted in `resets` if the identity was already open |
+| own-UID `EACCES` (non-dumpable) | app shows `≥ X`, `inaccessible_pids` in coverage |
+| `io.stat` absent for a unit | device split shows `not delegated`; `T` unaffected |
+| daemon absent | banner + `Open settings` button; GUI owns collection |
+| daemon enabled but silent | `enabled, not answering`; no pretend data |
+| BPF load failure | Files tab shows errno + verifier line; `T`/`D` continue |
+| map insert failure | `overflow_*` counters rise; Files footer says how much is unknown |
+| drain/reconnect | `(epoch, seq)` dedupe; explicit `gap` frames become `gap` rows |
+| reap detected | child total subtracted, `R_reap` incremented, never negative |
+| clock step / suspend | monotonic ordering; gap rows; no phantom bytes |
+| GUI closed while daemon runs | nothing lost (daemon persists) |
+| GUI closed with daemon off | `gap` row covering the absence; totals labelled `≥` |
+| DB corruption | quarantine `history.db.corrupt-<ts>`, recreate, notify |
+| `pkexec` dismissed/failed | switch reverts, exact code and stderr shown |
+| delegation installed, activation pending | banner + `pending_activation`; probe re-checks `cgroup.controllers` |
+| `appio-setup` missing / container host | switch disabled with the reason |
 
-## Testing strategy
+## 11. Testing strategy
 
-- Unit tests with a **fixture `/proc` and `/sys/fs/cgroup` tree** on disk; no test
-  requires root, real processes, or a live session.
-- `appio.procs`: parsing, `ESRCH` races, uid filtering, PID reuse detection via
-  `start_ticks`.
-- `appio.cgroups`: `io.stat` parsing including multi-device lines, `major:minor`
-  → `nvme0n1` mapping, missing-file returns `[]`.
-- `appio.identity`: `app-chromium@<uuid>.service` → desktop id; exe-path fallback;
-  stable keys across restarts.
-- `appio.store`: since-boot/launch/lifetime windows, retention pruning,
-  migration idempotency, and the reconciliation identity as a **signed**
-  property: `dev_sum + residual == launch_total`, plus the read-only and
-  write-only variants, plus a negative-residual case (attributed > total) that
-  must serialise, display and round-trip without clamping.
-- `appio.sampler`: cadence drift, first-tick baseline, launch rollover on restart.
-- `appio.iodclient`: NDJSON framing, truncated line, daemon disappearance.
-- UI with `pytest-qt` and `QT_QPA_PLATFORM=offscreen`: list sorting, metric
-  toggle, detail view series plumbing, tray menu text toggling
-  (`Show`/`Hide`), consent dialog text.
-- Golden test for the reconciliation strip so "1.8%" cannot silently become a lie.
-- `appio.files`: synthetic BPF map dumps → `file_sample` rows; top-N capping;
-  `cgroup_id` → unit-path resolution from a fixture kernfs tree; residual
-  arithmetic (`sum(file bytes) + file_residual == launch total`).
-- BPF program: aggregator logic compiled with a userspace shim and asserted on
-  synthetic key/value vectors; an integration test that actually loads the object
-  is skipped unless `os.geteuid() == 0` and BTF is present, so CI never fakes a
-  pass.
-- `Files` tab: sort by every column, search filtering, residual footer text.
-- `appio.setup_client`: verb allowlist (`argv[1]` only), exit-code mapping
-  (0/126/127/other), toggle reverts on dismissal, status probing with a fake
-  `systemctl` on `PATH`, and the enabled-but-unreachable case reported as such.
-- The two deep links (main-window banner, `Files` tab empty state) are driven in a
-  `pytest-qt` test that asserts each one lands on the Settings row with the switch
-  focused and **changes no state** — the failure this guards against is a "helpful"
-  button that quietly starts a privileged operation.
-- Only one widget may own the switch: a test asserts the tray menu contains no
-  `System services` action, so a future edit cannot reintroduce a second surface.
-- `appio-setup`: invoked with a wrong verb or extra arguments, it must exit 2 and
-  touch nothing (asserted against a tmp root).
+- Fixture `/proc` and `/sys/fs/cgroup` trees; no test needs root, a real session, or
+  live processes.
+- `procs`: parsing, `ESRCH` race, `EACCES`, PID reuse via `start_ticks`.
+- `sampler`: delta clamping, reap correction (`R_reap`), coverage counters,
+  short-lived process flagging, monotonic bucketing across an NTP step and a suspend.
+- `cgroups`: multi-device `io.stat`, `major:minor` mapping, absent controller.
+- `identity`: `@<uuid>.service`, `@autostart.service`, `app-<Name>-<pid>.scope`,
+  escaped desktop ids, shared cgroups, executable fallback.
+- `store`: signed reconciliation identity for total/read/write including a
+  **negative-residual** case; disjoint tier selection; retention pruning; path GC;
+  global file quota; migration idempotency; `(source, epoch, seq)` dedupe.
+- `files`: top-N determinism with tie-breaks, `file_coverage` arithmetic
+  (`Σ rows + unknown = observed`), truncated-name states, inode-reuse separation via
+  `i_generation`.
+- BPF: aggregator logic compiled against a userspace shim and asserted on synthetic
+  key/value vectors; a load test that skips unless `geteuid()==0` and BTF exists, so
+  CI never fakes a pass.
+- `iodclient`: framing, oversized frame rejection, `gap` handling, peer-uid
+  verification, slow-client disconnect.
+- `setup_client`: verb allowlist, exit-code mapping, switch revert, probe parsing,
+  `pending_activation` surfacing.
+- UI (`pytest-qt`, offscreen): sort on every Files column, tier labels, reconciliation
+  strip arithmetic parsed from rendered text, deep links change no state, tray menu
+  contains no `System services` action, tray transitions per §8.
+
+## 12. Findings ledger — review attempt-3
+
+| # | Blocker | Resolution |
+| --- | --- | --- |
+| B1 | fentry sees requested bytes | §4.1 `fexit` on all four VFS entry points; `ret > 0`; eligible-object filter; exclusion counters |
+| B2 | logical vs physical mixed in `file_residual` | §1 three counters, `F` never subtracted from `T`; `F_unknown` counted separately |
+| B3 | reaping double count, snapshot sums, cancelled writes | §2 identity validation, delta clamping, explicit reap correction, `R_reap` |
+| B4 | missed short-lived processes; no durable collection | §2.6 `unobserved_starts` + `interval_partial`; §3 daemon persists |
+| B5 | rollups lack boot/device; overlapping tiers | §6 boot-scoped `rollup_app`/`rollup_dev`, explicit disjoint tier rule, totals tables |
+| B6 | wall-clock PK unsafe | §2.7 + §6 `(source, epoch, seq)` identity, monotonic ordering, wall time display-only |
+| B7 | storage bound wrong by orders of magnitude | §6 N=200/minute, global 2 M rows/day quota, path GC, stated 400 MB budget, deterministic selection |
+| B8 | LRU loss, drain race, no dedupe | §4.1 non-evicting map + `overflow_*` counters + `lookup_and_delete`; §4.2 `(epoch, seq)` dedupe |
+| B9 | truncated names, links, inode reuse, vanished cgroup | §4.1 basename-with-states, `i_generation` key, cgroup cache before removal, rename policy |
+| B10 | identity/transport ambiguity | §4.2 protocol v1 with boot/epoch/seq/capabilities/status, precedence rule; §7 `exe` in `ProcSample` |
+| B11 | socket security unspecified | §5 directory/socket modes, group, `SO_PEERCRED` both directions, framing caps, slow-client policy |
+| B12 | helper privilege boundary | §5 polkit action binding, absolute paths, argc check, atomic config writes, trusted deps |
+| B13 | no install-delegation path; `Linger=yes` breaks logout advice | §3.3 + §9 single consent flow, explicit manager-restart/reboot choice, probe verification |
+| B14 | tray parity incomplete | §8 tray parity contract, written from the reference implementation's actual transitions |
+| B15 | mockups contradict text | §8 precedence + superseded list; detail frame re-rendered with three lanes; F1 frame gains coverage footer |
+
+Machine-fact corrections folded in: own-UID `EACCES` (§Background, §2.5), `Linger=yes`
+(§3.3), eBPF tooling present but not `bpftrace` (§4.1), sampling cost restated as a
+dated observation (§Background).
