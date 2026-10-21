@@ -128,6 +128,11 @@ UI contract for the toggle (`Settings → System services (root)`):
    is reported as `enabled, not answering` rather than shown as working.
 5. The toggle is disabled (with an explanation) when `appio-setup` is missing,
    when the process is not on a systemd host, or inside a container.
+6. **One code path, three doors.** The same consent flow is reachable from (a) the
+   `Settings → System services (root)` switch, (b) the main-window banner button,
+   and (c) the tray item. All three call `appio.setup_client.request(action)` and
+   all three show the identical probed status line afterwards — no surface gets
+   its own copy of the logic, and none of them requires a terminal.
 
 Steps 1–3 of `install-delegation` only take effect for **new** user units, so the
 UI states plainly: "log out and back in to activate per-app disk attribution",
@@ -276,7 +281,8 @@ The approved mockups are the specification; reproduce them as drawn.
   BPF map), so the table never pretends to sum to the KPI total.
 - **Tray** (mirrors `ai-manager/ui/system_tray.py`): dynamic `Show`/`Hide`
   item, single-click (`Trigger`) toggles the window, separator-separated
-  domain actions — `Pause sampling`, `Open data folder` — then `⚙ Settings…`,
+  domain actions — `Pause sampling`, `Open data folder`, and
+  `System services: off — enable…` (text follows probed state) — then `⚙ Settings…`,
   `About appio`, `Quit appio`; `close_to_tray` defaults to true;
   `start_minimized` supported with `--minimized` / `--tray`; icon is
   palette-tinted and re-tinted on `paletteChanged`;
@@ -294,7 +300,7 @@ The approved mockups are the specification; reproduce them as drawn.
 | `ESRCH` / process exits mid-scan | skip silently, never a gap error |
 | `EACCES` on `/proc/<pid>/io` | mark app `scope=system, unattributed` when the daemon is off |
 | `io.stat` missing for a unit | device split shows `not delegated`; totals unaffected |
-| `appio-iod` absent or socket refused | banner "system apps are not measured"; own-UID sampling continues |
+| `appio-iod` absent or socket refused | main-window banner "system apps are not measured" with an **Enable…** button that opens the consent dialog; own-UID sampling continues |
 | SQLite write failure | retry once, then pause sampling, keep UI responsive, surface a non-modal banner |
 | DB corruption | move to `history.db.corrupt-<ts>`, recreate schema, notify |
 | `pkexec` dismissed/failed | toggle reverts to the probed state, status line carries the exact exit code (126 = dismissed) and first stderr line |
@@ -307,7 +313,7 @@ The approved mockups are the specification; reproduce them as drawn.
 | BPF program fails to load (no BTF, verifier error, old kernel) | `Files` tab shows `unavailable: <errno and verifier line>`; sampling and the Overview tab are unaffected |
 | BPF map full | LRU eviction; evicted files roll into the `not attributable to a file` row, count surfaced in the UI |
 | daemon restarted mid-window | map drains are cumulative-only in the store; a restart starts a fresh drain sequence, never a negative delta |
-| unprivileged user, daemon disabled | `Files` tab explains that per-file data requires the daemon, with a link to the consent dialog |
+| unprivileged user, daemon disabled | `Files` tab explains that per-file data requires the daemon and offers the same **Enable…** button, so the fix is one click from the empty state |
 
 ## Testing strategy
 
@@ -339,5 +345,8 @@ The approved mockups are the specification; reproduce them as drawn.
 - `appio.setup_client`: verb allowlist (`argv[1]` only), exit-code mapping
   (0/126/127/other), toggle reverts on dismissal, status probing with a fake
   `systemctl` on `PATH`, and the enabled-but-unreachable case reported as such.
+- All three entry points (Settings switch, banner button, tray item) are driven in
+  one `pytest-qt` test against a fake `setup_client` and must converge on the same
+  status text — that is what stops the three doors drifting apart.
 - `appio-setup`: invoked with a wrong verb or extra arguments, it must exit 2 and
   touch nothing (asserted against a tmp root).
