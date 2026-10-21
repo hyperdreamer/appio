@@ -72,7 +72,11 @@ class StaleFrameError(ValueError):
 
 @dataclass(frozen=True)
 class TickInput:
-    """One already-read collector frame; no host process access happens here."""
+    """One already-read collector frame; no host process access happens here.
+
+    ``known_uncovered`` carries measured gap bounds; None means unknown bounds.
+    An epoch change without measured bounds also leaves rate time unknown.
+    """
 
     boot_id: str
     source: Literal["gui", "iod"]
@@ -85,6 +89,7 @@ class TickInput:
     suspend_boundaries: tuple[tuple[int, int], ...] | None = ()
     unresolved_pids: tuple[int, ...] = ()
     vanished_pids: tuple[int, ...] = ()
+    known_uncovered: tuple[tuple[int, int], ...] | None = ()
 
     def __post_init__(self) -> None:
         _boot(self.boot_id, "tick.boot_id")
@@ -117,6 +122,14 @@ class TickInput:
                 validate_sqlite_integer(end, "tick.suspend_boundaries.end")
                 if end < start:
                     raise ValueError("a suspend boundary must end at or after its start")
+        if self.known_uncovered is not None:
+            if not isinstance(self.known_uncovered, tuple):
+                raise ValueError("tick.known_uncovered must be a tuple or None")
+            for start, end in self.known_uncovered:
+                validate_sqlite_integer(start, "tick.known_uncovered.start")
+                validate_sqlite_integer(end, "tick.known_uncovered.end")
+                if end < start:
+                    raise ValueError("an uncovered interval must end at or after its start")
         if not isinstance(self.unresolved_pids, tuple):
             raise ValueError("tick.unresolved_pids must be a tuple")
         unresolved: set[int] = set()
@@ -501,6 +514,26 @@ def aggregate_tick(
         epoch_changed = tick.epoch > previous_state.epoch
 
     old_processes = _state_process_map(previous_state)
+    rate_unknown = tick.known_uncovered is None or (epoch_changed and not tick.known_uncovered)
+    if tick.known_uncovered or rate_unknown:
+        # Retain gap evidence across EACCES/unstable reads until the next readable
+        # baseline. A restart with no measured bounds cannot define a rate.
+        old_processes = {
+            identity: replace(
+                process,
+                rate_uncovered_intervals=process.rate_uncovered_intervals + (tick.known_uncovered or ()),
+                rate_unknown=process.rate_unknown or rate_unknown,
+            )
+            for identity, process in old_processes.items()
+        }
+    if epoch_changed:
+        # The exact v1 checkpoint has no reset/conservation provenance. Every
+        # restored identity can create a future credit, including one that closes
+        # in this frame, so retain uncertainty before processing disappearances.
+        old_processes = {
+            identity: replace(process, reap_incomplete=True)
+            for identity, process in old_processes.items()
+        }
     old_by_pid = _process_by_pid(old_processes)
     current_records: dict[int, StableProcRecord] = {}
     for record in tick.processes:
@@ -627,10 +660,6 @@ def aggregate_tick(
         app_key = _record_app(record)
         launch_key = assignments[identity]
         previous = old_processes.get(identity)
-        if epoch_changed and previous is not None and previous.credits:
-            # The checkpoint preserves credit amounts but not reset provenance.
-            incomplete_identities.add(identity)
-            incomplete_by_app.add(app_key)
         if previous is not None and previous.reap_incomplete:
             incomplete_by_app.add(app_key)
         parent_identity = _parent_identity(record, current_records, old_by_pid)
@@ -654,6 +683,8 @@ def aggregate_tick(
                     last_observed_mono_ns=previous.last_observed_mono_ns,
                     had_reset=previous.had_reset,
                     reap_incomplete=previous.reap_incomplete or identity in incomplete_identities,
+                    rate_uncovered_intervals=previous.rate_uncovered_intervals,
+                    rate_unknown=previous.rate_unknown,
                 )
             else:
                 staged[identity] = ProcessState(
@@ -692,7 +723,10 @@ def aggregate_tick(
             previous.last_observed_mono_ns if previous is not None else None,
             tick.observed_mono_ns,
             suspension_set,
+            known_uncovered=previous.rate_uncovered_intervals if previous is not None else (),
         )
+        if previous is not None and previous.rate_unknown:
+            evidence = replace(evidence, observed_ns=None)
         staged[identity] = ProcessState(
             identity=identity,
             ppid_identity=parent_identity,
@@ -773,6 +807,8 @@ def aggregate_tick(
                 last_observed_mono_ns=target_process.last_observed_mono_ns,
                 had_reset=target_process.had_reset,
                 reap_incomplete=target_process.reap_incomplete,
+                rate_uncovered_intervals=target_process.rate_uncovered_intervals,
+                rate_unknown=target_process.rate_unknown,
             )
         else:
             # Prefer the exact parent's app while its closed state is available;
@@ -880,7 +916,7 @@ def aggregate_tick(
             reap_corrections=reap_corrections_by_app[app_key],
             reap_unapplied=unapplied_by_app[app_key],
             partial_intervals=int(app_key in partial_by_app),
-            gap_intervals=int(epoch_changed),
+            gap_intervals=int(epoch_changed or tick.known_uncovered is None or bool(tick.known_uncovered)),
             spans_suspend_intervals=int(app_key in spans_by_app),
             spans_suspend=app_key in spans_by_app,
             reap_incomplete=app_key in incomplete_by_app,

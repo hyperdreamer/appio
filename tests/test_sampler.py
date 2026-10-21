@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+from collections import defaultdict
 from collections.abc import Iterable
 from dataclasses import replace
 
 import pytest
 
 from appio.cgroups import CgroupObservation, DevStat, DeviceDelta
+from appio.durable import ProcessRef, canonical_json, decode_sampler_checkpoint
+from appio.launch import LaunchIdentity, LaunchState, ProcessState, ReapCredit
 from appio.procs import AppKeyInputs, IoReadOutcome, ProcessIdentity, StableProcRecord
 from appio.sampler import SamplerState, StaleFrameError, TickInput, aggregate_tick
 
@@ -64,6 +67,53 @@ def tick(
         processes=tuple(processes),
         cgroups=cgroups,
         suspend_boundaries=suspend,
+    )
+
+
+def restored(state: SamplerState) -> SamplerState:
+    """Review adapter: rehydrate only fields in a validated canonical v1 checkpoint."""
+    data = decode_sampler_checkpoint(
+        canonical_json(state.to_checkpoint()),
+        {
+            "source": state.source, "boot_id": state.boot_id, "epoch": state.epoch,
+            "seq": state.last_seq, "checkpoint_mono_ns": state.checkpoint_mono_ns,
+        },
+    )
+
+    def identity(ref: ProcessRef | None) -> ProcessIdentity | None:
+        return ProcessIdentity(data.boot_id, ref.pid, ref.start_ticks) if ref else None
+
+    processes = tuple(
+        ProcessState(
+            identity=ProcessIdentity(data.boot_id, item.pid, item.start_ticks),
+            ppid_identity=identity(item.parent), app_key=item.app_key,
+            launch_identity=LaunchIdentity(identity(item.launch_root), item.app_key),
+            baseline=item.baseline,
+            credits=tuple(
+                ReapCredit(
+                    ProcessIdentity(data.boot_id, credit.child.pid, credit.child.start_ticks),
+                    credit.disappearance_epoch, credit.disappearance_seq,
+                    credit.remaining, bool(credit.correction_counted),
+                )
+                for credit in item.credits
+            ),
+            last_observed_mono_ns=data.checkpoint_mono_ns if item.baseline is not None else None,
+        )
+        for item in data.processes
+    )
+    groups: dict[LaunchIdentity, list[ProcessIdentity]] = defaultdict(list)
+    for item in processes:
+        if item.launch_identity.root is not None:
+            groups[item.launch_identity].append(item.identity)
+    return SamplerState(
+        data.boot_id, data.source, data.epoch, data.last_seq,
+        data.checkpoint_mono_ns, processes,
+        tuple(LaunchState(key, tuple(members)) for key, members in groups.items()),
+        tuple(
+            ((data.boot_id, item.cgroup_id, item.dev), (item.rbytes, item.wbytes))
+            for item in data.devices
+        ),
+        data.checkpoint_mono_ns,
     )
 
 
@@ -574,3 +624,164 @@ def test_checkpoint_state_has_schema_fields_and_deterministic_process_order() ->
     assert set(checkpoint) == {
         "version", "boot_id", "source", "epoch", "last_seq", "checkpoint_mono_ns", "processes", "devices"
     }
+
+
+def test_a_restart_gap_is_not_counted_as_observed_rate_time() -> None:
+    """Review reproduction: epoch changes cannot offer the gap as measured time."""
+    _, state = aggregate_tick(
+        None, tick(0, 10_000_000_000, [proc(110, 1, 10, (0, 0, 100, 0))])
+    )
+    frame, _ = aggregate_tick(
+        state,
+        tick(0, 110_000_000_000, [proc(110, 1, 10, (0, 0, 120, 0))], epoch=2),
+    )
+    assert frame.coverage[0].gap_intervals == 1
+    assert sum(delta.counters[2] for delta in frame.deltas) == 20
+    # No collector-start timestamp or measured post-start interval is supplied.
+    assert frame.deltas[0].observed_ns in (None, 0)
+
+
+def test_known_uncovered_intervals_are_unioned_with_suspend_for_rates() -> None:
+    """Gap/suspend overlaps must be subtracted once, preserving attribution."""
+    _, state = aggregate_tick(
+        None, tick(0, 10_000_000_000, [proc(110, 1, 10, (0, 0, 100, 0))])
+    )
+    observed = replace(
+        tick(
+            1, 110_000_000_000, [proc(110, 1, 10, (0, 0, 120, 0))],
+            suspend=((50_000_000_000, 100_000_000_000),),
+        ),
+        known_uncovered=((20_000_000_000, 70_000_000_000), (60_000_000_000, 90_000_000_000)),
+    )
+    frame, _ = aggregate_tick(state, observed)
+    assert frame.deltas[0].counters == (0, 0, 20, 0)
+    assert frame.deltas[0].observed_ns == 20_000_000_000
+    assert frame.deltas[0].attributed_ts_mono_ns == 10_000_000_000
+    assert frame.deltas[0].spans_suspend is True
+
+
+def test_unknown_uncovered_duration_keeps_suspend_attribution_but_no_rate() -> None:
+    """Unknown uncovered time cannot become a guessed active denominator."""
+    _, state = aggregate_tick(
+        None, tick(0, 10_000_000_000, [proc(110, 1, 10, (0, 0, 100, 0))])
+    )
+    observed = replace(
+        tick(
+            1, 110_000_000_000, [proc(110, 1, 10, (0, 0, 120, 0))],
+            suspend=((20_000_000_000, 50_000_000_000),),
+        ),
+        known_uncovered=None,
+    )
+    frame, _ = aggregate_tick(state, observed)
+    assert frame.deltas[0].counters == (0, 0, 20, 0)
+    assert frame.deltas[0].observed_ns is None
+    assert frame.deltas[0].attributed_ts_mono_ns == 10_000_000_000
+    assert frame.deltas[0].spans_suspend is True
+
+
+@pytest.mark.parametrize("status", ["eacces", "error", "unresolved"])
+def test_restart_rate_gap_survives_unreadable_frames(status: str) -> None:
+    """Missing the first readable sample cannot hide an earlier restart gap."""
+    _, state = aggregate_tick(
+        None, tick(0, 10_000_000_000, [proc(110, 1, 10, (0, 0, 100, 0))])
+    )
+    first = tick(0, 110_000_000_000, [], epoch=2)
+    first = (
+        replace(first, unresolved_pids=(110,))
+        if status == "unresolved"
+        else replace(first, processes=(proc(110, 1, 10, None, status=status),))
+    )
+    _, state = aggregate_tick(restored(state), first)
+    frame, state = aggregate_tick(
+        state,
+        tick(1, 120_000_000_000, [proc(110, 1, 10, (0, 0, 120, 0))], epoch=2),
+    )
+    assert frame.deltas[0].counters == (0, 0, 20, 0)
+    assert frame.deltas[0].observed_ns is None
+    following, _ = aggregate_tick(
+        state,
+        tick(2, 130_000_000_000, [proc(110, 1, 10, (0, 0, 130, 0))], epoch=2),
+    )
+    assert following.deltas[0].counters == (0, 0, 10, 0)
+    assert following.deltas[0].observed_ns == 10_000_000_000
+
+
+def test_measured_gap_is_retained_until_next_readable_observation() -> None:
+    """EACCES must retain measured gaps alongside the unchanged counter baseline."""
+    _, state = aggregate_tick(
+        None, tick(0, 10_000_000_000, [proc(110, 1, 10, (0, 0, 100, 0))])
+    )
+    _, state = aggregate_tick(
+        state,
+        replace(
+            tick(1, 110_000_000_000, [proc(110, 1, 10, None, status="eacces")]),
+            known_uncovered=((20_000_000_000, 100_000_000_000),),
+        ),
+    )
+    frame, _ = aggregate_tick(
+        state, tick(2, 120_000_000_000, [proc(110, 1, 10, (0, 0, 120, 0))])
+    )
+    assert frame.deltas[0].counters == (0, 0, 20, 0)
+    assert frame.deltas[0].observed_ns == 30_000_000_000
+
+
+def test_a_future_credit_from_a_pre_restart_reset_child_is_incomplete() -> None:
+    """Review reproduction: v1 cannot prove a restored child's reset history."""
+    _, state = aggregate_tick(
+        None,
+        tick(0, T0, [proc(120, 1, 10), proc(121, 120, 11, (0, 0, 100, 0))]),
+    )
+    _, state = aggregate_tick(
+        state,
+        tick(1, T1, [proc(120, 1, 10), proc(121, 120, 11, (0, 0, 10, 0))]),
+    )
+    assert state.processes[1].had_reset is True
+    cleared = replace(
+        state,
+        processes=tuple(
+            replace(item, had_reset=False, reap_incomplete=False)
+            for item in state.processes
+        ),
+    )
+    assert cleared.to_checkpoint() == state.to_checkpoint()
+    uninterrupted, _ = aggregate_tick(
+        state, tick(2, T2, [proc(120, 1, 10, (0, 0, 10, 0))])
+    )
+    assert uninterrupted.coverage[0].reap_incomplete is True
+
+    frame, _ = aggregate_tick(
+        restored(state), tick(0, T2, [proc(120, 1, 10, (0, 0, 10, 0))], epoch=2)
+    )
+    assert sum(delta.counters[2] for delta in frame.deltas) == 0
+    assert frame.coverage[0].reap_corrections == 1
+    assert frame.coverage[0].reap_incomplete is True
+
+
+@pytest.mark.parametrize("status", ["readable", "eacces", "error", "unresolved"])
+def test_restored_reset_history_taints_credits_created_after_the_restart_frame(status: str) -> None:
+    """Restored reset uncertainty must survive until a later disappearance."""
+    _, state = aggregate_tick(
+        None,
+        tick(0, T0, [proc(120, 1, 10), proc(121, 120, 11, (0, 0, 100, 0))]),
+    )
+    _, state = aggregate_tick(
+        state,
+        tick(1, T1, [proc(120, 1, 10), proc(121, 120, 11, (0, 0, 10, 0))]),
+    )
+    first = tick(0, T2, [proc(120, 1, 10)], epoch=2)
+    first = (
+        replace(first, unresolved_pids=(121,))
+        if status == "unresolved"
+        else replace(
+            first,
+            processes=first.processes + (proc(121, 120, 11, (0, 0, 10, 0), status=status),),
+        )
+    )
+    _, state = aggregate_tick(restored(state), first)
+    frame, _ = aggregate_tick(
+        state,
+        tick(1, T2 + 10_000_000_000, [proc(120, 1, 10, (0, 0, 10, 0))], epoch=2),
+    )
+    assert sum(delta.counters[2] for delta in frame.deltas) == 0
+    assert frame.coverage[0].reap_corrections == 1
+    assert frame.coverage[0].reap_incomplete is True

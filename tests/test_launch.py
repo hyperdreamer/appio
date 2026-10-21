@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from appio.launch import LaunchIdentity, assign_launches
 from appio.procs import AppKeyInputs, IoReadOutcome, ProcessIdentity, StableProcRecord
+from appio.sampler import TickInput, aggregate_tick
 
 BOOT = "boot-A"
 APP_PATH = "/user.slice/app.slice/app-demo.service"
@@ -75,3 +76,26 @@ def test_launch_identity_includes_process_start_ticks() -> None:
     old = LaunchIdentity(ProcessIdentity(BOOT, 50, 7), "unit:app-demo.service")
     reused = LaunchIdentity(ProcessIdentity(BOOT, 50, 8), "unit:app-demo.service")
     assert old != reused
+
+
+def test_a_known_child_reparented_to_init_keeps_the_original_launch() -> None:
+    """Review reproduction: opening a new init-child launch loses the live root."""
+    _, state = aggregate_tick(
+        None,
+        TickInput(
+            BOOT, "gui", 1, 0, 10_000_000_000, 1_010_000_000_000,
+            (proc(100, 1, 1000), proc(101, 100, 1001)),
+        ),
+    )
+    original = state.processes[1].launch_identity
+    frame, state = aggregate_tick(
+        state,
+        TickInput(
+            BOOT, "gui", 1, 1, 20_000_000_000, 1_020_000_000_000,
+            (proc(101, 1, 1001),),
+        ),
+    )
+    assert frame.deltas[0].launch_key == original
+    assert len(state.launches) == 1
+    assert state.launches[0].identity == original
+    assert state.launches[0].members == (ProcessIdentity(BOOT, 101, 1001),)
