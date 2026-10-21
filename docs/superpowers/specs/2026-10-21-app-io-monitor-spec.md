@@ -1,18 +1,20 @@
-# appio: P1 Contract Specification
+# appio: P1 Contract Specification (revision 2)
 
 Date: 2026-10-21  
-Status: P1 contract draft derived from the approved revision-3 decisions in the supplied design body.  
+Status: revision 2 — P1 contracts ratified against design revision 4 and the operator's A11/A22 rulings.
 Scope: measurement, aggregation, identity, SQLite storage, query semantics, and P1 error/degradation contracts. This document does not specify the daemon, socket protocol, BPF implementation, Qt UI, tray, packaging, or polkit, except for values those components must preserve.
 
 ## 1. Conformance and Scope
 
-The words **MUST**, **MUST NOT**, **SHOULD**, and **MAY** are normative. A requirement marked `TODO(design)` records a decision that the supplied design does not determine. The recommendation is not binding until the design owner resolves it. Implementations MUST NOT silently choose a different answer for an unresolved item.
+The words **MUST**, **MUST NOT**, **SHOULD**, and **MAY** are normative. All 22 appendix decisions A01–A22 are **ratified**. Their tags identify the decision's origin; they do not make its requirements provisional. A11 and A22 follow the operator's explicit rulings; the other 20 adopt revision 1's recommendations, including their limits on exactness.
 
 P1 MUST provide interchangeable sampler/store components. P1 MUST NOT implement the daemon, socket protocol, BPF program, UI, tray, package, or privilege setup. P1 MUST reserve the stream fields `source`, `boot_id`, `epoch`, and `seq`, and file-coverage fields needed by later plans.
 
-This specification treats the approved design body and its explicit decisions as authoritative. Its title says “revision 2” and “awaiting re-review,” while its section 13 describes revision-3 resolutions and section 14 records an agreed delivery decomposition. That source metadata inconsistency is recorded in section 13; it does not reopen the closed review history.
+The authoritative source is `2026-10-21-app-io-monitor-design.md`, revision 4, whose header now includes revision history. The operator's explicit A11/A22 rulings take precedence over conflicting source wording; section 13 records the remaining A22 wording conflict without changing the design.
 
-The concrete encodings, added storage columns, and algorithms explicitly linked to an appendix item are proposed contracts for review, not resolutions of that item. Fixtures depending on them MUST be marked provisional. Given the same database state, ordered input observations, supplied metadata, and ratified policies, implementations MUST produce equal row values; this does not require identical SQLite file bytes or page layout.
+The concrete encodings, storage columns, algorithms, and acceptance fixtures below are binding P1 contracts. Given the same database state, ordered input observations, supplied metadata, and ratified policies, implementations MUST produce equal row values; this does not require identical SQLite file bytes or page layout.
+
+Revision history: r1 specified P1 and recorded 22 decisions plus six source contradictions; r2 ratifies those decisions, adopts r4's corrected arithmetic, overflow attribution, boot scope and stored raw coverage, and disables unrepresentable windows.
 
 ## 2. Measurement Model
 
@@ -32,7 +34,7 @@ The canonical stored device token is the decimal `major:minor` token from `io.st
 
 `F` is logical VFS read/write activity. For a file, store access counts and returned byte counts independently for reads and writes. Page-cache activity counts in `F`. `F` MUST NOT be added to or subtracted from `T` or `D`, and MUST NOT be labelled physical disk traffic.
 
-Only explicitly counted omissions and overflow bytes may complete the file-activity accounting equation. `skipped_nonfile` and `skipped_unsupported_fs` describe excluded objects and MUST NOT be added to `F`.
+Only explicitly counted omissions and overflow bytes may complete the file-activity accounting equation. `skipped_nonfile` and `skipped_unsupported_fs` describe excluded objects and MUST NOT be added to `F`. Per-app overflow MUST originate in a per-cgroup-keyed producer counter and an unambiguous cgroup-to-AppKey mapping. Loss under the reserved `overflow_owner_unknown` key is a separate, first-class unknown-owner quantity; it MUST NOT be distributed among apps or hidden in an invented app/path row.
 
 ### 2.4 Reconciliation equations
 
@@ -46,6 +48,8 @@ F_read  = sum(file_row.bytes_r) + counted_omitted_bytes_r + uncounted_overflow_b
 F_write = sum(file_row.bytes_w) + counted_omitted_bytes_w + uncounted_overflow_bytes_w
 F       = F_read + F_write
 ```
+
+For a whole-window file total, `F_all_read = sum(app F_read) + overflow_owner_unknown.bytes_r` and `F_all_write = sum(app F_write) + overflow_owner_unknown.bytes_w`. Each term MUST cover the same window and be counted once. The unknown-owner remainder does not belong to any app's equation. A consumer MUST display it separately even when a selected app has zero attributed overflow.
 
 Therefore `sum(D) + R == T` and the corresponding read and write identities hold exactly. `R` is signed; a negative value means attributed device bytes exceed task-accounted bytes. It means “difference between accounting points,” not bytes lost to a named cause. `R` is derived at query time and is not persisted as an independent counter. Python results MUST use signed integers; SQLite unsigned-like counters are limited to `[0, 2^63-1]`.
 
@@ -68,7 +72,7 @@ AppKey = "unit:" UnitName
        | "scope:" CgroupPath
 ```
 
-`AppKey` is a nonempty UTF-8 string without NUL. Under the proposed A07 encoding, each payload is nonempty and preserves the source UTF-8 bytes: ASCII letters, digits, and `/._:@+-` pass through; every other byte is `%HH` with uppercase hexadecimal. Literal `%` is therefore `%25`; safe bytes MUST NOT be unnecessarily escaped. A decoded executable/cgroup payload MUST start with `/`; a decoded unit/desktop payload MUST NOT contain `/`. The all-inputs-unavailable fallback is proposed as `scope:/session/unknown`. No case folding or Unicode normalization is applied to identity. `app_id` is a positive, database-local surrogate and MUST NOT be sent across stores or treated as identity. Stores correlate applications only by exact `AppKey` equality plus boot identity where required.
+`AppKey` is a nonempty UTF-8 string without NUL. Under the ratified A07 encoding, each payload is nonempty and preserves the source UTF-8 bytes: ASCII letters, digits, and `/._:@+-` pass through; every other byte is `%HH` with uppercase hexadecimal. Literal `%` is therefore `%25`; safe bytes MUST NOT be unnecessarily escaped. A decoded executable/cgroup payload MUST start with `/`; a decoded unit/desktop payload MUST NOT contain `/`. The all-inputs-unavailable fallback MUST be `scope:/session/unknown`. No case folding or Unicode normalization is applied to identity. `app_id` is a positive, database-local surrogate and MUST NOT be sent across stores or treated as identity. Stores correlate applications only by exact `AppKey` equality plus boot identity where required.
 
 `resolve_app(cgroup_path, exe, desktop_id)` MUST use this precedence:
 
@@ -80,13 +84,13 @@ AppKey = "unit:" UnitName
 
 Within the same precedence class, the candidate is the deepest path component; equal-depth candidates are ordered by bytewise UTF-8 unit name. The fallback must always return an `AppKey`; unavailable cgroup, desktop, and executable inputs resolve to a session-scope key.
 
-`TODO(design) A07` records that the design gives examples and precedence but does not specify systemd escaping, desktop-ID canonicalization, executable symlink normalization, or the exact encoding of arbitrary cgroup components. The grammar and tie-break above are recommendations, not a silent claim that the design chose those encodings.
+**A07 — ratified.** Resolution MUST preserve systemd unit spelling and use a supplied desktop file ID verbatim. The executable fallback MUST use the absolute `/proc/<pid>/exe` target without resolving another symlink layer. The percent encoding, precedence, fallback, and tie ordering above MUST be used; identity MUST NOT depend on locale, case folding, or display-name normalization.
 
 ### 3.3 Launch identity
 
 A launch row is scoped by `(app_id, boot_id, launch_id)`. `launch_id` is a positive local surrogate. Raw task samples MUST include a non-null `launch_id`; `0` is reserved for “launch not resolved” and MUST NOT appear in `launch`. Device/file rows are app-level and need not be split by launch.
 
-`TODO(design) A06`: the design does not define which process starts or events open and close a launch, how multiple concurrent instances of one app are grouped, or how a launch is recovered after collector restart. Recommendation: define one launch per app-root process identity and descendants that resolve to the same AppKey; close only after all known member identities disappear. P2 MUST NOT claim launch/lifetime accuracy until this is ratified.
+**A06 — ratified.** A collector MUST open one launch per app-root process identity and group its known descendants only while they resolve to the same AppKey. An app root is a validated identity with no known same-AppKey parent; concurrent roots create distinct launches. A launch MUST close only after all known members are confirmed absent, not when its root alone exits. The stored `(boot_id, root_pid, root_start_ticks)` identifies the root across collector restarts; an unresolved membership MUST use `launch_id=0` rather than guess. Launch records support aggregation bookkeeping; A22 disables every public launch-window query.
 
 ### 3.4 Collector stream identity
 
@@ -94,7 +98,13 @@ A stored observation is namespaced by `(boot_id, source, epoch, seq)`. Reserved 
 
 Each collector-owned interval is half-open `[from_mono_ns, to_mono_ns)`. Handover uses a single `cutoff_mono_ns`; the outgoing interval ends there and the incoming interval starts there. Baselines captured at the cutoff MUST prevent the incoming collector from re-emitting pre-cutoff counters. An uncovered interval MUST be represented by a `gap` row. If a handover record is missing and two ownership intervals overlap, both byte contributions in the overlap MUST be excluded and the overlap MUST be marked uncertain.
 
-`TODO(design) A08`: the design names persisted epochs and sequence identity but does not specify atomic epoch allocation, sequence persistence, restart behavior, or the exact interval when a collector dies before closing its interval. Recommendation: allocate a new epoch transactionally on every process start, persist sequence before publishing each row, and close a crashed interval at the first durable evidence of the next collector's start.
+**A08 — ratified.** Every collector process start MUST transactionally allocate a new epoch (`previous + 1` in the same boot, otherwise `1`) and set `last_seq=NULL`; sequence numbering starts at zero. A frame MUST commit its sequence receipt, rows, and totals before publication. A crashed interval MUST be closed at the first durable evidence of the next collector's start, with the time after its last durable observation recorded as a gap rather than claimed coverage. Handover baseline JSON MUST be versioned before interchange: P1 reserves an object with integer `version=1`, `boot_id`, `cutoff_mono_ns`, and `processes`/`devices` arrays. Process entries MUST carry stable process/parent identities, AppKey, launch-root identity, all four cumulative baselines and pending component-wise credits; device entries MUST carry `(cgroup_id,dev,rbytes,wbytes)`. Null explicitly denotes an unknown parent/root. Arrays MUST use stable identity order and section 5.4's canonical JSON. An incompatible or incomplete object MUST be rejected as a handover, recording the resulting gap/uncertainty. This is a store contract, not a socket protocol.
+
+### 3.5 Path identity and boot chronology
+
+**A20 — ratified.** Every monotonic endpoint MUST retain its boot identity: `path`/`path_alias` use first/last boot-ID pairs, lifetime totals use `updated_boot_id`, and clock segments use `(boot_id,segment_start_mono_ns)`. Cross-boot first/last ordering MUST use persisted `boot.boot_order`, then the within-boot monotonic value; implementations MUST NOT compare boottimes from different boots. A new locally observed boot gets the next positive boot order. Imports MUST supply consistent relative boot chronology and remap local orders transactionally; conflicting or missing chronology MUST be rejected rather than guessed from current wall time. Boot order is local ordering metadata, not external identity.
+
+A strong file identity MUST use the supplied filesystem UUID, device, inode, generation, and captured basename. ext4 supports strong identity; btrfs/overlayfs and an unverified filesystem MUST be weak, and missing UUID MUST use the empty string with `identity_weak=1`. Weak and strong rows MUST remain separate. tmpfs is excluded and counted under the supported-filesystem policy; excluded objects MUST NOT enter F. A new captured basename MUST create/reuse its own path row and record aliases without rewriting an earlier captured name. For one app/file identity aggregated within an hour, including contributions from different cgroups, the bytewise least captured basename is the canonical row name and all other captured names MUST be preserved as aliases. This canonicalization selects among observed basenames; it MUST NOT reconstruct a full path or hide truncated/unresolved states. Each alias's first/last pair MUST be updated using the same persisted chronology. LAST for a file query MUST come from its selected observations/totals, not a global alias timestamp.
 
 ## 4. Time, Buckets, Windows, and Coverage
 
@@ -109,15 +119,15 @@ bucket interval = [bucket_start_mono_ns, bucket_start_mono_ns + bucket_ns)
 
 Bucket boundaries MUST be computed with integer division and MUST NOT use wall time. Wall labels use a persisted mapping `wall_ns = mono_ns + wall_offset_ns`; each offset is sampled from realtime and boottime at the same observation. A new `clock_map` segment starts at the current boottime timestamp when the absolute change from the previous offset is strictly greater than `1_000_000_000` ns. Historical labels use the segment with the greatest start timestamp not greater than the sample timestamp. An NTP step MUST NOT alter a bucket key or row order.
 
-A new boot's first accepted observation MUST create its initial clock segment at `segment_start_mono_ns=0`, using that observation's offset; this extends the initial label mapping back to boot zero without asserting collection coverage there. Subsequent segments follow the threshold rule above. Raw durable observations have a nominal 10-second cadence; the 2-second live cache is not a second durable stream. The proposed raw series bucket width is `10_000_000_000` ns. Exact attribution timestamps for suspend-spanning observations and persisted observed-time denominators remain part of `TODO(design) A09`; they MUST NOT be inferred from a long delay alone.
+A new boot's first accepted observation MUST create its initial clock segment at `segment_start_mono_ns=0`, using that observation's offset; this extends the initial label mapping back to boot zero without asserting collection coverage there. Subsequent segments follow the threshold rule above. Raw durable observations have a nominal 10-second cadence; the 2-second live cache is not a second durable stream. The raw series bucket width MUST be `10_000_000_000` ns. Each raw sample MUST persist the actual `observed_mono_ns`, the attributed `ts_mono_ns`, and the nullable `interval_start_mono_ns`/`observed_ns` rate evidence. All these timestamps belong to that row's `boot_id`.
 
 A delta known to span suspend is assigned to the bucket of the last observation before suspend, and its sample row has `spans_suspend=1`. The rate denominator excludes the suspended interval. `spans_suspend` is a boolean integer, `0` or `1`; aggregation across rows uses logical OR, not addition.
 
-`TODO(design) A09`: the design does not specify how suspend is detected, whether the suspend boundary is exact, how observed time is computed for a partially observed interval, or how multiple gaps and suspends interact. Recommendation: consume an explicit suspend/resume boundary source; subtract only measured suspended nanoseconds from the sample interval; never infer a suspend from a large sampling delay alone.
+**A09 — ratified.** The collector MUST consume explicit suspend/resume boundaries and MUST NOT infer suspend from a long sampling delay. It MUST subtract the union of measured suspended intervals from the observed interval, intersecting boundaries with that interval and counting overlaps only once. Known uncovered time is likewise excluded once. `observed_ns` MUST persist this denominator; unknown boundaries or duration MUST produce NULL, not a guessed rate. A first baseline has NULL interval/rate evidence. If contributors to an app/launch row do not have a common measured interval, its rate MUST be unavailable; their bytes still accumulate. A suspend-spanning sample MUST retain its actual observation timestamp while `ts_mono_ns` identifies the last pre-suspend observation for bucket assignment.
 
 ### 4.2 Windows and tier selection
 
-Every query window is half-open. A bounded range is `[start_mono_ns, end_mono_ns)` with `start < end` and one `boot_id`. `since_boot` is from the boot's first boottime instant to the requested end. `launch` is bounded by that launch's stored start/end. `lifetime` spans all boots and is answered from lifetime totals only.
+Every supported query window is half-open. A bounded `range` is `[start_mono_ns, end_mono_ns)` with `start < end` and one `boot_id`. `since_boot` is from boot zero to the requested end. `lifetime` spans all boots and is answered from lifetime totals only. `launch` remains a syntactically valid reserved Window kind but MUST be rejected as disabled, even when raw launch rows survive (A22 — ratified).
 
 For a bounded window of duration `d = end - start`, tier selection is disjoint and MUST use these inclusive upper bounds:
 
@@ -126,11 +136,13 @@ For a bounded window of duration `d = end - start`, tier selection is disjoint a
 | `d <= 24 hours` | raw `sample` and `sample_dev` | raw observations |
 | `24 hours < d <= 30 days` | 60-second `rollup_app` and `rollup_dev` | 60 s |
 | `30 days < d <= 365 days` | 3600-second rollups | 3600 s |
-| `d > 365 days` or lifetime | totals tables | totals only; no time series or peak |
+| bounded `range` with `d > 365 days` | none | disabled; `WindowUnavailableError(reason="unsupported_window")` |
+| exact full `since_boot` with `d > 365 days`, or `lifetime` | totals tables | totals only; no time series or peak |
+| `launch`, at any duration/age | none | disabled; `WindowUnavailableError(reason="launch_attribution")` |
 
-The source tier MUST NOT be blended with an adjacent tier for the same quantity. Results MUST disclose the selected tier and coverage. Selection by duration does not guarantee that the selected history is still retained: a short old window whose raw observations have expired remains unavailable rather than silently switching tiers. Exact partial-bucket inclusion at either window edge is unresolved; see `TODO(design) A10`. Recommendation: include only complete buckets wholly contained in the requested window, expose omitted boundary duration as incomplete coverage, and do not prorate bytes. A duration above 365 days selects the totals-only presentation, but arbitrary bounded and launch windows cannot necessarily be answered from the existing totals; see `TODO(design) A22`. A full-boot/lifetime total MUST NOT be substituted for a different requested range.
+The source tier MUST NOT be blended with an adjacent tier for the same quantity. Disabled-window checks MUST precede tier selection. Results MUST disclose the selected tier and coverage. Selection by duration does not guarantee retention: a short old window whose selected observations expired MUST remain unavailable/incomplete rather than switch tiers. **A10 — ratified:** only complete buckets wholly contained in the request MUST contribute; omitted boundary time MUST make coverage incomplete, and bytes MUST NOT be prorated. An exact full-boot total means a `since_boot` request ending at that boot's durable collection cutoff, not an arbitrary historical prefix. A full-boot/lifetime total MUST NOT substitute for a different requested range.
 
-File data has its own 14-day `file_sample` retention and `app_boot_file_total` totals. The design does not define exact file-table behavior for 14-365 day bounded windows, nor whether `file_sample` is per drain or pre-aggregated to hourly top-100. See `TODO(design) A11`. Recommendation: answer only from retained file observations or exact full-boot totals; return explicit unavailable/incomplete coverage for an unrepresentable bounded window, never relabel a full-boot total as a bounded-window result.
+**A11 — ratified, operator ruling.** File observations MUST be HOURLY: one finalized snapshot per `(boot_id,AppKey,hour)` after aggregation across all authoritative contributions, with at most the top 100 files per app-hour. File observations and their hourly coverage MUST have independent 14-day retention. File queries MUST use retained hourly observations, or exact full-boot/lifetime retained-observation totals; other unrepresentable allowed windows MUST return explicit unavailable/incomplete file results. Section 8.3's disabled-window error takes precedence for all launch and over-365-day range queries.
 
 ### 4.3 Stored coverage quantities
 
@@ -152,16 +164,19 @@ All coverage counts are nonnegative integers no greater than `2^63-1`. They are 
 | `counted_omitted_files` | integer count | distinct file rows omitted by deterministic top-N/quota selection in the represented interval |
 | `counted_omitted_bytes_r/w` | nonnegative integer bytes | exact bytes of those counted omitted rows |
 | `uncounted_overflow_files` | integer count | failed map insert attempts; not a distinct-file estimate |
-| `uncounted_overflow_bytes_r/w` | nonnegative integer bytes | exact bytes charged to overflow counters |
+| `uncounted_overflow_bytes_r/w` | nonnegative integer bytes | exact bytes from the app's attributable per-cgroup overflow counters |
+| `overflow_owner_unknown` | separate owner key with attempt/read-byte/write-byte counters | unassignable overflow, stored and queried independently; never allocated to an app |
+| `reap_incomplete` | integer boolean | nested/rebased reap credits lack proven conservation; no exactness claim |
+| `counter_overflow` | integer boolean | a rejected out-of-range transaction affects the window; durable diagnostic, never a wrapped byte count |
 | `skipped_nonfile` | integer count | excluded non-file objects |
 | `skipped_unsupported_fs` | integer count | excluded filesystem objects |
 | `weak_identity_rows` | integer count | observed file identities whose `path.identity_weak=1`, including retained and omitted rows |
 | `hook_hits` | object of six nonnegative integer counters | hits for `vfs_read`, `vfs_write`, `vfs_readv`, `vfs_writev`, `vfs_iter_read`, `vfs_iter_write`; zero means no observed hit, not proof of inactivity |
 | `identity_weak` | integer boolean on `path` | `1` means the path key is weak and MUST NOT merge with a strong identity |
 
-`identity_weak`, `first_seen_partial`, and `spans_suspend` are constrained to `{0,1}` in SQLite. Coverage over a union of source rows is computed after stream deduplication and interval selection: sum integer counts/bytes and the four reap components; sum all six `hook_hits`; OR boolean coverage flags. `device_state` is `incomplete` if any selected interval is incomplete or if `available` and `not_delegated` are mixed, `not_delegated` if all selected intervals are not delegated, and `available` if all are available. With no source rows it is `incomplete`. `hook_hits` are stored in the file subobject of `coverage_json` and in the six `hook_*` columns of `file_coverage`, so they survive the independent 14-day file retention; `weak_identity_rows` is stored in `file_coverage`. A result's `Coverage` MUST report the exact aggregation tier and whether the requested window is complete.
+`identity_weak`, `first_seen_partial`, `spans_suspend`, `reap_incomplete`, and `counter_overflow` use `{0,1}` when persisted. After stream deduplication and interval selection, implementations MUST sum integer counts/bytes and each reap component, sum all six hook counters, and OR boolean flags. `device_state` is `incomplete` if any selected interval is incomplete or if `available` and `not_delegated` are mixed, `not_delegated` if all are not delegated, and `available` if all are available; no source rows means `incomplete`. Hook counters and `weak_identity_rows` MUST survive independently in hourly `file_coverage` and file totals. A result's `Coverage` MUST report its source tier and window completeness. Unknown-owner overflow MUST have its own window result and MUST NOT be summed once per app.
 
-`TODO(design) A12`: the design does not define counter units for `inaccessible_pids`, `resets`, `reap_corrections`, `partial_intervals`, or `skipped_*`, nor a stable JSON schema for `coverage_json`. The table above is the recommendation used by this draft and requires ratification. In addition, the original raw `sample` schema has nowhere to persist most process-coverage counters; this draft adds `sample_coverage` rather than silently dropping them.
+**A12 — ratified.** Section 4.3 defines the required units and operators. `sample_coverage` MUST persist one per-app receipt per accepted process tick, including zero-T ticks. Its JSON is a superset of r4's abbreviated raw-coverage columns and preserves all four components of reap quantities. Raw coverage MUST be read from these rows, not inferred from missing byte rows or borrowed from full-boot coverage.
 
 ## 5. Aggregation Algorithm
 
@@ -204,7 +219,7 @@ aggregate_tick(boot_id, source, epoch, seq, ts_mono_ns, wall_ns):
         if identity has no baseline:
             if any current counter is nonzero:
                 set first_seen_partial = 1
-                emit current cumulative counters as the proposed initial delta
+                emit current cumulative counters once as the initial partial delta (A01 — ratified)
             else:
                 set first_seen_partial = 0
                 emit four zero deltas
@@ -239,39 +254,46 @@ aggregate_tick(boot_id, source, epoch, seq, ts_mono_ns, wall_ns):
         add that remainder to reap_unapplied; attribute it to no app total
 
     aggregate cgroup io.stat deltas per (app, dev), never per process
-    aggregate file events and file-coverage counters independently from T and D
+    accumulate file candidates and coverage independently in their boottime app-hour
+    finalize a file snapshot only when its app-hour closes; apply top-100 after aggregation
+    route keyed overflow to its unambiguous app; keep overflow_owner_unknown separate
     materialize one sample row per (app, launch) with at least one readable identity:
         sum each adjusted counter; first_seen_partial is OR across contributing identities
         spans_suspend is OR across contributing identity intervals
         delta_kind = 'reset' if any counter decreased,
                      else 'baseline' if any identity had no prior baseline,
                      else 'normal'
-    materialize sample_dev, sample_coverage, file_sample, file_coverage
-        including coverage rows with zero T/F rows; store per-tick inaccessible set counts
-    update rollup and lifetime/boot totals once; commit all state with collector_epoch.last_seq
+    materialize sample_dev and per-tick sample_coverage, including zero-T coverage
+    persist staged open file-hour state; for finalized hours materialize file_sample,
+        file_coverage and file_overflow_unknown, including zero-F coverage
+    update each quantity's rollups and lifetime/boot totals once; commit with last_seq
 ```
 
 `first_seen_partial` on the app/launch sample row is `1` iff at least one contributing process identity was first observed with nonzero counters; `spans_suspend` is `1` iff at least one contributing interval spans suspend. `partial_intervals` increments once per app/frame if any contributing identity is first-seen partial, and `spans_suspend_intervals` increments once per app/frame if any contributing interval spans suspend; multiple launches in that frame do not multiply these counts. For aggregated `delta_kind`, `reset` takes precedence over `baseline`, and `baseline` over `normal`; `baseline` applies when any contributing identity had no prior readable baseline, including a zero-valued first read.
 
-Credits are component-wise. Credit values are cumulative child counters because the parent receives the child's cumulative totals on reap. A credit is applied to a delta computed on or after the scan that detects disappearance and never makes an emitted delta negative; this includes the current parent delta in section 10's reap fixture. No parent delta means the credit carries unchanged. Increment `reap_corrections` only on the first positive application of a child's credit, even if later ticks consume more components. Queue order is disappearance sequence ascending, then `(child_pid, child_start_ticks)` ascending for simultaneous disappearances. If the parent vanishes first, remaining credit is recorded in its app's `reap_unapplied` and not folded into T. `reap_unobserved` MUST NOT be guessed from a large parent delta alone. Parent capture, nested reaps, and counter-reset interactions still require the A02/A04 policies; this ordering does not resolve those source ambiguities.
+Credits are component-wise. Credit values are cumulative child counters because the parent receives the child's cumulative totals on reap. A credit is applied to a delta computed on or after the scan that detects disappearance and never makes an emitted delta negative; this includes the current parent delta in section 10's reap fixture. No parent delta means the credit carries unchanged. Increment `reap_corrections` only on the first positive application of a child's credit, even if later ticks consume more components. Queue order is disappearance sequence ascending, then `(child_pid, child_start_ticks)` ascending for simultaneous disappearances. If the parent vanishes first, remaining credit is recorded in its app's `reap_unapplied` and not folded into T. `reap_unobserved` MUST NOT be guessed from a large parent delta alone. **A02 — ratified:** each decreasing field MUST reset only its own baseline; an identity record with any decrease contributes exactly one reset. An already-open identity's ESRCH outcome contributes one reset independently; an unknown identity contributes none.
 
-`TODO(design) A03`: polling alone does not identify which portion of a parent jump is a never-sampled child's reap charge or provide a threshold for a “jump.” Recommendation: until an explicit event/threshold contract exists, set `reap_unobserved` to zero and account the parent delta normally; do not label ordinary parent activity as an unseen reap.
+**A01 — ratified.** A first readable identity without an incoming handover baseline MUST emit its current counters exactly once and set `first_seen_partial=1` if any is nonzero. A handover baseline MUST take precedence and prevent re-emission of pre-cutoff bytes.
 
-`TODO(design) A04`: the design does not determine parent-identity capture across reparenting, a child disappearing between scans, or credit ordering when multiple children are reaped into one parent. Recommendation: preserve the last observed `(boot_id,pid,start_ticks)` parent identity and consume credits FIFO by disappearance sequence, then `(child_pid, child_start_ticks)` for simultaneous disappearances.
+**A03 — ratified.** P1 MUST keep all four `reap_unobserved` components zero and account a parent increment normally unless explicit evidence classifies it; polling magnitude alone MUST NOT infer an unseen child.
+
+**A04 — ratified.** Parent credits MUST target the last observed `(boot_id,pid,start_ticks)` parent, never a reused PID or guessed reparenting target. FIFO MUST use disappearance sequence then `(child_pid,child_start_ticks)`; a child correction MUST count only at first positive use. Nested reaps or counter resets that make credit conservation unprovable MUST set persisted `reap_incomplete=1` and force T coverage incomplete. The component-wise nonnegative algorithm still applies, but an implementation MUST NOT claim byte-exactness for those intervals without an independently proved conservation rule. This is the ratified conservative contract, not a pending product decision.
 
 ### 5.2 Cgroup and file deltas
 
-For each cgroup/device pair, D is the current cumulative `io.stat` value minus the last value for the same boot and cgroup identity. A cgroup with no `io.stat` contributes no D row and is not equivalent to a zero-byte row. Counter-decrease and cgroup-recreation handling for D is unresolved (`TODO(design) A05`); recommendation: key baselines by `(boot_id,cgroup_id,dev)`, clamp a decrease to zero, and establish a fresh baseline.
+For each cgroup/device pair, D is the current cumulative `io.stat` value minus the last value for the same boot and cgroup identity. A cgroup with no `io.stat` contributes no D row and is not equivalent to a zero-byte row. **A05 — ratified:** baselines MUST be keyed by `(boot_id,cgroup_id,dev)`. A first observation or observed recreation MUST establish a fresh baseline and emit zero; a decrease MUST emit zero for that field and reset its baseline. Task migration MUST NOT copy a cgroup baseline to another cgroup or consume it once per process.
 
-F events are keyed by `(cgroup_id,dev,inode,generation)` in the later BPF plan and are translated to app ownership before persistence. F aggregation MUST preserve reads, writes, bytes_r, and bytes_w separately. Insertion overflow bytes are counted as unknown; they MUST NOT be made up from retained file rows.
+**A19 — ratified.** If distinct AppKeys share one cgroup and no unique approved owner exists, P1 MUST NOT duplicate or divide its D bytes. It MUST emit no per-app D for that cgroup and mark all affected apps' device attribution incomplete. This specification approves no synthetic cgroup owner; ordinary single-AppKey cgroups retain exact once-only attribution.
+
+F events use `(cgroup_id,dev,inode,generation)` producer keys and MUST preserve reads, writes, bytes_r, and bytes_w separately. The later producer MUST supply per-cgroup overflow attempts and exact read/write bytes. A uniquely resolved cgroup MUST contribute to that app's `uncounted_overflow_*`; unkeyable loss MUST contribute under `overflow_owner_unknown`. A keyed cgroup without a unique app owner MUST also remain in that unknown-owner remainder, never receive an arbitrary split. Producer and store MUST preserve both quantities without deriving overflow from retained rows.
 
 ### 5.3 Quota and prune job
 
 The quota job runs every 300 seconds and after a bulk import. Before expiring or quota-deleting a source unit, the transaction MUST commit the exact 60-second/hour rollups and boot/lifetime totals promised for that unit; file totals MUST be committed before deleting file observations. Expiry uses mapped wall nanoseconds: for `(boot_id, mono_ns)`, select `wall_offset_ns` from the `clock_map` row in that boot with greatest `segment_start_mono_ns <= mono_ns`, then compute `mono_ns + wall_offset_ns`. The current comparison time is mapped by the same rule. If either mapping is absent, pruning MUST stop before deleting a row and mark coverage incomplete rather than guess. A row is expired only when its mapped time is strictly less than `now_wall_ns - retention_ns`.
 
-Retention and deletion units are independent: `sample`, `sample_dev`, and `sample_coverage` expire after 24 hours; `file_sample` and `file_coverage` expire after 14 days; 60-second rollups expire after 30 days; 3600-second rollups expire after 365 days; totals and `path` identities referenced by totals are never expired. `sample_coverage` and `file_coverage` MUST have one row per app/stream observation even when the corresponding T or F row set is empty. This preserves per-app time and lets 14-day file observations outlive 24-hour process samples. `gap` rows expire after 24 hours; rollup coverage retains older gap effects.
+Retention and deletion units are independent: `sample`, `sample_dev`, and `sample_coverage` expire after 24 hours; hourly `file_sample`, `file_coverage`, and `file_overflow_unknown` expire after 14 days; 60-second rollups expire after 30 days; 3600-second rollups expire after 365 days. Totals, diagnostics, boot chronology, and path identities referenced by totals MUST NOT expire. `sample_coverage` MUST exist once per app/process tick, even with zero T. `file_coverage` MUST exist once per monitored app-hour, even with zero F, and MUST persist hour completeness independently of process retention. The unknown-owner hourly coverage MUST likewise exist for every monitored file hour, including a zero remainder. A pending hour is durable accumulator state, not an additional observation; it MUST be removed atomically when that hour is finalized. `gap` rows expire after 24 hours; persisted tier coverage retains older gap effects.
 
-Under quota pressure, select candidates in tier order: raw units, 60-second app buckets, then 3600-second app buckets. Within each tier select the smallest deterministic key. A core raw unit is `(boot_id, source, epoch, seq, app_id)` and deletes all `sample` launches plus matching `sample_dev` and `sample_coverage` rows. A file raw unit is the same key and deletes only matching `file_sample` and `file_coverage` rows. A gap is its own unit keyed by `gap_id`. A rollup unit is `(boot_id, app_id, bucket_secs, bucket_start_mono_ns)` and includes the corresponding `rollup_app` row and all `rollup_dev` rows. Within a tier, the primary sort value is mapped wall time computed from `sample_coverage.ts_mono_ns` for core units, `file_coverage.ts_mono_ns` for file units, `gap.to_mono_ns` for gaps, and `bucket_start_mono_ns` for rollups. Remaining keys sort by `boot_id` UTF-8 bytes, `source` UTF-8 bytes (empty for rollups), `epoch` (zero for rollups), `seq` (zero for rollups), `app_id` (zero for gaps), unit kind (`core`, `file`, `gap`, then `rollup`), `bucket_secs` (zero for raw/gap units), and `gap_id` for gaps or zero otherwise. No child row may outlive a deleted core raw unit; file observations are independent units by design.
+Under quota pressure, select candidates in tier order: raw units, 60-second app buckets, then 3600-second app buckets. Within each tier select the smallest deterministic key. A core raw unit is `(boot_id, source, epoch, seq, app_id)` and deletes all `sample` launches plus matching `sample_dev` and `sample_coverage` rows. A file raw unit is `(boot_id,app_id,ts_mono_ns)` for one hour and deletes its `file_sample` plus `file_coverage`; source/epoch/seq are provenance, not extra hourly budgets. Unknown-owner file units use `(boot_id,ts_mono_ns)` and delete `file_overflow_unknown` only. A gap is its own unit keyed by `gap_id`. A rollup unit is `(boot_id, app_id, bucket_secs, bucket_start_mono_ns)` and includes the corresponding `rollup_app` row and all `rollup_dev` rows. Within a tier, the primary sort value is mapped wall time computed from `sample_coverage.ts_mono_ns` for core units, `file_coverage.ts_mono_ns` for app-file units, `file_overflow_unknown.ts_mono_ns` for unknown-owner units, `gap.to_mono_ns` for gaps, and `bucket_start_mono_ns` for rollups. Remaining keys sort by `boot_id` UTF-8 bytes, `source` UTF-8 bytes (empty for rollups), `epoch` (zero for rollups), `seq` (zero for rollups), `app_id` (zero for gaps), unit kind (`core`, `file`, `file_unknown`, `gap`, then `rollup`), `bucket_secs` (zero for raw/gap units), and `gap_id` for gaps or zero otherwise. No child row may outlive a deleted core raw unit; file observations are independent units by design.
 
 ```text
 quota_prune(boot_id, now_mono_ns):
@@ -279,7 +301,7 @@ quota_prune(boot_id, now_mono_ns):
     ensure exact due rollups and boot/lifetime totals already exist; do not re-add them
     map the current boottime to now_wall_ns
     delete expired core raw units using 24h cutoff
-    delete expired file raw units using 14d cutoff
+    delete expired app-file and unknown-owner hourly units using 14d cutoff
     delete expired gap units using 24h cutoff
     delete expired 60-second rollup units using 30d cutoff
     delete expired 3600-second rollup units using 365d cutoff
@@ -303,17 +325,19 @@ quota_prune(boot_id, now_mono_ns):
     resume sampling only after a fresh physical_store_bytes() check is <= 1_500_000_000
 ```
 
-`physical_store_bytes()` is the sum of `st_size` for the main database, `-wal`, and `-shm` files after a successful checkpoint; a missing sidecar contributes zero. The loop commits each deletion unit and checkpoints before measuring again. For raw-unit key sorting, the final row key is `gap_id` for a gap and zero for core, file, and rollup units. `TODO(design) A13`: the design specifies neither decimal versus binary GB, physical versus logical byte accounting, cross-boot age, nor tie ordering. This draft recommends a decimal 1,500,000,000-byte hard limit, mapped-wall age across boots, file lengths as measured above, and the exact ordering stated here. These choices require ratification. Totals are never deleted; if all eligible history has been pruned and the store remains over quota, sampling pauses rather than silently exceeding the limit.
+**A13 — ratified.** `physical_store_bytes()` MUST sum `st_size` for the main database, `-wal`, and `-shm` after a successful checkpoint; a missing sidecar contributes zero. The quota MUST be decimal `1_500_000_000` bytes. Each deletion unit MUST commit and checkpoint before remeasurement; the final sort key is `gap_id` for gaps and zero otherwise. Unknown-owner units use `app_id=0` for sorting only, never a synthetic app row. The mapped-wall age and exact deterministic ordering above MUST be used across boots. Totals MUST never be deleted. Sampling MUST pause when eligible pruning/shrink cannot meet quota and MUST resume only after a fresh successful size check satisfies the limit.
 
 ### 5.4 Deterministic materialization
 
-For each newly accepted frame, app/launch sample counters are component-wise sums of adjusted process deltas. Each cgroup/device baseline is consumed once, then its D delta is summed into the app/device row; the proposed first cgroup observation establishes a baseline and emits zero. F candidates with the same producer identity are summed before top-N selection. Counted omissions and overflow are never re-added to retained rows.
+For each accepted frame, app/launch samples MUST sum adjusted process deltas component-wise. Each cgroup/device baseline MUST be consumed once, with its first observation emitting zero. F candidates MUST accumulate for a fixed boottime hour before top-100 selection, merging the same app/file identity across cgroups. A single `file_hour_state` record per `(boot_id,hour)` MUST checkpoint the complete accumulator atomically with stream receipts. Its version-1 object MUST contain `version`, `apps`, and `unknown_owner`: apps use external AppKeys and file identities with all byte/access counters, aliases, LAST, coverage and last receipt; unknown_owner carries its counters/coverage/last receipt. Database-local IDs MUST NOT be used as interchange identity. Pending state MUST survive restart/handover. Finalization MUST write one snapshot (at most 100 rows) and coverage row per app-hour, but exactly one unknown-owner row per boot-hour, then delete pending state atomically. It MUST advance `boot.file_finalized_through_mono_ns` to that hour's end in chronological order. An hour below that durable watermark MUST NOT reopen after replay or even after its observations have expired. Counted omissions and overflow MUST NOT be re-added to retained rows.
 
-For each app/frame, coverage is reduced once across its identities, independently of the number of launches. Insert its coverage once into each selected 60-second and 3600-second bucket, boot total, and lifetime total. Both rollup widths receive the frame directly; an hourly row MUST NOT also add a minute row containing the same frame. All additive UPSERTs execute only behind the committed sequence guard. Retention/pruning jobs validate or rebuild from a complete source snapshot; they MUST NOT replay additive UPSERTs into existing totals.
+For each app/process frame, process coverage MUST be reduced once across identities, independently of launches, and inserted once into both 60-second and 3600-second app buckets and boot/lifetime process totals. Both widths receive the frame directly; an hour MUST NOT also add its minute rows. File coverage instead follows its hourly tier and `app_boot_file_coverage`; lifetime file coverage is the sum of those boot rows. Process-tier JSON retains a zero-valued file placeholder and MUST NOT masquerade as a finer file observation. File queries MUST obtain file fields from their own hourly/total source. All additive updates and hour finalization MUST be guarded by the committed receipt/finalized-hour identity. Retention jobs MUST NOT replay additive UPSERTs into existing totals.
 
-Within a boot, ordinary deltas go to `floor(ts_mono_ns / width_ns) * width_ns`. Suspend attribution and observation duration use A09, not wall labels. Proposed A16 peak semantics are the maximum defined app-interval rate in the represented bucket/window: `floor(delta_bytes * 1_000_000_000 / observed_ns)` for positive observed duration. A baseline without an observed interval has no rate; persisted peak fields use zero until a defined rate exists, while incomplete coverage prevents that placeholder from implying a measured peak. The same frame's rate feeds both rollup widths and its boot peak. Totals-only query peaks remain `None`. This numeric and temporal peak policy requires A16 ratification.
+**A16 — ratified.** For a positive measured app interval, each rate MUST be `floor(delta_bytes * 1_000_000_000 / observed_ns)`. Raw queries and both rollup widths MUST take maxima of those same defined interval rates, never averages fabricated from a wider bucket. A baseline, zero-duration, or unknown/common-interval failure has no defined rate. Persisted peak fields use zero until a defined rate exists; such coverage MUST prevent that placeholder from implying a measured peak. The same frame rate feeds its boot peak. Totals-only query peaks MUST remain `None`. Ordinary bucket assignment uses the integer rule in section 4.1; suspend timestamps/durations MUST follow A09.
 
 Surrogate IDs are allocated as one greater than the current maximum positive ID (or `1` for an empty table), with new apps sorted by AppKey UTF-8 bytes, launches by `(app_id, started_mono_ns, root_pid, root_start_ticks)`, and paths by their declared uniqueness tuple. Existing identities reuse their IDs. Text metadata is supplied input, not locale-derived. Canonical JSON uses sorted keys, UTF-8, `ensure_ascii=False`, separators `(',', ':')`, decimal integer tokens, and no trailing LF or nonfinite values. These rules specify equal row values from equal prior state without promising equal database files.
+
+**A21 — ratified.** A counter, aggregate, or peak outside its SQLite range MUST reject and roll back the entire observation transaction, including sequence, baseline and total changes. The caller MUST receive `CounterOverflowError`. In a separate representable transaction, the store MUST persist a `store_diagnostic` with `code="counter_overflow"`, stream identity, affected already-persisted app (NULL means the whole stream, including a new app whose insert rolled back), the observation time and offending field name; no out-of-range numeric payload is stored. Queries intersecting the affected observation bucket MUST OR `counter_overflow=1` into coverage, including boot/lifetime queries, and MUST report incomplete coverage. Diagnostics MUST survive pruning. If diagnostic persistence fails, collection MUST stop with that failure rather than acknowledge success. Subsequent observations MUST NOT silently bridge the rejected interval; recovery MUST establish an explicit baseline/gap. Wrapping, saturation and REAL coercion are forbidden.
 
 ## 6. SQLite Schema
 
@@ -321,13 +345,13 @@ Surrogate IDs are allocated as one greater than the current maximum positive ID 
 
 SQLite uses signed 64-bit `INTEGER`. Every table below is `STRICT`; the minimum supported SQLite version is 3.37.0 with the JSON functions available. Nonnegative counters and timestamps have range `[0, 9223372036854775807]`; explicitly signed integers use `[-9223372036854775808, 9223372036854775807]`. `pid` and local surrogate IDs are positive integers; `start_ticks` is nonnegative. `ts_wall`, `started_wall`, and app `first_seen`/`last_seen` are Unix epoch seconds as finite nonnegative binary64 SQLite `REAL`; conversion from integer wall nanoseconds divides by `1_000_000_000` with round-to-nearest, ties-to-even. Booleans are integer `0` or `1`. `STRICT` enforces storage classes after SQLite affinity conversion; the Python boundary MUST reject bools as integers and MUST validate types/ranges before binding, rather than rely on coercion.
 
-`coverage_json` is UTF-8 JSON object text. Its top-level object has exactly `inaccessible_pids`, `resets`, `reap_corrections`, `reap_unapplied`, `reap_unobserved`, `partial_intervals`, `gap_intervals`, `overlap_uncertain_intervals`, `spans_suspend_intervals`, `device_state`, and `file`. The integer counters and each of the four reap-counter components have range `[0, 2^63-1]`; `device_state` is `available`, `not_delegated`, or `incomplete`. The `file` object has exactly the nine numeric quantities in section 4.3 plus `hook_hits`, whose object has exactly the six named counters, each in `[0, 2^63-1]`. Booleans are not accepted in place of integers. The implementation MUST validate the exact object shape, component names, and value ranges in Python in addition to SQLite `json_valid`; `reap_unapplied` and `reap_unobserved` each have exactly `rchar`, `wchar`, `read_bytes`, and `write_bytes`. All coverage rows are inserted in the same transaction as their matching stream receipt and observations. The numeric file fields in `sample_coverage.coverage_json.file` MUST equal the structured columns in `file_coverage` for the same `(boot_id, source, epoch, seq, app_id)`; the six `hook_*` columns mirror the corresponding `hook_hits` fields. Both rows are present with zero file values when the app has an observation but no F row.
+`coverage_json` MUST be UTF-8 JSON object text. Its top-level keys MUST be exactly `inaccessible_pids`, `resets`, `reap_corrections`, `reap_unapplied`, `reap_unobserved`, `partial_intervals`, `gap_intervals`, `overlap_uncertain_intervals`, `spans_suspend_intervals`, `reap_incomplete`, `counter_overflow`, `device_state`, and `file`. Counts and each reap component use `[0,2^63-1]`; the two added flags use integer `{0,1}`. `device_state` is `available`, `not_delegated`, or `incomplete`. The `file` object MUST have exactly `counted_omitted_files`, `counted_omitted_bytes_r`, `counted_omitted_bytes_w`, `uncounted_overflow_files`, `uncounted_overflow_bytes_r`, `uncounted_overflow_bytes_w`, `skipped_nonfile`, `skipped_unsupported_fs`, `weak_identity_rows`, and `hook_hits`. `hook_hits` MUST have exactly the six named counters. Python MUST reject booleans in place of these integers and validate exact keys, components and ranges in addition to SQLite `json_valid`; each reap object has exactly the four CounterName keys.
 
-`TODO(design) A14`: precise JSON keys and aggregation operators are not provided by the design. These keys are a recommended compatibility contract and must be ratified before two stores exchange coverage.
+**A14 — ratified.** Counts/bytes/reap components/hook hits MUST add component-wise, and flags MUST combine by OR. Process coverage MUST commit with its tick; hourly file coverage MUST commit with hour finalization. `file_coverage.coverage_json.file` MUST equal its nine structured numeric columns and six hook columns for that same app-hour. A zero-F monitored hour still has that row. The file subobject in process-only `sample_coverage`, process rollups and process totals MUST be the zero placeholder; file evidence MUST instead survive in hourly `file_coverage` and never-pruned `app_boot_file_coverage`. This period separation supersedes revision 1's per-tick mirror, which cannot represent the ratified hourly file observations. Unknown-owner quantities MUST remain separate from every app JSON.
 
 ### 6.2 DDL
 
-`file_coverage` adds `ts_mono_ns`, `weak_identity_rows`, and six `hook_*` counters so bounded-window file coverage survives independently of 24-hour process retention. This DDL also adds `sample_coverage`, `collector_epoch.last_seq` (nullable only before the first committed frame), `clock_map.boot_id`, `gap.gap_id`, boot IDs alongside the first/last monotonic path and alias timestamps, `identity_weak` to the path uniqueness key, and `coverage_json` plus `updated_boot_id` to lifetime totals. Each addition makes an existing query, identity, or recovery contract representable; these additions and their effect on the design's measured-byte table are not present in its abbreviated DDL. `path` and `path_alias` boot ordering remains unresolved in `TODO(design) A20`.
+The DDL is an executable, typed superset of r4's abbreviated schema. It persists raw coverage, sequence receipts, boot chronology and every monotonic value's boot identity. It also persists observed-time rate evidence, launch roots, hourly file completeness, pending-hour recovery state, per-boot file LAST/coverage, separate unknown-owner hourly/boot totals, and representable counter-overflow diagnostics. Hourly file primary keys enforce a single app-hour budget across collectors. Every table is STRICT; these additions require the schema-specific size measurement in A15.
 
 ```sql
 PRAGMA foreign_keys = ON;
@@ -335,6 +359,9 @@ BEGIN IMMEDIATE;
 
 CREATE TABLE boot (
     boot_id TEXT PRIMARY KEY NOT NULL CHECK (length(boot_id) > 0),
+    boot_order INTEGER NOT NULL UNIQUE CHECK (boot_order > 0),
+    file_finalized_through_mono_ns INTEGER NOT NULL DEFAULT 0
+        CHECK (file_finalized_through_mono_ns >= 0 AND file_finalized_through_mono_ns % 3600000000000 = 0),
     started_mono_ns INTEGER NOT NULL CHECK (started_mono_ns >= 0),
     started_wall REAL NOT NULL CHECK (started_wall BETWEEN 0.0 AND 1.7976931348623157e308),
     source TEXT NOT NULL CHECK (source IN ('gui', 'iod'))
@@ -354,11 +381,14 @@ CREATE TABLE launch (
     launch_id INTEGER PRIMARY KEY NOT NULL CHECK (launch_id > 0),
     app_id INTEGER NOT NULL REFERENCES app(app_id),
     boot_id TEXT NOT NULL REFERENCES boot(boot_id),
+    root_pid INTEGER NOT NULL CHECK (root_pid > 0),
+    root_start_ticks INTEGER NOT NULL CHECK (root_start_ticks >= 0),
     started_mono_ns INTEGER NOT NULL CHECK (started_mono_ns >= 0),
     ended_mono_ns INTEGER CHECK (ended_mono_ns IS NULL OR ended_mono_ns >= started_mono_ns),
     proc_count INTEGER NOT NULL CHECK (proc_count >= 0),
     coverage_json TEXT NOT NULL CHECK (json_valid(coverage_json)),
-    UNIQUE (launch_id, app_id, boot_id)
+    UNIQUE (launch_id, app_id, boot_id),
+    UNIQUE (boot_id, app_id, root_pid, root_start_ticks)
 ) STRICT;
 
 CREATE TABLE sample (
@@ -369,6 +399,9 @@ CREATE TABLE sample (
     app_id INTEGER NOT NULL REFERENCES app(app_id),
     launch_id INTEGER NOT NULL CHECK (launch_id >= 0),
     ts_mono_ns INTEGER NOT NULL CHECK (ts_mono_ns >= 0),
+    observed_mono_ns INTEGER NOT NULL CHECK (observed_mono_ns >= ts_mono_ns),
+    interval_start_mono_ns INTEGER,
+    observed_ns INTEGER,
     ts_wall REAL NOT NULL CHECK (ts_wall BETWEEN 0.0 AND 1.7976931348623157e308),
     rchar INTEGER NOT NULL CHECK (rchar BETWEEN 0 AND 9223372036854775807),
     wchar INTEGER NOT NULL CHECK (wchar BETWEEN 0 AND 9223372036854775807),
@@ -377,6 +410,10 @@ CREATE TABLE sample (
     delta_kind TEXT NOT NULL CHECK (delta_kind IN ('normal', 'baseline', 'reset')),
     first_seen_partial INTEGER NOT NULL CHECK (first_seen_partial IN (0, 1)),
     spans_suspend INTEGER NOT NULL CHECK (spans_suspend IN (0, 1)),
+    CHECK ((interval_start_mono_ns IS NULL AND observed_ns IS NULL) OR
+           (interval_start_mono_ns IS NOT NULL AND observed_ns IS NOT NULL AND
+            interval_start_mono_ns BETWEEN 0 AND observed_mono_ns AND
+            observed_ns BETWEEN 0 AND observed_mono_ns - interval_start_mono_ns)),
     PRIMARY KEY (boot_id, source, epoch, seq, app_id, launch_id)
 ) WITHOUT ROWID, STRICT;
 
@@ -438,7 +475,7 @@ CREATE TABLE file_sample (
     epoch INTEGER NOT NULL CHECK (epoch > 0),
     seq INTEGER NOT NULL CHECK (seq >= 0),
     app_id INTEGER NOT NULL REFERENCES app(app_id),
-    ts_mono_ns INTEGER NOT NULL CHECK (ts_mono_ns >= 0),
+    ts_mono_ns INTEGER NOT NULL CHECK (ts_mono_ns >= 0 AND ts_mono_ns % 3600000000000 = 0),
     dev TEXT NOT NULL CHECK (length(dev) > 0),
     path_id INTEGER NOT NULL REFERENCES path(path_id),
     reads INTEGER NOT NULL CHECK (reads BETWEEN 0 AND 9223372036854775807),
@@ -446,7 +483,8 @@ CREATE TABLE file_sample (
     bytes_r INTEGER NOT NULL CHECK (bytes_r BETWEEN 0 AND 9223372036854775807),
     bytes_w INTEGER NOT NULL CHECK (bytes_w BETWEEN 0 AND 9223372036854775807),
     last_seen_mono_ns INTEGER NOT NULL CHECK (last_seen_mono_ns >= 0),
-    PRIMARY KEY (boot_id, source, epoch, seq, app_id, path_id)
+    CHECK (last_seen_mono_ns >= ts_mono_ns AND last_seen_mono_ns - ts_mono_ns < 3600000000000),
+    PRIMARY KEY (boot_id, app_id, ts_mono_ns, path_id)
 ) WITHOUT ROWID, STRICT;
 
 CREATE TABLE file_coverage (
@@ -455,7 +493,8 @@ CREATE TABLE file_coverage (
     epoch INTEGER NOT NULL CHECK (epoch > 0),
     seq INTEGER NOT NULL CHECK (seq >= 0),
     app_id INTEGER NOT NULL REFERENCES app(app_id),
-    ts_mono_ns INTEGER NOT NULL CHECK (ts_mono_ns >= 0),
+    ts_mono_ns INTEGER NOT NULL CHECK (ts_mono_ns >= 0 AND ts_mono_ns % 3600000000000 = 0),
+    coverage_json TEXT NOT NULL CHECK (json_valid(coverage_json)),
     counted_omitted_files INTEGER NOT NULL CHECK (counted_omitted_files >= 0),
     counted_omitted_bytes_r INTEGER NOT NULL CHECK (counted_omitted_bytes_r >= 0),
     counted_omitted_bytes_w INTEGER NOT NULL CHECK (counted_omitted_bytes_w >= 0),
@@ -471,8 +510,38 @@ CREATE TABLE file_coverage (
     hook_vfs_writev INTEGER NOT NULL CHECK (hook_vfs_writev >= 0),
     hook_vfs_iter_read INTEGER NOT NULL CHECK (hook_vfs_iter_read >= 0),
     hook_vfs_iter_write INTEGER NOT NULL CHECK (hook_vfs_iter_write >= 0),
-    PRIMARY KEY (boot_id, source, epoch, seq, app_id)
+    PRIMARY KEY (boot_id, app_id, ts_mono_ns)
 ) WITHOUT ROWID, STRICT;
+
+CREATE TABLE file_hour_state (
+    boot_id TEXT NOT NULL REFERENCES boot(boot_id),
+    ts_mono_ns INTEGER NOT NULL CHECK (ts_mono_ns >= 0 AND ts_mono_ns % 3600000000000 = 0),
+    state_json TEXT NOT NULL CHECK (json_valid(state_json)),
+    PRIMARY KEY (boot_id, ts_mono_ns)
+) WITHOUT ROWID, STRICT;
+
+CREATE TABLE file_overflow_unknown (
+    boot_id TEXT NOT NULL REFERENCES boot(boot_id),
+    source TEXT NOT NULL CHECK (source IN ('gui', 'iod')),
+    epoch INTEGER NOT NULL CHECK (epoch > 0),
+    seq INTEGER NOT NULL CHECK (seq >= 0),
+    ts_mono_ns INTEGER NOT NULL CHECK (ts_mono_ns >= 0 AND ts_mono_ns % 3600000000000 = 0),
+    owner_key TEXT NOT NULL CHECK (owner_key = 'overflow_owner_unknown'),
+    overflow_files INTEGER NOT NULL CHECK (overflow_files >= 0),
+    overflow_bytes_r INTEGER NOT NULL CHECK (overflow_bytes_r >= 0),
+    overflow_bytes_w INTEGER NOT NULL CHECK (overflow_bytes_w >= 0),
+    coverage_json TEXT NOT NULL CHECK (json_valid(coverage_json)),
+    PRIMARY KEY (boot_id, ts_mono_ns)
+) WITHOUT ROWID, STRICT;
+
+CREATE TABLE boot_file_overflow_unknown (
+    boot_id TEXT PRIMARY KEY NOT NULL REFERENCES boot(boot_id),
+    owner_key TEXT NOT NULL CHECK (owner_key = 'overflow_owner_unknown'),
+    overflow_files INTEGER NOT NULL CHECK (overflow_files >= 0),
+    overflow_bytes_r INTEGER NOT NULL CHECK (overflow_bytes_r >= 0),
+    overflow_bytes_w INTEGER NOT NULL CHECK (overflow_bytes_w >= 0),
+    coverage_json TEXT NOT NULL CHECK (json_valid(coverage_json))
+) STRICT;
 
 CREATE TABLE collector_epoch (
     source TEXT PRIMARY KEY NOT NULL CHECK (source IN ('gui', 'iod')),
@@ -563,7 +632,15 @@ CREATE TABLE app_boot_file_total (
     bytes_w INTEGER NOT NULL CHECK (bytes_w >= 0),
     reads INTEGER NOT NULL CHECK (reads >= 0),
     writes INTEGER NOT NULL CHECK (writes >= 0),
+    last_seen_mono_ns INTEGER NOT NULL CHECK (last_seen_mono_ns >= 0),
     PRIMARY KEY (boot_id, app_id, path_id)
+) WITHOUT ROWID, STRICT;
+
+CREATE TABLE app_boot_file_coverage (
+    boot_id TEXT NOT NULL REFERENCES boot(boot_id),
+    app_id INTEGER NOT NULL REFERENCES app(app_id),
+    coverage_json TEXT NOT NULL CHECK (json_valid(coverage_json)),
+    PRIMARY KEY (boot_id, app_id)
 ) WITHOUT ROWID, STRICT;
 
 CREATE TABLE app_lifetime_total (
@@ -588,6 +665,19 @@ CREATE TABLE gap (
     reason TEXT NOT NULL CHECK (reason IN ('collector_gap', 'overlap_uncertain', 'gui_absent', 'quota_exhausted'))
 ) STRICT;
 
+CREATE TABLE store_diagnostic (
+    diagnostic_id INTEGER PRIMARY KEY NOT NULL CHECK (diagnostic_id > 0),
+    boot_id TEXT NOT NULL REFERENCES boot(boot_id),
+    source TEXT NOT NULL CHECK (source IN ('gui', 'iod')),
+    epoch INTEGER NOT NULL CHECK (epoch > 0),
+    seq INTEGER NOT NULL CHECK (seq >= 0),
+    app_id INTEGER REFERENCES app(app_id),
+    ts_mono_ns INTEGER NOT NULL CHECK (ts_mono_ns >= 0),
+    code TEXT NOT NULL CHECK (code = 'counter_overflow'),
+    field TEXT NOT NULL CHECK (length(field) > 0),
+    UNIQUE (boot_id, source, epoch, seq, field)
+) STRICT;
+
 CREATE INDEX app_name_idx ON app(name COLLATE NOCASE, key);
 CREATE INDEX launch_app_time_idx ON launch(app_id, boot_id, started_mono_ns);
 CREATE INDEX sample_app_time_idx ON sample(app_id, boot_id, ts_mono_ns, source, epoch, seq);
@@ -598,6 +688,7 @@ CREATE INDEX path_alias_basename_idx ON path_alias(basename COLLATE NOCASE, path
 CREATE INDEX file_sample_app_time_idx ON file_sample(app_id, boot_id, ts_mono_ns, path_id);
 CREATE INDEX file_sample_last_seen_idx ON file_sample(app_id, boot_id, last_seen_mono_ns DESC, path_id);
 CREATE INDEX file_coverage_app_time_idx ON file_coverage(app_id, boot_id, ts_mono_ns, source, epoch, seq);
+CREATE INDEX store_diagnostic_time_idx ON store_diagnostic(boot_id, ts_mono_ns, app_id);
 CREATE INDEX collector_interval_time_idx ON collector_interval(boot_id, from_mono_ns, to_mono_ns);
 CREATE INDEX rollup_app_time_idx ON rollup_app(app_id, boot_id, bucket_secs, bucket_start_mono_ns);
 CREATE INDEX rollup_dev_time_idx ON rollup_dev(app_id, boot_id, bucket_secs, bucket_start_mono_ns, dev);
@@ -609,7 +700,7 @@ COMMIT;
 
 ### 6.3 WITHOUT ROWID and index rationale
 
-Composite-key observation tables use `WITHOUT ROWID` because their full composite keys address the records directly, avoiding a second rowid-to-key index. `path`, `app`, `launch`, and `app_lifetime_total` retain rowids so their integer primary keys alias the rowid without a separate primary-key B-tree. Single-key metadata tables `boot` and `collector_epoch` retain conventional rowid storage; its extra text-key index cost is included in schema measurements. `gap` retains a rowid-backed surrogate because gap intervals may share stream coordinates after recovery and require independently addressable records.
+Composite-key observation tables use `WITHOUT ROWID` because their full composite keys address the records directly, avoiding a second rowid-to-key index. `path`, `app`, `launch`, and `app_lifetime_total` retain rowids so their integer primary keys alias the rowid without a separate primary-key B-tree. Single-key metadata tables `boot`, `collector_epoch`, and `boot_file_overflow_unknown` retain conventional rowid storage; their text-key indexes MUST be included in schema measurements. `gap` and `store_diagnostic` retain rowid-backed surrogates for independently addressable recovery records.
 
 The primary keys on `handover` and `clock_map` already provide their boot/cutoff and boot/segment lookup order, so no duplicate secondary indexes are created. The secondary indexes cover app/time filtering and the supported path basename / last-seen sort. Additional indexes MUST be justified by an observed query plan and included in quota measurements; no index may change the result order specified in section 8.
 
@@ -617,7 +708,7 @@ The primary keys on `handover` and `clock_map` already provide their boot/cutoff
 
 For a new empty DB, a migration runner MUST enable foreign keys outside the transaction, execute the single `BEGIN IMMEDIATE` in section 6.2, and then confirm no user tables exist and `PRAGMA user_version = 0` before executing that block's first `CREATE TABLE`. It executes the remaining statements and sets `user_version=1` before the block's single commit. The runner MUST NOT wrap the block in another transaction or use an executor that implicitly commits between statements. Failed preconditions or DDL MUST roll back. If a nonempty database has `user_version=0`, startup MUST fail closed and preserve the file; it MUST NOT guess that the file is empty or rewrite it. If `user_version=1`, startup MUST validate required columns, constraints, tables, and indexes without recreating them. Any unsupported higher version MUST be rejected without mutation.
 
-The database schema is created independently in each store. Integer `app_id`, `launch_id`, `path_id`, and `gap_id` values are local and MUST NOT cross store boundaries. External identity uses `AppKey`, `boot_id`, and stream identity.
+The database schema is created independently in each store. Integer `app_id`, `launch_id`, `path_id`, `gap_id`, `diagnostic_id`, and `boot_order` values are local and MUST NOT cross store boundaries as identity. External identity uses `AppKey`, `boot_id`, and stream identity.
 
 ## 7. Storage Budget
 
@@ -635,9 +726,11 @@ The design reports measured SQLite payload sizes (record header included) and a 
 | `rollup_*`, 3600 s | `107 * 24 * 3 = 7704` | 64 | 493,056 | 365 days | 179,965,440 |
 | totals | fixed | n/a | n/a | forever | `< 1,000,000` stated |
 
-The payload subtotal excluding totals is exactly 1,450,406,400 bytes, the sum of the exact retained-payload cells above. The design's rounded steady-state entries (`66 + 74 + 322 + 296 + 518 + 181 MB`) sum to 1,457 MB before totals. The `file_sample` exact product is 316,377,600 bytes, not 322,000,000 bytes. These budget arithmetic discrepancies and the difference between measured payload sizes and this expanded DDL are recorded as design contradictions in section 13. The quota check, not this planning estimate, is the enforceable limit.
+The required hourly file arithmetic is: `107 apps * 100 files = 10700 rows/snapshot`; `10700 * 88 = 941600 bytes`, about 1 MB per snapshot. `24 snapshots/day * 10700 = 256800 rows/day`; `256800 * 88 = 22598400 bytes/day`, about 22.6 MB/day. `256800 * 14 = 3595200 rows`; `3595200 * 88 = 316377600 bytes`, about 316 MB of retained payload. These are hourly snapshots after aggregation, not another sampling cadence.
 
-`TODO(design) A15`: the design does not state whether its 1.5 GB limit is decimal or binary, or how its measured payload bytes map to a database containing indexes, coverage rows, free pages, and WAL. Recommendation: hard-limit allocated file sizes at 1,500,000,000 bytes and treat the table as planning data until measurements are repeated on this exact schema.
+The exact payload subtotal excluding totals is `66562560 + 73958400 + 316377600 + 295833600 + 517708800 + 179965440 = 1450406400` bytes. R4's coarsely rounded planning entries (`66 + 74 + 316 + 296 + 518 + 181 MB`) sum to 1,451 MB; the exact products above govern arithmetic. These payloads omit indexes, extra coverage/identity columns, pending-hour state, diagnostics, free pages and sidecars. They MUST NOT be presented as a measured total for this DDL.
+
+**A15 — ratified.** Before shipping, the exact schema MUST be remeasured with its indexes and representative data, including all added tables/columns and DB/WAL/SHM. Until then the table is planning data. The enforceable physical limit MUST remain decimal `1_500_000_000` bytes under A13; a planning estimate MUST NOT waive quota enforcement.
 
 ### 7.2 Retention and selection
 
@@ -645,7 +738,7 @@ Default retention is raw app/device samples 24 hours, file observations 14 days,
 
 File top-N ordering is descending `bytes_r + bytes_w`, then descending `reads + writes`, then ascending `(dev, inode, generation)` as a deterministic total order. Basename is not a tiebreaker. The omitted remainder is stored in `file_coverage` as counted omission; full-map insertion failures are stored separately as uncounted overflow. The Files result is labelled “retained observations” because a per-hour top-N can hide a file that led a larger window.
 
-The design states `top-100 per app per hour`; it does not determine whether selection is by interval, by hour, or after aggregation, nor how separate collectors' budgets combine. These choices are included in `TODO(design) A11`.
+**A11 — ratified.** Hours MUST be fixed `CLOCK_BOOTTIME` buckets of `3_600_000_000_000` ns. All contributions owned by either collector in that app-hour MUST aggregate into the same candidate set before applying one top-100 budget. Stored `ts_mono_ns` is the hour start; source/epoch/seq identify the last authoritative contributing receipt, not another snapshot. No per-drain snapshot or extra per-collector top-100 budget is permitted. The pending accumulator MUST retain all candidates needed for exact hour ranking; quota failure MUST pause collection and disclose a gap. Hourly coverage records the full counted omitted remainder, overflow, hooks, gaps and completeness, even if no file row survives selection. Boot file totals MUST sum retained hourly rows, with omissions/overflow preserved separately; they retain the “retained observations” meaning and MUST store per-boot LAST.
 
 ## 8. Query Contracts
 
@@ -665,7 +758,14 @@ UnavailableReason = Literal["not_retained", "unsupported_window",
                             "launch_attribution", "file_source_unavailable"]
 
 class WindowUnavailableError(ValueError):
-    reason: UnavailableReason
+    def __init__(self, reason: UnavailableReason, message: str) -> None:
+        super().__init__(message)
+        self.reason = reason
+
+class CounterOverflowError(OverflowError):
+    def __init__(self, field: str) -> None:
+        super().__init__(f"Counter outside SQLite INTEGER range: {field}")
+        self.field = field
 
 @dataclass(frozen=True)
 class Window:
@@ -699,6 +799,8 @@ class Coverage:
     overlap_uncertain_intervals: int
     spans_suspend_intervals: int
     spans_suspend: bool
+    reap_incomplete: bool
+    counter_overflow: bool
     device_state: Literal["available", "not_delegated", "incomplete"]
     counted_omitted_files: int
     counted_omitted_bytes_r: int
@@ -804,6 +906,15 @@ class FileRow:
     last_seen_mono_ns: int
 
 @dataclass(frozen=True)
+class UnknownOwnerOverflow:
+    window: Window
+    owner_key: Literal["overflow_owner_unknown"]
+    overflow_files: int
+    overflow_bytes_r: int
+    overflow_bytes_w: int
+    coverage: Coverage
+
+@dataclass(frozen=True)
 class FileTable:
     app_id: int
     window: Window
@@ -811,6 +922,7 @@ class FileTable:
     sort: FileSort
     direction: Direction
     search: str | None
+    unknown_owner_overflow: UnknownOwnerOverflow
     coverage: Coverage
 
 @dataclass(frozen=True)
@@ -829,10 +941,11 @@ class FileCoverage:
     hook_hits: HookHits
     observed_bytes_r: int
     observed_bytes_w: int
+    unknown_owner_overflow: UnknownOwnerOverflow
     coverage: Coverage
 ```
 
-`TODO(design) A16`: the design does not specify the numeric representation or temporal grain of peak rates. The proposed contract uses the maximum defined app-interval integer rate, calculated by exact floor division as in section 5.4. UI formatting SHOULD round to the nearest displayed unit, ties upward. This requires ratification: truncating each rate changes it by less than 1 B/s, and choosing interval peaks rather than whole-bucket averages can change it by more.
+**A16 — ratified.** Peaks MUST use the exact integer interval-rate rule in section 5.4, preserving original byte counts. UI formatting SHOULD round to the nearest displayed unit with ties upward; display rounding MUST NOT change stored rates or reconciliation arithmetic. A wider rollup MUST retain the maxima of the same underlying intervals.
 
 ### 8.2 Exact function signatures and ordering
 
@@ -848,27 +961,37 @@ def file_table(
     search: str | None,
 ) -> FileTable: ...
 def file_coverage(app_id: int, window: Window) -> FileCoverage: ...
+def unknown_owner_file_coverage(window: Window) -> UnknownOwnerOverflow: ...
 ```
 
-`Window` validation MUST reject malformed combinations with `ValueError`: `range` requires boot/start/end, `0 <= start < end <= 2^63-1`, and no launch; `since_boot` requires boot and positive end and has no explicit start/launch; `launch` requires boot and positive launch ID and no range endpoints; `lifetime` has no boot, launch, or monotonic bounds. Query enum values outside the declared Literals, nonpositive app IDs, or NUL in search are `ValueError`; a valid but unknown app/launch ID is `KeyError`. An open launch uses one query-start boottime read as its end. Each query reads one consistent database snapshot. All result containers carry populated `Coverage`; individual points/rows inherit it from their container.
+`Window` validation MUST reject malformed combinations with `ValueError`: `range` requires boot/start/end, `0 <= start < end <= 2^63-1`, and no launch; `since_boot` requires boot and positive end and has no explicit start/launch; `launch` requires boot and positive launch ID and no endpoints; `lifetime` has no boot, launch, or monotonic bounds. Enum values outside the Literals, nonpositive app IDs, and NUL in search MUST raise `ValueError`. Next, every function in section 8.2 MUST enforce A22's disabled-window errors before any ID lookup or tier selection; a well-formed launch with an unknown ID still receives the disabled-window error. For supported windows, a valid but unknown app ID MUST raise `KeyError`. Each query MUST use one consistent database snapshot. All result containers carry populated Coverage; individual points/rows inherit it.
 
-For every query, `Coverage.complete` is false if any required source interval is missing, uncertain, clipped by the selected tier's bucket edges, pruned, or marked incomplete; for T it is also false when `inaccessible_pids`, `resets`, or `partial_intervals` is nonzero. For D it is false unless `device_state="available"` throughout and ownership is exact. For F accounting it is false when any bytes are uncounted or the requested window cannot be reconstructed; counted omissions remain complete because their bytes are represented exactly, while the returned path rows are explicitly only retained/top-N rows. `weak_identity_rows` reports identity quality but does not by itself make byte accounting incomplete. A metric unaffected by another metric's unavailable source may remain complete (for example, not-delegated D does not make T incomplete).
+For every query, `Coverage.complete` MUST be false if a required interval is missing, uncertain, clipped by bucket edges, pruned, or marked incomplete. For T it MUST also be false for nonzero `inaccessible_pids`, `resets`, `partial_intervals`, `reap_incomplete`, or an affecting counter-overflow diagnostic. For D it MUST be false unless device coverage and ownership are exact. For F it MUST be false when overflow loses path attribution, a nonzero unknown-owner remainder could belong to the app, unknown-owner evidence is missing, an affecting diagnostic exists, or the window cannot be reconstructed. Counted omissions remain complete for byte accounting because their bytes are represented exactly; returned rows remain retained/top-N observations. `weak_identity_rows` reports identity quality but does not by itself make byte accounting incomplete. A metric unaffected by another metric's unavailable source may remain complete (for example, not-delegated D does not make T incomplete).
 
 `ranking` sorts by requested metric descending, then `app_key` ascending bytewise. `total_bytes = read_bytes + write_bytes`. Every result's app total is the sum of accepted task deltas for the selected tier/window and stream ownership rules. An inaccessible process makes that app total a lower bound; the result carries its count and `complete=False`. `ranking` completeness concerns T; `series` and `disk_share` completeness concern both requested T and D; file-query completeness concerns F. An empty ranking is `[]`, not an invented zero-valued app.
 
 `series` returns no points for `totals_only`; `peak_*_bps` is `None` there. Other points sort by `(bucket_start_mono_ns, bucket_secs)`; device points append `dev` bytewise to that key, and residual points align with task points. `device_points` use raw major:minor tokens. Residuals are computed per bucket from task and device bucket totals and are `None` where D is unavailable. `disk_share` returns device rows in ascending `(boot_id, dev)` UTF-8 order, preserving distinct boot identities. When D is unavailable or mixed, aggregate device bytes and all residuals are `None`; available device rows may still be returned as partial observations with `complete=False`. Its signed total/read/write residuals obey section 2.4 whenever device coverage is complete.
 
-File sort keys are exact: `bytes_total = bytes_r + bytes_w`; numeric keys sort numerically; `last_seen` sorts by `last_seen_mono_ns` within one boot (cross-boot ordering remains A20); `basename` sorts by Unicode codepoint order after Unicode NFC normalization; `dev` sorts bytewise. Every sort appends the deterministic tie key `(dev, inode, generation, basename, path_id)` ascending. `direction` reverses only the selected primary sort, never the tie key. Under proposed A17 search, compare `NFC(search).casefold()` as a substring of `NFC(basename).casefold()` before sorting; `None` and the empty string match all rows. The returned basename retains its original spelling. `FileCoverage.observed_bytes_r/w` is the sum of retained rows before search; it excludes omissions and overflow, which remain separate fields.
+File sort keys MUST be exact: `bytes_total=bytes_r+bytes_w`; numeric keys sort numerically; `last_seen` uses `(boot.boot_order,last_seen_mono_ns)`, never cross-boot boottime alone; `basename` uses NFC Unicode codepoint order; `dev` uses UTF-8 bytes. Every sort MUST append `(dev,inode,generation,basename,path_id)` ascending; `direction` reverses only the primary key. LAST MUST use `file_sample.last_seen_mono_ns` or that boot's `app_boot_file_total.last_seen_mono_ns`. Lifetime rows MUST choose their last boot by persisted chronology.
 
-`TODO(design) A17`: the design does not define search case/normalization semantics, `direction` defaults, or how unavailable file windows are represented. Recommendation: use NFC-normalized, case-insensitive substring search and an empty row tuple with `coverage.complete=False` plus explicit file-window unavailability for an unrepresentable window.
+**A17 — ratified.** Search MUST compare `NFC(search).casefold()` as a substring of `NFC(basename).casefold()` before sorting; None/empty search matches all. Returned names retain their spelling. The API requires an explicit direction; the consumer default MUST be `sort="bytes_total", direction="desc"`. For a supported but unrepresentable file window, the result MUST have an empty row tuple, zero retained-observation bytes, incomplete coverage and the applicable unavailability reason; zero observed bytes MUST NOT claim zero F. A22's disabled-window exceptions take precedence. `FileCoverage.observed_bytes_r/w` MUST sum retained rows before search and MUST exclude omissions and both kinds of overflow.
 
 ### 8.3 Tier behavior
 
-`ranking`, `series`, and `disk_share` use the app/device tier table in section 4.2. For exact full-boot/lifetime requests, totals-only ranking uses `app_boot_total`/`app_lifetime_total`; disk share uses that T source plus `app_boot_dev_total` grouped by `(boot_id, dev)`. There is no separate lifetime device table, and identical major:minor strings from different boots MUST NOT merge into one device identity. Totals-only series has no time points and no peak. Results MUST state `tier="totals_only"` and `complete` according to coverage.
+`ranking`, `series`, and `disk_share` MUST use section 4.2's app/device tiers after validating scope. Exact full-boot/lifetime totals-only ranking MUST use `app_boot_total`/`app_lifetime_total`; disk share MUST use that T source and `app_boot_dev_total` grouped by `(boot_id,dev)`. Equal major:minor strings from different boots MUST NOT merge. Totals-only series MUST have empty point tuples and no peak; coverage MUST state `tier="totals_only"`. An explicit since-boot or lifetime request may use its exact totals even above 365 days; this does not enable a bounded range of that duration.
 
-`TODO(design) A22`: the tables cannot reconstruct a general bounded window above 365 days, an old launch from app-level rollups/totals, or a concurrent launch's D/F split from app-level rows. The proposed app-query contract raises `WindowUnavailableError` with `reason="unsupported_window"` or `reason="launch_attribution"` instead of returning a larger scope as though exact. For a selected historical tier already pruned, `series` returns its remaining observed points and `unavailable_reason="not_retained"`; missing time is incomplete, not a zero interval. These representability rules require ratification alongside the design contradiction in section 13.
+**A22 — ratified, operator ruling.** Every public store query, including file and unknown-owner coverage queries, MUST apply this table. Error `str(error)` MUST equal the reason text shown; `error.reason` is the listed token. A consumer MUST render a disabled, unselected chip/control with that text visible as its reason (also exposed to accessibility), MUST NOT dispatch it as an enabled choice, and MUST NOT silently select or label a wider replacement window. If an old persisted selection or direct API call reaches this error, the detail view MUST render unavailable data with the same text; no stale numeric series/totals may appear under the disabled label.
 
-`file_table` and `file_coverage` MUST never fabricate a bounded window from a full-boot total. `file_sample` supports only retained observations. `app_boot_file_total` supports full-boot byte/access counts, but contains no per-boot last-seen timestamp; a global path timestamp MUST NOT masquerade as that boot's last observation. Until `TODO(design) A11/A20/A22` is resolved, an unrepresentable file query returns no guessed rows, zero retained-observation bytes, `coverage.complete=False`, and the applicable `unavailable_reason`; zero retained-observation bytes is not a claim of zero F. `file_source_unavailable` covers an absent/failed F producer; `unsupported_window` covers an unrepresentable bounded range; `launch_attribution` covers a launch split; `not_retained` covers expired raw file history. Available file coverage reads the independent `file_coverage` hook counters, so 24-hour process expiry does not erase 14-day file evidence.
+| Requested scope | Exact store outcome | Exact required consumer state |
+|---|---|---|
+| Any well-formed `kind="launch"`, regardless of raw retention | Raise `WindowUnavailableError(reason="launch_attribution", message="Launch window disabled: device and file activity are not stored per launch.")` | `Launch` control disabled and unselected; reason text exactly as the error message; queried detail state unavailable |
+| `kind="range"` with `end-start > 365*86400*1000000000` | Raise `WindowUnavailableError(reason="unsupported_window", message="Ranges longer than 365 days are disabled: retained rollups cannot represent arbitrary ranges.")` | That range control disabled and unselected; reason text exactly as the error message; queried detail state unavailable |
+
+For a supported selected historical tier already pruned, `series` MUST return remaining observed points with `coverage.complete=False` and `unavailable_reason="not_retained"`; missing time MUST NOT become zero-valued points or trigger a tier substitution. A historical since-boot prefix above 365 days that is not the exact full-boot cutoff MUST raise `WindowUnavailableError(reason="unsupported_window", message="Historical boot prefix unavailable: totals cover the full collected boot.")`; it MUST render unavailable with that reason, not the full-boot number.
+
+File queries MUST use retained, fully contained hourly observations with `tier="raw"` (hourly file resolution, not 10-second process resolution). `app_boot_file_total` and `app_boot_file_coverage` MUST support exact full-boot retained-observation totals, access counts, per-boot LAST and coverage after hourly expiry. Lifetime file totals MUST aggregate these boot rows, choosing LAST by boot chronology; they MUST NOT fabricate an arbitrary bounded range. An unfinished hour remains pending, so a query including its tail MUST be incomplete. A supported bounded file request whose necessary hourly history expired MUST return the A17 empty/incomplete result with `unavailable_reason="not_retained"`; absent/failed F uses `file_source_unavailable`, and another unrepresentable allowed scope uses `unsupported_window`. File coverage MUST read its independent hourly/boot sources, so process expiry cannot erase file hooks or gap evidence.
+
+`unknown_owner_file_coverage` MUST return `owner_key="overflow_owner_unknown"`, exact attempts/read/write bytes and coverage for the same window, reading `file_overflow_unknown` or exact `boot_file_overflow_unknown` totals. A monitored zero remainder MUST be returned explicitly as zero; missing evidence MUST be unavailable/incomplete rather than inferred zero. `FileTable` and `FileCoverage` MUST attach this same global window quantity as context, never add it to the selected app's F or app overflow fields, and never multiply it by the number of apps. The Files consumer MUST display `Unknown owner overflow: <R> read bytes, <W> write bytes (<N> failed inserts)` once for the window, alongside per-app overflow. Unknown-owner byte loss MUST remain visible even when per-app counters are zero.
 
 ## 9. P1 Error and Edge Contracts
 
@@ -886,9 +1009,12 @@ File sort keys are exact: `bytes_total = bytes_r + bytes_w`; numeric keys sort n
 | Parent disappears with remaining child credit | Add remainder to `reap_unapplied`; attribute it to no app's T | Coverage discloses unapplied reap bytes; totals do not silently absorb them. |
 | Clock offset changes by more than 1 second | Add boot-scoped `clock_map` segment; retain all monotonic keys | Historical row order and bucket assignment do not move or repeat because of NTP. |
 | Delta spans suspend | Assign it to last pre-suspend observation bucket; set `spans_suspend=1`; exclude suspended time from rate denominator | No suspend trough/spike is inferred; coverage indicates suspend-spanning data. |
-| BPF/file-map insert failure (later P4 producer) | Increment `uncounted_overflow_files` per failed insert and add exact bytes to overflow read/write counters; do not create a file row | File coverage states how many bytes are unknown; F remains separate from T. |
+| BPF/file-map insert failure (later P4 producer), cgroup uniquely owned | Increment that app's `uncounted_overflow_*` from its per-cgroup counters; do not create a file row | File coverage states the app's unknown-path bytes; F remains separate from T. |
+| Overflow cgroup cannot be keyed or uniquely owned | Persist under `overflow_owner_unknown` in hourly and boot unknown-owner tables; do not assign an app ID | Files shows the separate unknown-owner remainder, including when the selected app's overflow is zero. |
+| Integer exceeds the declared SQLite range | Roll back the whole observation, persist separate `store_diagnostic.code="counter_overflow"`, raise `CounterOverflowError` | Affected coverage is incomplete with `counter_overflow=True`; no wrapped/saturated value is shown. |
+| Disabled launch or over-365-day bounded range | No query-side mutation; raise the exact A22 exception | The requested control is disabled with the exact reason; detail data is unavailable and the scope is never widened. |
 | BPF drain/reconnect produces an explicit gap | Preserve `(boot_id, source, epoch, seq)`; insert `gap`; never dedupe on wall time | The affected window is visibly incomplete; no continuity is invented. |
-| Database integrity check reports corruption | Preserve the damaged DB under `history.db.corrupt-<ts>` and create a new schema-v1 DB only after quarantine succeeds | Notify that prior history is quarantined and unavailable in the new DB. Exact timestamp/collision rule is `TODO(design) A18`. |
+| Database integrity check reports corruption | Quarantine as `history.db.corrupt-<UTC-epoch-ns>[-<suffix>]` by the A18 no-replace procedure; create schema-v1 DB only after quarantine succeeds | Notify that prior history is quarantined and unavailable in the new DB; quarantine failure leaves collection stopped and the source preserved. |
 | GUI closes while daemon is active | P1 store does not change ownership; daemon-owned durable rows remain in its store | No history is lost solely because the GUI closes. Daemon mechanics are P3. |
 | GUI closes while daemon is off | Persist a `gui_absent` gap when collection resumes; do not synthesize process deltas across the absence | Totals are marked incomplete/lower-bound. |
 | Daemon absent | Active collector source is `gui`; P1 stream/gap rules apply | P3/P5 show the absent-daemon banner with `Open settings`; GUI owns collection for its recorded intervals. |
@@ -898,7 +1024,7 @@ File sort keys are exact: `bytes_total = bytes_r + bytes_w`; numeric keys sort n
 | Delegation installed, activation pending | Reserve `pending_activation`; no successful accounting state is inferred | P3/P5 show the pending banner and re-probe `cgroup.controllers`. |
 | Setup helper missing or container host | Reserve the reason text; no setup or collection success is inferred | P3/P5 disable the switch with that reason. |
 
-`TODO(design) A18` also covers the corruption timestamp format and collision handling. Recommendation: UTC epoch nanoseconds plus an atomic no-replace rename; if the destination exists, append a monotonically increasing suffix.
+**A18 — ratified.** Corruption quarantine MUST use the UTC Unix epoch timestamp in integer decimal nanoseconds, with an atomic no-replace rename. A collision MUST try suffixes `-1`, `-2`, … in increasing order for that timestamp; no prior quarantine may be overwritten. Relevant WAL/SHM evidence MUST be preserved with the quarantined DB before creating a replacement. If any required quarantine step fails, startup MUST preserve the source/evidence, report that failure and stop; it MUST NOT recreate over the damaged file.
 
 ## 10. Deterministic Acceptance Fixtures and Vectors
 
@@ -970,11 +1096,11 @@ At `t2`, its `io.stat` is exactly:
 
 The sibling PID-reuse leaf has `cgroup.procs` exactly `500\n` and, at all three ticks, `io.stat` exactly `259:0 rbytes=0 wbytes=0 rios=0 wios=0\n`. A separate controller-absent tree has `cgroup.controllers` exactly `cpu memory pids\n` and no `io.stat` in its app leaf. Expected device state for that tree is `not_delegated`, with no zero-valued D rows.
 
-The shared-cgroup case has `cgroup.procs` exactly `420\n421\n`, both PIDs in `app-shared.scope`, and one `io.stat` delta for `259:0` of `rbytes=40`, `wbytes=5`. Both PIDs resolve to the same app. D MUST be stored once as `(259:0,40,5)`, not once per PID. A second shared-cgroup fixture uses cgroup path `/fixture-shared` (no recognized app unit), with PID 420's executable `/usr/bin/tool-a` and PID 421's executable `/usr/bin/tool-b`; these resolve to distinct executable AppKeys. Per-app D ownership is unresolved by the design and has no normative expected split (`TODO(design) A19`).
+The shared-cgroup case has `cgroup.procs` exactly `420\n421\n`, both PIDs in `app-shared.scope`, and one `io.stat` delta for `259:0` of `rbytes=40`, `wbytes=5`. Both PIDs resolve to the same app. D MUST be stored once as `(259:0,40,5)`, not once per PID. A second shared-cgroup fixture uses cgroup path `/fixture-shared` (no recognized app unit), with PID 420's executable `/usr/bin/tool-a` and PID 421's executable `/usr/bin/tool-b`; these resolve to distinct executable AppKeys. Under A19 — ratified, this second fixture MUST emit no per-app D row, MUST mark both apps' device state incomplete, and MUST NOT duplicate or divide the single `(40,5)` delta.
 
 ### 10.3 Aggregator-shim BPF vectors
 
-The shim receives one drain for app cgroup id `42`, device `259:0`, with these exact entries:
+The shim receives these entries for app cgroup id `42`, device `259:0`, over one completed boottime hour `[0,3600s)`. Drains MUST aggregate before producing its single hourly snapshot (`ts_mono_ns=0`, all supplied LAST values `120_000_000_000`); they are not independent observations:
 
 | Key `(cgroup_id,dev,inode,generation)` | Value `(reads,writes,bytes_r,bytes_w,basename)` |
 |---|---|
@@ -984,7 +1110,9 @@ The shim receives one drain for app cgroup id `42`, device `259:0`, with these e
 
 Generation 7 and 8 are distinct path identities even though inode and basename match. `fs_uuid` is supplied by the fixture as `1111-aaaa` for all three entries. Additional coverage inputs for the same app/interval are: one counted omitted file `(20 read bytes,30 write bytes)`, one failed insertion `(5 read bytes,7 write bytes)`, `skipped_nonfile=3`, and `skipped_unsupported_fs=1`.
 
-For a synthetic map capacity of three, insert the three entries above, then submit the single failed entry `(42,"259:0",2000,1)` with value `(1,0,5,7,"lost")` while full. It fails insertion once and contributes overflow bytes `(5,7)`; this is the same failed insertion counted in the coverage inputs above, not an additional failure.
+For a synthetic map capacity of three, insert the three entries above, then submit the single failed entry `(42,"259:0",2000,1)` with value `(1,0,5,7,"lost")` while full. It fails insertion once and contributes overflow bytes `(5,7)` to cgroup 42's keyed counter; this is the same failed insertion counted above, not another failure. Independently, the reserved `overflow_owner_unknown` counter reports two failures with read bytes `6+5=11` and write bytes `8+5=13`. These MUST remain separate from cgroup 42's app counters. The app's file equation is unchanged; the all-owner equation adds this remainder once.
+
+A separate hourly aggregation vector uses a synthetic top-1 test limit: in two disjoint authoritative collector intervals of the same app-hour, file A contributes `(bytes_r=60,bytes_w=40,accesses=2)` then `(40,60,3)`, while file B contributes `(150,0,6)` across the hour. After aggregation A is `(100,100,5)` and ranks first at 200 bytes; B's 150 read bytes and six accesses are counted omitted. Exactly one app-hour snapshot and one coverage row MUST result across both collectors. Production uses top-100; only the test capacity is one.
 
 For deterministic top-2 selection, candidates are:
 
@@ -1010,13 +1138,19 @@ The top-2 are `("259:0",200,1)` then `("259:1",100,2)`: byte totals tie, access 
 | Shared-cgroup D | Exactly one row `(dev="259:0",rbytes=40,wbytes=5)` for both PIDs |
 | F retained rows | `(bytes_r=100,bytes_w=120,reads=5,writes=4,total=220)` across three identities |
 | F coverage | counted omitted `(files=1,bytes_r=20,bytes_w=30)`; overflow `(attempts=1,bytes_r=5,bytes_w=7)`; skipped `(nonfile=3,unsupported_fs=1)` |
-| F equality | `F_read=100+20+5=125`; `F_write=120+30+7=157`; `F=282`; retained rows `220` + counted `50` + uncounted `12` = `282` |
+| Per-app F equality | `F_read=100+20+5=125`; `F_write=120+30+7=157`; `F=282`; retained `220` + counted `50` + app overflow `12` = `282` |
+| Unknown-owner overflow | Reserved owner key, `attempts=2`, `bytes_r=6+5=11`, `bytes_w=8+5=13`, total `24`; never included in the selected app's overflow `(1,5,7)` |
+| All-owner F equality | `F_all_read=125+11=136`; `F_all_write=157+13=170`; `F_all=136+170=306=282+24`; unknown-owner bytes enter once |
+| Hourly snapshot/top-N | Two collectors' disjoint contributions yield one hour: A `(100,100,5)` retained, B `(150,0,6)` omitted under synthetic top-1; `200+150=350` bytes accounted |
 | BPF top-2 | first `("259:0",200,1)`, second `("259:1",100,2)`; omitted candidate total `99`, accesses `9` |
 | Controller absent | no device rows; `device_state="not_delegated"`; T values unchanged |
-| First-seen nonzero identity | With no baseline and input `(rchar=70,wchar=30,read_bytes=7,write_bytes=3)`, proposed output is that same delta, headline `10`, `first_seen_partial=1`, `partial_intervals=1`, and `delta_kind="baseline"`; provisional under `TODO(design) A01` |
-| Per-field reset | Prior `(100,20,10,5)`, current `(90,25,8,9)` emits `(0,5,0,4)` with `resets=1`; next `(95,30,9,10)` emits `(5,5,1,1)` with no new reset; provisional under A02 |
+| First-seen nonzero identity | With no baseline and input `(70,30,7,3)`, output MUST be that delta once, headline `7+3=10`, `first_seen_partial=1`, `partial_intervals=1`, `delta_kind="baseline"`; A01 — ratified |
+| Per-field reset | Prior `(100,20,10,5)`, current `(90,25,8,9)` emits `(0,5,0,4)` with `resets=1`; next `(95,30,9,10)` emits `(5,5,1,1)` with no new reset; A02 — ratified |
 | ESRCH mid-scan | One enumerated, already-open identity whose read vanishes increments `resets` exactly once, closes once, and emits no bytes; an unknown identity gives zero resets |
-| Ordinary interval peak | With exact 10-second observed intervals, Chromium t1 rates are `18` read B/s and `9` write B/s, t2 rates `2` and `1`; proposed interval peaks are `(18,9)` under A16 |
+| Ordinary interval peak | Persisted 10-second observed intervals give Chromium t1 `floor(180/10)=18` read B/s, `floor(90/10)=9` write B/s; t2 gives `floor(20/10)=2`, `floor(10/10)=1`; interval peaks MUST be `(18,9)` under ratified A16 |
+| SQLite counter overflow | Input `2^63=9223372036854775808` MUST reject/roll back without sequence or baseline changes; diagnostic code `counter_overflow` persists; affected coverage MUST be incomplete |
+| Disabled launch | Even a retained known launch MUST raise A22's `launch_attribution` error; its UI control MUST be disabled with the exact reason |
+| Tier upper boundary | `365*86400*1000000000=31536000000000000` ns uses 3600s rollups for a range; `31536000000000001` ns MUST raise A22's `unsupported_window` error, never return totals |
 | Duplicate frame | Re-delivering `(boot_id,gui,1,2)` after t2 leaves every row, baseline, rollup, total, and coverage counter unchanged |
 
 ### 10.5 Clock/suspend acceptance sequence
@@ -1031,61 +1165,73 @@ Use `bucket_ns=60_000_000_000`. Observations are in one boot:
 | 179,000,000,000 | 679 | 500,000,000,000 | last sample before suspend; bucket starts 120,000,000,000 |
 | 661,000,000,000 | 1161 | 500,000,000,000 | first sample after suspend; known suspend boundary `[180s,660s]`; spanning delta assigned to pre-suspend bucket and flagged |
 
-The clock fixture starts with an initial observation at boottime zero and wall seconds `1000`, with zero counters, before the observations shown. Expected clock map rows are `(segment_start=0,offset=1_000_000_000_000)` and `(segment_start=125_000_000_000,offset=500_000_000_000)`. The bucket sequence is `[60s,120s)`, `[120s,180s)`, `[660s,720s)` for ordinary observations, while the spanning delta is stored in the last pre-suspend observed bucket `[120s,180s)` with `spans_suspend=1`. No row is assigned by wall time. This sequence fixes bucket partition and labeling only; rate denominator details remain `TODO(design) A09`.
+The clock fixture starts with an initial observation at boottime zero and wall seconds `1000`, with zero counters, before the observations shown. Expected clock map rows are `(segment_start=0,offset=1_000_000_000_000)` and `(segment_start=125_000_000_000,offset=500_000_000_000)`. The bucket sequence is `[60s,120s)`, `[120s,180s)`, `[660s,720s)` for ordinary observations, while the spanning delta is stored in the last pre-suspend observed bucket `[120s,180s)` with `spans_suspend=1`. No row is assigned by wall time. Under A09 — ratified, the spanning interval MUST store `observed_mono_ns=661_000_000_000`, `interval_start_mono_ns=179_000_000_000`, and attributed `ts_mono_ns=179_000_000_000`. Its elapsed time is `661-179=482` s; measured suspend is `660-180=480` s; persisted `observed_ns=(482-480)*1000000000=2000000000`. A delta `(read=40,write=20)` therefore has exact rates `(20,10)` B/s, not `(floor(40/482),floor(20/482))=(0,0)`. The actual observation falls in `[660s,720s)` but its delta is assigned only to `[120s,180s)` for the 60s bucket test. Repeated/overlapping suspend boundaries MUST be unioned, not subtracted twice.
+
+A cross-boot vector uses boot A order 1 with LAST `900_000_000_000` and boot B order 2 with LAST `10_000_000_000`. B MUST sort later despite its smaller boottime. Both boots may have a `clock_map` segment at zero without collision. A path/alias first endpoint MUST remain `(A,900_000_000_000)`, its last endpoint MUST become `(B,10_000_000_000)`, and lifetime `updated_boot_id` MUST accompany B's timestamp.
 
 ## 11. Property-Based Tests
 
 All property tests use deterministic seeds recorded with failures. Generate 0–128 observations, counters/counts in `[0, 2^63-1]`, canonical AppKeys under the chosen A07 policy, devices `f"{major}:{minor}"` with each component in `[0, 2^20-1]`, inode values in `[0, 2^63-1]`, generations in `[0, 2^32-1]`, and nonnegative boottimes no greater than `2^63-1`. Coverage generators use the exact section 6.1 shape. Mathematical intermediate sums may use signed 128-bit test arithmetic; sums outside the storage range MUST exercise the overflow path, not a successful insert. The production oracle uses arbitrary-precision integers. Shrink by deleting unrelated apps/devices/files first, then timestamps, then reducing to the minimum two samples/two identities needed to preserve the failing condition.
 
 1. **Device reconciliation:** For every generated app/window, `sum(dev.total_bytes) + residual_total == task_total_bytes`; independently, `sum(dev.rbytes) + residual_read == task_read_bytes` and `sum(dev.wbytes) + residual_write == task_write_bytes`. Include positive, zero, and negative residuals.
-2. **File byte equality:** For read and write independently, `sum(file rows) + counted omissions + uncounted overflow == F`. Total equality is the sum of those independent equations. Skipped objects do not enter either side.
+2. **File byte equality:** Per app and read/write independently, `sum(file rows)+counted omissions+app overflow==app F`. Across owners, `sum(app F)+overflow_owner_unknown==all-owner F`. Unknown-owner loss MUST enter once, never be apportioned to apps; skipped objects enter neither equation.
 3. **Coverage equality:** For any selected window/tier, result coverage equals the exact, deduplicated aggregation of persisted source coverage rows; it is never recomputed from absence of rows. Counted omission bytes and overflow bytes are independently preserved across rollup and total aggregation.
 4. **Monotonic bucket partition:** Generate nonnegative integer `ts_mono_ns` values and positive `bucket_ns`; for every timestamp, exactly one bucket index is `floor(ts_mono_ns / bucket_ns)`, and the mathematical half-open intervals for consecutive indices touch without gaps or overlap. Observed samples may skip bucket indices, which does not imply coverage. Generate positive and negative NTP offset steps and suspend intervals crossing zero, one, or multiple bucket boundaries. Clock steps MUST NOT change bucket keys. Suspend-spanning deltas are placed in the last pre-suspend observed bucket and marked once; no byte delta is duplicated or omitted by partitioning.
-5. **Counter reset:** A decreasing counter emits no negative delta, resets the selected baseline, and the next nondecreasing value is measured from the reset baseline under the recommended per-counter rule.
+5. **Counter reset:** A decreasing counter emits no negative delta, resets the selected baseline, and the next nondecreasing value is measured from the reset baseline under ratified A02's per-counter rule.
 6. **PID reuse:** Replacing `(boot,pid,start_ticks)` with a new start time never transfers the old baseline or reap credit.
 7. **Credit conservation:** For each counter, emitted parent delta plus the applied credit equals the raw parent delta; leftover credit equals the stored reap-unapplied amount if the parent closes. No adjusted delta is negative.
-8. **Top-N determinism:** Permuting input BPF entries does not change selected rows, omitted counts, or omitted byte totals. Equal byte/access ranks resolve by ascending `(dev,inode,generation)`.
-9. **Tier boundary:** Duration exactly 24h uses raw; one nanosecond over uses 60s; exactly 30d uses 60s; one nanosecond over uses 3600s; exactly 365d uses 3600s; one nanosecond over uses totals-only. No query reads two tiers for the same quantity.
+8. **Hourly top-N determinism:** Permuting BPF entries or partitioning the same authoritative app-hour across drains/collectors MUST leave one identical snapshot, selected rows and omissions. Aggregate first, then select top-100 by bytes/accesses and ascending `(dev,inode,generation)`; no source gains another hourly budget. Each hour's unknown-owner remainder MUST also remain invariant.
+9. **Tier boundary and disabled scope:** An allowed range of exactly 24h uses raw; one nanosecond over uses 60s; exactly 30d uses 60s; one nanosecond over uses 3600s; exactly 365d uses 3600s. A range one nanosecond over 365d MUST raise the exact A22 error, and every launch request MUST raise its exact A22 error even with retained raw rows. Only explicit exact full-boot/lifetime scopes may use totals-only. No query blends tiers or broadens a window.
 10. **Stream dedupe/ownership:** Duplicate or stale `(boot_id,source,epoch,seq)` frames are rejected before baseline changes and have no effect on any rows/totals; a new frame is applied once. Disjoint half-open collector intervals have no overlap; uncertain overlap contributes zero bytes from both owners in the overlap and increments coverage once per interval. Generate integer interval endpoints with `start < end`, collector ownership labels, and duplicate/stale sequence keys; shrink to the smallest two overlapping intervals or duplicate frames that preserve the failure.
 11. **ESRCH accounting:** Generate an open or unknown `(boot,pid,start_ticks)` identity and one `ESRCH` scan outcome. An already-open identity increments `resets` by exactly one and is closed once; an unknown identity increments it by zero. Neither case emits a negative delta or adds a reap credit without a readable baseline. Shrink by removing other identities and reducing the scan to this single outcome.
-12. **Retention independence and overflow:** Generate ages on both sides of 24 hours and 14 days, file/core units with the same stream key, and nonzero hook counters. Core expiry MUST leave eligible file rows and hook counters byte-for-byte equal until file expiry. Separately generate a counter or sum in `[2^63, 2^64-1]`; it MUST NOT commit as a wrapped integer, REAL, or saturated counter. Shrink age toward each boundary and overflow toward `2^63`; persistence of the overflow diagnostic itself remains A21.
+12. **Retention independence and overflow:** Generate ages on both sides of 24 hours and 14 days, file/core units with the same stream key, and nonzero hook counters. Core expiry MUST leave eligible file rows and hook counters byte-for-byte equal until file expiry. Separately generate a counter or sum in `[2^63, 2^64-1]`; it MUST NOT commit as a wrapped integer, REAL, or saturated counter. Shrink age toward each boundary and overflow toward `2^63`; the entire observation MUST roll back and a representable A21 diagnostic MUST survive with incomplete coverage.
 
-## 12. Ambiguous in the Design
+## 12. Ambiguous in the Design — Ratified Decisions
 
-Each item is unresolved by the approved design text. Recommendations below are not binding until ratified. Any unresolved item blocks an exactness claim for behavior that depends on it; unrelated behavior may proceed.
+All 22 revision-1 items are ratified. This ledger preserves their IDs and the binding outcome; A11/A22 use the operator's rulings, and the other 20 preserve the recommendations' substance. Conservative unavailability/incompleteness is an explicit outcome, not an unresolved decision.
 
-1. `TODO(design) A01` First observation: emit current cumulative counters as a partial delta, establish a zero baseline without emitting, or use a collector-start baseline. Recommendation: emit current values once and set `first_seen_partial=1`, because those counters are known observed values and the missing history is explicitly disclosed.
-2. `TODO(design) A02` Counter reset and `ESRCH` accounting: whether decreases reset one field or all four baselines, whether to count one reset per field or identity record, and how the design's explicit rule to count an open-identity `ESRCH` in `resets` composes with counter decreases. Recommendation: reset each decreasing field independently, increment once for an identity record with any decrease, and increment once for an `ESRCH` outcome only when that exact identity was already open.
-3. `TODO(design) A03` Never-sampled child reap: no event source/threshold distinguishes it from parent I/O. Recommendation: do not infer `reap_unobserved` from magnitude alone; keep zero until a detector is specified.
-4. `TODO(design) A04` Parent identity, nested reaps, and credit ordering across reparenting/multiple reaps. Recommendation: retain last observed parent identity and queue by disappearance sequence, then child `(pid,start_ticks)`; count a correction once on first positive credit use. Nested reaps and resets of cumulative counters require an explicit conservation rule before claiming exactness.
-5. `TODO(design) A05` D counter decreases, cgroup recreation, and cgroup migration baseline treatment. Recommendation: key by boot+cgroup id+device, clamp decrease to zero, establish a fresh baseline.
-6. `TODO(design) A06` Launch opening/closing and grouping concurrent process trees. Recommendation: one app-root process identity plus same-AppKey descendants, closed when all known members disappear.
-7. `TODO(design) A07` Exact AppKey escaping/canonicalization for systemd units, desktop IDs, executable symlinks, and cgroup paths. Recommendation: preserve systemd unit spelling, use desktop file ID verbatim, and use the absolute `/proc/<pid>/exe` target without resolving a second symlink layer; encode reserved characters as UTF-8 percent escapes.
-8. `TODO(design) A08` Epoch allocation, sequence persistence/high-water replay rejection, handover baseline JSON shape, and crash interval closure. Recommendation: transactionally allocate an epoch and reset `last_seq` to NULL on collector start; serialize each frame behind the committed high-water guard in section 3.4. Define/version the baseline object before store interchange; P1 reserves it without inventing a daemon protocol.
-9. `TODO(design) A09` Suspend detection, persisted attribution timestamp versus actual observation timestamp, and exact observed-time rate denominator. Recommendation: explicit suspend/resume boundaries and persisted observed durations; subtract measured suspended duration only. The abbreviated schema has no dedicated duration field, so complete reconstruction of suspend rates requires ratification.
-10. `TODO(design) A10` Partial buckets at query boundaries. Recommendation: include full contained buckets only and mark the clipped interval incomplete rather than prorating bytes.
-11. `TODO(design) A11` File observation cadence/top-100 timing, separate 14-day file retention, and bounded file queries beyond retention. Recommendation: define one observation per app-hour after aggregation; exact full-boot totals only beyond observations, and mark other ranges unavailable.
-12. `TODO(design) A12` Coverage count units, operators, raw persistence, and stable JSON schema. Recommendation: use section 4.3 definitions and the added `sample_coverage` table.
-13. `TODO(design) A13` Quota unit, file-size accounting, pruning tie-break, physical shrink policy, and quota-exhaustion resume. Recommendation: decimal 1,500,000,000 bytes across DB/WAL/SHM; use the algorithm in section 5.3.
-14. `TODO(design) A14` Exact persisted `coverage_json` keys and how file coverage is carried in rollups/totals. Recommendation: section 6.1 schema, with component-wise addition for byte/count counters and logical OR for flags.
-15. `TODO(design) A15` How measured row payload numbers apply to the expanded schema and indexes. Recommendation: remeasure the exact schema before shipping; hard quota remains authoritative.
-16. `TODO(design) A16` Peak numeric representation and temporal grain. Recommendation: integer floor bytes/second for each defined app interval, then maxima over the selected bucket/window as in section 5.4; preserve exact byte counts.
-17. `TODO(design) A17` File search normalization/case behavior, sort defaults, and unavailable result encoding. Recommendation: NFC case-insensitive substring, explicit direction, empty/incomplete for unrepresentable ranges.
-18. `TODO(design) A18` Corrupt-database timestamp format/collision policy and recovery if quarantine fails. Recommendation: atomic UTC-nanosecond no-replace rename; never overwrite a prior quarantine.
-19. `TODO(design) A19` D ownership where different AppKeys share one cgroup. Recommendation: never duplicate D; report it under a deterministic cgroup owner only if the ownership rule is approved, otherwise mark affected device attribution incomplete.
-20. `TODO(design) A20` `path.fs_uuid`, device identity, weak identity, rename/hardlink alias updates, and path timestamps across boots. Recommendation: pair every monotonic endpoint with a boot ID as in this DDL, choose first/last boots using persisted boot chronology rather than comparing monotonic values across boots, and keep weak identities separate from strong identities. The chronology source and canonical alias choice still require ratification.
-21. `TODO(design) A21` Behavior when a Linux counter or aggregate exceeds SQLite's signed 64-bit maximum. Recommendation: reject that transaction, persist an overflow/incomplete coverage state in a separate representable field, and never wrap or saturate. That diagnostic field is not yet defined by the source design.
-22. `TODO(design) A22` Scope representability: general bounded windows above 365 days, launch totals after raw expiry, and launch-specific D/F splits cannot be reconstructed from app/boot totals. Recommendation: use the explicit unavailable/error contracts in section 8.3 until the design chooses additional per-launch/range storage or narrows the promised queries; never substitute a full-boot/lifetime/app total for a narrower scope.
+| ID/status | Normative decision and contract |
+|---|---|
+| A01 — ratified | First readable counters MUST emit once with `first_seen_partial` for nonzero values; an incoming baseline MUST prevent pre-cutoff re-emission (§5.1). |
+| A02 — ratified | Only decreasing fields MUST reset; any decrease counts once per identity record, and an open-identity ESRCH counts once (§5.1). |
+| A03 — ratified | P1 MUST NOT infer unseen reaps from delta size; unsupported `reap_unobserved` components MUST remain zero (§5.1). |
+| A04 — ratified | Credits MUST retain the last observed parent identity and FIFO disappearance/child order, counting a correction once. Unproved nested/reset conservation MUST persist `reap_incomplete` and MUST NOT claim exactness (§5.1). |
+| A05 — ratified | D baselines MUST use boot/cgroup/device, establish zero-delta initial/recreation baselines, and clamp/reset decreases (§5.2). |
+| A06 — ratified | One launch MUST group an app root and same-AppKey descendants, closing only after all known members disappear; concurrent roots MUST remain separate (§3.3). |
+| A07 — ratified | AppKeys MUST preserve unit/desktop/executable spelling and use the specified UTF-8 percent encoding and deterministic precedence (§3.2). |
+| A08 — ratified | Each process start MUST allocate an epoch/reset high water transactionally; receipts MUST commit before publication; crashes MUST leave explicit gaps. Baseline interchange MUST be versioned/validated (§3.4). |
+| A09 — ratified | Suspend detection MUST use explicit boundaries; actual/attributed timestamps and measured observed durations MUST persist, excluding only measured suspended/uncovered time (§4.1). |
+| A10 — ratified | Queries MUST include only fully contained buckets, MUST mark clipped edges incomplete, and MUST NOT prorate bytes (§4.2). |
+| A11 — ratified, operator | File observations MUST be HOURLY after app-hour aggregation: one snapshot, top 100 files, independent 14-day retention. `107*100=10700` rows/snapshot (~1 MB), `*24=256800` rows/day (~22.6 MB/day), `*14=3595200` rows (~316 MB payload). Other bounded file windows MUST NOT borrow boot totals (§4.2, §7). |
+| A12 — ratified | Coverage units/operators MUST follow §4.3, and raw-window evidence MUST persist in per-tick `sample_coverage`, including zero-byte ticks. |
+| A13 — ratified | The physical quota MUST be decimal 1,500,000,000 bytes across DB/WAL/SHM; deterministic mapped-age pruning/shrink/pause/resume MUST follow §5.3. |
+| A14 — ratified | Coverage JSON MUST use the exact §6.1 shape, component-wise sums and OR flags, with independent hourly file coverage and file totals rather than a finer fictional file tier. |
+| A15 — ratified | The exact expanded schema and indexes MUST be remeasured before shipping; planning payload estimates MUST NOT override the hard quota (§7.1). |
+| A16 — ratified | Defined interval rates MUST use integer floor B/s and bucket/window maxima, preserving exact bytes; display rounding SHOULD use nearest unit, ties upward (§5.4, §8.1). |
+| A17 — ratified | File search MUST use NFC/casefold substring matching, the caller MUST pass direction, and default presentation MUST be traffic descending; unsupported allowed file windows MUST return empty/incomplete (§8.2–8.3). |
+| A18 — ratified | Corrupt DBs MUST use atomic UTC-nanosecond no-replace quarantine with increasing collision suffixes; failure MUST preserve evidence and stop rather than overwrite (§9). |
+| A19 — ratified | Distinct AppKeys sharing a cgroup MUST NOT duplicate/divide D. With no approved unique owner, affected device attribution MUST be incomplete (§5.2). |
+| A20 — ratified | Every monotonic value MUST retain boot identity; persisted boot chronology MUST order endpoints/LAST, observed aliases MUST remain faithful, and weak/strong identities MUST stay separate (§3.5, §6.2). |
+| A21 — ratified | An out-of-range counter/aggregate MUST roll back, MUST persist a representable separate overflow diagnostic, and MUST mark coverage incomplete without wrapping, saturation or REAL coercion (§5.4). |
+| A22 — ratified, operator | Every launch window and every bounded range above 365 days MUST be disabled with §8.3's exact store exception and consumer state. No wider window may substitute. Exact explicit boot/lifetime totals remain distinct supported scopes. |
 
-## 13. Design Contradictions
+## 13. Design Contradictions — Resolution Against r4
 
-1. **Revision metadata:** the design header identifies revision 2 and says it awaits re-review, while section 13 says its decisions are revision-3 resolutions and section 14 records the agreed decomposition. The user-provided task identifies revision 3 as approved. The behavioral body is usable, but the artifact's revision/status metadata is contradictory.
-2. **File storage arithmetic:** the stated `file_sample` formula gives `107 * 24 * 100 * 88 = 22,598,400` bytes/day and `316,377,600` bytes for 14 days, not the table's `23 MB/day * 14 = 322 MB`. This specification preserves the formula and states both values rather than silently changing the approved estimate.
-3. **Overflow attribution:** the BPF section describes a separate global overflow counter map, while `file_coverage` and the N4 resolution require overflow bytes per app. A global counter cannot produce exact per-app bytes without an app/cgroup-keyed mechanism. The P1 schema keeps per-app fields but no correct producer can populate them until design chooses a mechanism.
-4. **Boot scoping of monotonic values:** `clock_map` uses only `segment_start_mono_ns` as its primary key although monotonic time restarts each boot and the rest of the schema stores multiple boots. `path`/`path_alias` and `app_lifetime_total.updated_mono_ns` likewise retain monotonic timestamps without a boot identity. Such values can collide or be ordered incorrectly across boots. This draft adds boot scope; path-lifetime chronological ordering remains unresolved in TODO(design) A20.
-5. **Raw coverage availability:** the design promises window coverage and coverage in results, and carries coverage JSON in rollups/totals, but the raw `sample`/`sample_dev` schema has no raw storage for most process counters (`inaccessible_pids`, resets, reap credits, gaps). Exact raw-window coverage cannot be reconstructed from the listed columns. This draft adds `sample_coverage`; the exact shape remains TODO(design) A12/A14.
-6. **Promised windows versus stored dimensions:** the query windows include launches and general ranges, and the tier rule sends ranges above 365 days to totals. App rollups/totals lack launch IDs, app-level D/F rows lack launch attribution, and full-boot/lifetime totals lack arbitrary range endpoints. `app_boot_file_total` also lacks per-boot last-seen data required by the file-row result. These dimensions cannot be recovered exactly from the listed rows. A11/A22 record the choices; this draft does not add guessed splits or silently broaden a request.
+| Revision-1 contradiction | How design r4 resolved it | What specification revision 2 now requires |
+|---|---|---|
+| Revision metadata disagreed with the approved body | Header explicitly says revision 4 and supplies r1–r4 revision history | §1 names r4 as authoritative and records spec r1–r2 history; no stale revision-2/3 source-status claim remains. |
+| File-sample storage arithmetic | §6 gives `107*24*100=256800` rows/day, 22.6 MB/day and 316 MB/14 days | §7 shows exact hourly/snapshot/day/14-day products: 3,595,200 retained rows and 316,377,600 payload bytes; exact-schema remeasurement and physical quota remain mandatory. |
+| Global overflow could not produce per-app loss | §4.1 now keys the overflow map by cgroup and reserves `overflow_owner_unknown` when keying fails | §2/§5 separate attributable app overflow from unknown-owner loss; STRICT hourly/boot remainder tables, a first-class query result and UI disclosure preserve both without apportioning loss. |
+| Monotonic values lacked boot scope | §2.7/§6 key clock segments by `(boot_id,segment_start_mono_ns)` and require boot identity beside every monotonic value, including path/alias/lifetime endpoints | DDL pairs path/alias endpoints with their boots and lifetime update time with `updated_boot_id`; §3.5 uses persisted boot chronology for cross-boot ordering. |
+| Raw-window coverage had no durable source | §6 adds `sample_coverage` and says it cannot be reconstructed later | §4.3/§6 adopt a typed superset using exact coverage JSON and per-app tick timestamps, preserving zero-T intervals, full reap components and flags; file hours retain independent coverage. |
+| Promised launch/long-range scopes exceeded stored dimensions | §6 narrows promises and requires a disabled chip with a reason; its residual raw-launch/totals wording still conflicts with unconditional disablement (below) | Operator A22 controls §4.2/§8.3: every launch and every bounded range above 365 days raises an exact typed error and renders disabled/unavailable, never a substitute scope. File totals now store per-boot LAST. |
+
+**Remaining source contradiction: 1 (window promises).** R4's decision table still says launch is selectable, and §6 says launch is “offered only while raw rows … are retained” and `>365 d` “returns totals only,” while the same paragraph says both are disabled. The operator's A22 ruling is unambiguous and overrides those sentences for this specification: launch is always disabled, and a bounded range above 365 days errors. Only a separately requested exact boot/lifetime scope can return totals. This source-text conflict remains recorded rather than claiming r4 is internally consistent; no new product decision is needed and the design file is unchanged.
+
+All six original contradictions have concrete specification outcomes. The five other source contradictions are resolved by r4; the remaining source conflict above has an explicit operator-precedence resolution in the spec. No unratified design decisions remain.
 
 ## 14. P2 Can Start Immediately
 
-A P2 implementer can build the pure `/proc` parser and identity validator, `CLOCK_BOOTTIME` bucket arithmetic, signed T/D reconciliation, SQLite schema creation and app/time query indexes, stream-key deduplication, the controller-absent path, and the fixture/property tests whose expected values are fixed in section 10. P2 should keep launch grouping, first-seen policy, reset counting, shared-cgroup D ownership, partial rollup edges, and file-window behavior behind explicit seams until their `TODO(design)` decisions are ratified; those unresolved details must not block a narrow since-boot vertical slice that uses one app, one collector stream, complete permissions, and aligned windows.
+P2 can implement the pure `/proc` parser, identity validator, boottime buckets, signed reconciliation, reviewed schema-v1 creation, indexes, stream deduplication and controller-absent path against these ratified contracts. First-seen/reset/launch bookkeeping, shared-cgroup degradation, clipped edges, file-hour semantics and disabled-window errors MUST follow the rules above; no provisional policy seam or further ratification is required. P2 MUST preserve the stored coverage and typed failures while building the since-boot vertical slice. Daemon/BPF/UI mechanics remain in their agreed later plans; their consumers MUST preserve the values and disabled states specified here.
+
+Unratified items remaining: **0**. Remaining design-source contradictions: **1**, recorded in section 13 and governed by the explicit A22 operator ruling.
