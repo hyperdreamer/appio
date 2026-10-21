@@ -56,7 +56,7 @@ accounting for units started before setup, and per-access *timestamps* per file
 | Accumulation window | **Since boot** for the list default; `since launch` and `lifetime` also stored and selectable | every app measured over an identical window; survives browser restarts |
 | Detail view | **Combined A+B**: KPI strip, per-disk timeline lanes (plus a dual-sided TOTAL lane), read/write donut, share-by-disk, hour-of-day heatmap, reconciliation strip | keeps the time axis *and* the composition summary |
 | Tray | mirror `ai-manager` | familiar, already part of the user's workflow |
-| Root enablement | in-app consent dialog listing exact commands, then `pkexec` | no surprise privilege escalation |
+| Root enablement | in-app consent dialog listing exact commands, then `pkexec appio-setup <verb>`; the same switch turns the daemon **on and off**, and the UI always shows the probed state | no surprise privilege escalation, and no one-way door: the user can always undo it from the app |
 | Per-file data source | **F1**: eBPF `vfs_read`/`vfs_write` accounting inside `appio-iod` | the only source that yields measured per-file bytes *and* a real access count; clang 23.1.3 + libbpf 1.7 + `/usr/include/bpf` + kernel BTF are already present, so no new package |
 | Per-file scope | ships in **v1** | the requirement is part of the app's purpose, not an add-on |
 
@@ -88,22 +88,52 @@ the user's own apps needs no daemon. `appio-iod` exists for exactly the gap:
 other-UID application totals. It never writes to `/proc`, never accepts commands
 over its socket, and answers one query type.
 
-### Enabling machine-wide coverage (one-time, consented)
+### Enabling and disabling the root daemon (consented, reversible)
 
-`appio-setup` performs, and the consent dialog lists verbatim:
+The daemon is **switched on and off from the app**, never by asking the user to
+type systemctl commands. `appio-setup` is a root-owned helper installed by the
+package; it accepts exactly four fixed verbs and nothing else:
 
-1. write `/etc/systemd/system/user@.service.d/10-appio-io.conf` with
-   `[Service]\nDelegate=pids memory cpu io`
-2. write `/etc/systemd/user.conf.d/10-appio.conf` with
-   `[Manager]\nDefaultIOAccounting=yes`
-3. `systemctl daemon-reload`
-4. `systemctl enable --now appio-iod.service`
+| Verb | Effect |
+| --- | --- |
+| `pkexec appio-setup install-delegation` | writes `/etc/systemd/system/user@.service.d/10-appio-io.conf` (`Delegate=pids memory cpu io`), writes `/etc/systemd/user.conf.d/10-appio.conf` (`DefaultIOAccounting=yes`), runs `systemctl daemon-reload` |
+| `pkexec appio-setup enable` | `systemctl enable --now appio-iod.service` |
+| `pkexec appio-setup disable` | `systemctl disable --now appio-iod.service` (leaves the delegation drop-ins in place) |
+| `pkexec appio-setup status` | prints `is-enabled`/`is-active`/socket presence as JSON; read-only |
 
-Steps 1–3 only take effect for **new** user units, so the UI states plainly:
-"log out and back in to activate per-app disk attribution", and then verifies by
-probing for `io.stat` under `app.slice/<unit>/`. Until verified, the app renders
-`nvme*` lanes for system services only and labels user apps' device split
-`unavailable until re-login`.
+Hard rules for the helper:
+
+- `argv[1]` must match one of those four verbs exactly; anything else exits 2
+  without side effects. No shell, no user-supplied arguments, no globbing.
+- The helper file is root:root mode 0755 and is shipped by the package together
+  with a polkit action, so `pkexec` shows a named prompt rather than a generic one.
+- `disable` never removes the drop-ins; removing them is a separate explicit
+  action (`uninstall-delegation`, out of scope for v1). Turning the service off
+  must not silently undo a system configuration the user approved earlier.
+
+UI contract for the toggle (`Settings → System services (root)`):
+
+1. On open, and after every toggle, the app reads state **unprivileged** via
+   `systemctl is-enabled appio-iod` + `systemctl is-active appio-iod` + a socket
+   probe, so the switch always reflects reality rather than the last click.
+2. Turning it **on** opens a consent dialog that lists the exact commands above,
+   then runs `pkexec appio-setup enable`. On success the toggle stays on and the
+   status line reports the verification result; on polkit dismissal (exit 126) or
+   any failure the toggle **reverts** and the status line carries the exit code
+   and the first stderr line verbatim.
+3. Turning it **off** opens the same dialog with the `disable` command, then
+   re-probes. If the daemon is still active, the toggle reverts to on and says so.
+4. Success is verified, not assumed: `enable` counts as successful only when the
+   socket answers a `status` request within 5 s. A started-but-unreachable daemon
+   is reported as `enabled, not answering` rather than shown as working.
+5. The toggle is disabled (with an explanation) when `appio-setup` is missing,
+   when the process is not on a systemd host, or inside a container.
+
+Steps 1–3 of `install-delegation` only take effect for **new** user units, so the
+UI states plainly: "log out and back in to activate per-app disk attribution",
+and then verifies by probing for `io.stat` under `app.slice/<unit>/`. Until
+verified, the app renders `nvme*` lanes for system services only and labels user
+apps' device split `unavailable until re-login`.
 
 ## Components
 
@@ -252,8 +282,10 @@ The approved mockups are the specification; reproduce them as drawn.
   palette-tinted and re-tinted on `paletteChanged`;
   `app.setQuitOnLastWindowClosed(False)`, `app.setDesktopFileName("appio")`.
 - **Settings**: sampling cadence (1–10 s, default 2), retention, tray options,
-  autostart `.desktop` generation, and the `System services (root)` toggle that
-  opens the consent dialog.
+  autostart `.desktop` generation, and the `System services (root)` switch that
+  turns `appio-iod` on or off with a consent dialog and `pkexec` (see above).
+  A status line under the switch always shows the probed reality:
+  `off` · `on, answering` · `enabled, not answering` · `on, delegation needs a re-login`.
 
 ## Error handling and degradation
 
@@ -265,7 +297,11 @@ The approved mockups are the specification; reproduce them as drawn.
 | `appio-iod` absent or socket refused | banner "system apps are not measured"; own-UID sampling continues |
 | SQLite write failure | retry once, then pause sampling, keep UI responsive, surface a non-modal banner |
 | DB corruption | move to `history.db.corrupt-<ts>`, recreate schema, notify |
-| `pkexec` dismissed/failed | toggle reverts to off, status line carries the exact exit code and stderr |
+| `pkexec` dismissed/failed | toggle reverts to the probed state, status line carries the exact exit code (126 = dismissed) and first stderr line |
+| `enable` returns 0 but the socket never answers | status line reads `enabled, not answering`; the switch stays on, the banner keeps saying system apps are unmeasured |
+| daemon enabled outside the app (pacman hook, admin) | next probe reflects it; the UI follows reality and never fights the admin |
+| `disable` while the GUI is sampling | the GUI drops to own-UID mode within one tick, keeps its history, and the `Files` tab explains why per-file rows stopped |
+| `appio-setup` missing or container host | switch is rendered disabled with the reason, instead of failing after a polkit prompt |
 | Delegation installed but not yet re-logged-in | detail view states `unavailable until re-login`, with a probe re-check button |
 | Clock jump / suspend | deltas derived from consecutive snapshots; a gap becomes one bucket, never negative bytes |
 | BPF program fails to load (no BTF, verifier error, old kernel) | `Files` tab shows `unavailable: <errno and verifier line>`; sampling and the Overview tab are unaffected |
@@ -300,3 +336,8 @@ The approved mockups are the specification; reproduce them as drawn.
   is skipped unless `os.geteuid() == 0` and BTF is present, so CI never fakes a
   pass.
 - `Files` tab: sort by every column, search filtering, residual footer text.
+- `appio.setup_client`: verb allowlist (`argv[1]` only), exit-code mapping
+  (0/126/127/other), toggle reverts on dismissal, status probing with a fake
+  `systemctl` on `PATH`, and the enabled-but-unreachable case reported as such.
+- `appio-setup`: invoked with a wrong verb or extra arguments, it must exit 2 and
+  touch nothing (asserted against a tmp root).
