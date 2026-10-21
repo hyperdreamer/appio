@@ -36,12 +36,15 @@ Measured facts that shape the design (verified on the target machine):
 4. Show explicitly which disk the I/O landed on, with the measurement residual
    disclosed rather than hidden.
 5. Match the tray behaviour of `ai-manager`, which the user already runs daily.
+6. For any application, list the **files it accessed**, with per-file read/write
+   byte counts and access frequency, sortable by any column.
 
 ## Non-goals (v1)
 
-Per-file attribution, network I/O, per-process detail below app granularity,
-alerting/notifications on thresholds, remote or multi-machine collection,
-Windows/macOS, retroactive accounting for units started before setup.
+Network I/O, per-process detail below app granularity, alerting/notifications on
+thresholds, remote or multi-machine collection, Windows/macOS, retroactive
+accounting for units started before setup, and per-access *timestamps* per file
+(only the aggregates listed here are retained).
 
 ## Decisions taken with the user
 
@@ -54,12 +57,14 @@ Windows/macOS, retroactive accounting for units started before setup.
 | Detail view | **Combined A+B**: KPI strip, per-disk timeline lanes (plus a dual-sided TOTAL lane), read/write donut, share-by-disk, hour-of-day heatmap, reconciliation strip | keeps the time axis *and* the composition summary |
 | Tray | mirror `ai-manager` | familiar, already part of the user's workflow |
 | Root enablement | in-app consent dialog listing exact commands, then `pkexec` | no surprise privilege escalation |
+| Per-file data source | **F1**: eBPF `vfs_read`/`vfs_write` accounting inside `appio-iod` | the only source that yields measured per-file bytes *and* a real access count; clang 23.1.3 + libbpf 1.7 + `/usr/include/bpf` + kernel BTF are already present, so no new package |
+| Per-file scope | ships in **v1** | the requirement is part of the app's purpose, not an add-on |
 
 ## Architecture
 
 ```
 ┌──────────────────────────── appio (unprivileged, PyQt6) ───────────────────────────┐
-│  sampler ──► store (SQLite) ──► model ──► main window (list │ detail)  ──► tray    │
+│  sampler ──► store (SQLite) ──► model ──► main window (list │ Overview │ Files) ──► tray
 │     │                                    ▲                                          │
 │     └── reads /proc/<pid>/io (own UID) ──┘                                          │
 │     └── reads /sys/fs/cgroup/**/io.stat  (world-readable)                           │
@@ -68,6 +73,7 @@ Windows/macOS, retroactive accounting for units started before setup.
                                                │  newline-delimited JSON, read-only
 ┌──────────────────────────── appio-iod (root, systemd) ──────────────────────────────┐
 │  samples /proc/<pid>/io for every PID; reads per-unit io.stat; serves snapshots     │
+│  loads appio_fileio.bpf.o (fentry on vfs_read/vfs_write) → LRU map drained ≥1/s     │
 └─────────────────────────────────────────────────────────────────────────────────────┘
 
 setup path (once, with consent):  pkexec appio-setup  ──►  drop-in + daemon-reload
@@ -109,7 +115,9 @@ probing for `io.stat` under `app.slice/<unit>/`. Until verified, the app renders
 | `appio.sampler` | take one snapshot per tick; compute per-launch deltas; append rows; never block the UI thread | `procs`, `cgroups`, `identity`, `store` |
 | `appio.store` | SQLite schema, migrations, insert/rollup/retention, query API for the UI | sqlite3 |
 | `appio.iodclient` | connect to `/run/appio/iod.sock`, parse snapshots, degrade to own-UID when absent | socket |
-| `appio.iod` (daemon) | same snapshot logic for all PIDs, served read-only as NDJSON | `procs`, `cgroups` |
+| `appio.iod` (daemon) | same snapshot logic for all PIDs, served read-only as NDJSON; loads and drains the per-file BPF map | `procs`, `cgroups`, BPF |
+| `appio_iod/bpf/fileio.bpf.c` | fentry `vfs_read`/`vfs_write` → `bpf_get_current_cgroup_id()`; LRU hash keyed `(cgroup_id, dev, inode)`; value `{reads, writes, bytes_r, bytes_w, name[64]}`; captures the dentry name on first insert | libbpf, kernel BTF |
+| `appio.files` | maps `cgroup_id` → unit path via kernfs inode = cgroup id; resolves inodes to paths; merges map dumps into `file_sample`; enforces top-N caps | `store` |
 | `appio.ui.listview` | sorted application list (proxy model over the query API) | store |
 | `appio.ui.detailview` | approved infographic pane | store |
 | `appio.ui.tray` | `QSystemTrayIcon` mirroring ai-manager | Qt |
@@ -135,7 +143,21 @@ sample_dev(launch_id INTEGER NOT NULL, ts REAL NOT NULL, dev TEXT NOT NULL,
 rollup(app_id INTEGER NOT NULL, bucket_start REAL NOT NULL, bucket_secs INTEGER NOT NULL,
        read_bytes INTEGER, write_bytes INTEGER, rchar INTEGER, wchar INTEGER,
        PRIMARY KEY (app_id, bucket_start, bucket_secs)) WITHOUT ROWID;
+-- per-file access, filled only while the daemon runs (F1)
+path(path_id INTEGER PRIMARY KEY, text TEXT UNIQUE NOT NULL);
+file_sample(app_id INTEGER NOT NULL REFERENCES app(app_id), bucket_start REAL NOT NULL,
+            dev TEXT NOT NULL, inode INTEGER NOT NULL, path_id INTEGER NOT NULL REFERENCES path(path_id),
+            reads INTEGER NOT NULL, writes INTEGER NOT NULL,
+            bytes_r INTEGER NOT NULL, bytes_w INTEGER NOT NULL,
+            PRIMARY KEY (app_id, bucket_start, dev, inode)) WITHOUT ROWID;
 ```
+
+Per-file sizing and retention: the BPF LRU map holds at most 65 536 entries
+(≈6 MB), evicting least-recently-used files first; the daemon drains at least
+once per second; the store keeps 1-minute `file_sample` buckets for 24 h and only
+the **top 500 files per app** per bucket, so a pathological app cannot fill the
+disk. Evicted or capped files are reported as part of the
+`not attributable to a file` row rather than dropped silently.
 
 - **Since boot** = Σ deltas whose `boot.boot_id` = the current `/proc/sys/kernel/random/boot_id`.
 - **Since launch** = Σ deltas for the app's current `launch` row.
@@ -174,6 +196,12 @@ def record(snapshots: Sequence[LaunchDelta], dev: Mapping[str, Sequence[DevStat]
 def ranking(window: Window, metric: Metric) -> list[AppTotal]: ...
 def series(app_id: int, window: Window, bucket_secs: int) -> list[Bucket]: ...
 def disk_share(app_id: int, window: Window) -> DiskShare: ...   # includes residual
+
+# appio.files
+def record_files(app_id: int, ts: float, stats: Sequence[FileStat]) -> None: ...
+def file_table(app_id: int, window: Window,
+               sort: Literal["reads","writes","bytes_r","bytes_w","path"]) -> list[FileRow]: ...
+def file_residual(app_id: int, window: Window) -> int: ...   # app total - sum(file rows)
 ```
 
 Daemon wire format, one JSON object per line, server → client only:
@@ -184,7 +212,11 @@ Daemon wire format, one JSON object per line, server → client only:
             "rchar": 10, "wchar": 20, "read_bytes": 30, "write_bytes": 40,
             "cgroup": "system.slice/sshd.service"}],
  "devs":  [{"cgroup": "system.slice/sshd.service", "dev": "nvme0n1",
-            "rbytes": 4096, "wbytes": 0}]}
+            "rbytes": 4096, "wbytes": 0}],
+ "files": [{"cgroup": "app.slice/app-chromium@x.service", "dev": "nvme0n1",
+            "inode": 412345, "name": "data_1",
+            "reads": 12481, "writes": 3, "bytes_r": 191230771, "bytes_w": 1258291}],
+ "files_dropped": 0}
 ```
 
 ## UI
@@ -205,6 +237,13 @@ The approved mockups are the specification; reproduce them as drawn.
   range chips in the title bar (`1h 6h 24h boot 30d`); read/write donut;
   share-by-disk bars; hour-of-day intensity strip; reconciliation strip
   (`reconciled … within 1.8%`, `residual …`).
+- **Files tab** (beside `Overview`, see `assets/2026-10-21-per-file.png`): search
+  field, a sort indicator, and a table of `FILE · DISK · READS · WRITES ·
+  BYTES R · BYTES W`, sortable by clicking any column (path sorts
+  lexicographically, counters numerically). `READS`/`WRITES` are `read()`/
+  `write()` syscall counts. A footer row states the part of the app total that
+  is **not attributable to a file** (`mmap`, `io_uring`, files evicted from the
+  BPF map), so the table never pretends to sum to the KPI total.
 - **Tray** (mirrors `ai-manager/ui/system_tray.py`): dynamic `Show`/`Hide`
   item, single-click (`Trigger`) toggles the window, separator-separated
   domain actions — `Pause sampling`, `Open data folder` — then `⚙ Settings…`,
@@ -229,6 +268,10 @@ The approved mockups are the specification; reproduce them as drawn.
 | `pkexec` dismissed/failed | toggle reverts to off, status line carries the exact exit code and stderr |
 | Delegation installed but not yet re-logged-in | detail view states `unavailable until re-login`, with a probe re-check button |
 | Clock jump / suspend | deltas derived from consecutive snapshots; a gap becomes one bucket, never negative bytes |
+| BPF program fails to load (no BTF, verifier error, old kernel) | `Files` tab shows `unavailable: <errno and verifier line>`; sampling and the Overview tab are unaffected |
+| BPF map full | LRU eviction; evicted files roll into the `not attributable to a file` row, count surfaced in the UI |
+| daemon restarted mid-window | map drains are cumulative-only in the store; a restart starts a fresh drain sequence, never a negative delta |
+| unprivileged user, daemon disabled | `Files` tab explains that per-file data requires the daemon, with a link to the consent dialog |
 
 ## Testing strategy
 
@@ -249,3 +292,11 @@ The approved mockups are the specification; reproduce them as drawn.
   toggle, detail view series plumbing, tray menu text toggling
   (`Show`/`Hide`), consent dialog text.
 - Golden test for the reconciliation strip so "1.8%" cannot silently become a lie.
+- `appio.files`: synthetic BPF map dumps → `file_sample` rows; top-N capping;
+  `cgroup_id` → unit-path resolution from a fixture kernfs tree; residual
+  arithmetic (`sum(file bytes) + file_residual == launch total`).
+- BPF program: aggregator logic compiled with a userspace shim and asserted on
+  synthetic key/value vectors; an integration test that actually loads the object
+  is skipped unless `os.geteuid() == 0` and BTF is present, so CI never fakes a
+  pass.
+- `Files` tab: sort by every column, search filtering, residual footer text.
