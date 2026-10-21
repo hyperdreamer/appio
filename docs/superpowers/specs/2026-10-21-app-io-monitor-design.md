@@ -1,11 +1,14 @@
-# appio — Per-application disk I/O monitor (design, revision 2)
+# appio — Per-application disk I/O monitor (design, revision 4)
 
 Date: 2026-10-21
-Status: revised after design review attempt-3 (FAIL, 15 blockers) — awaiting re-review
+Status: revision 4 — P1 contract decisions ratified by the operator; spec drafted against it
 Target: Arch Linux, KDE Plasma 6 / Wayland, Python 3.14 + PyQt6
 
-Revision 2 changes the *measurement model*, not the product. Every blocker from the
-review is answered in "Findings ledger" at the end, with the section that fixes it.
+Revision history: r1 initial design; r2 rewrote the measurement model after review
+attempt-3 (15 blockers); r3 answered review attempt-4 (11 partial closures, 7 new
+blockers) and adopted the A′ delivery order; r4 fixes the six internal contradictions
+found while drafting the P1 specification and records the operator's two product
+rulings (hourly file observations; unanswerable windows are disabled, not faked).
 
 ## Background
 
@@ -134,7 +137,7 @@ Per sample tick, for every readable PID:
    arithmetic**: `bucket_start_mono_ns = ts_mono_ns // bucket_ns * bucket_ns`. There is
    no per-insert wall offset — that was algebraically identical to using realtime and
    is removed. Wall time is converted for display only, through persisted
-   `clock_map(segment_start_mono_ns, wall_offset_ns)` segments written whenever the
+   `clock_map(boot_id, segment_start_mono_ns, wall_offset_ns)` segments written whenever the
    offset changes by more than 1 s; a historical hour-of-day chart after pruned raw
    data re-derives wall labels from those segments, so an NTP step cannot move rows
    or repeat labels. A delta that spans a suspend is assigned to the last bucket
@@ -220,9 +223,14 @@ of being assumed to work.
   reuse within a bucket (B9).
 - **Value:** `{reads, writes, bytes_r, bytes_w, name_len, name[40]}` — a truncated
   *basename* captured while the dentry is alive, never a reconstructed path.
-- **Never evict silently (B8):** `BPF_MAP_TYPE_HASH`, `max_entries = 262144`, no LRU.
-  A failed insert increments `overflow_files`; overflowed bytes are added to
-  `overflow_bytes_r/w` in a separate global-counter map, so loss is **counted**.
+- **Never evict silently, and attribute the loss (B8, corrected in r4):**
+  `BPF_MAP_TYPE_HASH`, `max_entries = 262144`, no LRU. A failed insert increments
+  `overflow_files` **and** `overflow_bytes_r/w` in a **per-cgroup-keyed** overflow map
+  (`BPF_MAP_TYPE_HASH`, key `cgroup_id`, value three counters), not a single global
+  counter. r3 specified both a global counter and per-app overflow accounting, which
+  cannot both be true; per-cgroup keying is what makes `file_coverage`'s per-app
+  fields producible. A cgroup that cannot be keyed (map full) rolls into a reserved
+  `overflow_owner_unknown` key, which the UI reports as an unknown-owner remainder.
   Measured payload: 262144 × (key 32 B + value 88 B) ≈ 31 MB plus hash overhead, and
   that figure is stated in the settings UI.
 - **Lossless drain by double buffering (B8, replaces lookup-and-delete):** the data
@@ -336,7 +344,16 @@ collector_interval(source TEXT, boot_id TEXT, epoch INTEGER, from_mono_ns INTEGE
                    PRIMARY KEY (source, boot_id, epoch));
 handover(boot_id, from_source, to_source, cutoff_mono_ns INTEGER,
          baselines_json TEXT, PRIMARY KEY (boot_id, cutoff_mono_ns));
-clock_map(segment_start_mono_ns INTEGER PRIMARY KEY, wall_offset_ns INTEGER);
+clock_map(boot_id TEXT, segment_start_mono_ns INTEGER, wall_offset_ns INTEGER,
+          PRIMARY KEY (boot_id, segment_start_mono_ns));
+-- r4: monotonic values restart every boot, so every table that stores one also stores
+-- its boot identity (clock_map, path, path_alias, app_lifetime_total.updated_boot_id).
+-- Raw-window coverage is stored per tick, because it cannot be reconstructed later.
+sample_coverage(boot_id, source, epoch, seq, app_id,
+                inaccessible_pids INTEGER, resets INTEGER, reap_corrections INTEGER,
+                reap_unapplied INTEGER, reap_unobserved INTEGER,
+                first_seen_partial INTEGER, spans_suspend INTEGER,
+                PRIMARY KEY (boot_id, source, epoch, seq, app_id)) WITHOUT ROWID;
 -- rollups: carry boot identity AND device, so the promised windows stay answerable (B5)
 rollup_app(boot_id, app_id, bucket_start_mono_ns, bucket_secs, read_bytes, write_bytes,
            rchar, wchar, peak_read_bps, peak_write_bps, coverage_json,
@@ -353,9 +370,15 @@ app_lifetime_total(app_id PRIMARY KEY, read_bytes, write_bytes, rchar, wchar, up
 gap(boot_id, source, epoch, seq, from_mono_ns, to_mono_ns, reason);
 ```
 
-**Tier selection is disjoint, never blended (B5):** window ≤ 24 h → `sample`;
-≤ 30 d → `rollup_*` at 60 s; ≤ 365 d → `rollup_*` at 3600 s; longer → totals tables
-only, and the UI says "totals only beyond 365 days".
+**Tier selection is disjoint, never blended (B5, narrowed in r4):** window ≤ 24 h →
+`sample`; ≤ 30 d → `rollup_*` at 60 s; ≤ 365 d → `rollup_*` at 3600 s; longer → totals
+tables only. **Ratified limit on what the UI may promise:** because launch identity is
+not carried by rollups or totals, the `launch` window is offered only while raw rows
+for that launch are retained; `> 365 d` returns totals only. Both are rendered as a
+disabled chip with a stated reason, never as a wider window wearing a narrower label.
+Each tier's coverage is stored with it (`sample_coverage` for raw, `coverage_json` for
+rollups and totals), so a partial window reports its own gaps instead of borrowing the
+whole-boot coverage.
 
 **Storage budget, with arithmetic that actually holds (B7).** Row sizes used below are
 measured SQLite payloads including the record header, not estimates:
@@ -364,7 +387,7 @@ measured SQLite payloads including the record header, not estimates:
 | --- | --- | --- | --- | --- | --- |
 | raw `sample` (10 s persistence, 2 s live cache) | 107 apps × 8 640 | 72 | 66 MB | 24 h | 66 MB |
 | raw `sample_dev` | 107 × 2 devs × 8 640 | 40 | 74 MB | 24 h | 74 MB |
-| raw `file_sample` (top-100 per app per **hour**) | 107 × 24 × 100 | 88 | 23 MB | 14 d | 322 MB |
+| raw `file_sample` (top-100 per app per **hour**) | 107 × 24 × 100 = 256 800 | 88 | 22.6 MB | 14 d | 316 MB |
 | `rollup_app` 60 s | 107 × 1 440 | 64 | 10 MB | 30 d | 296 MB |
 | `rollup_dev` 60 s | 107 × 1 440 × 2 | 56 | 17 MB | 30 d | 518 MB |
 | `rollup_*` 3 600 s | 107 × 24 × 3 | 64 | 0.5 MB | 365 d | 181 MB |
