@@ -1311,3 +1311,11 @@ The B1–B10 repairs also add the extended attributed-timestamp sample key, dura
 P2 can implement the pure `/proc` parser, identity validator, boottime buckets, signed reconciliation, reviewed schema-v1 creation, indexes, stream deduplication and controller-absent path against these ratified contracts. First-seen/reset/launch bookkeeping, shared-cgroup degradation, clipped edges, file-hour semantics and disabled-window errors MUST follow the rules above; no provisional policy seam or further ratification is required. P2 MUST preserve the stored coverage and typed failures while building the since-boot vertical slice. Daemon/BPF/UI mechanics remain in their agreed later plans; their consumers MUST preserve the values and disabled states specified here.
 
 Unratified items remaining: **0**. Remaining design-source contradictions: **1**, recorded in section 13 and governed by the explicit A22 operator ruling.
+
+## Errata and amendments
+
+1. **E-1 (pinned 2026-10-21, before T-006/T-009).** `HourlyFileSnapshot.apps` had no declared
+   record type. It is fixed as
+   `tuple[tuple[AppKey, tuple[FileObservation, ...], FileCoverageInput], ...]`, i.e. one
+   `(app_key, observations, coverage)` triple per application per hour, ordered by `app_key`
+   ascending. T-006 and T-009 MUST both use this shape; a different shape is a contract breach.

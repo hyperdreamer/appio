@@ -61,7 +61,7 @@
 - [ ] Implement the frozen dataclasses and validators. Keep `CounterVector` order fixed everywhere, compute `AppTotal.total_bytes` and `FileRow.bytes_total` only from integer fields, and do not put database-local IDs into external identity types.
 - [ ] Encode the A22 exact messages as constants: `Launch window disabled: device and file activity are not stored per launch.` and `Ranges longer than 365 days are disabled: retained rollups cannot represent arbitrary ranges.`; also expose `Historical boot prefix unavailable: totals cover the full collected boot.` for the query task.
 - [ ] Run `python -m pytest -q tests/test_contracts.py`; it MUST pass with no failures.
-- [ ] Commit with `git add pyproject.toml src/appio/__init__.py src/appio/contracts.py tests/test_contracts.py && git commit -m "feat(appio): define shared P1 contracts"`.
+- [ ] Ensure the FINAL commit message is `git add pyproject.toml src/appio/__init__.py src/appio/contracts.py tests/test_contracts.py && git commit -m "feat(appio): define shared P1 contracts"`.
 
 ## Task 2: Parse fixture `/proc` records and resolve stable process identity
 
@@ -106,7 +106,7 @@
 - [ ] Implement `ProcReader.read_stable()` as one logical record: stat-before, all metadata and IO outcome, stat-after. Preserve the old open identity only at the sampler layer when stat is unstable; do not emit a partial process sample here.
 - [ ] Implement the exact A07 AppKey grammar and precedence. For systemd paths select the deepest matching `app-*` component, then the deepest `app.slice` ancestor; use bytewise unit tie ordering; then desktop, absolute executable, and the session-scope prefix rule.
 - [ ] Run `python -m pytest -q tests/test_procs.py tests/test_identity.py`; it MUST pass with no failures.
-- [ ] Commit with `git add src/appio/procs.py src/appio/identity.py tests/test_procs.py tests/test_identity.py tests/fixtures/proc && git commit -m "feat(appio): parse proc fixtures and resolve AppKeys"`.
+- [ ] Ensure the FINAL commit message is `git add src/appio/procs.py src/appio/identity.py tests/test_procs.py tests/test_identity.py tests/fixtures/proc && git commit -m "feat(appio): parse proc fixtures and resolve AppKeys"`.
 
 ## Task 3: Parse cgroup device accounting and controller state
 
@@ -150,7 +150,7 @@
 - [ ] Implement component-wise baseline deltas with the A05 key and reset semantics. Return reset metadata so the sampler can add coverage without emitting a negative D value.
 - [ ] Implement shared-owner attribution exactly as A19: one unique owner is attributed once; multiple distinct owners receive no D rows and each affected app carries incomplete device coverage.
 - [ ] Run `python -m pytest -q tests/test_cgroups.py`; it MUST pass with no failures.
-- [ ] Commit with `git add src/appio/cgroups.py tests/test_cgroups.py tests/fixtures/cgroup && git commit -m "feat(appio): parse cgroup device accounting"`.
+- [ ] Ensure the FINAL commit message is `git add src/appio/cgroups.py tests/test_cgroups.py tests/fixtures/cgroup && git commit -m "feat(appio): parse cgroup device accounting"`.
 
 ## Task 4: Implement boottime buckets, clock segments, suspend attribution, and signed reconciliation
 
@@ -194,7 +194,7 @@
 - [ ] Implement `SuspensionSet` by sorting and merging intervals before subtracting them from an observation interval. Do not infer suspend from a long delay. Preserve actual observation time separately from the attributed bucket timestamp.
 - [ ] Implement reconciliation with signed Python integers and the exact read/write/combined equations; return `None` for aggregate D and residuals whenever coverage is unavailable or mixed.
 - [ ] Run `python -m pytest -q tests/test_clock.py tests/test_reconcile.py`; it MUST pass with no failures.
-- [ ] Commit with `git add src/appio/clock.py src/appio/reconcile.py tests/test_clock.py tests/test_reconcile.py && git commit -m "feat(appio): add boottime arithmetic and reconciliation"`.
+- [ ] Ensure the FINAL commit message is `git add src/appio/clock.py src/appio/reconcile.py tests/test_clock.py tests/test_reconcile.py && git commit -m "feat(appio): add boottime arithmetic and reconciliation"`.
 
 ## Task 5: Create and validate the exact STRICT SQLite schema-v1 migration
 
@@ -235,7 +235,7 @@
 - [ ] The required table definitions must include these load-bearing columns and keys: `sample` includes `observed_mono_ns`, nullable `interval_start_mono_ns`/`observed_ns`, `first_seen_partial`, `spans_suspend`, and primary key `(boot_id,source,epoch,seq,app_id,launch_id,ts_mono_ns)`; `sample_coverage` is keyed by `(boot_id,source,epoch,seq,app_id)`; `sampler_checkpoint` stores `source,boot_id,epoch,seq,checkpoint_mono_ns,state_json`; file tables include hourly keys and all omission/overflow/hook columns; rollups and totals include nullable `peak_read_bps`, `peak_write_bps`, and `peak_total_bps`; `app_lifetime_total` stores `updated_boot_id` and `updated_mono_ns`; diagnostics store stream identity, optional app, time, field, and unique `(boot_id,source,epoch,seq,field)`.
 - [ ] Implement migration preconditions so `PRAGMA foreign_keys=ON` is set before `BEGIN IMMEDIATE`, the migration runner never wraps `SCHEMA_SQL` in another transaction, and unsupported state fails closed without rewriting the file.
 - [ ] Run `python -m pytest -q tests/test_schema.py`; it MUST pass with no failures and report all schema/index checks successful.
-- [ ] Commit with `git add src/appio/schema.py src/appio/migrations.py tests/test_schema.py && git commit -m "feat(appio): add STRICT schema v1 migration"`.
+- [ ] Ensure the FINAL commit message is `git add src/appio/schema.py src/appio/migrations.py tests/test_schema.py && git commit -m "feat(appio): add STRICT schema v1 migration"`.
 
 ## Task 6: Add canonical durable JSON and collector stream state
 
@@ -277,7 +277,7 @@
 - [ ] Implement file-hour state validation with top-level `version,boot_id,hour_start_mono_ns,apps,unknown_owner`; app arrays are AppKey-byte sorted, file arrays use the declared typed identity order, aliases are unique byte-sorted, coverage has exactly the specified scalar and six hook keys, and an explicit zero `unknown_owner` object is required.
 - [ ] Implement transactional epoch allocation and high-water acceptance against `collector_epoch`, with no baseline mutation in the rejection path.
 - [ ] Run `python -m pytest -q tests/test_durable.py tests/test_stream.py`; it MUST pass with no failures.
-- [ ] Commit with `git add src/appio/durable.py src/appio/stream.py tests/test_durable.py tests/test_stream.py && git commit -m "feat(appio): validate durable state and stream receipts"`.
+- [ ] Ensure the FINAL commit message is `git add src/appio/durable.py src/appio/stream.py tests/test_durable.py tests/test_stream.py && git commit -m "feat(appio): validate durable state and stream receipts"`.
 
 ## Task 7: Implement the pure identity, delta, credit, and coverage aggregation tick
 
@@ -326,7 +326,7 @@
 - [ ] Use `attribute_interval()` from Task 4 for each contribution so suspend-spanning deltas retain actual observation time but use the last pre-suspend attributed timestamp and measured active denominator. Aggregate app rows by `(AppKey, launch identity, attributed timestamp)` while reducing frame coverage once per app at the observed timestamp.
 - [ ] Aggregate cgroup/device observations once per `(AppKey,dev)`, apply the shared-cgroup degradation from Task 3, and preserve `device_state="not_delegated"` without zero-valued D rows.
 - [ ] Run `python -m pytest -q tests/test_sampler.py tests/test_launch.py`; it MUST pass with no failures.
-- [ ] Commit with `git add src/appio/launch.py src/appio/sampler.py tests/test_sampler.py tests/test_launch.py && git commit -m "feat(appio): implement identity and credit-based sampling"`.
+- [ ] Ensure the FINAL commit message is `git add src/appio/launch.py src/appio/sampler.py tests/test_sampler.py tests/test_launch.py && git commit -m "feat(appio): implement identity and credit-based sampling"`.
 
 ## Task 8: Build the atomic store writer, rollups, totals, and checkpoint persistence
 
@@ -373,7 +373,7 @@
 - [ ] Implement diagnostic persistence after a rolled-back overflow in a separate transaction; if diagnostic persistence fails, surface that failure instead of acknowledging the observation.
 - [ ] Implement checkpoint restore and gap creation so post-checkpoint time is explicitly uncovered and the restored cumulative baseline is subtracted from the next sample.
 - [ ] Run `python -m pytest -q tests/test_store.py tests/test_store_overflow.py`; it MUST pass with no failures.
-- [ ] Commit with `git add src/appio/store.py tests/test_store.py tests/test_store_overflow.py && git commit -m "feat(appio): persist atomic samples, rollups, totals, and checkpoints"`.
+- [ ] Ensure the FINAL commit message is `git add src/appio/store.py tests/test_store.py tests/test_store_overflow.py && git commit -m "feat(appio): persist atomic samples, rollups, totals, and checkpoints"`.
 
 ## Task 9: Implement synthetic hourly file contracts and deterministic retention primitives
 
@@ -420,7 +420,7 @@
 - [ ] Implement `FileHourStore` with a single app-hour primary key across collectors, exact coverage columns plus canonical `coverage_json`, boot file totals with persisted last-seen boot identity, and no reopening below the durable finalized watermark.
 - [ ] Implement retention’s mapped-wall age and deterministic ordering. `physical_store_bytes()` must sum `st_size` for the main database and sidecars; the decimal quota is exactly `1_500_000_000`; totals, diagnostics, boot chronology, and path identities referenced by totals are never deleted.
 - [ ] Run `python -m pytest -q tests/test_files.py tests/test_file_store.py tests/test_quota.py`; it MUST pass with no failures.
-- [ ] Commit with `git add src/appio/files.py src/appio/file_store.py src/appio/quota.py tests/test_files.py tests/test_file_store.py tests/test_quota.py && git commit -m "feat(appio): add hourly file contracts and retention"`.
+- [ ] Ensure the FINAL commit message is `git add src/appio/files.py src/appio/file_store.py src/appio/quota.py tests/test_files.py tests/test_file_store.py tests/test_quota.py && git commit -m "feat(appio): add hourly file contracts and retention"`.
 
 ## Task 10: Implement tiered queries, coverage reduction, and signed residual results
 
@@ -466,7 +466,7 @@
 - [ ] Implement signed residuals per bucket and aggregate. For complete D, use `R_read=T_read-sum(D_read)`, `R_write=T_write-sum(D_write)`, and `R=R_read+R_write`; for incomplete D return `None` for all D/residual aggregates and preserve T.
 - [ ] Implement exact file sorts, Unicode search, hourly completeness, full-boot/lifetime file totals, and the A17 empty/incomplete response for supported but unrepresentable file windows. Preserve `Coverage.unavailable_reason` as query-derived data rather than persisted counter data.
 - [ ] Run `python -m pytest -q tests/test_query.py tests/test_query_properties.py`; it MUST pass with no failures.
-- [ ] Commit with `git add src/appio/tier.py src/appio/query.py tests/test_query.py tests/test_query_properties.py && git commit -m "feat(appio): implement tiered queries and coverage overlays"`.
+- [ ] Ensure the FINAL commit message is `git add src/appio/tier.py src/appio/query.py tests/test_query.py tests/test_query_properties.py && git commit -m "feat(appio): implement tiered queries and coverage overlays"`.
 
 ## Task 11: Build the P2 thin PyQt6 application window
 
@@ -507,7 +507,7 @@
 - [ ] On selection, query `disk_share()` for the selected AppKey and update the residual/coverage labels. Use the `Coverage` state to choose unavailable text; never coerce `None` to zero.
 - [ ] Keep the layout small and deterministic for the offscreen test: title/header, list, KPI strip, residual strip, and coverage note. Do not add later-plan tabs, tray objects, daemon controls, BPF/file panels, or setup flows.
 - [ ] Run `QT_QPA_PLATFORM=offscreen python -m pytest -q tests/test_ui.py`; it MUST pass with no failures.
-- [ ] Commit with `git add src/appio/ui/__init__.py src/appio/ui/main_window.py src/appio/ui/formatting.py tests/test_ui.py && git commit -m "feat(appio): add thin since-boot Qt window"`.
+- [ ] Ensure the FINAL commit message is `git add src/appio/ui/__init__.py src/appio/ui/main_window.py src/appio/ui/formatting.py tests/test_ui.py && git commit -m "feat(appio): add thin since-boot Qt window"`.
 
 ## Task 12: Prove the P1/P2 vertical slice against the complete fixture tree
 
@@ -547,4 +547,4 @@
 - [ ] Assert the full database/query/UI result in one test and include coverage text for EACCES and signed residual arithmetic. Ensure duplicate frame replay in the acceptance path changes no rows or displayed totals.
 - [ ] Run `QT_QPA_PLATFORM=offscreen python -m pytest -q tests/acceptance/test_p1_p2.py tests/acceptance/test_no_later_scope.py`; it MUST pass with no failures.
 - [ ] Run the complete suite with `QT_QPA_PLATFORM=offscreen python -m pytest -q`; it MUST pass with no failures.
-- [ ] Commit with `git add tests/acceptance/test_p1_p2.py tests/acceptance/test_no_later_scope.py tests/fixtures/acceptance && git commit -m "test(appio): verify P1 contracts through the P2 screen"`.
+- [ ] Ensure the FINAL commit message is `git add tests/acceptance/test_p1_p2.py tests/acceptance/test_no_later_scope.py tests/fixtures/acceptance && git commit -m "test(appio): verify P1 contracts through the P2 screen"`.
