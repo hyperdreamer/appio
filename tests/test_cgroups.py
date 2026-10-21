@@ -134,14 +134,21 @@ def test_parse_io_stat_requires_both_byte_counters(line: str) -> None:
 
 
 @pytest.mark.parametrize(
-    "field",
-    ["rbytes=-1", "wbytes=-5", "rbytes=9223372036854775808", "rbytes=1.5", "rbytes=abc"],
+    "line",
+    [
+        "259:0 rbytes=-1 wbytes=2",
+        "259:0 rbytes=1 wbytes=-5",
+        "259:0 rbytes=9223372036854775808 wbytes=2",
+        "259:0 rbytes=1 wbytes=9223372036854775808",
+        "259:0 rbytes=1.5 wbytes=2",
+        "259:0 rbytes=abc wbytes=2",
+    ],
 )
-def test_parse_io_stat_rejects_negative_out_of_range_or_noninteger_values(field: str) -> None:
+def test_parse_io_stat_rejects_negative_out_of_range_or_noninteger_values(line: str) -> None:
     """Falsified if a negative, floating, or out-of-SQLite-range value is stored."""
 
     with pytest.raises(ValueError):
-        parse_io_stat(f"259:0 {field} wbytes=2\n", 1)
+        parse_io_stat(f"{line}\n", 1)
 
 
 def test_parse_io_stat_accepts_the_sqlite_maximum() -> None:
