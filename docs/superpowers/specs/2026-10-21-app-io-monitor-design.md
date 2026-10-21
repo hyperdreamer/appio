@@ -1,14 +1,19 @@
-# appio — Per-application disk I/O monitor (design, revision 4)
+# appio — Per-application disk I/O monitor (design, revision 5)
 
 Date: 2026-10-21
-Status: revision 4 — P1 contract decisions ratified by the operator; spec drafted against it
+Status: revision 5 — aligned with the reviewed P1 specification (spec r3); awaiting operator sign-off
 Target: Arch Linux, KDE Plasma 6 / Wayland, Python 3.14 + PyQt6
 
 Revision history: r1 initial design; r2 rewrote the measurement model after review
 attempt-3 (15 blockers); r3 answered review attempt-4 (11 partial closures, 7 new
 blockers) and adopted the A′ delivery order; r4 fixes the six internal contradictions
 found while drafting the P1 specification and records the operator's two product
-rulings (hourly file observations; unanswerable windows are disabled, not faked).
+rulings (hourly file observations; unanswerable windows are disabled, not faked); r5
+aligns this document with the reviewed specification: evidence-only unseen-reap
+classification, nullable peak validity with a persisted combined peak, an
+attributed-timestamp sample key, a durable sampler checkpoint, canonical durable JSON
+schemas, file identity versus alias separation, and null semantics for unavailable
+results.
 
 ## Background
 
@@ -116,8 +121,12 @@ Per sample tick, for every readable PID:
    the remainder of the credit carries forward until exhausted. If `P` also
    disappears first, the unapplied credit is counted in `R_reap_unapplied` rather
    than being folded anywhere. If a parent shows a jump and no child identity is
-   known (the child was never sampled), the jump is `reap_unobserved` — counted as an
-   unknown, never attributed.
+   known (the child was never sampled), the jump is **counted normally and disclosed**: r5
+   supersedes the earlier `reap_unobserved` attribution because magnitude alone cannot
+   distinguish a reaped child from ordinary parent I/O. The provisional rule is
+   evidence-only — without a disappeared child identity there is no evidence, so the
+   increment is not reclassified — and the audit counter records that an unclassified
+   increment occurred (`unclassified_parent_increment`) rather than claiming it was a reap.
    Identity is read atomically: `/proc/<pid>/stat` (for `starttime`) and
    `/proc/<pid>/io` are read as one logical record, then `starttime` is re-read; a
    mismatch discards the sample rather than mixing two processes.
@@ -315,11 +324,17 @@ launch(launch_id INTEGER PRIMARY KEY, app_id, boot_id, started_mono_ns, ended_mo
        proc_count, coverage_json);
 -- raw samples: identity is (source, epoch, seq); monotonic ordering; wall time for display
 -- identity is per collector stream: boot + source + epoch + seq (+ app, launch)
-sample(boot_id, source, epoch, seq, app_id, launch_id,
-       ts_mono_ns INTEGER, ts_wall REAL,
+sample(boot_id, source, epoch, seq, app_id, launch_id, ts_mono_ns INTEGER,
+       ts_wall REAL,
        rchar INTEGER, wchar INTEGER, read_bytes INTEGER, write_bytes INTEGER,
        delta_kind TEXT, first_seen_partial INTEGER, spans_suspend INTEGER,
-       PRIMARY KEY (boot_id, source, epoch, seq, app_id, launch_id)) WITHOUT ROWID;
+       PRIMARY KEY (boot_id, source, epoch, seq, app_id, launch_id, ts_mono_ns)) WITHOUT ROWID;
+-- r5: one frame may attribute contributions to several buckets (a suspend-spanning
+-- parent delta and a newly seen child land in different buckets), so the attributed
+-- timestamp is part of the key and coverage is stored once per frame, not per row.
+sampler_checkpoint(source TEXT PRIMARY KEY, boot_id TEXT, epoch INTEGER, seq INTEGER,
+                   identities_json TEXT NOT NULL, credits_json TEXT NOT NULL,
+                   committed_mono_ns INTEGER NOT NULL);
 sample_dev(boot_id, source, epoch, seq, app_id, ts_mono_ns INTEGER,
            dev TEXT, rbytes INTEGER, wbytes INTEGER,
            PRIMARY KEY (boot_id, source, epoch, seq, app_id, dev)) WITHOUT ROWID;
@@ -356,12 +371,12 @@ sample_coverage(boot_id, source, epoch, seq, app_id,
                 PRIMARY KEY (boot_id, source, epoch, seq, app_id)) WITHOUT ROWID;
 -- rollups: carry boot identity AND device, so the promised windows stay answerable (B5)
 rollup_app(boot_id, app_id, bucket_start_mono_ns, bucket_secs, read_bytes, write_bytes,
-           rchar, wchar, peak_read_bps, peak_write_bps, coverage_json,
+           rchar, wchar, peak_read_bps, peak_write_bps, peak_total_bps, coverage_json,
            PRIMARY KEY (boot_id, app_id, bucket_start_mono_ns, bucket_secs));
 rollup_dev(boot_id, app_id, bucket_start_mono_ns, bucket_secs, dev, rbytes, wbytes,
            PRIMARY KEY (boot_id, app_id, bucket_start_mono_ns, bucket_secs, dev));
 -- never pruned: the windows the UI promises, including device and file totals
-app_boot_total(boot_id, app_id, read_bytes, write_bytes, rchar, wchar, peak_read_bps, peak_write_bps,
+app_boot_total(boot_id, app_id, read_bytes, write_bytes, rchar, wchar, peak_read_bps, peak_write_bps, peak_total_bps,
                coverage_json, PRIMARY KEY (boot_id, app_id));
 app_boot_dev_total(boot_id, app_id, dev, rbytes, wbytes, PRIMARY KEY (boot_id, app_id, dev));
 app_boot_file_total(boot_id, app_id, path_id, bytes_r, bytes_w, reads, writes,
@@ -373,9 +388,16 @@ gap(boot_id, source, epoch, seq, from_mono_ns, to_mono_ns, reason);
 **Tier selection is disjoint, never blended (B5, narrowed in r4):** window ≤ 24 h →
 `sample`; ≤ 30 d → `rollup_*` at 60 s; ≤ 365 d → `rollup_*` at 3600 s; longer → totals
 tables only. **Ratified limit on what the UI may promise:** because launch identity is
-not carried by rollups or totals, the `launch` window is offered only while raw rows
-for that launch are retained; `> 365 d` returns totals only. Both are rendered as a
-disabled chip with a stated reason, never as a wider window wearing a narrower label.
+not carried by rollups or totals, the `launch` window is **disabled** and rendered as a
+chip with a stated reason (`launch_attribution`), and any range beyond 365 days is
+disabled with its own reason (`unsupported_window`). Both were ratified by the operator:
+a consumer MUST NOT silently select or label a wider replacement window. Peaks are
+stored as NULL when no rate was ever defined and as `0` when a defined rate rounded to
+zero, so "no data" and "measured zero" are distinguishable after pruning; the combined
+peak is persisted as `peak_total_bps` because per-component maxima cannot recover
+`(read+write)/secs` (the intervals `(100,0),(0,100)` and `(100,100),(0,0)` have identical
+component maxima but different combined peaks). Device and residual values are `None`,
+never `0`, whenever the underlying accounting is unavailable or incomplete.
 Each tier's coverage is stored with it (`sample_coverage` for raw, `coverage_json` for
 rollups and totals), so a partial window reports its own gaps instead of borrowing the
 whole-boot coverage.
