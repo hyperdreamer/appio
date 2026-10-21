@@ -1,0 +1,251 @@
+# appio — Per-application disk I/O monitor (design)
+
+Date: 2026-10-21
+Status: draft for approval
+Target: Arch Linux, KDE Plasma 6 / Wayland, Python 3.14 + PyQt6
+
+## Background
+
+Nothing on a stock Arch desktop answers "which application is wearing out my
+NVMe drives, and by how much". `iotop` needs root, is per-process and transient,
+and shows no history. `iostat` shows devices but no applications. This machine has
+two 1.8 TB NVMe devices (`nvme0n1` holding `/` and `/data`, `nvme1n1` holding
+`/vm`), so both "which app" and "which disk" are real questions.
+
+Measured facts that shape the design (verified on the target machine):
+
+| Fact | Observed value |
+| --- | --- |
+| `/proc/<pid>/io` access | readable for own UID; `PERMISSION DENIED` for root/system PIDs (mode `0400`) |
+| Full sampling pass (351 processes) | 19 ms |
+| Distinguishing user processes / app names | ~726 PIDs / 107 names / 343 user PIDs |
+| User-session systemd app units | 130 |
+| cgroup v2 `io` controller | enabled at root, `system.slice`, `user.slice`; **not delegated** below `user.slice` |
+| Per-service `io.stat` | present and world-readable for system services (`avahi 259:3 rbytes=569344 …`) |
+| Per-app `io.stat` in the user session | absent — `user-1000.slice` exposes only `cpu memory pids` |
+| eBPF tooling / unprivileged BPF | none installed / `unprivileged_bpf_disabled=2` |
+| polkit | `pkexec` present, `polkit-kde-authentication-agent-1` running |
+
+## Goals
+
+1. Record every application's total disk I/O — reads and writes separately —
+   accumulated since the current boot.
+2. Rank applications by that total, with read/write/total sortable.
+3. Open one application and see its historical I/O as an infographic: per-disk
+   lanes over time, read/write composition, disk share, hour-of-day intensity.
+4. Show explicitly which disk the I/O landed on, with the measurement residual
+   disclosed rather than hidden.
+5. Match the tray behaviour of `ai-manager`, which the user already runs daily.
+
+## Non-goals (v1)
+
+Per-file attribution, network I/O, per-process detail below app granularity,
+alerting/notifications on thresholds, remote or multi-machine collection,
+Windows/macOS, retroactive accounting for units started before setup.
+
+## Decisions taken with the user
+
+| Decision | Choice | Why |
+| --- | --- | --- |
+| Monitoring scope | **C1**: unprivileged GUI *plus* `appio-iod` root daemon shipped in v1, disabled by default | machine-wide reach exists on day one, enabled with consent |
+| Default metric | **Disk I/O** (`read_bytes`/`write_bytes`); all four kernel counters stored | the number that costs SSD wear; logical I/O (`rchar`/`wchar`) available as a toggle |
+| Disk attribution | **systemd cgroup `io.stat`** | same block layer as the headline metric, so the split reconciles; no eBPF dependency |
+| Accumulation window | **Since boot** for the list default; `since launch` and `lifetime` also stored and selectable | every app measured over an identical window; survives browser restarts |
+| Detail view | **Combined A+B**: KPI strip, per-disk timeline lanes (plus a dual-sided TOTAL lane), read/write donut, share-by-disk, hour-of-day heatmap, reconciliation strip | keeps the time axis *and* the composition summary |
+| Tray | mirror `ai-manager` | familiar, already part of the user's workflow |
+| Root enablement | in-app consent dialog listing exact commands, then `pkexec` | no surprise privilege escalation |
+
+## Architecture
+
+```
+┌──────────────────────────── appio (unprivileged, PyQt6) ───────────────────────────┐
+│  sampler ──► store (SQLite) ──► model ──► main window (list │ detail)  ──► tray    │
+│     │                                    ▲                                          │
+│     └── reads /proc/<pid>/io (own UID) ──┘                                          │
+│     └── reads /sys/fs/cgroup/**/io.stat  (world-readable)                           │
+│     └── reads /run/appio/iod.sock  ──────────┐  (optional, for other-UID apps)      │
+└──────────────────────────────────────────────┼──────────────────────────────────────┘
+                                               │  newline-delimited JSON, read-only
+┌──────────────────────────── appio-iod (root, systemd) ──────────────────────────────┐
+│  samples /proc/<pid>/io for every PID; reads per-unit io.stat; serves snapshots     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+
+setup path (once, with consent):  pkexec appio-setup  ──►  drop-in + daemon-reload
+                                                        ──►  enable --now appio-iod
+```
+
+### Why two processes
+
+`/proc/<pid>/io` is mode `0400`, so other-UID totals require root. Device splits
+are world-readable *once the cgroup controller is delegated*, so per-disk data for
+the user's own apps needs no daemon. `appio-iod` exists for exactly the gap:
+other-UID application totals. It never writes to `/proc`, never accepts commands
+over its socket, and answers one query type.
+
+### Enabling machine-wide coverage (one-time, consented)
+
+`appio-setup` performs, and the consent dialog lists verbatim:
+
+1. write `/etc/systemd/system/user@.service.d/10-appio-io.conf` with
+   `[Service]\nDelegate=pids memory cpu io`
+2. write `/etc/systemd/user.conf.d/10-appio.conf` with
+   `[Manager]\nDefaultIOAccounting=yes`
+3. `systemctl daemon-reload`
+4. `systemctl enable --now appio-iod.service`
+
+Steps 1–3 only take effect for **new** user units, so the UI states plainly:
+"log out and back in to activate per-app disk attribution", and then verifies by
+probing for `io.stat` under `app.slice/<unit>/`. Until verified, the app renders
+`nvme*` lanes for system services only and labels user apps' device split
+`unavailable until re-login`.
+
+## Components
+
+| Unit | Responsibility | Depends on |
+| --- | --- | --- |
+| `appio.procs` | enumerate PIDs, read `/proc/<pid>/io`, `/proc/<pid>/stat`, `/proc/<pid>/cgroup`; tolerate `ESRCH`/`EACCES` | `/proc` |
+| `appio.cgroups` | parse `io.stat` for a unit path; map `major:minor` → device name via `/proc/diskstats` + `/sys/block` | `/sys/fs/cgroup` |
+| `appio.identity` | resolve an app key from a cgroup unit (`app-<desktopid>@<uuid>.service`) or executable path; merge that app's processes across PIDs | `appio.procs` |
+| `appio.sampler` | take one snapshot per tick; compute per-launch deltas; append rows; never block the UI thread | `procs`, `cgroups`, `identity`, `store` |
+| `appio.store` | SQLite schema, migrations, insert/rollup/retention, query API for the UI | sqlite3 |
+| `appio.iodclient` | connect to `/run/appio/iod.sock`, parse snapshots, degrade to own-UID when absent | socket |
+| `appio.iod` (daemon) | same snapshot logic for all PIDs, served read-only as NDJSON | `procs`, `cgroups` |
+| `appio.ui.listview` | sorted application list (proxy model over the query API) | store |
+| `appio.ui.detailview` | approved infographic pane | store |
+| `appio.ui.tray` | `QSystemTrayIcon` mirroring ai-manager | Qt |
+| `appio.ui.settings` | cadence, retention, tray options, system-service toggle | store, `appio.setup_client` |
+| `appio.setup_client` | consent dialog + `pkexec appio-setup <action>` + verification probes | polkit |
+
+## Data model (SQLite, `~/.local/share/appio/history.db`)
+
+```sql
+boot(boot_id TEXT PRIMARY KEY, started_at REAL NOT NULL);
+app(app_id INTEGER PRIMARY KEY, key TEXT UNIQUE NOT NULL, name TEXT NOT NULL,
+    icon_path TEXT, first_seen REAL NOT NULL, last_seen REAL NOT NULL);
+launch(launch_id INTEGER PRIMARY KEY, app_id INTEGER NOT NULL REFERENCES app(app_id),
+       boot_id TEXT NOT NULL REFERENCES boot(boot_id), started_at REAL NOT NULL,
+       ended_at REAL, proc_count INTEGER NOT NULL DEFAULT 0);
+-- cumulative snapshot of a launch, so deltas are trivial and restarts are visible
+sample(launch_id INTEGER NOT NULL REFERENCES launch(launch_id), ts REAL NOT NULL,
+       rchar INTEGER, wchar INTEGER, read_bytes INTEGER, write_bytes INTEGER,
+       PRIMARY KEY (launch_id, ts)) WITHOUT ROWID;
+-- per-device cumulative counters from the app's cgroup, when available
+sample_dev(launch_id INTEGER NOT NULL, ts REAL NOT NULL, dev TEXT NOT NULL,
+           rbytes INTEGER, wbytes INTEGER, PRIMARY KEY (launch_id, ts, dev)) WITHOUT ROWID;
+rollup(app_id INTEGER NOT NULL, bucket_start REAL NOT NULL, bucket_secs INTEGER NOT NULL,
+       read_bytes INTEGER, write_bytes INTEGER, rchar INTEGER, wchar INTEGER,
+       PRIMARY KEY (app_id, bucket_start, bucket_secs)) WITHOUT ROWID;
+```
+
+- **Since boot** = Σ deltas whose `boot.boot_id` = the current `/proc/sys/kernel/random/boot_id`.
+- **Since launch** = Σ deltas for the app's current `launch` row.
+- **Lifetime** = Σ over all rows for the `app`.
+- **Residual** = launch total − Σ `sample_dev` bytes for that launch, reported for
+  the window; never silently merged into the disk split.
+- Retention: raw `sample*` 24 h at the configured cadence; `rollup` 1-minute
+  buckets for 30 days and 1-hour buckets for 365 days; a nightly job prunes in
+  one transaction.
+- Timestamps are wall clock for display; deltas are derived from consecutive
+  snapshots so a clock jump cannot create negative or phantom bytes.
+
+## Contracts
+
+```python
+# appio.procs
+@dataclass(frozen=True)
+class ProcSample:
+    pid: int; start_ticks: int; uid: int
+    io: dict[str, int]            # rchar, wchar, read_bytes, write_bytes
+    cgroup: str | None            # e.g. app.slice/app-chromium@…​.service
+
+def sample_procs(*, uids: set[int] | None = None) -> Iterator[ProcSample]: ...
+
+# appio.cgroups
+@dataclass(frozen=True)
+class DevStat:
+    dev: str                      # "nvme0n1"; "unattributed" is a caller concept
+    rbytes: int; wbytes: int
+
+def unit_io_stat(cgroup_path: str) -> list[DevStat]: ...   # [] when not delegated
+def dev_name(major_minor: str) -> str: ...                 # "259:3" -> "nvme0n1"
+
+# appio.store
+def record(snapshots: Sequence[LaunchDelta], dev: Mapping[str, Sequence[DevStat]], ts: float) -> None: ...
+def ranking(window: Window, metric: Metric) -> list[AppTotal]: ...
+def series(app_id: int, window: Window, bucket_secs: int) -> list[Bucket]: ...
+def disk_share(app_id: int, window: Window) -> DiskShare: ...   # includes residual
+```
+
+Daemon wire format, one JSON object per line, server → client only:
+
+```json
+{"ts": 1761000000.0, "pids": 726,
+ "procs": [{"pid": 1234, "start_ticks": 88213, "uid": 0,
+            "rchar": 10, "wchar": 20, "read_bytes": 30, "write_bytes": 40,
+            "cgroup": "system.slice/sshd.service"}],
+ "devs":  [{"cgroup": "system.slice/sshd.service", "dev": "nvme0n1",
+            "rbytes": 4096, "wbytes": 0}]}
+```
+
+## UI
+
+The approved mockups are the specification; reproduce them as drawn.
+
+- Detail view (approved): `docs/superpowers/specs/assets/2026-10-21-detail-view.png`
+- Scope and daemon split (approved): `docs/superpowers/specs/assets/2026-10-21-scope-and-daemon.png`
+
+
+- **Main window**: left application list (name, "since boot" total, inline bar,
+  search field), right detail pane; window title `appio`. Sorted by total disk
+  bytes descending by default; sortable by read, write, total; a metric switch
+  toggles disk ↔ logical.
+- **Detail pane**, top to bottom: KPI strip (`TOTAL` with lifetime sub-line,
+  `READ`, `WRITE`, `PEAK`); timeline with three lanes — `TOTAL` dual-sided
+  (read up, write down) above `nvme0n1` and `nvme1n1` stacked lanes — with
+  range chips in the title bar (`1h 6h 24h boot 30d`); read/write donut;
+  share-by-disk bars; hour-of-day intensity strip; reconciliation strip
+  (`reconciled … within 1.8%`, `residual …`).
+- **Tray** (mirrors `ai-manager/ui/system_tray.py`): dynamic `Show`/`Hide`
+  item, single-click (`Trigger`) toggles the window, separator-separated
+  domain actions — `Pause sampling`, `Open data folder` — then `⚙ Settings…`,
+  `About appio`, `Quit appio`; `close_to_tray` defaults to true;
+  `start_minimized` supported with `--minimized` / `--tray`; icon is
+  palette-tinted and re-tinted on `paletteChanged`;
+  `app.setQuitOnLastWindowClosed(False)`, `app.setDesktopFileName("appio")`.
+- **Settings**: sampling cadence (1–10 s, default 2), retention, tray options,
+  autostart `.desktop` generation, and the `System services (root)` toggle that
+  opens the consent dialog.
+
+## Error handling and degradation
+
+| Condition | Behaviour |
+| --- | --- |
+| `ESRCH` / process exits mid-scan | skip silently, never a gap error |
+| `EACCES` on `/proc/<pid>/io` | mark app `scope=system, unattributed` when the daemon is off |
+| `io.stat` missing for a unit | device split shows `not delegated`; totals unaffected |
+| `appio-iod` absent or socket refused | banner "system apps are not measured"; own-UID sampling continues |
+| SQLite write failure | retry once, then pause sampling, keep UI responsive, surface a non-modal banner |
+| DB corruption | move to `history.db.corrupt-<ts>`, recreate schema, notify |
+| `pkexec` dismissed/failed | toggle reverts to off, status line carries the exact exit code and stderr |
+| Delegation installed but not yet re-logged-in | detail view states `unavailable until re-login`, with a probe re-check button |
+| Clock jump / suspend | deltas derived from consecutive snapshots; a gap becomes one bucket, never negative bytes |
+
+## Testing strategy
+
+- Unit tests with a **fixture `/proc` and `/sys/fs/cgroup` tree** on disk; no test
+  requires root, real processes, or a live session.
+- `appio.procs`: parsing, `ESRCH` races, uid filtering, PID reuse detection via
+  `start_ticks`.
+- `appio.cgroups`: `io.stat` parsing including multi-device lines, `major:minor`
+  → `nvme0n1` mapping, missing-file returns `[]`.
+- `appio.identity`: `app-chromium@<uuid>.service` → desktop id; exe-path fallback;
+  stable keys across restarts.
+- `appio.store`: since-boot/launch/lifetime windows, residual arithmetic
+  (property test: `dev_sum + residual == launch_total`), retention pruning,
+  migration idempotency.
+- `appio.sampler`: cadence drift, first-tick baseline, launch rollover on restart.
+- `appio.iodclient`: NDJSON framing, truncated line, daemon disappearance.
+- UI with `pytest-qt` and `QT_QPA_PLATFORM=offscreen`: list sorting, metric
+  toggle, detail view series plumbing, tray menu text toggling
+  (`Show`/`Hide`), consent dialog text.
+- Golden test for the reconciliation strip so "1.8%" cannot silently become a lie.
