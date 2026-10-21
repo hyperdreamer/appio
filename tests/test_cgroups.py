@@ -422,6 +422,53 @@ def test_not_delegated_observation_yields_no_delta_and_no_baseline() -> None:
     assert baselines == {}
 
 
+def test_rejected_mixed_boot_batch_leaves_baselines_unchanged() -> None:
+    """Falsified if a mid-batch boot mismatch has already advanced a baseline."""
+
+    baselines = {(BOOT_A, 101, "259:0"): (1000, 200)}
+    snapshot = dict(baselines)
+    other_boot = CgroupObservation(
+        boot_id=BOOT_B,
+        cgroup_id=202,
+        cgroup_path="/user.slice/app-y.scope",
+        device_state="available",
+        devices=(DevStat(202, "259:0", 5, 5),),
+    )
+
+    with pytest.raises(ValueError, match="boot"):
+        device_deltas(BOOT_B, (other_boot, read_normal("normal-t0")), baselines)
+
+    assert baselines == snapshot
+
+
+def test_malformed_stored_baseline_leaves_every_baseline_unchanged() -> None:
+    """Falsified if a later baseline's validation happens after an earlier write."""
+
+    bad_key = (BOOT_A, 101, "259:1")
+    baselines = {bad_key: ("not-an-integer", 5)}  # type: ignore[dict-item]
+    snapshot = dict(baselines)
+
+    with pytest.raises(ValueError):
+        device_deltas(BOOT_A, (read_normal("normal-t0"),), baselines)
+
+    assert baselines == snapshot
+
+
+def test_non_observation_in_batch_leaves_baselines_unchanged() -> None:
+    """Falsified if a batch is applied before every element is validated."""
+
+    baselines: dict[tuple[str, int, str], tuple[int, int]] = {}
+
+    with pytest.raises(ValueError):
+        device_deltas(
+            BOOT_A,
+            (read_normal("normal-t0"), "not-an-observation"),  # type: ignore[arg-type]
+            baselines,
+        )
+
+    assert baselines == {}
+
+
 # --- shared-owner attribution (A19) -----------------------------------------
 
 

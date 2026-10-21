@@ -63,6 +63,9 @@ DeviceBaselineKey = tuple[str, int, str]
 #: Stored cumulative ``(rbytes, wbytes)`` for one :data:`DeviceBaselineKey`.
 DeviceBaseline = tuple[int, int]
 
+#: Distinguishes an absent baseline from a stored value that failed validation.
+_MISSING = object()
+
 
 def _require_text(value: object, field: str) -> str:
     if not isinstance(value, str) or value == "":
@@ -466,7 +469,7 @@ def device_deltas(
     if not isinstance(baselines, MutableMapping):
         raise ValueError("device_deltas requires a mutable baseline mapping")
 
-    deltas: list[DeviceDelta] = []
+    planned: list[tuple[DeviceDelta, DeviceBaselineKey, DeviceBaseline]] = []
     seen: set[tuple[int, str]] = set()
     for observation in observations:
         if not isinstance(observation, CgroupObservation):
@@ -486,14 +489,13 @@ def device_deltas(
             seen.add(identity)
 
             key: DeviceBaselineKey = (boot_id, observation.cgroup_id, stat.dev)
-            if key not in baselines:
-                baselines[key] = (stat.rbytes, stat.wbytes)
-                deltas.append(
-                    DeviceDelta(observation.cgroup_id, stat.dev, 0, 0, reset=False)
-                )
+            stored = baselines.get(key, _MISSING)
+            if stored is _MISSING:
+                delta = DeviceDelta(observation.cgroup_id, stat.dev, 0, 0, reset=False)
+                planned.append((delta, key, (stat.rbytes, stat.wbytes)))
                 continue
 
-            previous_rbytes, previous_wbytes = _baseline_value(baselines[key], key)
+            previous_rbytes, previous_wbytes = _baseline_value(stored, key)
             reset = False
             if stat.rbytes < previous_rbytes:
                 delta_rbytes = 0
@@ -509,18 +511,32 @@ def device_deltas(
             else:
                 delta_wbytes = stat.wbytes - previous_wbytes
                 previous_wbytes = stat.wbytes
-            baselines[key] = (previous_rbytes, previous_wbytes)
-            deltas.append(
-                DeviceDelta(
-                    observation.cgroup_id,
-                    stat.dev,
-                    delta_rbytes,
-                    delta_wbytes,
-                    reset=reset,
+            planned.append(
+                (
+                    DeviceDelta(
+                        observation.cgroup_id,
+                        stat.dev,
+                        delta_rbytes,
+                        delta_wbytes,
+                        reset=reset,
+                    ),
+                    key,
+                    (previous_rbytes, previous_wbytes),
                 )
             )
 
-    return tuple(sorted(deltas, key=lambda delta: (delta.cgroup_id, delta.dev)))
+    # Commit only after the whole batch validated. A rejection therefore leaves
+    # the caller's baselines untouched instead of partially advanced past bytes
+    # that were never emitted.
+    for _delta, key, next_baseline in planned:
+        baselines[key] = next_baseline
+
+    return tuple(
+        sorted(
+            (delta for delta, _key, _baseline in planned),
+            key=lambda delta: (delta.cgroup_id, delta.dev),
+        )
+    )
 
 
 def attribute_shared_cgroup(
