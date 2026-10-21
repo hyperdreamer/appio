@@ -1,0 +1,1005 @@
+source_plan:
+  path: docs/superpowers/plans/2026-10-21-app-io-monitor-p1-p2.md
+  sha256: 4c23feb1778b3b988fe0ac179221b407457e56036bc60ad72309f4dcec794291
+  commit: f9de8f13ed85dc9bfda1261b5149aae3b02559a5
+  task_numbers: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+schema_version: 1
+epoch: 1
+source_documents:
+  spec:
+    path: docs/superpowers/specs/2026-10-21-app-io-monitor-spec.md
+    sha256: 02a0467eaba82a6d84aabef33dad4a55b23f9c9845dbbc402140f95a43de5a6c
+    revision: 3
+  design:
+    path: docs/superpowers/specs/2026-10-21-app-io-monitor-design.md
+    sha256: adad78b0d1ef741b276f3139f3fc9ee9bb808eb2d59a841a44bfc14c3ca8a509
+    revision: 5
+    lane_intent_section: 14
+derivation:
+  signature_normalization: Collapse ASCII whitespace runs to one space; trim; SHA-256 over UTF-8 signature bytes without trailing newline.
+  lane_policy: Preserve every source-plan Lane verbatim. Sequence is lane-local from 1; source_sequence preserves the original phase label. Each source lane has one task.
+  ownership_policy: Preserve source-plan Ownership globs exactly. They are statically disjoint; no ownership serialization or pattern changes are needed.
+  exclusive_resources_policy: 'No global runtime resource is shared: tests use private temporary fixture trees/databases and offscreen Qt; each lane has its own worktree.'
+  validation_policy: Deduplicate the plan test commands; encode offscreen environment assignment through env argv; omit all plan commit commands. Cwd lane means the lane worktree root.
+  validation_timeouts: Per-task timeout_seconds are conservative orchestration defaults (120-300 seconds; full suite 600), inferred rather than specified by the plan.
+  interface_policy: Only repository-produced interfaces are producer/consumer records; Python stdlib, PyQt6 and pytest are environment requirements. Result fields and query signatures are extracted from specification section 8.
+  json_sampler_seam: Task 6 implements specification-defined structural JSON mappings independently of concrete Task 7 SamplerState; Task 8 binds checkpoint mappings to SamplerState. This avoids inventing a Task 6/7 dependency cycle.
+  query_service_seam: The UI-local QueryService protocol binds the specified Task 10 ranking/disk_share functions; no unplanned concrete query service class or module is prescribed. selected_app_id supplies the local ID required by disk_share; AppKey remains the external identity.
+  acceptance_output: Task 12 produces a fixture/assertion artifact interface and no production API.
+  added_dependencies:
+    - task: T-006
+      depends_on: T-002
+      reason: Task 6 explicitly consumes AppKey validation defined by Task 2; Task 2 is absent from its source depends_on. This newly orders a potentially parallel pair.
+      reduces_source_parallelism: true
+    - task: T-008
+      depends_on: T-001
+      reason: Direct consumption of Task 1 shared contracts/validators; make its existing transitive prerequisite direct.
+      reduces_source_parallelism: false
+    - task: T-010
+      depends_on: T-001
+      reason: Direct consumption of Task 1 shared contracts/validators; make its existing transitive prerequisite direct.
+      reduces_source_parallelism: false
+    - task: T-011
+      depends_on: T-001
+      reason: Direct consumption of Task 1 shared contracts/validators; make its existing transitive prerequisite direct.
+      reduces_source_parallelism: false
+    - task: T-012
+      depends_on: T-001
+      reason: Direct consumption of Task 1 shared contracts/validators; make its existing transitive prerequisite direct.
+      reduces_source_parallelism: false
+    - task: T-012
+      depends_on: T-007
+      reason: The acceptance implementation explicitly connects the production sampler; make its existing transitive prerequisite direct.
+      reduces_source_parallelism: false
+tasks:
+  - id: T-001
+    plan_task: 1
+    title: "Establish the Python package and shared contract types"
+    implementer_tier: Standard
+    implementer_tier_line: "**Implementer tier:** Standard"
+    lane: P1-foundation
+    sequence: 1
+    source_sequence: P1.1
+    depends_on: []
+    owns:
+      - pyproject.toml
+      - src/appio/__init__.py
+      - src/appio/contracts.py
+      - tests/test_contracts.py
+    exclusive_resources: []
+    produces:
+      - id: appio.contracts.core.v1
+        signature: "CounterVector = tuple[int, int, int, int] ordered (rchar, wchar, read_bytes, write_bytes); AppKey = str; CounterName = Literal[\"rchar\", \"wchar\", \"read_bytes\", \"write_bytes\"]; Metric = Literal[\"total_bytes\", \"read_bytes\", \"write_bytes\", \"rchar\", \"wchar\"]; Tier = Literal[\"raw\", \"rollup_60s\", \"rollup_3600s\", \"totals_only\"]; FileSort = Literal[\"bytes_total\", \"bytes_r\", \"bytes_w\", \"reads\", \"writes\", \"basename\", \"dev\", \"last_seen\"]; Direction = Literal[\"asc\", \"desc\"]; UnavailableReason = Literal[\"not_retained\", \"unsupported_window\", \"launch_attribution\", \"file_source_unavailable\"]; frozen dataclass Window(kind: Literal['range', 'since_boot', 'launch', 'lifetime'], boot_id: str | None = None, start_mono_ns: int | None = None, end_mono_ns: int | None = None, launch_id: int | None = None); frozen dataclass HookHits(vfs_read: int, vfs_write: int, vfs_readv: int, vfs_writev: int, vfs_iter_read: int, vfs_iter_write: int)"
+        sha256: 4461f8290ad52bff7973cf2fd5a2d53ee7f07453f41e663e8cd5ae7ace014a4a
+        authority:
+          - docs/superpowers/plans/2026-10-21-app-io-monitor-p1-p2.md#task-1
+          - docs/superpowers/specs/2026-10-21-app-io-monitor-spec.md#81-python-types
+      - id: appio.contracts.results.v1
+        signature: "frozen dataclass Coverage(tier: Tier, complete: bool, unavailable_reason: UnavailableReason | None, inaccessible_pids: int, resets: int, reap_corrections: int, reap_unapplied: tuple[int, int, int, int], reap_unobserved: tuple[int, int, int, int], partial_intervals: int, gap_intervals: int, overlap_uncertain_intervals: int, spans_suspend_intervals: int, spans_suspend: bool, reap_incomplete: bool, counter_overflow: bool, device_state: Literal['available', 'not_delegated', 'incomplete'], counted_omitted_files: int, counted_omitted_bytes_r: int, counted_omitted_bytes_w: int, uncounted_overflow_files: int, uncounted_overflow_bytes_r: int, uncounted_overflow_bytes_w: int, skipped_nonfile: int, skipped_unsupported_fs: int, weak_identity_rows: int, hook_hits: HookHits); frozen dataclass AppTotal(app_id: int, app_key: str, name: str, read_bytes: int, write_bytes: int, total_bytes: int, rchar: int, wchar: int, peak_read_bps: int | None, peak_write_bps: int | None, peak_total_bps: int | None, coverage: Coverage); frozen dataclass SeriesPoint(bucket_start_mono_ns: int, bucket_secs: int, wall_start_seconds: float | None, read_bytes: int, write_bytes: int, peak_read_bps: int | None, peak_write_bps: int | None, peak_total_bps: int | None, spans_suspend: bool); frozen dataclass DeviceSeriesPoint(bucket_start_mono_ns: int, bucket_secs: int, dev: str, rbytes: int, wbytes: int); frozen dataclass ResidualPoint(bucket_start_mono_ns: int, bucket_secs: int, total: int | None, read: int | None, write: int | None); frozen dataclass Series(app_id: int, window: Window, tier: Tier, points: tuple[SeriesPoint, ...], device_points: tuple[DeviceSeriesPoint, ...], residual_points: tuple[ResidualPoint, ...], coverage: Coverage); frozen dataclass DeviceShareRow(boot_id: str, dev: str, rbytes: int, wbytes: int, total_bytes: int); frozen dataclass DiskShare(app_id: int, window: Window, task_read_bytes: int, task_write_bytes: int, task_total_bytes: int, devices: tuple[DeviceShareRow, ...], device_read_bytes: int | None, device_write_bytes: int | None, device_total_bytes: int | None, residual_read: int | None, residual_write: int | None, residual_total: int | None, coverage: Coverage); frozen dataclass FileRow(path_id: int, basename: str, state: Literal['resolved', 'truncated', 'unresolved'], identity_weak: bool, dev: str, inode: int, generation: int, reads: int, writes: int, bytes_r: int, bytes_w: int, bytes_total: int, last_seen_boot_id: str, last_seen_mono_ns: int); frozen dataclass UnknownOwnerOverflow(window: Window, owner_key: Literal['overflow_owner_unknown'], overflow_files: int, overflow_bytes_r: int, overflow_bytes_w: int, coverage: Coverage); frozen dataclass FileTable(app_id: int, window: Window, rows: tuple[FileRow, ...], sort: FileSort, direction: Direction, search: str | None, unknown_owner_overflow: UnknownOwnerOverflow, coverage: Coverage); frozen dataclass FileCoverage(app_id: int, window: Window, counted_omitted_files: int, counted_omitted_bytes_r: int, counted_omitted_bytes_w: int, uncounted_overflow_files: int, uncounted_overflow_bytes_r: int, uncounted_overflow_bytes_w: int, skipped_nonfile: int, skipped_unsupported_fs: int, weak_identity_rows: int, hook_hits: HookHits, observed_bytes_r: int, observed_bytes_w: int, unknown_owner_overflow: UnknownOwnerOverflow, coverage: Coverage)"
+        sha256: 8150fa1226db3b7bb638bc0600cb5ba453486b6cfb2eb0fe4ae92b1f2086766b
+        authority:
+          - docs/superpowers/specs/2026-10-21-app-io-monitor-spec.md#81-python-types
+      - id: appio.contracts.validation.v1
+        signature: "WindowUnavailableError(reason, message) exposes reason and exact str(error); CounterOverflowError(field) exposes field; validate_window(window); validate_enum(value, allowed, field); validate_sqlite_integer(value, field, nonnegative=True); integer validation rejects bool; search validation rejects NUL; Launch window disabled: device and file activity are not stored per launch.; Ranges longer than 365 days are disabled: retained rollups cannot represent arbitrary ranges.; Historical boot prefix unavailable: totals cover the full collected boot."
+        sha256: 9af426fdb912ee6fefa2dfbd15f1aac472df1e0fc683fd24c41589cc50db364d
+        authority:
+          - docs/superpowers/plans/2026-10-21-app-io-monitor-p1-p2.md#task-1
+          - docs/superpowers/specs/2026-10-21-app-io-monitor-spec.md#82-exact-function-signatures-and-ordering
+          - docs/superpowers/specs/2026-10-21-app-io-monitor-spec.md#83-tier-behavior
+      - id: appio.contracts.file-inputs.v1
+        signature: "FileObservation(app_key, fs_uuid, dev, inode, generation, basename, state, identity_weak, reads, writes, bytes_r, bytes_w, last_seen_mono_ns); FileCoverageInput(counted_omitted_files, counted_omitted_bytes_r, counted_omitted_bytes_w, uncounted_overflow_files, uncounted_overflow_bytes_r, uncounted_overflow_bytes_w, skipped_nonfile, skipped_unsupported_fs, weak_identity_rows, hook_hits, gap_intervals, overlap_uncertain_intervals, complete); UnknownOwnerInput(overflow_files, overflow_bytes_r, overflow_bytes_w, gap_intervals, overlap_uncertain_intervals, complete); HourlyFileSnapshot(boot_id, hour_start_mono_ns, apps, unknown_owner); frozen validated synthetic transport dataclasses with no BPF producer"
+        sha256: f57121f0bad5cafa50eb619be648b6a55990dda04424e4cbb4b4a27642d645cd
+        authority:
+          - docs/superpowers/plans/2026-10-21-app-io-monitor-p1-p2.md#task-1
+          - docs/superpowers/specs/2026-10-21-app-io-monitor-spec.md#54-deterministic-materialization
+    consumes: []
+    interfaces:
+      produces:
+        - id: appio.contracts.core.v1
+          signature: "CounterVector = tuple[int, int, int, int] ordered (rchar, wchar, read_bytes, write_bytes); AppKey = str; CounterName = Literal[\"rchar\", \"wchar\", \"read_bytes\", \"write_bytes\"]; Metric = Literal[\"total_bytes\", \"read_bytes\", \"write_bytes\", \"rchar\", \"wchar\"]; Tier = Literal[\"raw\", \"rollup_60s\", \"rollup_3600s\", \"totals_only\"]; FileSort = Literal[\"bytes_total\", \"bytes_r\", \"bytes_w\", \"reads\", \"writes\", \"basename\", \"dev\", \"last_seen\"]; Direction = Literal[\"asc\", \"desc\"]; UnavailableReason = Literal[\"not_retained\", \"unsupported_window\", \"launch_attribution\", \"file_source_unavailable\"]; frozen dataclass Window(kind: Literal['range', 'since_boot', 'launch', 'lifetime'], boot_id: str | None = None, start_mono_ns: int | None = None, end_mono_ns: int | None = None, launch_id: int | None = None); frozen dataclass HookHits(vfs_read: int, vfs_write: int, vfs_readv: int, vfs_writev: int, vfs_iter_read: int, vfs_iter_write: int)"
+          sha256: 4461f8290ad52bff7973cf2fd5a2d53ee7f07453f41e663e8cd5ae7ace014a4a
+          authority:
+            - docs/superpowers/plans/2026-10-21-app-io-monitor-p1-p2.md#task-1
+            - docs/superpowers/specs/2026-10-21-app-io-monitor-spec.md#81-python-types
+        - id: appio.contracts.results.v1
+          signature: "frozen dataclass Coverage(tier: Tier, complete: bool, unavailable_reason: UnavailableReason | None, inaccessible_pids: int, resets: int, reap_corrections: int, reap_unapplied: tuple[int, int, int, int], reap_unobserved: tuple[int, int, int, int], partial_intervals: int, gap_intervals: int, overlap_uncertain_intervals: int, spans_suspend_intervals: int, spans_suspend: bool, reap_incomplete: bool, counter_overflow: bool, device_state: Literal['available', 'not_delegated', 'incomplete'], counted_omitted_files: int, counted_omitted_bytes_r: int, counted_omitted_bytes_w: int, uncounted_overflow_files: int, uncounted_overflow_bytes_r: int, uncounted_overflow_bytes_w: int, skipped_nonfile: int, skipped_unsupported_fs: int, weak_identity_rows: int, hook_hits: HookHits); frozen dataclass AppTotal(app_id: int, app_key: str, name: str, read_bytes: int, write_bytes: int, total_bytes: int, rchar: int, wchar: int, peak_read_bps: int | None, peak_write_bps: int | None, peak_total_bps: int | None, coverage: Coverage); frozen dataclass SeriesPoint(bucket_start_mono_ns: int, bucket_secs: int, wall_start_seconds: float | None, read_bytes: int, write_bytes: int, peak_read_bps: int | None, peak_write_bps: int | None, peak_total_bps: int | None, spans_suspend: bool); frozen dataclass DeviceSeriesPoint(bucket_start_mono_ns: int, bucket_secs: int, dev: str, rbytes: int, wbytes: int); frozen dataclass ResidualPoint(bucket_start_mono_ns: int, bucket_secs: int, total: int | None, read: int | None, write: int | None); frozen dataclass Series(app_id: int, window: Window, tier: Tier, points: tuple[SeriesPoint, ...], device_points: tuple[DeviceSeriesPoint, ...], residual_points: tuple[ResidualPoint, ...], coverage: Coverage); frozen dataclass DeviceShareRow(boot_id: str, dev: str, rbytes: int, wbytes: int, total_bytes: int); frozen dataclass DiskShare(app_id: int, window: Window, task_read_bytes: int, task_write_bytes: int, task_total_bytes: int, devices: tuple[DeviceShareRow, ...], device_read_bytes: int | None, device_write_bytes: int | None, device_total_bytes: int | None, residual_read: int | None, residual_write: int | None, residual_total: int | None, coverage: Coverage); frozen dataclass FileRow(path_id: int, basename: str, state: Literal['resolved', 'truncated', 'unresolved'], identity_weak: bool, dev: str, inode: int, generation: int, reads: int, writes: int, bytes_r: int, bytes_w: int, bytes_total: int, last_seen_boot_id: str, last_seen_mono_ns: int); frozen dataclass UnknownOwnerOverflow(window: Window, owner_key: Literal['overflow_owner_unknown'], overflow_files: int, overflow_bytes_r: int, overflow_bytes_w: int, coverage: Coverage); frozen dataclass FileTable(app_id: int, window: Window, rows: tuple[FileRow, ...], sort: FileSort, direction: Direction, search: str | None, unknown_owner_overflow: UnknownOwnerOverflow, coverage: Coverage); frozen dataclass FileCoverage(app_id: int, window: Window, counted_omitted_files: int, counted_omitted_bytes_r: int, counted_omitted_bytes_w: int, uncounted_overflow_files: int, uncounted_overflow_bytes_r: int, uncounted_overflow_bytes_w: int, skipped_nonfile: int, skipped_unsupported_fs: int, weak_identity_rows: int, hook_hits: HookHits, observed_bytes_r: int, observed_bytes_w: int, unknown_owner_overflow: UnknownOwnerOverflow, coverage: Coverage)"
+          sha256: 8150fa1226db3b7bb638bc0600cb5ba453486b6cfb2eb0fe4ae92b1f2086766b
+          authority:
+            - docs/superpowers/specs/2026-10-21-app-io-monitor-spec.md#81-python-types
+        - id: appio.contracts.validation.v1
+          signature: "WindowUnavailableError(reason, message) exposes reason and exact str(error); CounterOverflowError(field) exposes field; validate_window(window); validate_enum(value, allowed, field); validate_sqlite_integer(value, field, nonnegative=True); integer validation rejects bool; search validation rejects NUL; Launch window disabled: device and file activity are not stored per launch.; Ranges longer than 365 days are disabled: retained rollups cannot represent arbitrary ranges.; Historical boot prefix unavailable: totals cover the full collected boot."
+          sha256: 9af426fdb912ee6fefa2dfbd15f1aac472df1e0fc683fd24c41589cc50db364d
+          authority:
+            - docs/superpowers/plans/2026-10-21-app-io-monitor-p1-p2.md#task-1
+            - docs/superpowers/specs/2026-10-21-app-io-monitor-spec.md#82-exact-function-signatures-and-ordering
+            - docs/superpowers/specs/2026-10-21-app-io-monitor-spec.md#83-tier-behavior
+        - id: appio.contracts.file-inputs.v1
+          signature: "FileObservation(app_key, fs_uuid, dev, inode, generation, basename, state, identity_weak, reads, writes, bytes_r, bytes_w, last_seen_mono_ns); FileCoverageInput(counted_omitted_files, counted_omitted_bytes_r, counted_omitted_bytes_w, uncounted_overflow_files, uncounted_overflow_bytes_r, uncounted_overflow_bytes_w, skipped_nonfile, skipped_unsupported_fs, weak_identity_rows, hook_hits, gap_intervals, overlap_uncertain_intervals, complete); UnknownOwnerInput(overflow_files, overflow_bytes_r, overflow_bytes_w, gap_intervals, overlap_uncertain_intervals, complete); HourlyFileSnapshot(boot_id, hour_start_mono_ns, apps, unknown_owner); frozen validated synthetic transport dataclasses with no BPF producer"
+          sha256: f57121f0bad5cafa50eb619be648b6a55990dda04424e4cbb4b4a27642d645cd
+          authority:
+            - docs/superpowers/plans/2026-10-21-app-io-monitor-p1-p2.md#task-1
+            - docs/superpowers/specs/2026-10-21-app-io-monitor-spec.md#54-deterministic-materialization
+      consumes: []
+    validation:
+      - argv: ["python", "-m", "pytest", "-q", "tests/test_contracts.py"]
+        cwd: lane
+        timeout_seconds: 120
+  - id: T-002
+    plan_task: 2
+    title: "Parse fixture `/proc` records and resolve stable process identity"
+    implementer_tier: Advanced
+    implementer_tier_line: "**Implementer tier:** Advanced"
+    lane: P1-proc-identity
+    sequence: 1
+    source_sequence: P1.2
+    depends_on: [T-001]
+    owns:
+      - src/appio/procs.py
+      - src/appio/identity.py
+      - tests/test_procs.py
+      - tests/test_identity.py
+      - tests/fixtures/proc/**
+    exclusive_resources: []
+    produces:
+      - id: appio.procs.records.v1
+        signature: "ProcessIdentity(boot_id: str, pid: int, start_ticks: int); ProcessStat(pid, comm, state, ppid, start_ticks); IoReadOutcome(status: Literal[\"readable\", \"eacces\", \"esrch\", \"error\"], counters: CounterVector | None, dumpable: bool | None, errno_name: str | None); StableProcRecord(identity, ppid, uid, exe, cgroup_path, app_key_inputs, io_outcome)"
+        sha256: 0542b374e2aabc7158b28d5270448e3a4531bdb99e8b59133fcec309b0decb6b
+        authority:
+          - docs/superpowers/plans/2026-10-21-app-io-monitor-p1-p2.md#task-2
+          - docs/superpowers/specs/2026-10-21-app-io-monitor-spec.md#31-process-identity
+      - id: appio.procs.reader.v1
+        signature: "ProcReader(root: Path, dumpability: Callable[[int], bool | None] | None = None); enumerate_pids() -> tuple[int, ...]; read_stat(pid); read_io(pid); read_stable(pid); parse_stat(text); parse_io(text); parse_status_uid(text); read_stable reads stat-before, IO and metadata, stat-after; changed start_ticks accepts no sample; ESRCH/ENOENT and EACCES remain distinct; exe target is not resolved through another symlink"
+        sha256: 45a1c201209182d7d3a8ea72c0b34276ac567dfc0b7eae8b204e3dc22b3e82e1
+        authority:
+          - docs/superpowers/plans/2026-10-21-app-io-monitor-p1-p2.md#task-2
+          - docs/superpowers/specs/2026-10-21-app-io-monitor-spec.md#31-process-identity
+          - docs/superpowers/specs/2026-10-21-app-io-monitor-spec.md#101-proc-fixture
+      - id: appio.identity.app-key.v1
+        signature: "encode_app_key(kind, payload); validate_app_key(key); resolve_app(cgroup_path: str | None, exe: str | None, desktop_id: str | None) -> AppKey; session_scope_key(cgroup_path); AppKey prefixes unit:, desktop:, exe:, scope:; pass ASCII letters, digits and /._:@+-; other UTF-8 bytes use uppercase %HH; executable and cgroup payloads absolute; unit and desktop payloads have no slash; no identity normalization; precedence deepest app-* unit, nearest app.slice ancestor, desktop, executable, deepest session-scope ancestor; fallback scope:/session/unknown"
+        sha256: 5c838f2ae4ff09d231c48ed189664e31ca83163e394c1c3749a413d110b25c54
+        authority:
+          - docs/superpowers/plans/2026-10-21-app-io-monitor-p1-p2.md#task-2
+          - docs/superpowers/specs/2026-10-21-app-io-monitor-spec.md#32-appkey-grammar-and-resolution
+    consumes:
+      - producer_task: T-001
+        interface_id: appio.contracts.core.v1
+        sha256: 4461f8290ad52bff7973cf2fd5a2d53ee7f07453f41e663e8cd5ae7ace014a4a
+      - producer_task: T-001
+        interface_id: appio.contracts.validation.v1
+        sha256: 9af426fdb912ee6fefa2dfbd15f1aac472df1e0fc683fd24c41589cc50db364d
+    interfaces:
+      produces:
+        - id: appio.procs.records.v1
+          signature: "ProcessIdentity(boot_id: str, pid: int, start_ticks: int); ProcessStat(pid, comm, state, ppid, start_ticks); IoReadOutcome(status: Literal[\"readable\", \"eacces\", \"esrch\", \"error\"], counters: CounterVector | None, dumpable: bool | None, errno_name: str | None); StableProcRecord(identity, ppid, uid, exe, cgroup_path, app_key_inputs, io_outcome)"
+          sha256: 0542b374e2aabc7158b28d5270448e3a4531bdb99e8b59133fcec309b0decb6b
+          authority:
+            - docs/superpowers/plans/2026-10-21-app-io-monitor-p1-p2.md#task-2
+            - docs/superpowers/specs/2026-10-21-app-io-monitor-spec.md#31-process-identity
+        - id: appio.procs.reader.v1
+          signature: "ProcReader(root: Path, dumpability: Callable[[int], bool | None] | None = None); enumerate_pids() -> tuple[int, ...]; read_stat(pid); read_io(pid); read_stable(pid); parse_stat(text); parse_io(text); parse_status_uid(text); read_stable reads stat-before, IO and metadata, stat-after; changed start_ticks accepts no sample; ESRCH/ENOENT and EACCES remain distinct; exe target is not resolved through another symlink"
+          sha256: 45a1c201209182d7d3a8ea72c0b34276ac567dfc0b7eae8b204e3dc22b3e82e1
+          authority:
+            - docs/superpowers/plans/2026-10-21-app-io-monitor-p1-p2.md#task-2
+            - docs/superpowers/specs/2026-10-21-app-io-monitor-spec.md#31-process-identity
+            - docs/superpowers/specs/2026-10-21-app-io-monitor-spec.md#101-proc-fixture
+        - id: appio.identity.app-key.v1
+          signature: "encode_app_key(kind, payload); validate_app_key(key); resolve_app(cgroup_path: str | None, exe: str | None, desktop_id: str | None) -> AppKey; session_scope_key(cgroup_path); AppKey prefixes unit:, desktop:, exe:, scope:; pass ASCII letters, digits and /._:@+-; other UTF-8 bytes use uppercase %HH; executable and cgroup payloads absolute; unit and desktop payloads have no slash; no identity normalization; precedence deepest app-* unit, nearest app.slice ancestor, desktop, executable, deepest session-scope ancestor; fallback scope:/session/unknown"
+          sha256: 5c838f2ae4ff09d231c48ed189664e31ca83163e394c1c3749a413d110b25c54
+          authority:
+            - docs/superpowers/plans/2026-10-21-app-io-monitor-p1-p2.md#task-2
+            - docs/superpowers/specs/2026-10-21-app-io-monitor-spec.md#32-appkey-grammar-and-resolution
+      consumes:
+        - producer_task: T-001
+          interface_id: appio.contracts.core.v1
+          sha256: 4461f8290ad52bff7973cf2fd5a2d53ee7f07453f41e663e8cd5ae7ace014a4a
+        - producer_task: T-001
+          interface_id: appio.contracts.validation.v1
+          sha256: 9af426fdb912ee6fefa2dfbd15f1aac472df1e0fc683fd24c41589cc50db364d
+    validation:
+      - argv: ["python", "-m", "pytest", "-q", "tests/test_procs.py", "tests/test_identity.py"]
+        cwd: lane
+        timeout_seconds: 180
+  - id: T-003
+    plan_task: 3
+    title: "Parse cgroup device accounting and controller state"
+    implementer_tier: Advanced
+    implementer_tier_line: "**Implementer tier:** Advanced"
+    lane: P1-cgroups
+    sequence: 1
+    source_sequence: P1.2
+    depends_on: [T-001]
+    owns:
+      - src/appio/cgroups.py
+      - tests/test_cgroups.py
+      - tests/fixtures/cgroup/**
+    exclusive_resources: []
+    produces:
+      - id: appio.cgroups.accounting.v1
+        signature: "DevStat(cgroup_id: int, dev: str, rbytes: int, wbytes: int); CgroupObservation(boot_id, cgroup_id, cgroup_path, device_state: Literal[\"available\", \"not_delegated\", \"incomplete\"], devices: tuple[DevStat, ...]); DeviceDelta(cgroup_id, dev, rbytes, wbytes, reset: bool); parse_io_stat(text, cgroup_id) -> tuple[DevStat, ...]; parse_diskstats(text) -> dict[str, str]; friendly_device_name(dev, diskstats) -> str; read_cgroup_fixture(root, relative_path, boot_id, cgroup_id); device_deltas(boot_id, observations, baselines); attribute_shared_cgroup(observation, owners_by_cgroup); baselines keyed (boot_id, cgroup_id, dev); major:minor is canonical identity; first observation emits zero deltas; decreasing components reset separately; not_delegated emits no device rows; shared distinct owners emit no per-app D and mark each owner incomplete"
+        sha256: e4beb9409cf1679662a3d93569492b214f4d9b8e2dfd16377edee212cf44d913
+        authority:
+          - docs/superpowers/plans/2026-10-21-app-io-monitor-p1-p2.md#task-3
+          - docs/superpowers/specs/2026-10-21-app-io-monitor-spec.md#52-cgroup-and-file-deltas
+    consumes:
+      - producer_task: T-001
+        interface_id: appio.contracts.core.v1
+        sha256: 4461f8290ad52bff7973cf2fd5a2d53ee7f07453f41e663e8cd5ae7ace014a4a
+      - producer_task: T-001
+        interface_id: appio.contracts.validation.v1
+        sha256: 9af426fdb912ee6fefa2dfbd15f1aac472df1e0fc683fd24c41589cc50db364d
+    interfaces:
+      produces:
+        - id: appio.cgroups.accounting.v1
+          signature: "DevStat(cgroup_id: int, dev: str, rbytes: int, wbytes: int); CgroupObservation(boot_id, cgroup_id, cgroup_path, device_state: Literal[\"available\", \"not_delegated\", \"incomplete\"], devices: tuple[DevStat, ...]); DeviceDelta(cgroup_id, dev, rbytes, wbytes, reset: bool); parse_io_stat(text, cgroup_id) -> tuple[DevStat, ...]; parse_diskstats(text) -> dict[str, str]; friendly_device_name(dev, diskstats) -> str; read_cgroup_fixture(root, relative_path, boot_id, cgroup_id); device_deltas(boot_id, observations, baselines); attribute_shared_cgroup(observation, owners_by_cgroup); baselines keyed (boot_id, cgroup_id, dev); major:minor is canonical identity; first observation emits zero deltas; decreasing components reset separately; not_delegated emits no device rows; shared distinct owners emit no per-app D and mark each owner incomplete"
+          sha256: e4beb9409cf1679662a3d93569492b214f4d9b8e2dfd16377edee212cf44d913
+          authority:
+            - docs/superpowers/plans/2026-10-21-app-io-monitor-p1-p2.md#task-3
+            - docs/superpowers/specs/2026-10-21-app-io-monitor-spec.md#52-cgroup-and-file-deltas
+      consumes:
+        - producer_task: T-001
+          interface_id: appio.contracts.core.v1
+          sha256: 4461f8290ad52bff7973cf2fd5a2d53ee7f07453f41e663e8cd5ae7ace014a4a
+        - producer_task: T-001
+          interface_id: appio.contracts.validation.v1
+          sha256: 9af426fdb912ee6fefa2dfbd15f1aac472df1e0fc683fd24c41589cc50db364d
+    validation:
+      - argv: ["python", "-m", "pytest", "-q", "tests/test_cgroups.py"]
+        cwd: lane
+        timeout_seconds: 120
+  - id: T-004
+    plan_task: 4
+    title: "Implement boottime buckets, clock segments, suspend attribution, and signed reconciliation"
+    implementer_tier: Advanced
+    implementer_tier_line: "**Implementer tier:** Advanced"
+    lane: P1-time-math
+    sequence: 1
+    source_sequence: P1.2
+    depends_on: [T-001]
+    owns:
+      - src/appio/clock.py
+      - src/appio/reconcile.py
+      - tests/test_clock.py
+      - tests/test_reconcile.py
+    exclusive_resources: []
+    produces:
+      - id: appio.clock.boottime.v1
+        signature: "bucket_start_mono_ns(ts_mono_ns: int, bucket_ns: int) -> int; ClockSegment(boot_id, segment_start_mono_ns, wall_offset_ns); ClockMapState.observe(boot_id, ts_mono_ns, wall_ns) -> ClockSegment | None; ClockMapState.wall_ns(boot_id, ts_mono_ns) -> int | None; SuspensionSet.add(start_ns, end_ns); SuspensionSet.measured_active_ns(start_ns, end_ns) -> int | None; IntervalEvidence(interval_start_mono_ns, observed_ns, attributed_ts_mono_ns, spans_suspend); attribute_interval(last_observed_ns, observed_ns, suspend_set, known_uncovered=None); rate_bps(delta_bytes, observed_ns) -> int | None; all buckets are half-open CLOCK_BOOTTIME integer buckets; initial clock segment starts at zero; a later segment requires abs(offset_delta) > 1000000000; suspend boundaries are explicit, unioned and intersected once; spanning bytes use last pre-suspend timestamp; undefined rates are None; defined rates floor(delta_bytes * 1000000000 / observed_ns)"
+        sha256: 5366c5596fb20aeb199d971e2e424c0089220cba76b56afca18e5ba047692b36
+        authority:
+          - docs/superpowers/plans/2026-10-21-app-io-monitor-p1-p2.md#task-4
+          - docs/superpowers/specs/2026-10-21-app-io-monitor-spec.md#41-clocks-and-bucket-arithmetic
+          - docs/superpowers/specs/2026-10-21-app-io-monitor-spec.md#54-deterministic-materialization
+      - id: appio.reconcile.signed.v1
+        signature: "Reconciliation(task_read, task_write, task_total, device_read, device_write, device_total, residual_read, residual_write, residual_total, device_state); residual_read = task_read - device_read; residual_write = task_write - device_write; residual_total = task_total - device_total = residual_read + residual_write; signed arbitrary-precision intermediates; device_state != available returns None for every aggregate D and residual field and numeric task totals"
+        sha256: 3af9199dcd1abb9eaa5a5cc86dfaf359692b843c1dc6f6f82370c595b06d8f24
+        authority:
+          - docs/superpowers/plans/2026-10-21-app-io-monitor-p1-p2.md#task-4
+          - docs/superpowers/specs/2026-10-21-app-io-monitor-spec.md#24-reconciliation-equations
+    consumes:
+      - producer_task: T-001
+        interface_id: appio.contracts.core.v1
+        sha256: 4461f8290ad52bff7973cf2fd5a2d53ee7f07453f41e663e8cd5ae7ace014a4a
+      - producer_task: T-001
+        interface_id: appio.contracts.results.v1
+        sha256: 8150fa1226db3b7bb638bc0600cb5ba453486b6cfb2eb0fe4ae92b1f2086766b
+      - producer_task: T-001
+        interface_id: appio.contracts.validation.v1
+        sha256: 9af426fdb912ee6fefa2dfbd15f1aac472df1e0fc683fd24c41589cc50db364d
+    interfaces:
+      produces:
+        - id: appio.clock.boottime.v1
+          signature: "bucket_start_mono_ns(ts_mono_ns: int, bucket_ns: int) -> int; ClockSegment(boot_id, segment_start_mono_ns, wall_offset_ns); ClockMapState.observe(boot_id, ts_mono_ns, wall_ns) -> ClockSegment | None; ClockMapState.wall_ns(boot_id, ts_mono_ns) -> int | None; SuspensionSet.add(start_ns, end_ns); SuspensionSet.measured_active_ns(start_ns, end_ns) -> int | None; IntervalEvidence(interval_start_mono_ns, observed_ns, attributed_ts_mono_ns, spans_suspend); attribute_interval(last_observed_ns, observed_ns, suspend_set, known_uncovered=None); rate_bps(delta_bytes, observed_ns) -> int | None; all buckets are half-open CLOCK_BOOTTIME integer buckets; initial clock segment starts at zero; a later segment requires abs(offset_delta) > 1000000000; suspend boundaries are explicit, unioned and intersected once; spanning bytes use last pre-suspend timestamp; undefined rates are None; defined rates floor(delta_bytes * 1000000000 / observed_ns)"
+          sha256: 5366c5596fb20aeb199d971e2e424c0089220cba76b56afca18e5ba047692b36
+          authority:
+            - docs/superpowers/plans/2026-10-21-app-io-monitor-p1-p2.md#task-4
+            - docs/superpowers/specs/2026-10-21-app-io-monitor-spec.md#41-clocks-and-bucket-arithmetic
+            - docs/superpowers/specs/2026-10-21-app-io-monitor-spec.md#54-deterministic-materialization
+        - id: appio.reconcile.signed.v1
+          signature: "Reconciliation(task_read, task_write, task_total, device_read, device_write, device_total, residual_read, residual_write, residual_total, device_state); residual_read = task_read - device_read; residual_write = task_write - device_write; residual_total = task_total - device_total = residual_read + residual_write; signed arbitrary-precision intermediates; device_state != available returns None for every aggregate D and residual field and numeric task totals"
+          sha256: 3af9199dcd1abb9eaa5a5cc86dfaf359692b843c1dc6f6f82370c595b06d8f24
+          authority:
+            - docs/superpowers/plans/2026-10-21-app-io-monitor-p1-p2.md#task-4
+            - docs/superpowers/specs/2026-10-21-app-io-monitor-spec.md#24-reconciliation-equations
+      consumes:
+        - producer_task: T-001
+          interface_id: appio.contracts.core.v1
+          sha256: 4461f8290ad52bff7973cf2fd5a2d53ee7f07453f41e663e8cd5ae7ace014a4a
+        - producer_task: T-001
+          interface_id: appio.contracts.results.v1
+          sha256: 8150fa1226db3b7bb638bc0600cb5ba453486b6cfb2eb0fe4ae92b1f2086766b
+        - producer_task: T-001
+          interface_id: appio.contracts.validation.v1
+          sha256: 9af426fdb912ee6fefa2dfbd15f1aac472df1e0fc683fd24c41589cc50db364d
+    validation:
+      - argv: ["python", "-m", "pytest", "-q", "tests/test_clock.py", "tests/test_reconcile.py"]
+        cwd: lane
+        timeout_seconds: 120
+  - id: T-005
+    plan_task: 5
+    title: "Create and validate the exact STRICT SQLite schema-v1 migration"
+    implementer_tier: Capable
+    implementer_tier_line: "**Implementer tier:** Capable"
+    lane: P1-schema
+    sequence: 1
+    source_sequence: P1.2
+    depends_on: [T-001]
+    owns:
+      - src/appio/schema.py
+      - src/appio/migrations.py
+      - tests/test_schema.py
+    exclusive_resources: []
+    produces:
+      - id: appio.schema.sqlite-v1
+        signature: "SCHEMA_VERSION = 1; SCHEMA_SQL is the exact specification r3 section 6.2 DDL; migrate_empty(connection) -> None; open_database(path: Path) -> sqlite3.Connection; validate_schema(connection) -> None; SQLite >= 3.37.0 with JSON functions; exactly 27 STRICT tables and 15 specified indexes; foreign_keys enabled outside the single BEGIN IMMEDIATE migration; empty version 0 migrates atomically, version 1 validates without recreation, nonempty version 0 and higher versions reject without mutation; table columns, keys, checks, WITHOUT ROWID choices and indexes are pinned by source_documents.spec.sha256"
+        sha256: 6555c99f5e6d956dd0cdeb9b9a0d5675982df58e09a6f9341451f3133caaff73
+        authority:
+          - docs/superpowers/plans/2026-10-21-app-io-monitor-p1-p2.md#task-5
+          - docs/superpowers/specs/2026-10-21-app-io-monitor-spec.md#62-ddl
+          - docs/superpowers/specs/2026-10-21-app-io-monitor-spec.md#64-empty-database-migration
+    consumes:
+      - producer_task: T-001
+        interface_id: appio.contracts.core.v1
+        sha256: 4461f8290ad52bff7973cf2fd5a2d53ee7f07453f41e663e8cd5ae7ace014a4a
+      - producer_task: T-001
+        interface_id: appio.contracts.validation.v1
+        sha256: 9af426fdb912ee6fefa2dfbd15f1aac472df1e0fc683fd24c41589cc50db364d
+    interfaces:
+      produces:
+        - id: appio.schema.sqlite-v1
+          signature: "SCHEMA_VERSION = 1; SCHEMA_SQL is the exact specification r3 section 6.2 DDL; migrate_empty(connection) -> None; open_database(path: Path) -> sqlite3.Connection; validate_schema(connection) -> None; SQLite >= 3.37.0 with JSON functions; exactly 27 STRICT tables and 15 specified indexes; foreign_keys enabled outside the single BEGIN IMMEDIATE migration; empty version 0 migrates atomically, version 1 validates without recreation, nonempty version 0 and higher versions reject without mutation; table columns, keys, checks, WITHOUT ROWID choices and indexes are pinned by source_documents.spec.sha256"
+          sha256: 6555c99f5e6d956dd0cdeb9b9a0d5675982df58e09a6f9341451f3133caaff73
+          authority:
+            - docs/superpowers/plans/2026-10-21-app-io-monitor-p1-p2.md#task-5
+            - docs/superpowers/specs/2026-10-21-app-io-monitor-spec.md#62-ddl
+            - docs/superpowers/specs/2026-10-21-app-io-monitor-spec.md#64-empty-database-migration
+      consumes:
+        - producer_task: T-001
+          interface_id: appio.contracts.core.v1
+          sha256: 4461f8290ad52bff7973cf2fd5a2d53ee7f07453f41e663e8cd5ae7ace014a4a
+        - producer_task: T-001
+          interface_id: appio.contracts.validation.v1
+          sha256: 9af426fdb912ee6fefa2dfbd15f1aac472df1e0fc683fd24c41589cc50db364d
+    validation:
+      - argv: ["python", "-m", "pytest", "-q", "tests/test_schema.py"]
+        cwd: lane
+        timeout_seconds: 180
+  - id: T-006
+    plan_task: 6
+    title: "Add canonical durable JSON and collector stream state"
+    implementer_tier: Advanced
+    implementer_tier_line: "**Implementer tier:** Advanced"
+    lane: P1-durable-stream
+    sequence: 1
+    source_sequence: P1.3
+    depends_on: [T-001, T-002, T-005]
+    owns:
+      - src/appio/durable.py
+      - src/appio/stream.py
+      - tests/test_durable.py
+      - tests/test_stream.py
+    exclusive_resources: []
+    produces:
+      - id: appio.durable.canonical-json.v1
+        signature: "canonical_json(value) -> str; decode_handover(text, expected_boot_id, expected_cutoff); decode_sampler_checkpoint(text, expected_row); decode_file_hour_state(text, expected_boot_id, expected_hour_start); UTF-8, sorted object keys, ensure_ascii=False, separators=(',', ':'), decimal integer tokens, no trailing LF; exact specification r3 section 5.4 version-1 structural schemas and typed array orders; handover root keys (version, boot_id, cutoff_mono_ns, processes, devices); checkpoint root keys (version, boot_id, source, epoch, last_seq, checkpoint_mono_ns, processes, devices); file-hour root keys (version, boot_id, hour_start_mono_ns, apps, unknown_owner); process keys (pid, start_ticks, ppid, parent, app_key, launch_root, launch_id, baseline, credits); credit keys (child, disappearance_epoch, disappearance_seq, remaining, correction_counted); device keys (cgroup_id, dev, rbytes, wbytes); reject missing/extra/duplicate keys, bool integers, nonfinite values, duplicate identities, invalid AppKeys, mismatched row metadata and noncanonical re-encodings; no import of the concrete SamplerState is required"
+        sha256: 90c0ea1fe6a6d603c52a43b9bb666da2b71e8541f92d0d85508ebfb3bd4ca5e5
+        authority:
+          - docs/superpowers/plans/2026-10-21-app-io-monitor-p1-p2.md#task-6
+          - docs/superpowers/specs/2026-10-21-app-io-monitor-spec.md#54-deterministic-materialization
+      - id: appio.stream.receipts.v1
+        signature: "CollectorEpoch(source, boot_id, epoch, last_seq, allocated_mono_ns); FrameIdentity(boot_id, source, epoch, seq); allocate_epoch(connection, source, boot_id, allocated_mono_ns); accept_frame(connection, frame) -> bool; source in (gui, iod); same-boot epoch increments and new-boot epoch is 1; last_seq starts NULL and seq starts zero; inactive, stale and duplicate receipts reject before baseline or durable mutation; acceptance is committed atomically by the caller with frame rows and checkpoint"
+        sha256: 59d6a3d428996bacb9e4f2e0223a0ef41c2688a1829b64591e6d424f54cc5dd5
+        authority:
+          - docs/superpowers/plans/2026-10-21-app-io-monitor-p1-p2.md#task-6
+          - docs/superpowers/specs/2026-10-21-app-io-monitor-spec.md#34-collector-stream-identity
+    consumes:
+      - producer_task: T-001
+        interface_id: appio.contracts.core.v1
+        sha256: 4461f8290ad52bff7973cf2fd5a2d53ee7f07453f41e663e8cd5ae7ace014a4a
+      - producer_task: T-001
+        interface_id: appio.contracts.validation.v1
+        sha256: 9af426fdb912ee6fefa2dfbd15f1aac472df1e0fc683fd24c41589cc50db364d
+      - producer_task: T-001
+        interface_id: appio.contracts.file-inputs.v1
+        sha256: f57121f0bad5cafa50eb619be648b6a55990dda04424e4cbb4b4a27642d645cd
+      - producer_task: T-002
+        interface_id: appio.identity.app-key.v1
+        sha256: 5c838f2ae4ff09d231c48ed189664e31ca83163e394c1c3749a413d110b25c54
+      - producer_task: T-005
+        interface_id: appio.schema.sqlite-v1
+        sha256: 6555c99f5e6d956dd0cdeb9b9a0d5675982df58e09a6f9341451f3133caaff73
+    interfaces:
+      produces:
+        - id: appio.durable.canonical-json.v1
+          signature: "canonical_json(value) -> str; decode_handover(text, expected_boot_id, expected_cutoff); decode_sampler_checkpoint(text, expected_row); decode_file_hour_state(text, expected_boot_id, expected_hour_start); UTF-8, sorted object keys, ensure_ascii=False, separators=(',', ':'), decimal integer tokens, no trailing LF; exact specification r3 section 5.4 version-1 structural schemas and typed array orders; handover root keys (version, boot_id, cutoff_mono_ns, processes, devices); checkpoint root keys (version, boot_id, source, epoch, last_seq, checkpoint_mono_ns, processes, devices); file-hour root keys (version, boot_id, hour_start_mono_ns, apps, unknown_owner); process keys (pid, start_ticks, ppid, parent, app_key, launch_root, launch_id, baseline, credits); credit keys (child, disappearance_epoch, disappearance_seq, remaining, correction_counted); device keys (cgroup_id, dev, rbytes, wbytes); reject missing/extra/duplicate keys, bool integers, nonfinite values, duplicate identities, invalid AppKeys, mismatched row metadata and noncanonical re-encodings; no import of the concrete SamplerState is required"
+          sha256: 90c0ea1fe6a6d603c52a43b9bb666da2b71e8541f92d0d85508ebfb3bd4ca5e5
+          authority:
+            - docs/superpowers/plans/2026-10-21-app-io-monitor-p1-p2.md#task-6
+            - docs/superpowers/specs/2026-10-21-app-io-monitor-spec.md#54-deterministic-materialization
+        - id: appio.stream.receipts.v1
+          signature: "CollectorEpoch(source, boot_id, epoch, last_seq, allocated_mono_ns); FrameIdentity(boot_id, source, epoch, seq); allocate_epoch(connection, source, boot_id, allocated_mono_ns); accept_frame(connection, frame) -> bool; source in (gui, iod); same-boot epoch increments and new-boot epoch is 1; last_seq starts NULL and seq starts zero; inactive, stale and duplicate receipts reject before baseline or durable mutation; acceptance is committed atomically by the caller with frame rows and checkpoint"
+          sha256: 59d6a3d428996bacb9e4f2e0223a0ef41c2688a1829b64591e6d424f54cc5dd5
+          authority:
+            - docs/superpowers/plans/2026-10-21-app-io-monitor-p1-p2.md#task-6
+            - docs/superpowers/specs/2026-10-21-app-io-monitor-spec.md#34-collector-stream-identity
+      consumes:
+        - producer_task: T-001
+          interface_id: appio.contracts.core.v1
+          sha256: 4461f8290ad52bff7973cf2fd5a2d53ee7f07453f41e663e8cd5ae7ace014a4a
+        - producer_task: T-001
+          interface_id: appio.contracts.validation.v1
+          sha256: 9af426fdb912ee6fefa2dfbd15f1aac472df1e0fc683fd24c41589cc50db364d
+        - producer_task: T-001
+          interface_id: appio.contracts.file-inputs.v1
+          sha256: f57121f0bad5cafa50eb619be648b6a55990dda04424e4cbb4b4a27642d645cd
+        - producer_task: T-002
+          interface_id: appio.identity.app-key.v1
+          sha256: 5c838f2ae4ff09d231c48ed189664e31ca83163e394c1c3749a413d110b25c54
+        - producer_task: T-005
+          interface_id: appio.schema.sqlite-v1
+          sha256: 6555c99f5e6d956dd0cdeb9b9a0d5675982df58e09a6f9341451f3133caaff73
+    validation:
+      - argv: ["python", "-m", "pytest", "-q", "tests/test_durable.py", "tests/test_stream.py"]
+        cwd: lane
+        timeout_seconds: 180
+  - id: T-007
+    plan_task: 7
+    title: "Implement the pure identity, delta, credit, and coverage aggregation tick"
+    implementer_tier: Capable
+    implementer_tier_line: "**Implementer tier:** Capable"
+    lane: P1-sampler
+    sequence: 1
+    source_sequence: P1.3
+    depends_on: [T-001, T-002, T-003, T-004]
+    owns:
+      - src/appio/launch.py
+      - src/appio/sampler.py
+      - tests/test_sampler.py
+      - tests/test_launch.py
+    exclusive_resources: []
+    produces:
+      - id: appio.sampler.tick.v1
+        signature: "SamplerState(open identities, readable baselines, app/parent/root metadata, pending component-wise credits, launch state, cgroup/device baselines); ProcessState(identity, ppid_identity, app_key, launch_identity, baseline, credits, open); TickInput(boot_id, source, epoch, seq, observed_mono_ns, wall_ns, processes, cgroups, suspend_boundaries); AppDelta(app_key, launch_key, counters, attributed_ts_mono_ns, observed_mono_ns, interval_start_mono_ns, delta_kind, first_seen_partial, spans_suspend); FrameCoverage; AggregatedFrame; aggregate_tick(previous_state: SamplerState | None, tick: TickInput) -> tuple[AggregatedFrame, SamplerState]; pure private next-state; separate app/launch/attributed-timestamp deltas; exactly one app coverage receipt per frame including zero T; device deltas, clock offset and serializable checkpoint state; reset > baseline > normal; first nonzero baseline emits once; component-wise FIFO credits never make adjusted deltas negative; no magnitude-based unseen-reap inference"
+        sha256: cb5ead06c61adae527a2a93aa5ced466a7794efa619b34f569aec44d53e2de2e
+        authority:
+          - docs/superpowers/plans/2026-10-21-app-io-monitor-p1-p2.md#task-7
+          - docs/superpowers/specs/2026-10-21-app-io-monitor-spec.md#51-normative-tick-ordering
+      - id: appio.launch.identities.v1
+        signature: "LaunchIdentity(root: ProcessIdentity, app_key: AppKey); LaunchState; assign_launches(); same-AppKey descendants share their app-root launch; concurrent roots remain distinct; unknown membership uses launch ID 0; close only after every known member disappears; database-local launch surrogates are assigned by the store"
+        sha256: d43215d5013d6749eecb3b75a4a2c610fb2a50ad1b066c7bf4cf3a32b8ba38f6
+        authority:
+          - docs/superpowers/plans/2026-10-21-app-io-monitor-p1-p2.md#task-7
+          - docs/superpowers/specs/2026-10-21-app-io-monitor-spec.md#33-launch-identity
+    consumes:
+      - producer_task: T-001
+        interface_id: appio.contracts.core.v1
+        sha256: 4461f8290ad52bff7973cf2fd5a2d53ee7f07453f41e663e8cd5ae7ace014a4a
+      - producer_task: T-001
+        interface_id: appio.contracts.results.v1
+        sha256: 8150fa1226db3b7bb638bc0600cb5ba453486b6cfb2eb0fe4ae92b1f2086766b
+      - producer_task: T-001
+        interface_id: appio.contracts.validation.v1
+        sha256: 9af426fdb912ee6fefa2dfbd15f1aac472df1e0fc683fd24c41589cc50db364d
+      - producer_task: T-002
+        interface_id: appio.procs.records.v1
+        sha256: 0542b374e2aabc7158b28d5270448e3a4531bdb99e8b59133fcec309b0decb6b
+      - producer_task: T-002
+        interface_id: appio.identity.app-key.v1
+        sha256: 5c838f2ae4ff09d231c48ed189664e31ca83163e394c1c3749a413d110b25c54
+      - producer_task: T-003
+        interface_id: appio.cgroups.accounting.v1
+        sha256: e4beb9409cf1679662a3d93569492b214f4d9b8e2dfd16377edee212cf44d913
+      - producer_task: T-004
+        interface_id: appio.clock.boottime.v1
+        sha256: 5366c5596fb20aeb199d971e2e424c0089220cba76b56afca18e5ba047692b36
+    interfaces:
+      produces:
+        - id: appio.sampler.tick.v1
+          signature: "SamplerState(open identities, readable baselines, app/parent/root metadata, pending component-wise credits, launch state, cgroup/device baselines); ProcessState(identity, ppid_identity, app_key, launch_identity, baseline, credits, open); TickInput(boot_id, source, epoch, seq, observed_mono_ns, wall_ns, processes, cgroups, suspend_boundaries); AppDelta(app_key, launch_key, counters, attributed_ts_mono_ns, observed_mono_ns, interval_start_mono_ns, delta_kind, first_seen_partial, spans_suspend); FrameCoverage; AggregatedFrame; aggregate_tick(previous_state: SamplerState | None, tick: TickInput) -> tuple[AggregatedFrame, SamplerState]; pure private next-state; separate app/launch/attributed-timestamp deltas; exactly one app coverage receipt per frame including zero T; device deltas, clock offset and serializable checkpoint state; reset > baseline > normal; first nonzero baseline emits once; component-wise FIFO credits never make adjusted deltas negative; no magnitude-based unseen-reap inference"
+          sha256: cb5ead06c61adae527a2a93aa5ced466a7794efa619b34f569aec44d53e2de2e
+          authority:
+            - docs/superpowers/plans/2026-10-21-app-io-monitor-p1-p2.md#task-7
+            - docs/superpowers/specs/2026-10-21-app-io-monitor-spec.md#51-normative-tick-ordering
+        - id: appio.launch.identities.v1
+          signature: "LaunchIdentity(root: ProcessIdentity, app_key: AppKey); LaunchState; assign_launches(); same-AppKey descendants share their app-root launch; concurrent roots remain distinct; unknown membership uses launch ID 0; close only after every known member disappears; database-local launch surrogates are assigned by the store"
+          sha256: d43215d5013d6749eecb3b75a4a2c610fb2a50ad1b066c7bf4cf3a32b8ba38f6
+          authority:
+            - docs/superpowers/plans/2026-10-21-app-io-monitor-p1-p2.md#task-7
+            - docs/superpowers/specs/2026-10-21-app-io-monitor-spec.md#33-launch-identity
+      consumes:
+        - producer_task: T-001
+          interface_id: appio.contracts.core.v1
+          sha256: 4461f8290ad52bff7973cf2fd5a2d53ee7f07453f41e663e8cd5ae7ace014a4a
+        - producer_task: T-001
+          interface_id: appio.contracts.results.v1
+          sha256: 8150fa1226db3b7bb638bc0600cb5ba453486b6cfb2eb0fe4ae92b1f2086766b
+        - producer_task: T-001
+          interface_id: appio.contracts.validation.v1
+          sha256: 9af426fdb912ee6fefa2dfbd15f1aac472df1e0fc683fd24c41589cc50db364d
+        - producer_task: T-002
+          interface_id: appio.procs.records.v1
+          sha256: 0542b374e2aabc7158b28d5270448e3a4531bdb99e8b59133fcec309b0decb6b
+        - producer_task: T-002
+          interface_id: appio.identity.app-key.v1
+          sha256: 5c838f2ae4ff09d231c48ed189664e31ca83163e394c1c3749a413d110b25c54
+        - producer_task: T-003
+          interface_id: appio.cgroups.accounting.v1
+          sha256: e4beb9409cf1679662a3d93569492b214f4d9b8e2dfd16377edee212cf44d913
+        - producer_task: T-004
+          interface_id: appio.clock.boottime.v1
+          sha256: 5366c5596fb20aeb199d971e2e424c0089220cba76b56afca18e5ba047692b36
+    validation:
+      - argv: ["python", "-m", "pytest", "-q", "tests/test_sampler.py", "tests/test_launch.py"]
+        cwd: lane
+        timeout_seconds: 180
+  - id: T-008
+    plan_task: 8
+    title: "Build the atomic store writer, rollups, totals, and checkpoint persistence"
+    implementer_tier: Capable
+    implementer_tier_line: "**Implementer tier:** Capable"
+    lane: P1-store-write
+    sequence: 1
+    source_sequence: P1.4
+    depends_on: [T-001, T-004, T-005, T-006, T-007]
+    owns:
+      - src/appio/store.py
+      - tests/test_store.py
+      - tests/test_store_overflow.py
+    exclusive_resources: []
+    produces:
+      - id: appio.store.atomic-v1
+        signature: "AppIoStore(connection_or_path); start_boot(boot_id, boot_order, started_mono_ns, started_wall, source); start_collector(source, boot_id, allocated_mono_ns) -> CollectorEpoch; record_tick(frame: AggregatedFrame, next_state: SamplerState) -> None; restore_checkpoint(source, boot_id) -> SamplerState | None; record_gap(...); physical_store_bytes() -> int; one connection and one BEGIN IMMEDIATE atomically commit receipt, clock map, app/launch IDs, sample rows, one coverage receipt per app/frame, device rows, direct 60s and 3600s rollups, boot/lifetime totals and checkpoint; publish in-memory state only after commit; duplicate/stale frames change nothing; IDs allocated by specification r3 section 5.4 deterministic ordering; same-boot restore preserves all baselines/credits and records a post-checkpoint gap; overflow rolls back the observation, persists a separate representable counter_overflow diagnostic and raises CounterOverflowError; process file coverage is the zero placeholder; size sums DB, WAL and SHM"
+        sha256: e90a8a6bc4a65d216dfbc2fd95ec96f963a615a5be05219b710ec7899ebcced8
+        authority:
+          - docs/superpowers/plans/2026-10-21-app-io-monitor-p1-p2.md#task-8
+          - docs/superpowers/specs/2026-10-21-app-io-monitor-spec.md#51-normative-tick-ordering
+          - docs/superpowers/specs/2026-10-21-app-io-monitor-spec.md#54-deterministic-materialization
+    consumes:
+      - producer_task: T-001
+        interface_id: appio.contracts.core.v1
+        sha256: 4461f8290ad52bff7973cf2fd5a2d53ee7f07453f41e663e8cd5ae7ace014a4a
+      - producer_task: T-001
+        interface_id: appio.contracts.results.v1
+        sha256: 8150fa1226db3b7bb638bc0600cb5ba453486b6cfb2eb0fe4ae92b1f2086766b
+      - producer_task: T-001
+        interface_id: appio.contracts.validation.v1
+        sha256: 9af426fdb912ee6fefa2dfbd15f1aac472df1e0fc683fd24c41589cc50db364d
+      - producer_task: T-004
+        interface_id: appio.clock.boottime.v1
+        sha256: 5366c5596fb20aeb199d971e2e424c0089220cba76b56afca18e5ba047692b36
+      - producer_task: T-004
+        interface_id: appio.reconcile.signed.v1
+        sha256: 3af9199dcd1abb9eaa5a5cc86dfaf359692b843c1dc6f6f82370c595b06d8f24
+      - producer_task: T-005
+        interface_id: appio.schema.sqlite-v1
+        sha256: 6555c99f5e6d956dd0cdeb9b9a0d5675982df58e09a6f9341451f3133caaff73
+      - producer_task: T-006
+        interface_id: appio.durable.canonical-json.v1
+        sha256: 90c0ea1fe6a6d603c52a43b9bb666da2b71e8541f92d0d85508ebfb3bd4ca5e5
+      - producer_task: T-006
+        interface_id: appio.stream.receipts.v1
+        sha256: 59d6a3d428996bacb9e4f2e0223a0ef41c2688a1829b64591e6d424f54cc5dd5
+      - producer_task: T-007
+        interface_id: appio.sampler.tick.v1
+        sha256: cb5ead06c61adae527a2a93aa5ced466a7794efa619b34f569aec44d53e2de2e
+      - producer_task: T-007
+        interface_id: appio.launch.identities.v1
+        sha256: d43215d5013d6749eecb3b75a4a2c610fb2a50ad1b066c7bf4cf3a32b8ba38f6
+    interfaces:
+      produces:
+        - id: appio.store.atomic-v1
+          signature: "AppIoStore(connection_or_path); start_boot(boot_id, boot_order, started_mono_ns, started_wall, source); start_collector(source, boot_id, allocated_mono_ns) -> CollectorEpoch; record_tick(frame: AggregatedFrame, next_state: SamplerState) -> None; restore_checkpoint(source, boot_id) -> SamplerState | None; record_gap(...); physical_store_bytes() -> int; one connection and one BEGIN IMMEDIATE atomically commit receipt, clock map, app/launch IDs, sample rows, one coverage receipt per app/frame, device rows, direct 60s and 3600s rollups, boot/lifetime totals and checkpoint; publish in-memory state only after commit; duplicate/stale frames change nothing; IDs allocated by specification r3 section 5.4 deterministic ordering; same-boot restore preserves all baselines/credits and records a post-checkpoint gap; overflow rolls back the observation, persists a separate representable counter_overflow diagnostic and raises CounterOverflowError; process file coverage is the zero placeholder; size sums DB, WAL and SHM"
+          sha256: e90a8a6bc4a65d216dfbc2fd95ec96f963a615a5be05219b710ec7899ebcced8
+          authority:
+            - docs/superpowers/plans/2026-10-21-app-io-monitor-p1-p2.md#task-8
+            - docs/superpowers/specs/2026-10-21-app-io-monitor-spec.md#51-normative-tick-ordering
+            - docs/superpowers/specs/2026-10-21-app-io-monitor-spec.md#54-deterministic-materialization
+      consumes:
+        - producer_task: T-001
+          interface_id: appio.contracts.core.v1
+          sha256: 4461f8290ad52bff7973cf2fd5a2d53ee7f07453f41e663e8cd5ae7ace014a4a
+        - producer_task: T-001
+          interface_id: appio.contracts.results.v1
+          sha256: 8150fa1226db3b7bb638bc0600cb5ba453486b6cfb2eb0fe4ae92b1f2086766b
+        - producer_task: T-001
+          interface_id: appio.contracts.validation.v1
+          sha256: 9af426fdb912ee6fefa2dfbd15f1aac472df1e0fc683fd24c41589cc50db364d
+        - producer_task: T-004
+          interface_id: appio.clock.boottime.v1
+          sha256: 5366c5596fb20aeb199d971e2e424c0089220cba76b56afca18e5ba047692b36
+        - producer_task: T-004
+          interface_id: appio.reconcile.signed.v1
+          sha256: 3af9199dcd1abb9eaa5a5cc86dfaf359692b843c1dc6f6f82370c595b06d8f24
+        - producer_task: T-005
+          interface_id: appio.schema.sqlite-v1
+          sha256: 6555c99f5e6d956dd0cdeb9b9a0d5675982df58e09a6f9341451f3133caaff73
+        - producer_task: T-006
+          interface_id: appio.durable.canonical-json.v1
+          sha256: 90c0ea1fe6a6d603c52a43b9bb666da2b71e8541f92d0d85508ebfb3bd4ca5e5
+        - producer_task: T-006
+          interface_id: appio.stream.receipts.v1
+          sha256: 59d6a3d428996bacb9e4f2e0223a0ef41c2688a1829b64591e6d424f54cc5dd5
+        - producer_task: T-007
+          interface_id: appio.sampler.tick.v1
+          sha256: cb5ead06c61adae527a2a93aa5ced466a7794efa619b34f569aec44d53e2de2e
+        - producer_task: T-007
+          interface_id: appio.launch.identities.v1
+          sha256: d43215d5013d6749eecb3b75a4a2c610fb2a50ad1b066c7bf4cf3a32b8ba38f6
+    validation:
+      - argv: ["python", "-m", "pytest", "-q", "tests/test_store.py", "tests/test_store_overflow.py"]
+        cwd: lane
+        timeout_seconds: 300
+  - id: T-009
+    plan_task: 9
+    title: "Implement synthetic hourly file contracts and deterministic retention primitives"
+    implementer_tier: Capable
+    implementer_tier_line: "**Implementer tier:** Capable"
+    lane: P1-files-retention
+    sequence: 1
+    source_sequence: P1.4
+    depends_on: [T-001, T-004, T-005, T-006]
+    owns:
+      - src/appio/files.py
+      - src/appio/file_store.py
+      - src/appio/quota.py
+      - tests/test_files.py
+      - tests/test_file_store.py
+      - tests/test_quota.py
+    exclusive_resources: []
+    produces:
+      - id: appio.files.hourly-v1
+        signature: "HourlyAccumulator(boot_id, hour_start_mono_ns); add_observation(receipt, app_key, observation, coverage); add_unknown_owner(receipt, unknown); finalize(top_n=100) -> HourlyFileSnapshot; one shared candidate set per app-hour across collectors; merge by (app_key, fs_uuid, dev, inode, generation, identity_weak), canonical basename is least UTF-8 bytes; top-N key (bytes_r+bytes_w desc, reads+writes desc, dev, inode, generation, identity_weak, fs_uuid, basename, path_id asc); counted omissions, keyed overflow and unknown-owner overflow remain separate; weak identities retain their bytes"
+        sha256: 93c9dfc47b92e111e1ff93b630a6eada147cc8e1021b24c25c3868fab3af9716
+        authority:
+          - docs/superpowers/plans/2026-10-21-app-io-monitor-p1-p2.md#task-9
+          - docs/superpowers/specs/2026-10-21-app-io-monitor-spec.md#35-path-identity-and-boot-chronology
+          - docs/superpowers/specs/2026-10-21-app-io-monitor-spec.md#72-retention-and-selection
+      - id: appio.file-store.hourly-v1
+        signature: "FileHourStore(connection); apply_pending(snapshot); finalize_hour(snapshot); unknown_owner_for_hour(boot_id, hour_start); canonical file_hour_state and atomic finalization; one finalized app-hour snapshot with at most 100 file_sample rows and one file_coverage row; exactly one unknown-owner row per boot-hour including explicit zero; preserve aliases, boot-scoped LAST, app_boot_file_total, app_boot_file_coverage and boot_file_overflow_unknown; finalized watermark advances chronologically; finalized hours never reopen; pending tails are not observations"
+        sha256: f5aef427cd3b1c91d122a3d080b9be4fd014d549576a03dbfd9df6f7caa53775
+        authority:
+          - docs/superpowers/plans/2026-10-21-app-io-monitor-p1-p2.md#task-9
+          - docs/superpowers/specs/2026-10-21-app-io-monitor-spec.md#54-deterministic-materialization
+          - docs/superpowers/specs/2026-10-21-app-io-monitor-spec.md#83-tier-behavior
+      - id: appio.quota.retention-v1
+        signature: "QuotaPruner(connection, database_paths, quota_bytes=1500000000); expire(now_boot_id, now_mono_ns); shrink_if_needed(); independent retention raw 24h, file-hour 14d, 60s rollups 30d, 3600s rollups 365d; mapped-wall age and full typed deletion keys from specification r3 section 5.3; totals/diagnostics/boot chronology and referenced path identities never expire; missing clock mapping stops deletion and makes coverage incomplete; checkpoint after each deletion, measure DB/WAL/SHM, pause above quota and resume only after a fresh passing size check"
+        sha256: 416423dc3285eb72fdb9993c3ac41cb7b3d6168e310c526f001486dd616e550a
+        authority:
+          - docs/superpowers/plans/2026-10-21-app-io-monitor-p1-p2.md#task-9
+          - docs/superpowers/specs/2026-10-21-app-io-monitor-spec.md#53-quota-and-prune-job
+    consumes:
+      - producer_task: T-001
+        interface_id: appio.contracts.core.v1
+        sha256: 4461f8290ad52bff7973cf2fd5a2d53ee7f07453f41e663e8cd5ae7ace014a4a
+      - producer_task: T-001
+        interface_id: appio.contracts.validation.v1
+        sha256: 9af426fdb912ee6fefa2dfbd15f1aac472df1e0fc683fd24c41589cc50db364d
+      - producer_task: T-001
+        interface_id: appio.contracts.file-inputs.v1
+        sha256: f57121f0bad5cafa50eb619be648b6a55990dda04424e4cbb4b4a27642d645cd
+      - producer_task: T-004
+        interface_id: appio.clock.boottime.v1
+        sha256: 5366c5596fb20aeb199d971e2e424c0089220cba76b56afca18e5ba047692b36
+      - producer_task: T-005
+        interface_id: appio.schema.sqlite-v1
+        sha256: 6555c99f5e6d956dd0cdeb9b9a0d5675982df58e09a6f9341451f3133caaff73
+      - producer_task: T-006
+        interface_id: appio.durable.canonical-json.v1
+        sha256: 90c0ea1fe6a6d603c52a43b9bb666da2b71e8541f92d0d85508ebfb3bd4ca5e5
+      - producer_task: T-006
+        interface_id: appio.stream.receipts.v1
+        sha256: 59d6a3d428996bacb9e4f2e0223a0ef41c2688a1829b64591e6d424f54cc5dd5
+    interfaces:
+      produces:
+        - id: appio.files.hourly-v1
+          signature: "HourlyAccumulator(boot_id, hour_start_mono_ns); add_observation(receipt, app_key, observation, coverage); add_unknown_owner(receipt, unknown); finalize(top_n=100) -> HourlyFileSnapshot; one shared candidate set per app-hour across collectors; merge by (app_key, fs_uuid, dev, inode, generation, identity_weak), canonical basename is least UTF-8 bytes; top-N key (bytes_r+bytes_w desc, reads+writes desc, dev, inode, generation, identity_weak, fs_uuid, basename, path_id asc); counted omissions, keyed overflow and unknown-owner overflow remain separate; weak identities retain their bytes"
+          sha256: 93c9dfc47b92e111e1ff93b630a6eada147cc8e1021b24c25c3868fab3af9716
+          authority:
+            - docs/superpowers/plans/2026-10-21-app-io-monitor-p1-p2.md#task-9
+            - docs/superpowers/specs/2026-10-21-app-io-monitor-spec.md#35-path-identity-and-boot-chronology
+            - docs/superpowers/specs/2026-10-21-app-io-monitor-spec.md#72-retention-and-selection
+        - id: appio.file-store.hourly-v1
+          signature: "FileHourStore(connection); apply_pending(snapshot); finalize_hour(snapshot); unknown_owner_for_hour(boot_id, hour_start); canonical file_hour_state and atomic finalization; one finalized app-hour snapshot with at most 100 file_sample rows and one file_coverage row; exactly one unknown-owner row per boot-hour including explicit zero; preserve aliases, boot-scoped LAST, app_boot_file_total, app_boot_file_coverage and boot_file_overflow_unknown; finalized watermark advances chronologically; finalized hours never reopen; pending tails are not observations"
+          sha256: f5aef427cd3b1c91d122a3d080b9be4fd014d549576a03dbfd9df6f7caa53775
+          authority:
+            - docs/superpowers/plans/2026-10-21-app-io-monitor-p1-p2.md#task-9
+            - docs/superpowers/specs/2026-10-21-app-io-monitor-spec.md#54-deterministic-materialization
+            - docs/superpowers/specs/2026-10-21-app-io-monitor-spec.md#83-tier-behavior
+        - id: appio.quota.retention-v1
+          signature: "QuotaPruner(connection, database_paths, quota_bytes=1500000000); expire(now_boot_id, now_mono_ns); shrink_if_needed(); independent retention raw 24h, file-hour 14d, 60s rollups 30d, 3600s rollups 365d; mapped-wall age and full typed deletion keys from specification r3 section 5.3; totals/diagnostics/boot chronology and referenced path identities never expire; missing clock mapping stops deletion and makes coverage incomplete; checkpoint after each deletion, measure DB/WAL/SHM, pause above quota and resume only after a fresh passing size check"
+          sha256: 416423dc3285eb72fdb9993c3ac41cb7b3d6168e310c526f001486dd616e550a
+          authority:
+            - docs/superpowers/plans/2026-10-21-app-io-monitor-p1-p2.md#task-9
+            - docs/superpowers/specs/2026-10-21-app-io-monitor-spec.md#53-quota-and-prune-job
+      consumes:
+        - producer_task: T-001
+          interface_id: appio.contracts.core.v1
+          sha256: 4461f8290ad52bff7973cf2fd5a2d53ee7f07453f41e663e8cd5ae7ace014a4a
+        - producer_task: T-001
+          interface_id: appio.contracts.validation.v1
+          sha256: 9af426fdb912ee6fefa2dfbd15f1aac472df1e0fc683fd24c41589cc50db364d
+        - producer_task: T-001
+          interface_id: appio.contracts.file-inputs.v1
+          sha256: f57121f0bad5cafa50eb619be648b6a55990dda04424e4cbb4b4a27642d645cd
+        - producer_task: T-004
+          interface_id: appio.clock.boottime.v1
+          sha256: 5366c5596fb20aeb199d971e2e424c0089220cba76b56afca18e5ba047692b36
+        - producer_task: T-005
+          interface_id: appio.schema.sqlite-v1
+          sha256: 6555c99f5e6d956dd0cdeb9b9a0d5675982df58e09a6f9341451f3133caaff73
+        - producer_task: T-006
+          interface_id: appio.durable.canonical-json.v1
+          sha256: 90c0ea1fe6a6d603c52a43b9bb666da2b71e8541f92d0d85508ebfb3bd4ca5e5
+        - producer_task: T-006
+          interface_id: appio.stream.receipts.v1
+          sha256: 59d6a3d428996bacb9e4f2e0223a0ef41c2688a1829b64591e6d424f54cc5dd5
+    validation:
+      - argv: ["python", "-m", "pytest", "-q", "tests/test_files.py", "tests/test_file_store.py", "tests/test_quota.py"]
+        cwd: lane
+        timeout_seconds: 300
+  - id: T-010
+    plan_task: 10
+    title: "Implement tiered queries, coverage reduction, and signed residual results"
+    implementer_tier: Capable
+    implementer_tier_line: "**Implementer tier:** Capable"
+    lane: P1-query
+    sequence: 1
+    source_sequence: P1.5
+    depends_on: [T-001, T-004, T-008, T-009]
+    owns:
+      - src/appio/tier.py
+      - src/appio/query.py
+      - tests/test_query.py
+      - tests/test_query_properties.py
+    exclusive_resources: []
+    produces:
+      - id: appio.query.tiers-v1
+        signature: "select_tier(window, available_cutoff) -> Tier; bounded duration <=24h raw, >24h and <=30d rollup_60s, >30d and <=365d rollup_3600s; launch always raises launch_attribution; bounded range >365d raises unsupported_window; exact full since-boot/lifetime scopes may use totals_only; historical non-full boot prefix >365d raises the exact historical-prefix error; no tier blending, proration or substitution for expired history; validate disabled scope before app lookup"
+        sha256: 195624a57dbcd69eacf99df31569464876f4e988b076ca5dbbd271e49f990aeb
+        authority:
+          - docs/superpowers/plans/2026-10-21-app-io-monitor-p1-p2.md#task-10
+          - docs/superpowers/specs/2026-10-21-app-io-monitor-spec.md#42-windows-and-tier-selection
+          - docs/superpowers/specs/2026-10-21-app-io-monitor-spec.md#83-tier-behavior
+      - id: appio.query.api-v1
+        signature: "ranking(window: Window, metric: Metric) -> list[AppTotal]; series(app_id: int, window: Window) -> Series; disk_share(app_id: int, window: Window) -> DiskShare; file_table(app_id: int, window: Window, sort: FileSort, direction: Direction, search: str | None) -> FileTable; file_coverage(app_id: int, window: Window) -> FileCoverage; unknown_owner_file_coverage(window: Window) -> UnknownOwnerOverflow; each function uses one SQLite snapshot and populated Coverage; persisted reductions use exact selected/deduplicated source rows, then overlays for gaps/clipping/pruning/pending tails/diagnostics; task totals remain numeric; unavailable/mixed D returns None for aggregate D and every residual; complete D uses signed T-D independently for read/write/total; file sources are independent hourly/boot sources; unknown-owner overflow is one global context quantity; QueryService consumers may bind ranking and disk_share without a prescribed concrete service class"
+        sha256: 73c21b3582cacf6a6b194ee562e3c4b61d56478811b81bd700d096072cfcd66a
+        authority:
+          - docs/superpowers/plans/2026-10-21-app-io-monitor-p1-p2.md#task-10
+          - docs/superpowers/specs/2026-10-21-app-io-monitor-spec.md#82-exact-function-signatures-and-ordering
+          - docs/superpowers/specs/2026-10-21-app-io-monitor-spec.md#83-tier-behavior
+    consumes:
+      - producer_task: T-001
+        interface_id: appio.contracts.core.v1
+        sha256: 4461f8290ad52bff7973cf2fd5a2d53ee7f07453f41e663e8cd5ae7ace014a4a
+      - producer_task: T-001
+        interface_id: appio.contracts.results.v1
+        sha256: 8150fa1226db3b7bb638bc0600cb5ba453486b6cfb2eb0fe4ae92b1f2086766b
+      - producer_task: T-001
+        interface_id: appio.contracts.validation.v1
+        sha256: 9af426fdb912ee6fefa2dfbd15f1aac472df1e0fc683fd24c41589cc50db364d
+      - producer_task: T-004
+        interface_id: appio.clock.boottime.v1
+        sha256: 5366c5596fb20aeb199d971e2e424c0089220cba76b56afca18e5ba047692b36
+      - producer_task: T-004
+        interface_id: appio.reconcile.signed.v1
+        sha256: 3af9199dcd1abb9eaa5a5cc86dfaf359692b843c1dc6f6f82370c595b06d8f24
+      - producer_task: T-008
+        interface_id: appio.store.atomic-v1
+        sha256: e90a8a6bc4a65d216dfbc2fd95ec96f963a615a5be05219b710ec7899ebcced8
+      - producer_task: T-009
+        interface_id: appio.file-store.hourly-v1
+        sha256: f5aef427cd3b1c91d122a3d080b9be4fd014d549576a03dbfd9df6f7caa53775
+      - producer_task: T-009
+        interface_id: appio.quota.retention-v1
+        sha256: 416423dc3285eb72fdb9993c3ac41cb7b3d6168e310c526f001486dd616e550a
+    interfaces:
+      produces:
+        - id: appio.query.tiers-v1
+          signature: "select_tier(window, available_cutoff) -> Tier; bounded duration <=24h raw, >24h and <=30d rollup_60s, >30d and <=365d rollup_3600s; launch always raises launch_attribution; bounded range >365d raises unsupported_window; exact full since-boot/lifetime scopes may use totals_only; historical non-full boot prefix >365d raises the exact historical-prefix error; no tier blending, proration or substitution for expired history; validate disabled scope before app lookup"
+          sha256: 195624a57dbcd69eacf99df31569464876f4e988b076ca5dbbd271e49f990aeb
+          authority:
+            - docs/superpowers/plans/2026-10-21-app-io-monitor-p1-p2.md#task-10
+            - docs/superpowers/specs/2026-10-21-app-io-monitor-spec.md#42-windows-and-tier-selection
+            - docs/superpowers/specs/2026-10-21-app-io-monitor-spec.md#83-tier-behavior
+        - id: appio.query.api-v1
+          signature: "ranking(window: Window, metric: Metric) -> list[AppTotal]; series(app_id: int, window: Window) -> Series; disk_share(app_id: int, window: Window) -> DiskShare; file_table(app_id: int, window: Window, sort: FileSort, direction: Direction, search: str | None) -> FileTable; file_coverage(app_id: int, window: Window) -> FileCoverage; unknown_owner_file_coverage(window: Window) -> UnknownOwnerOverflow; each function uses one SQLite snapshot and populated Coverage; persisted reductions use exact selected/deduplicated source rows, then overlays for gaps/clipping/pruning/pending tails/diagnostics; task totals remain numeric; unavailable/mixed D returns None for aggregate D and every residual; complete D uses signed T-D independently for read/write/total; file sources are independent hourly/boot sources; unknown-owner overflow is one global context quantity; QueryService consumers may bind ranking and disk_share without a prescribed concrete service class"
+          sha256: 73c21b3582cacf6a6b194ee562e3c4b61d56478811b81bd700d096072cfcd66a
+          authority:
+            - docs/superpowers/plans/2026-10-21-app-io-monitor-p1-p2.md#task-10
+            - docs/superpowers/specs/2026-10-21-app-io-monitor-spec.md#82-exact-function-signatures-and-ordering
+            - docs/superpowers/specs/2026-10-21-app-io-monitor-spec.md#83-tier-behavior
+      consumes:
+        - producer_task: T-001
+          interface_id: appio.contracts.core.v1
+          sha256: 4461f8290ad52bff7973cf2fd5a2d53ee7f07453f41e663e8cd5ae7ace014a4a
+        - producer_task: T-001
+          interface_id: appio.contracts.results.v1
+          sha256: 8150fa1226db3b7bb638bc0600cb5ba453486b6cfb2eb0fe4ae92b1f2086766b
+        - producer_task: T-001
+          interface_id: appio.contracts.validation.v1
+          sha256: 9af426fdb912ee6fefa2dfbd15f1aac472df1e0fc683fd24c41589cc50db364d
+        - producer_task: T-004
+          interface_id: appio.clock.boottime.v1
+          sha256: 5366c5596fb20aeb199d971e2e424c0089220cba76b56afca18e5ba047692b36
+        - producer_task: T-004
+          interface_id: appio.reconcile.signed.v1
+          sha256: 3af9199dcd1abb9eaa5a5cc86dfaf359692b843c1dc6f6f82370c595b06d8f24
+        - producer_task: T-008
+          interface_id: appio.store.atomic-v1
+          sha256: e90a8a6bc4a65d216dfbc2fd95ec96f963a615a5be05219b710ec7899ebcced8
+        - producer_task: T-009
+          interface_id: appio.file-store.hourly-v1
+          sha256: f5aef427cd3b1c91d122a3d080b9be4fd014d549576a03dbfd9df6f7caa53775
+        - producer_task: T-009
+          interface_id: appio.quota.retention-v1
+          sha256: 416423dc3285eb72fdb9993c3ac41cb7b3d6168e310c526f001486dd616e550a
+    validation:
+      - argv: ["python", "-m", "pytest", "-q", "tests/test_query.py", "tests/test_query_properties.py"]
+        cwd: lane
+        timeout_seconds: 300
+  - id: T-011
+    plan_task: 11
+    title: "Build the P2 thin PyQt6 application window"
+    implementer_tier: Advanced
+    implementer_tier_line: "**Implementer tier:** Advanced"
+    lane: P2-window
+    sequence: 1
+    source_sequence: P2.1
+    depends_on: [T-001, T-010]
+    owns:
+      - src/appio/ui/__init__.py
+      - src/appio/ui/main_window.py
+      - src/appio/ui/formatting.py
+      - tests/test_ui.py
+    exclusive_resources: []
+    produces:
+      - id: appio.ui.window-v1
+        signature: "AppIoWindow(query_service, boot_id: str, end_mono_ns: int) -> QMainWindow; refresh() -> None; selected_app_id() -> int | None; format_bytes(value: int) -> str; format_residual(value: int | None, complete: bool) -> str; local QueryService protocol consumes ranking(window, metric) and disk_share(app_id, window) with refresh-safe reads; since-boot list, selected-app KPI, coverage and signed residual; residual label uses difference between accounting points; negative residual includes attributed exceeds task accounting by <formatted value>; unavailable D is explicit and never coerced to zero; no tray/Files/daemon/BPF/socket/privilege UI"
+        sha256: 9d33ac58135eb6d0394217383523dbfe1f30e9948daa8e702e647cb0e21df0b9
+        authority:
+          - docs/superpowers/plans/2026-10-21-app-io-monitor-p1-p2.md#task-11
+          - docs/superpowers/specs/2026-10-21-app-io-monitor-design.md#14-delivery-decomposition-agreed
+    consumes:
+      - producer_task: T-001
+        interface_id: appio.contracts.core.v1
+        sha256: 4461f8290ad52bff7973cf2fd5a2d53ee7f07453f41e663e8cd5ae7ace014a4a
+      - producer_task: T-001
+        interface_id: appio.contracts.results.v1
+        sha256: 8150fa1226db3b7bb638bc0600cb5ba453486b6cfb2eb0fe4ae92b1f2086766b
+      - producer_task: T-010
+        interface_id: appio.query.api-v1
+        sha256: 73c21b3582cacf6a6b194ee562e3c4b61d56478811b81bd700d096072cfcd66a
+    interfaces:
+      produces:
+        - id: appio.ui.window-v1
+          signature: "AppIoWindow(query_service, boot_id: str, end_mono_ns: int) -> QMainWindow; refresh() -> None; selected_app_id() -> int | None; format_bytes(value: int) -> str; format_residual(value: int | None, complete: bool) -> str; local QueryService protocol consumes ranking(window, metric) and disk_share(app_id, window) with refresh-safe reads; since-boot list, selected-app KPI, coverage and signed residual; residual label uses difference between accounting points; negative residual includes attributed exceeds task accounting by <formatted value>; unavailable D is explicit and never coerced to zero; no tray/Files/daemon/BPF/socket/privilege UI"
+          sha256: 9d33ac58135eb6d0394217383523dbfe1f30e9948daa8e702e647cb0e21df0b9
+          authority:
+            - docs/superpowers/plans/2026-10-21-app-io-monitor-p1-p2.md#task-11
+            - docs/superpowers/specs/2026-10-21-app-io-monitor-design.md#14-delivery-decomposition-agreed
+      consumes:
+        - producer_task: T-001
+          interface_id: appio.contracts.core.v1
+          sha256: 4461f8290ad52bff7973cf2fd5a2d53ee7f07453f41e663e8cd5ae7ace014a4a
+        - producer_task: T-001
+          interface_id: appio.contracts.results.v1
+          sha256: 8150fa1226db3b7bb638bc0600cb5ba453486b6cfb2eb0fe4ae92b1f2086766b
+        - producer_task: T-010
+          interface_id: appio.query.api-v1
+          sha256: 73c21b3582cacf6a6b194ee562e3c4b61d56478811b81bd700d096072cfcd66a
+    validation:
+      - argv: ["env", "QT_QPA_PLATFORM=offscreen", "python", "-m", "pytest", "-q", "tests/test_ui.py"]
+        cwd: lane
+        timeout_seconds: 120
+  - id: T-012
+    plan_task: 12
+    title: "Prove the P1/P2 vertical slice against the complete fixture tree"
+    implementer_tier: Capable
+    implementer_tier_line: "**Implementer tier:** Capable"
+    lane: P2-acceptance
+    sequence: 1
+    source_sequence: P2.2
+    depends_on: [T-001, T-002, T-003, T-007, T-008, T-010, T-011]
+    owns:
+      - tests/acceptance/test_p1_p2.py
+      - tests/acceptance/test_no_later_scope.py
+      - tests/fixtures/acceptance/**
+    exclusive_resources: []
+    produces:
+      - id: appio.acceptance.p1-p2-v1
+        signature: "tests/acceptance/test_p1_p2.py; tests/acceptance/test_no_later_scope.py; tests/fixtures/acceptance/**; deterministic fixture-only ProcReader -> cgroup reader -> aggregate_tick -> AppIoStore -> query -> actual offscreen AppIoWindow; Chromium T=(read=200, write=100, total=300), D=(170,120,290), residual=(30,-20,10); inaccessible_pids=3 and reap_corrections=1; no negative PID-reuse delta; absent controller has no D rows; duplicate receipt changes no rows or displayed totals; fixture and acceptance artifact only, no production interface changes"
+        sha256: 00a4eb8fd80d253845374a5c850ddfa1d82d6f80f112c3e0a2c494d8697867d3
+        authority:
+          - docs/superpowers/plans/2026-10-21-app-io-monitor-p1-p2.md#task-12
+          - docs/superpowers/specs/2026-10-21-app-io-monitor-spec.md#104-exact-acceptance-results
+          - docs/superpowers/specs/2026-10-21-app-io-monitor-design.md#14-delivery-decomposition-agreed
+    consumes:
+      - producer_task: T-001
+        interface_id: appio.contracts.core.v1
+        sha256: 4461f8290ad52bff7973cf2fd5a2d53ee7f07453f41e663e8cd5ae7ace014a4a
+      - producer_task: T-002
+        interface_id: appio.procs.reader.v1
+        sha256: 45a1c201209182d7d3a8ea72c0b34276ac567dfc0b7eae8b204e3dc22b3e82e1
+      - producer_task: T-002
+        interface_id: appio.identity.app-key.v1
+        sha256: 5c838f2ae4ff09d231c48ed189664e31ca83163e394c1c3749a413d110b25c54
+      - producer_task: T-003
+        interface_id: appio.cgroups.accounting.v1
+        sha256: e4beb9409cf1679662a3d93569492b214f4d9b8e2dfd16377edee212cf44d913
+      - producer_task: T-007
+        interface_id: appio.sampler.tick.v1
+        sha256: cb5ead06c61adae527a2a93aa5ced466a7794efa619b34f569aec44d53e2de2e
+      - producer_task: T-008
+        interface_id: appio.store.atomic-v1
+        sha256: e90a8a6bc4a65d216dfbc2fd95ec96f963a615a5be05219b710ec7899ebcced8
+      - producer_task: T-010
+        interface_id: appio.query.api-v1
+        sha256: 73c21b3582cacf6a6b194ee562e3c4b61d56478811b81bd700d096072cfcd66a
+      - producer_task: T-011
+        interface_id: appio.ui.window-v1
+        sha256: 9d33ac58135eb6d0394217383523dbfe1f30e9948daa8e702e647cb0e21df0b9
+    interfaces:
+      produces:
+        - id: appio.acceptance.p1-p2-v1
+          signature: "tests/acceptance/test_p1_p2.py; tests/acceptance/test_no_later_scope.py; tests/fixtures/acceptance/**; deterministic fixture-only ProcReader -> cgroup reader -> aggregate_tick -> AppIoStore -> query -> actual offscreen AppIoWindow; Chromium T=(read=200, write=100, total=300), D=(170,120,290), residual=(30,-20,10); inaccessible_pids=3 and reap_corrections=1; no negative PID-reuse delta; absent controller has no D rows; duplicate receipt changes no rows or displayed totals; fixture and acceptance artifact only, no production interface changes"
+          sha256: 00a4eb8fd80d253845374a5c850ddfa1d82d6f80f112c3e0a2c494d8697867d3
+          authority:
+            - docs/superpowers/plans/2026-10-21-app-io-monitor-p1-p2.md#task-12
+            - docs/superpowers/specs/2026-10-21-app-io-monitor-spec.md#104-exact-acceptance-results
+            - docs/superpowers/specs/2026-10-21-app-io-monitor-design.md#14-delivery-decomposition-agreed
+      consumes:
+        - producer_task: T-001
+          interface_id: appio.contracts.core.v1
+          sha256: 4461f8290ad52bff7973cf2fd5a2d53ee7f07453f41e663e8cd5ae7ace014a4a
+        - producer_task: T-002
+          interface_id: appio.procs.reader.v1
+          sha256: 45a1c201209182d7d3a8ea72c0b34276ac567dfc0b7eae8b204e3dc22b3e82e1
+        - producer_task: T-002
+          interface_id: appio.identity.app-key.v1
+          sha256: 5c838f2ae4ff09d231c48ed189664e31ca83163e394c1c3749a413d110b25c54
+        - producer_task: T-003
+          interface_id: appio.cgroups.accounting.v1
+          sha256: e4beb9409cf1679662a3d93569492b214f4d9b8e2dfd16377edee212cf44d913
+        - producer_task: T-007
+          interface_id: appio.sampler.tick.v1
+          sha256: cb5ead06c61adae527a2a93aa5ced466a7794efa619b34f569aec44d53e2de2e
+        - producer_task: T-008
+          interface_id: appio.store.atomic-v1
+          sha256: e90a8a6bc4a65d216dfbc2fd95ec96f963a615a5be05219b710ec7899ebcced8
+        - producer_task: T-010
+          interface_id: appio.query.api-v1
+          sha256: 73c21b3582cacf6a6b194ee562e3c4b61d56478811b81bd700d096072cfcd66a
+        - producer_task: T-011
+          interface_id: appio.ui.window-v1
+          sha256: 9d33ac58135eb6d0394217383523dbfe1f30e9948daa8e702e647cb0e21df0b9
+    validation:
+      - argv: ["env", "QT_QPA_PLATFORM=offscreen", "python", "-m", "pytest", "-q", "tests/acceptance/test_p1_p2.py", "tests/acceptance/test_no_later_scope.py"]
+        cwd: lane
+        timeout_seconds: 300
+      - argv: ["env", "QT_QPA_PLATFORM=offscreen", "python", "-m", "pytest", "-q"]
+        cwd: lane
+        timeout_seconds: 600
+lanes:
+  - id: P1-foundation
+    task_ids: [T-001]
+  - id: P1-proc-identity
+    task_ids: [T-002]
+  - id: P1-cgroups
+    task_ids: [T-003]
+  - id: P1-time-math
+    task_ids: [T-004]
+  - id: P1-schema
+    task_ids: [T-005]
+  - id: P1-durable-stream
+    task_ids: [T-006]
+  - id: P1-sampler
+    task_ids: [T-007]
+  - id: P1-store-write
+    task_ids: [T-008]
+  - id: P1-files-retention
+    task_ids: [T-009]
+  - id: P1-query
+    task_ids: [T-010]
+  - id: P2-window
+    task_ids: [T-011]
+  - id: P2-acceptance
+    task_ids: [T-012]

@@ -1,0 +1,86 @@
+// Generated from execution-graph.yaml and source-plan titles/tiers. Inspection artifact only; do not hand edit.
+digraph appio_p1_p2 {
+  graph [rankdir=LR, compound=true];
+  node [shape=box];
+  subgraph "cluster_P1-foundation" {
+    label="P1-foundation";
+    "T-001" [label="Task 1: Establish the Python package and shared contract types\nStandard"];
+  }
+  subgraph "cluster_P1-proc-identity" {
+    label="P1-proc-identity";
+    "T-002" [label="Task 2: Parse fixture `/proc` records and resolve stable process identity\nAdvanced"];
+  }
+  subgraph "cluster_P1-cgroups" {
+    label="P1-cgroups";
+    "T-003" [label="Task 3: Parse cgroup device accounting and controller state\nAdvanced"];
+  }
+  subgraph "cluster_P1-time-math" {
+    label="P1-time-math";
+    "T-004" [label="Task 4: Implement boottime buckets, clock segments, suspend attribution, and signed reconciliation\nAdvanced"];
+  }
+  subgraph "cluster_P1-schema" {
+    label="P1-schema";
+    "T-005" [label="Task 5: Create and validate the exact STRICT SQLite schema-v1 migration\nCapable"];
+  }
+  subgraph "cluster_P1-durable-stream" {
+    label="P1-durable-stream";
+    "T-006" [label="Task 6: Add canonical durable JSON and collector stream state\nAdvanced"];
+  }
+  subgraph "cluster_P1-sampler" {
+    label="P1-sampler";
+    "T-007" [label="Task 7: Implement the pure identity, delta, credit, and coverage aggregation tick\nCapable"];
+  }
+  subgraph "cluster_P1-store-write" {
+    label="P1-store-write";
+    "T-008" [label="Task 8: Build the atomic store writer, rollups, totals, and checkpoint persistence\nCapable"];
+  }
+  subgraph "cluster_P1-files-retention" {
+    label="P1-files-retention";
+    "T-009" [label="Task 9: Implement synthetic hourly file contracts and deterministic retention primitives\nCapable"];
+  }
+  subgraph "cluster_P1-query" {
+    label="P1-query";
+    "T-010" [label="Task 10: Implement tiered queries, coverage reduction, and signed residual results\nCapable"];
+  }
+  subgraph "cluster_P2-window" {
+    label="P2-window";
+    "T-011" [label="Task 11: Build the P2 thin PyQt6 application window\nAdvanced"];
+  }
+  subgraph "cluster_P2-acceptance" {
+    label="P2-acceptance";
+    "T-012" [label="Task 12: Prove the P1/P2 vertical slice against the complete fixture tree\nCapable"];
+  }
+  "T-001" -> "T-002";
+  "T-001" -> "T-003";
+  "T-001" -> "T-004";
+  "T-001" -> "T-005";
+  "T-001" -> "T-006";
+  "T-002" -> "T-006";
+  "T-005" -> "T-006";
+  "T-001" -> "T-007";
+  "T-002" -> "T-007";
+  "T-003" -> "T-007";
+  "T-004" -> "T-007";
+  "T-001" -> "T-008";
+  "T-004" -> "T-008";
+  "T-005" -> "T-008";
+  "T-006" -> "T-008";
+  "T-007" -> "T-008";
+  "T-001" -> "T-009";
+  "T-004" -> "T-009";
+  "T-005" -> "T-009";
+  "T-006" -> "T-009";
+  "T-001" -> "T-010";
+  "T-004" -> "T-010";
+  "T-008" -> "T-010";
+  "T-009" -> "T-010";
+  "T-001" -> "T-011";
+  "T-010" -> "T-011";
+  "T-001" -> "T-012";
+  "T-002" -> "T-012";
+  "T-003" -> "T-012";
+  "T-007" -> "T-012";
+  "T-008" -> "T-012";
+  "T-010" -> "T-012";
+  "T-011" -> "T-012";
+}
