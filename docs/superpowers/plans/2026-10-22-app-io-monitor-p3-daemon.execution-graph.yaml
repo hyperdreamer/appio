@@ -1,0 +1,1106 @@
+source_plan:
+  path: docs/superpowers/plans/2026-10-22-app-io-monitor-p3-daemon.md
+  sha256: bfff90b1c4a0594b2db7e0a423626d20e6f183cec2e2168571c818d6950d4b3c
+  commit: 2d4188878b20d1fa254763b59148ae20477b9be6
+  task_numbers: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
+schema_version: 1
+epoch: 1
+source_documents:
+  spec:
+    path: docs/superpowers/specs/2026-10-21-app-io-monitor-spec.md
+    sha256: 7044d23d95a755e3107c168b8eb0c414a122c4f2426c8f5c32e48bfd458dca9a
+    commit: ed23f87a14e0830a18a41f11c59dd1ee4932cd79
+    revision: 3
+  design:
+    path: docs/superpowers/specs/2026-10-21-app-io-monitor-design.md
+    sha256: adad78b0d1ef741b276f3139f3fc9ee9bb808eb2d59a841a44bfc14c3ca8a509
+    commit: 88910c52530582f77b42b768765321cd3854d46f
+    revision: 5
+    lane_intent_section: 14
+derivation:
+  signature_normalization: Collapse ASCII whitespace runs to one space; trim; SHA-256 over UTF-8 signature bytes without trailing newline.
+  lane_policy: Preserve all ten source Scheduling lanes and contiguous sequences verbatim. Every task is present exactly once; same-lane predecessor edges are explicit.
+  ownership_policy: Use exactly the Create/Modify/Test file paths; remove source line-range anchors only. Exact paths are literal POSIX globs; no broad directory claims. All task ownership sets are disjoint, including concurrent pairs; no ownership serialization is needed.
+  exclusive_resources_policy: 'No shared runtime resource: each lane uses private tmp_path trees/databases, injected credentials/service/session state, virtual clocks and offscreen Qt; no real system service, root helper or host process collection is run.'
+  interface_policy: One cohesive public interface per producing task, extracted from every Produces bullet. Mirror task produces/consumes under interfaces. Existing repository APIs are pinned immutable baseline_interfaces, resolved by producer_source rather than fictional tasks; every baseline consumer names its exact digest. No baseline producer is runnable or added to lanes.
+  baseline_policy: Static Python AST declarations pin actual APIs without importing runtime dependencies. Source and spec hashes are exact-byte pins. Inherited API declarations on modifying tasks are recorded as baseline consumes; new methods are supplied only by their P3 producer. Baseline interfaces describe pre-change APIs, not new handover semantics.
+  validation_policy: Deduplicate all explicit unprivileged pytest commands, encode their three environment assignments as env argv, preserve the full-suite command and dry-run acceptance script. Exclude all git commands and privileged --run/--allow-session-termination execution. Cwd lane is the lane worktree root.
+  validation_timeouts: 300 seconds per focused command/dry-run, 600 seconds for the complete suite; orchestration defaults inferred rather than promised runtime.
+  conditional_artifact_check: Task 6 also requests systemd-analyze verify data/systemd/appio-iod.service only when available; keep it informational outside blocking validation because the not-yet-installed /usr/bin/appio-iod may legitimately make it fail. No installation or system service invocation is authorized.
+  safety_limits: D1-D5 are unchanged plan rulings/limitations. The manifest makes no real-host accounting or lossless bidirectional-handover claim. Production filesystem paths in signatures are contracts, not ownership paths or commands to execute.
+  added_dependencies:
+    - task: T-009
+      depends_on: T-007
+      reason: Task 9 explicitly consumes Task 7 SetupIdentity/SetupDeps/CommandRunner; already ordered through Task 8.
+      reduces_source_parallelism: false
+    - task: T-010
+      depends_on: T-007
+      reason: Task 10 explicitly consumes Task 7 parsing/trusted-runtime/runner contracts; already ordered through Task 8.
+      reduces_source_parallelism: false
+    - task: T-013
+      depends_on: T-007
+      reason: Task 13 explicitly imports CommandResult and consumes the fixed six helper verbs; already ordered through Task 10.
+      reduces_source_parallelism: false
+  unstated_inferences:
+    - Use stable T-001..T-014 identifiers and appio.p3.<boundary>.v1 interface IDs.
+    - Group each task public contract into one interface; pin existing APIs separately instead of assigning their authorship to P3 tasks.
+    - A dependency consumer pins its prerequisite complete public interface, including acceptance prerequisites not individually restated in its Consumes bullet.
+    - Line anchors are inspection locations, not part of an owned filename; no write permission is widened.
+    - 'No extra serialization is needed: all additional API edges were already transitively ordered.'
+baseline_interfaces:
+  - id: appio.baseline.contracts.v1
+    immutable: true
+    sources:
+      - path: src/appio/contracts.py
+        sha256: 1e92ff51eb35b31fcca83050b5c5d70f3a960cd7439189953981ec8338af8a30
+        commit: 2274f0ede7021e62abab4358f01844e3411991f4
+      - path: src/appio/identity.py
+        sha256: 34196c6abbe9ba3ad2306a068b24cd1e87d5dfe60f0f5bb44155d2e03c986ac8
+        commit: 66ab73d52f0c41612b18774b5a593cf8a1bd1850
+    signature: "Metric = Literal['total_bytes', 'read_bytes', 'write_bytes', 'rchar', 'wchar']; FileSort = Literal['bytes_total', 'bytes_r', 'bytes_w', 'reads', 'writes', 'basename', 'dev', 'last_seen']; Direction = Literal['asc', 'desc']; LAUNCH_WINDOW_MESSAGE = 'Launch window disabled: device and file activity are not stored per launch.'; RANGE_TOO_LONG_MESSAGE = 'Ranges longer than 365 days are disabled: retained rollups cannot represent arbitrary ranges.'; HISTORICAL_BOOT_PREFIX_MESSAGE = 'Historical boot prefix unavailable: totals cover the full collected boot.'; WindowUnavailableError() extends ValueError; WindowUnavailableError.__init__(self, reason: UnavailableReason, message: str) -> None; validate_sqlite_integer(value: object, field: str, nonnegative: bool=True) -> int; validate_search(search: str | None) -> str | None; Window(kind: WindowKind; boot_id: str | None = None; start_mono_ns: int | None = None; end_mono_ns: int | None = None; launch_id: int | None = None); validate_window(window: Window) -> Window; HookHits(vfs_read: int; vfs_write: int; vfs_readv: int; vfs_writev: int; vfs_iter_read: int; vfs_iter_write: int); Coverage(tier: Tier; complete: bool; unavailable_reason: UnavailableReason | None; inaccessible_pids: int; resets: int; reap_corrections: int; reap_unapplied: CounterVector; reap_unobserved: CounterVector; partial_intervals: int; gap_intervals: int; overlap_uncertain_intervals: int; spans_suspend_intervals: int; spans_suspend: bool; reap_incomplete: bool; counter_overflow: bool; device_state: DeviceState; counted_omitted_files: int; counted_omitted_bytes_r: int; counted_omitted_bytes_w: int; uncounted_overflow_files: int; uncounted_overflow_bytes_r: int; uncounted_overflow_bytes_w: int; skipped_nonfile: int; skipped_unsupported_fs: int; weak_identity_rows: int; hook_hits: HookHits); AppTotal(app_id: int; app_key: str; name: str; read_bytes: int; write_bytes: int; total_bytes: int; rchar: int; wchar: int; peak_read_bps: int | None; peak_write_bps: int | None; peak_total_bps: int | None; coverage: Coverage); SeriesPoint(bucket_start_mono_ns: int; bucket_secs: int; wall_start_seconds: float | None; read_bytes: int; write_bytes: int; peak_read_bps: int | None; peak_write_bps: int | None; peak_total_bps: int | None; spans_suspend: bool); DeviceSeriesPoint(bucket_start_mono_ns: int; bucket_secs: int; dev: str; rbytes: int; wbytes: int); ResidualPoint(bucket_start_mono_ns: int; bucket_secs: int; total: int | None; read: int | None; write: int | None); Series(app_id: int; window: Window; tier: Tier; points: tuple[SeriesPoint, ...]; device_points: tuple[DeviceSeriesPoint, ...]; residual_points: tuple[ResidualPoint, ...]; coverage: Coverage); DeviceShareRow(boot_id: str; dev: str; rbytes: int; wbytes: int; total_bytes: int); DiskShare(app_id: int; window: Window; task_read_bytes: int; task_write_bytes: int; task_total_bytes: int; devices: tuple[DeviceShareRow, ...]; device_read_bytes: int | None; device_write_bytes: int | None; device_total_bytes: int | None; residual_read: int | None; residual_write: int | None; residual_total: int | None; coverage: Coverage); FileRow(path_id: int; basename: str; state: FileState; identity_weak: bool; dev: str; inode: int; generation: int; reads: int; writes: int; bytes_r: int; bytes_w: int; bytes_total: int; last_seen_boot_id: str; last_seen_mono_ns: int); UnknownOwnerOverflow(window: Window; owner_key: Literal['overflow_owner_unknown']; overflow_files: int; overflow_bytes_r: int; overflow_bytes_w: int; coverage: Coverage); FileTable(app_id: int; window: Window; rows: tuple[FileRow, ...]; sort: FileSort; direction: Direction; search: str | None; unknown_owner_overflow: UnknownOwnerOverflow; coverage: Coverage); FileCoverage(app_id: int; window: Window; counted_omitted_files: int; counted_omitted_bytes_r: int; counted_omitted_bytes_w: int; uncounted_overflow_files: int; uncounted_overflow_bytes_r: int; uncounted_overflow_bytes_w: int; skipped_nonfile: int; skipped_unsupported_fs: int; weak_identity_rows: int; hook_hits: HookHits; observed_bytes_r: int; observed_bytes_w: int; unknown_owner_overflow: UnknownOwnerOverflow; coverage: Coverage); validate_app_key(key: object) -> AppKey"
+    sha256: a1e8f1389518a87295483233e50ada6167ad1fe51a18244b37a25793e75cb700
+    authority:
+      - src/appio/contracts.py
+      - src/appio/identity.py
+      - docs/superpowers/specs/2026-10-21-app-io-monitor-spec.md#81-python-types
+      - docs/superpowers/specs/2026-10-21-app-io-monitor-spec.md#82-exact-function-signatures-and-ordering
+      - docs/superpowers/specs/2026-10-21-app-io-monitor-spec.md#83-tier-behavior
+    producer_source: baseline.contracts
+  - id: appio.baseline.query.v1
+    immutable: true
+    sources:
+      - path: src/appio/query.py
+        sha256: 09ad5f0d516b2e8d694b65737d1288f61ccc1ba41568f883a9120d04d931ecbf
+        commit: 2274f0ede7021e62abab4358f01844e3411991f4
+    signature: "QueryService(); QueryService.__init__(self, store_or_connection: object) -> None; QueryService.ranking(self, window: Window, metric: Metric) -> list[AppTotal]; QueryService.series(self, app_id: int, window: Window) -> Series; QueryService.disk_share(self, app_id: int, window: Window) -> DiskShare; QueryService.file_table(self, app_id: int, window: Window, sort: FileSort, direction: Direction, search: str | None) -> FileTable; QueryService.file_coverage(self, app_id: int, window: Window) -> FileCoverage; QueryService.unknown_owner_file_coverage(self, window: Window) -> UnknownOwnerOverflow; Preserve exact A22 error strings/reasons before ID lookup, coverage overlays, nullable D and signed residuals; AppKey is the cross-store identity."
+    sha256: fe11bd2c423afa9fd841bab4745d4e4b57250962087c3185f9a7dc4693b07968
+    authority:
+      - src/appio/query.py
+      - docs/superpowers/specs/2026-10-21-app-io-monitor-spec.md#82-exact-function-signatures-and-ordering
+      - docs/superpowers/specs/2026-10-21-app-io-monitor-spec.md#83-tier-behavior
+    producer_source: baseline.query
+  - id: appio.baseline.store.v1
+    immutable: true
+    sources:
+      - path: src/appio/store.py
+        sha256: 96452bb5ce9090f405f2131d119ca5b7e7b19c14c4575da2ef4347fb57f16ef7
+        commit: 2274f0ede7021e62abab4358f01844e3411991f4
+    signature: "AppIoStore(); AppIoStore.__init__(self, connection_or_path: sqlite3.Connection | str | Path) -> None; AppIoStore.start_boot(self, boot_id: str, boot_order: int, started_mono_ns: int, started_wall: float, source: str) -> None; AppIoStore.start_collector(self, source: str, boot_id: str, allocated_mono_ns: int) -> CollectorEpoch; AppIoStore.record_gap(self, boot_id: str, source: str, epoch: int, seq: int, from_mono_ns: int, to_mono_ns: int, reason: str='collector_gap') -> None; AppIoStore.record_tick(self, frame: AggregatedFrame, next_state: SamplerState) -> None; AppIoStore.restore_checkpoint(self, source: str, boot_id: str) -> SamplerState | None; AppIoStore.physical_store_bytes(self) -> int; record_tick owns BEGIN IMMEDIATE; state publishes only after commit; overflow diagnostics follow rollback in a separate transaction."
+    sha256: 4774682bf85ef052e6e8d5f4308eaee8f531795e76ff36fb0c0ae4cee96a74ce
+    authority:
+      - src/appio/store.py
+      - docs/superpowers/specs/2026-10-21-app-io-monitor-spec.md#34-collector-stream-identity
+      - docs/superpowers/specs/2026-10-21-app-io-monitor-spec.md#62-ddl
+    producer_source: baseline.store
+  - id: appio.baseline.stream.v1
+    immutable: true
+    sources:
+      - path: src/appio/stream.py
+        sha256: 50da96bac517ba6c437c8435765c9f80f31b7226dd5fd16a3bab010f02c70e46
+        commit: 7b089ea85b934df4f79bd55c690a64ca2dbc61c6
+    signature: "CollectorEpoch(source: str; boot_id: str; epoch: int; last_seq: int | None; allocated_mono_ns: int); FrameIdentity(boot_id: str; source: str; epoch: int; seq: int); allocate_epoch(connection: sqlite3.Connection, source: str, boot_id: str, allocated_mono_ns: int) -> CollectorEpoch; accept_frame(connection: sqlite3.Connection, frame: FrameIdentity) -> bool"
+    sha256: 91053cbba887817ad191661d6c6e24ec6e3359567129ef5d9637382a3f724eea
+    authority:
+      - src/appio/stream.py
+      - docs/superpowers/specs/2026-10-21-app-io-monitor-spec.md#34-collector-stream-identity
+      - docs/superpowers/specs/2026-10-21-app-io-monitor-spec.md#62-ddl
+    producer_source: baseline.stream
+  - id: appio.baseline.durable.v1
+    immutable: true
+    sources:
+      - path: src/appio/durable.py
+        sha256: 7b1d226bf91ae9b413aa2351a9723c0159837d43845e43159b2b52daf61aa415
+        commit: 2274f0ede7021e62abab4358f01844e3411991f4
+    signature: "canonical_json(value: object) -> str; ProcessRef(pid: int; start_ticks: int); Credit(child: ProcessRef; disappearance_epoch: int; disappearance_seq: int; remaining: CounterVector = _counter_field(); correction_counted: int); Credit.order_key(self) -> tuple[int, int, int, int]; ProcessCheckpoint(pid: int; start_ticks: int; ppid: int; parent: ProcessRef | None; app_key: AppKey; launch_root: ProcessRef | None; launch_id: int; baseline: CounterVector | None = _counter_field(); credits: tuple[Credit, ...]); ProcessCheckpoint.identity(self) -> tuple[int, int]; DeviceBaseline(cgroup_id: int; dev: str; rbytes: int; wbytes: int); DeviceBaseline.order_key(self) -> tuple[int, bytes]; HandoverState(boot_id: str; cutoff_mono_ns: int; processes: tuple[ProcessCheckpoint, ...]; devices: tuple[DeviceBaseline, ...]; version: int = 1); decode_handover(text: str, expected_boot_id: str, expected_cutoff: int) -> HandoverState"
+    sha256: 1a66e00307b93ffc5b76df1b7962ad52f8903cb53564281081944a69a5bb6274
+    authority:
+      - src/appio/durable.py
+      - docs/superpowers/specs/2026-10-21-app-io-monitor-spec.md#62-ddl
+    producer_source: baseline.durable
+  - id: appio.baseline.sampler.v1
+    immutable: true
+    sources:
+      - path: src/appio/sampler.py
+        sha256: 89a6a0a0e4c7ab379807432ab10fd19041868a55358f38de0154db9570c748dc
+        commit: 96e7ecf1ccd8fca15ba20b325d198adca9fa92d5
+    signature: "TickInput(boot_id: str; source: Literal['gui', 'iod']; epoch: int; seq: int; observed_mono_ns: int; wall_ns: int; processes: tuple[StableProcRecord, ...]; cgroups: tuple[CgroupObservation, ...] = (); suspend_boundaries: tuple[tuple[int, int], ...] | None = (); unresolved_pids: tuple[int, ...] = (); vanished_pids: tuple[int, ...] = (); known_uncovered: tuple[tuple[int, int], ...] | None = ()); AggregatedFrame(boot_id: str; source: Literal['gui', 'iod']; epoch: int; seq: int; observed_mono_ns: int; clock_offset_ns: int; deltas: tuple[AppDelta, ...]; coverage: tuple[FrameCoverage, ...]; device_deltas: tuple[AggregatedDeviceDelta, ...]; checkpoint_state: dict[str, object]); SamplerState(boot_id: str; source: Literal['gui', 'iod']; epoch: int; last_seq: int; checkpoint_mono_ns: int; processes: tuple[ProcessState, ...] = (); launches: tuple[LaunchState, ...] = (); device_baselines: tuple[tuple[tuple[str, int, str], tuple[int, int]], ...] = (); last_observed_mono_ns: int | None = None); SamplerState.to_checkpoint(self) -> dict[str, object]; aggregate_tick(previous_state: SamplerState | None, tick: TickInput) -> tuple[AggregatedFrame, SamplerState]"
+    sha256: 4c73e4a1f7c2fc3c5861562421258127d862bf21070734baad39d49d7686e8a7
+    authority:
+      - src/appio/sampler.py
+      - docs/superpowers/specs/2026-10-21-app-io-monitor-spec.md#5-aggregation-algorithm
+    producer_source: baseline.sampler
+  - id: appio.baseline.ownership.v1
+    immutable: true
+    sources:
+      - path: src/appio/ownership.py
+        sha256: ecd6b186daa0ad383a67a4a008bf518d0278485c46d5c127c881dc95a92414a5
+        commit: 2274f0ede7021e62abab4358f01844e3411991f4
+    signature: "intersects(start, observed, timestamp, intervals); uncertain_intervals(connection, boot_id); ownership_exclusions(connection, boot_id)"
+    sha256: 4af2acd0ef57d8e1e54035caf1f9f38a84edcfa4722f7107428eb0f7a0401c3c
+    authority:
+      - src/appio/ownership.py
+      - docs/superpowers/specs/2026-10-21-app-io-monitor-spec.md#34-collector-stream-identity
+      - docs/superpowers/specs/2026-10-21-app-io-monitor-spec.md#62-ddl
+    producer_source: baseline.ownership
+  - id: appio.baseline.live.v1
+    immutable: true
+    sources:
+      - path: src/appio/live.py
+        sha256: d1fec66e895d4002ff76850065d81c1edc9d67c8e3ce8de3f456d830c2d1038f
+        commit: cf02aa76c542e1820406d0407cea2e66d62a1755
+    signature: "SystemClock(); SystemClock.__call__(self) -> tuple[int, int]; CoverageSummary(inaccessible_pids: int = 0; resets: int = 0; reap_corrections: int = 0; partial_intervals: int = 0; gap_intervals: int = 0; overlap_uncertain_intervals: int = 0; spans_suspend_intervals: int = 0; device_state: Literal['available', 'not_delegated', 'incomplete'] = 'incomplete'); CoverageSummary.complete(self) -> bool; TickResult(apps_observed: int; rows_written: int; coverage: CoverageSummary); TickResult.coverage_summary(self) -> CoverageSummary; LiveCollector(); LiveCollector.__init__(self, proc_root: str | Path='/proc', cgroup_root: str | Path='/sys/fs/cgroup', database_path: str | Path='history.db', clock: object | None=None, *, source: Literal['gui', 'iod']=_SOURCE) -> None; LiveCollector.sampler_state(self) -> SamplerState | None; LiveCollector.last_result(self) -> TickResult | None; LiveCollector.last_observed_mono_ns(self) -> int | None; LiveCollector.next_seq(self) -> int; LiveCollector.tick(self) -> TickResult; LiveCollector.run_forever(self, interval_seconds: float, max_ticks: int | None=None) -> tuple[TickResult, ...]; LiveCollector.close(self) -> None; Existing source guard accepts only gui; Task 5 deliberately extends it to iod and handles mixed-source boot rows."
+    sha256: b9e5c4f67b6dd7b7200bf1d552f765b50d354b2d5c427716261f9b0ea33f0ead
+    authority:
+      - src/appio/live.py
+    producer_source: baseline.live
+  - id: appio.baseline.migrations.v1
+    immutable: true
+    sources:
+      - path: src/appio/migrations.py
+        sha256: 1fb4610ecd5cccb56eb9f19118e21c96c3c4bb416a0d2ed24bc5ec5c0642f22e
+        commit: d5f091c28aa97c9436ad72490b50d45803958311
+    signature: "validate_schema(connection: sqlite3.Connection) -> None; migrate_empty(connection: sqlite3.Connection) -> None; open_database(path: Path) -> sqlite3.Connection"
+    sha256: 48d0d3430805e116012566f03973d1c7f0b489a48c0c37a16421043c540ea2c9
+    authority:
+      - src/appio/migrations.py
+      - docs/superpowers/specs/2026-10-21-app-io-monitor-spec.md#6-sqlite-schema
+      - docs/superpowers/specs/2026-10-21-app-io-monitor-spec.md#64-empty-database-migration
+    producer_source: baseline.migrations
+  - id: appio.baseline.cgroups.v1
+    immutable: true
+    sources:
+      - path: src/appio/cgroups.py
+        sha256: 4c04de39c85b4a37e0b6bed59e150d01f3ff19262f38ad368e12f8422e818397
+        commit: 8f29a71a167ae83170a6bb1a29d34cb4e23d3190
+    signature: "DevStat(cgroup_id: int; dev: str; rbytes: int; wbytes: int); parse_io_stat(text: str, cgroup_id: int) -> tuple[DevStat, ...]"
+    sha256: 8422a57d72831af365592326beec2fecb39b33dee18212f539d77631ffc0bab6
+    authority:
+      - src/appio/cgroups.py
+      - docs/superpowers/specs/2026-10-21-app-io-monitor-spec.md#22-d-cgroup-device-bytes
+      - docs/superpowers/specs/2026-10-21-app-io-monitor-spec.md#52-cgroup-and-file-deltas
+    producer_source: baseline.cgroups
+  - id: appio.baseline.p2-window.v1
+    immutable: true
+    sources:
+      - path: src/appio/ui/main_window.py
+        sha256: 4c89758eca1596c43d5bf2cbb71af842f5ac8f086be9173e0f8ea93cb1ba79bb
+        commit: 36990b7af547d518f46eb7686af33f976f6215fc
+    signature: "AppIoWindow() extends QMainWindow; AppIoWindow.__init__(self, query_service: QueryService, boot_id: str, end_mono_ns: int) -> None; AppIoWindow.refresh(self) -> None; AppIoWindow.selected_app_id(self) -> int | None; AppIoWindow.set_window(self, window: Window) -> None"
+    sha256: cfce09b2c4bb48a2cdab0e6d25f6a81ccbc8dc9a5de3d16e5a72b3aa46f5bc96
+    authority:
+      - src/appio/ui/main_window.py
+    producer_source: baseline.p2-window
+tasks:
+  - id: T-001
+    plan_task: 1
+    title: "Define protocol-1 framing and typed read-only messages"
+    implementer_tier: Advanced
+    implementer_tier_line: "**Implementer tier:** Advanced"
+    lane: protocol
+    sequence: 1
+    depends_on: []
+    owns:
+      - src/appio/ipc_protocol.py
+      - src/appio/ipc_models.py
+      - tests/p3/test_ipc_protocol.py
+    exclusive_resources: []
+    produces:
+      - id: appio.p3.protocol.v1
+        signature: "encode_frame(message: dict, *, max_bytes: int = 262144) -> bytes; FrameDecoder(*, max_bytes: int = 1048576) with feed(data: bytes) -> tuple[dict, ...] and eof() -> None; ProtocolError(ValueError) with string reason.; validate_request(message: dict) -> Request, a frozen record with request_id: str, type: Literal[\"status\",\"subscribe\",\"query\"], since: StreamCursor | None, query: QueryRequest | None; StreamCursor(boot_id: str, iod_epoch: int, seq: int); Capabilities(proc_all: bool, dev_stat: bool, file_io: bool, bpf_loaded: bool).; QueryRequest(kind: str, window: Window, app_key: str | None = None, metric: str = \"total_bytes\", sort: str = \"bytes_total\", direction: str = \"desc\", search: str | None = None, cursor: str | None = None, limit: int = 500, coverage_kind: Literal[\"process\",\"file\",\"unknown_owner\"] = \"process\"); kind allowlist ranking, series, files, coverage, totals. coverage_kind selects only the coverage result and is default-only on other query kinds; totals returns typed disk share for one AppKey. No other selector dispatches.; validate_server_message(message: dict) -> dict, validating status, snapshot, gap, result, error envelopes before a consumer sees data. Every envelope carries protocol=1, a type, and request correlation where applicable; snapshot identity is (boot_id, source=\"iod\", iod_epoch, seq)."
+        sha256: b09027a79fb3678b432f83838f55561849ab575176702c1ee524cba4e3320f0d
+        authority:
+          - docs/superpowers/plans/2026-10-22-app-io-monitor-p3-daemon.md#task-1-define-protocol-1-framing-and-typed-read-only-messages
+    consumes:
+      - producer_source: baseline.contracts
+        interface_id: appio.baseline.contracts.v1
+        sha256: a1e8f1389518a87295483233e50ada6167ad1fe51a18244b37a25793e75cb700
+    validation:
+      - argv: ["env", "PYTHONDONTWRITEBYTECODE=1", "QT_QPA_PLATFORM=offscreen", "PYTEST_QT_API=pyqt6", "python", "-m", "pytest", "-q", "tests/p3/test_ipc_protocol.py"]
+        cwd: lane
+        timeout_seconds: 300
+    interfaces:
+      produces:
+        - id: appio.p3.protocol.v1
+          signature: "encode_frame(message: dict, *, max_bytes: int = 262144) -> bytes; FrameDecoder(*, max_bytes: int = 1048576) with feed(data: bytes) -> tuple[dict, ...] and eof() -> None; ProtocolError(ValueError) with string reason.; validate_request(message: dict) -> Request, a frozen record with request_id: str, type: Literal[\"status\",\"subscribe\",\"query\"], since: StreamCursor | None, query: QueryRequest | None; StreamCursor(boot_id: str, iod_epoch: int, seq: int); Capabilities(proc_all: bool, dev_stat: bool, file_io: bool, bpf_loaded: bool).; QueryRequest(kind: str, window: Window, app_key: str | None = None, metric: str = \"total_bytes\", sort: str = \"bytes_total\", direction: str = \"desc\", search: str | None = None, cursor: str | None = None, limit: int = 500, coverage_kind: Literal[\"process\",\"file\",\"unknown_owner\"] = \"process\"); kind allowlist ranking, series, files, coverage, totals. coverage_kind selects only the coverage result and is default-only on other query kinds; totals returns typed disk share for one AppKey. No other selector dispatches.; validate_server_message(message: dict) -> dict, validating status, snapshot, gap, result, error envelopes before a consumer sees data. Every envelope carries protocol=1, a type, and request correlation where applicable; snapshot identity is (boot_id, source=\"iod\", iod_epoch, seq)."
+          sha256: b09027a79fb3678b432f83838f55561849ab575176702c1ee524cba4e3320f0d
+          authority:
+            - docs/superpowers/plans/2026-10-22-app-io-monitor-p3-daemon.md#task-1-define-protocol-1-framing-and-typed-read-only-messages
+      consumes:
+        - producer_source: baseline.contracts
+          interface_id: appio.baseline.contracts.v1
+          sha256: a1e8f1389518a87295483233e50ada6167ad1fe51a18244b37a25793e75cb700
+  - id: T-002
+    plan_task: 2
+    title: "Verify Unix peers and bound slow-client queues"
+    implementer_tier: Advanced
+    implementer_tier_line: "**Implementer tier:** Advanced"
+    lane: transport
+    sequence: 1
+    depends_on: [T-001]
+    owns:
+      - src/appio/ipc_security.py
+      - src/appio/ipc_queue.py
+      - tests/p3/test_ipc_security.py
+      - tests/p3/test_ipc_queue.py
+    exclusive_resources: []
+    produces:
+      - id: appio.p3.transport.v1
+        signature: "Peer(pid: int, uid: int, gid: int); read_peer(sock: socket.socket) -> Peer using SO_PEERCRED; authorize_client(peer: Peer, *, appio_gid: int, supplementary_groups: Callable[[int], frozenset[int]]) -> bool; require_root_server(peer: Peer) -> None raising PeerRejected(PermissionError).; verify_runtime_paths(path: Path, *, metadata: Callable[[Path], object], appio_gid: int) -> None, checking /run/appio root:appio 0750 and socket root:appio 0660 without following symlinks. Metadata injection is test-only.; ClientQueue(max_bytes: int = 524288, max_pending_snapshots: int = 2) with push(frame: bytes, *, snapshot: StreamCursor | None = None) -> None, peek(max_bytes: int) -> memoryview, consume(sent: int) -> None, queued_bytes: int, closed: bool. Capacity/second pending snapshot raises SlowClientError and clears only that client's queue."
+        sha256: d18ab9acbaad00f9b26389fe38c82171393dfb3b4276bf0e6a796cc6814d0233
+        authority:
+          - docs/superpowers/plans/2026-10-22-app-io-monitor-p3-daemon.md#task-2-verify-unix-peers-and-bound-slow-client-queues
+    consumes:
+      - producer_task: T-001
+        interface_id: appio.p3.protocol.v1
+        sha256: b09027a79fb3678b432f83838f55561849ab575176702c1ee524cba4e3320f0d
+    validation:
+      - argv: ["env", "PYTHONDONTWRITEBYTECODE=1", "QT_QPA_PLATFORM=offscreen", "PYTEST_QT_API=pyqt6", "python", "-m", "pytest", "-q", "tests/p3/test_ipc_security.py", "tests/p3/test_ipc_queue.py"]
+        cwd: lane
+        timeout_seconds: 300
+    interfaces:
+      produces:
+        - id: appio.p3.transport.v1
+          signature: "Peer(pid: int, uid: int, gid: int); read_peer(sock: socket.socket) -> Peer using SO_PEERCRED; authorize_client(peer: Peer, *, appio_gid: int, supplementary_groups: Callable[[int], frozenset[int]]) -> bool; require_root_server(peer: Peer) -> None raising PeerRejected(PermissionError).; verify_runtime_paths(path: Path, *, metadata: Callable[[Path], object], appio_gid: int) -> None, checking /run/appio root:appio 0750 and socket root:appio 0660 without following symlinks. Metadata injection is test-only.; ClientQueue(max_bytes: int = 524288, max_pending_snapshots: int = 2) with push(frame: bytes, *, snapshot: StreamCursor | None = None) -> None, peek(max_bytes: int) -> memoryview, consume(sent: int) -> None, queued_bytes: int, closed: bool. Capacity/second pending snapshot raises SlowClientError and clears only that client's queue."
+          sha256: d18ab9acbaad00f9b26389fe38c82171393dfb3b4276bf0e6a796cc6814d0233
+          authority:
+            - docs/superpowers/plans/2026-10-22-app-io-monitor-p3-daemon.md#task-2-verify-unix-peers-and-bound-slow-client-queues
+      consumes:
+        - producer_task: T-001
+          interface_id: appio.p3.protocol.v1
+          sha256: b09027a79fb3678b432f83838f55561849ab575176702c1ee524cba4e3320f0d
+  - id: T-003
+    plan_task: 3
+    title: "Serve bounded historical queries without changing query semantics"
+    implementer_tier: Capable
+    implementer_tier_line: "**Implementer tier:** Capable"
+    lane: history
+    sequence: 1
+    depends_on: [T-001]
+    owns:
+      - src/appio/iod_history.py
+      - tests/p3/test_iod_history.py
+    exclusive_resources: []
+    produces:
+      - id: appio.p3.history.v1
+        signature: "QueryLimits(max_points: int = 4000, max_file_rows: int = 500, max_payload_bytes: int = 262144, max_scan_rows: int = 50000, timeout_ns: int = 200000000); HistoryRpc(connection: sqlite3.Connection, *, limits: QueryLimits = QueryLimits(), clock_ns: Callable[[], int] = time.monotonic_ns) with execute(request: QueryRequest, *, request_id: str) -> dict.; to_wire(value: object, *, app_keys: Mapping[int, str]) -> object and from_wire(value: object, *, app_ids: Callable[[str], int], result_kind: str) -> object. These explicitly translate typed P1 results without exposing surrogate IDs or dropping coverage, None, signed residuals or exact integer counters."
+        sha256: 85f28e0aa6708a075f6f5d1d8938392ac8f0fe49372937b0a454cf467d1c3060
+        authority:
+          - docs/superpowers/plans/2026-10-22-app-io-monitor-p3-daemon.md#task-3-serve-bounded-historical-queries-without-changing-query-semantics
+    consumes:
+      - producer_task: T-001
+        interface_id: appio.p3.protocol.v1
+        sha256: b09027a79fb3678b432f83838f55561849ab575176702c1ee524cba4e3320f0d
+      - producer_source: baseline.contracts
+        interface_id: appio.baseline.contracts.v1
+        sha256: a1e8f1389518a87295483233e50ada6167ad1fe51a18244b37a25793e75cb700
+      - producer_source: baseline.query
+        interface_id: appio.baseline.query.v1
+        sha256: fe11bd2c423afa9fd841bab4745d4e4b57250962087c3185f9a7dc4693b07968
+    validation:
+      - argv: ["env", "PYTHONDONTWRITEBYTECODE=1", "QT_QPA_PLATFORM=offscreen", "PYTEST_QT_API=pyqt6", "python", "-m", "pytest", "-q", "tests/p3/test_iod_history.py"]
+        cwd: lane
+        timeout_seconds: 300
+      - argv: ["env", "PYTHONDONTWRITEBYTECODE=1", "QT_QPA_PLATFORM=offscreen", "PYTEST_QT_API=pyqt6", "python", "-m", "pytest", "-q", "tests/test_query.py", "tests/test_query_properties.py"]
+        cwd: lane
+        timeout_seconds: 300
+    interfaces:
+      produces:
+        - id: appio.p3.history.v1
+          signature: "QueryLimits(max_points: int = 4000, max_file_rows: int = 500, max_payload_bytes: int = 262144, max_scan_rows: int = 50000, timeout_ns: int = 200000000); HistoryRpc(connection: sqlite3.Connection, *, limits: QueryLimits = QueryLimits(), clock_ns: Callable[[], int] = time.monotonic_ns) with execute(request: QueryRequest, *, request_id: str) -> dict.; to_wire(value: object, *, app_keys: Mapping[int, str]) -> object and from_wire(value: object, *, app_ids: Callable[[str], int], result_kind: str) -> object. These explicitly translate typed P1 results without exposing surrogate IDs or dropping coverage, None, signed residuals or exact integer counters."
+          sha256: 85f28e0aa6708a075f6f5d1d8938392ac8f0fe49372937b0a454cf467d1c3060
+          authority:
+            - docs/superpowers/plans/2026-10-22-app-io-monitor-p3-daemon.md#task-3-serve-bounded-historical-queries-without-changing-query-semantics
+      consumes:
+        - producer_task: T-001
+          interface_id: appio.p3.protocol.v1
+          sha256: b09027a79fb3678b432f83838f55561849ab575176702c1ee524cba4e3320f0d
+        - producer_source: baseline.contracts
+          interface_id: appio.baseline.contracts.v1
+          sha256: a1e8f1389518a87295483233e50ada6167ad1fe51a18244b37a25793e75cb700
+        - producer_source: baseline.query
+          interface_id: appio.baseline.query.v1
+          sha256: fe11bd2c423afa9fd841bab4745d4e4b57250962087c3185f9a7dc4693b07968
+  - id: T-004
+    plan_task: 4
+    title: "Persist atomic handover baselines and exclusive ownership"
+    implementer_tier: Capable
+    implementer_tier_line: "**Implementer tier:** Capable"
+    lane: ownership
+    sequence: 1
+    depends_on: []
+    owns:
+      - src/appio/handover.py
+      - src/appio/store.py
+      - tests/p3/test_handover.py
+    exclusive_resources: []
+    produces:
+      - id: appio.p3.handover.v1
+        signature: "HandoverOffer(from_source: str, to_source: str, outgoing_epoch: int, outgoing_seq: int, interval_start_mono_ns: int, state: HandoverState); it carries evidence, not a claim that arbitrary callers are authenticated.; capture_handover(state: SamplerState) -> HandoverState; seed_handover(offer: HandoverOffer, *, incoming_epoch: int, wall_ns: int) -> tuple[AggregatedFrame, SamplerState]; baseline_seed(tick: TickInput, *, previous: SamplerState | None = None) -> tuple[AggregatedFrame, SamplerState]. Both seeds have seq=0, zero emitted deltas, real process/device baselines, per-app coverage and matching version-1 checkpoint JSON.; AppIoStore.install_handover(offer: HandoverOffer, *, wall_ns: int) -> CollectorEpoch, atomically installing the row, outgoing interval evidence, new incoming epoch, zero-byte baseline receipt and checkpoint. A caller must bootstrap the boot row first. AppIoStore.record_tick remains compatible and never joins an unrelated outer transaction."
+        sha256: c0633252bb61622ff5e83248bcf59139901454d372095c3a9071989bb14663e7
+        authority:
+          - docs/superpowers/plans/2026-10-22-app-io-monitor-p3-daemon.md#task-4-persist-atomic-handover-baselines-and-exclusive-ownership
+    consumes:
+      - producer_source: baseline.contracts
+        interface_id: appio.baseline.contracts.v1
+        sha256: a1e8f1389518a87295483233e50ada6167ad1fe51a18244b37a25793e75cb700
+      - producer_source: baseline.store
+        interface_id: appio.baseline.store.v1
+        sha256: 4774682bf85ef052e6e8d5f4308eaee8f531795e76ff36fb0c0ae4cee96a74ce
+      - producer_source: baseline.stream
+        interface_id: appio.baseline.stream.v1
+        sha256: 91053cbba887817ad191661d6c6e24ec6e3359567129ef5d9637382a3f724eea
+      - producer_source: baseline.durable
+        interface_id: appio.baseline.durable.v1
+        sha256: 1a66e00307b93ffc5b76df1b7962ad52f8903cb53564281081944a69a5bb6274
+      - producer_source: baseline.sampler
+        interface_id: appio.baseline.sampler.v1
+        sha256: 4c73e4a1f7c2fc3c5861562421258127d862bf21070734baad39d49d7686e8a7
+      - producer_source: baseline.ownership
+        interface_id: appio.baseline.ownership.v1
+        sha256: 4af2acd0ef57d8e1e54035caf1f9f38a84edcfa4722f7107428eb0f7a0401c3c
+    validation:
+      - argv: ["env", "PYTHONDONTWRITEBYTECODE=1", "QT_QPA_PLATFORM=offscreen", "PYTEST_QT_API=pyqt6", "python", "-m", "pytest", "-q", "tests/p3/test_handover.py"]
+        cwd: lane
+        timeout_seconds: 300
+      - argv: ["env", "PYTHONDONTWRITEBYTECODE=1", "QT_QPA_PLATFORM=offscreen", "PYTEST_QT_API=pyqt6", "python", "-m", "pytest", "-q", "tests/test_store.py", "tests/test_store_overflow.py", "tests/test_stream.py", "tests/test_sampler.py", "tests/test_durable.py"]
+        cwd: lane
+        timeout_seconds: 300
+    interfaces:
+      produces:
+        - id: appio.p3.handover.v1
+          signature: "HandoverOffer(from_source: str, to_source: str, outgoing_epoch: int, outgoing_seq: int, interval_start_mono_ns: int, state: HandoverState); it carries evidence, not a claim that arbitrary callers are authenticated.; capture_handover(state: SamplerState) -> HandoverState; seed_handover(offer: HandoverOffer, *, incoming_epoch: int, wall_ns: int) -> tuple[AggregatedFrame, SamplerState]; baseline_seed(tick: TickInput, *, previous: SamplerState | None = None) -> tuple[AggregatedFrame, SamplerState]. Both seeds have seq=0, zero emitted deltas, real process/device baselines, per-app coverage and matching version-1 checkpoint JSON.; AppIoStore.install_handover(offer: HandoverOffer, *, wall_ns: int) -> CollectorEpoch, atomically installing the row, outgoing interval evidence, new incoming epoch, zero-byte baseline receipt and checkpoint. A caller must bootstrap the boot row first. AppIoStore.record_tick remains compatible and never joins an unrelated outer transaction."
+          sha256: c0633252bb61622ff5e83248bcf59139901454d372095c3a9071989bb14663e7
+          authority:
+            - docs/superpowers/plans/2026-10-22-app-io-monitor-p3-daemon.md#task-4-persist-atomic-handover-baselines-and-exclusive-ownership
+      consumes:
+        - producer_source: baseline.contracts
+          interface_id: appio.baseline.contracts.v1
+          sha256: a1e8f1389518a87295483233e50ada6167ad1fe51a18244b37a25793e75cb700
+        - producer_source: baseline.store
+          interface_id: appio.baseline.store.v1
+          sha256: 4774682bf85ef052e6e8d5f4308eaee8f531795e76ff36fb0c0ae4cee96a74ce
+        - producer_source: baseline.stream
+          interface_id: appio.baseline.stream.v1
+          sha256: 91053cbba887817ad191661d6c6e24ec6e3359567129ef5d9637382a3f724eea
+        - producer_source: baseline.durable
+          interface_id: appio.baseline.durable.v1
+          sha256: 1a66e00307b93ffc5b76df1b7962ad52f8903cb53564281081944a69a5bb6274
+        - producer_source: baseline.sampler
+          interface_id: appio.baseline.sampler.v1
+          sha256: 4c73e4a1f7c2fc3c5861562421258127d862bf21070734baad39d49d7686e8a7
+        - producer_source: baseline.ownership
+          interface_id: appio.baseline.ownership.v1
+          sha256: 4af2acd0ef57d8e1e54035caf1f9f38a84edcfa4722f7107428eb0f7a0401c3c
+  - id: T-005
+    plan_task: 5
+    title: "Extend the existing collector for daemon and handover starts"
+    implementer_tier: Advanced
+    implementer_tier_line: "**Implementer tier:** Advanced"
+    lane: ownership
+    sequence: 2
+    depends_on: [T-004]
+    owns:
+      - src/appio/live.py
+      - tests/p3/test_live_sources.py
+    exclusive_resources: []
+    produces:
+      - id: appio.p3.live-sources.v1
+        signature: "backwards-compatible LiveCollector(proc_root: str | Path = \"/proc\", cgroup_root: str | Path = \"/sys/fs/cgroup\", database_path: str | Path = \"history.db\", clock: object | None = None, *, source: Literal[\"gui\",\"iod\"] = \"gui\", baseline_only: bool = False, resume_handover: HandoverOffer | None = None); quiesce() -> HandoverOffer for a running collector whose destination is the other source; read-only last_frame: AggregatedFrame | None; next_seq accounts for a seq=0 seed. tick() still returns TickResult and close() remains idempotent.; exact publication order: read \u2192 stage \u2192 commit \u2192 assign state/frame/next_seq \u2192 notify. Quiesce prevents any later tick and captures the last committed cutoff; a collection never started cannot create a clean offer."
+        sha256: aa45785b4357b00141739acdba2c783e0fa90be076c6f6c4584137c428c6a25a
+        authority:
+          - docs/superpowers/plans/2026-10-22-app-io-monitor-p3-daemon.md#task-5-extend-the-existing-collector-for-daemon-and-handover-starts
+          - src/appio/live.py#LiveCollector
+          - src/appio/store.py#AppIoStore.record_tick
+    consumes:
+      - producer_task: T-004
+        interface_id: appio.p3.handover.v1
+        sha256: c0633252bb61622ff5e83248bcf59139901454d372095c3a9071989bb14663e7
+      - producer_source: baseline.live
+        interface_id: appio.baseline.live.v1
+        sha256: b9e5c4f67b6dd7b7200bf1d552f765b50d354b2d5c427716261f9b0ea33f0ead
+      - producer_source: baseline.store
+        interface_id: appio.baseline.store.v1
+        sha256: 4774682bf85ef052e6e8d5f4308eaee8f531795e76ff36fb0c0ae4cee96a74ce
+      - producer_source: baseline.sampler
+        interface_id: appio.baseline.sampler.v1
+        sha256: 4c73e4a1f7c2fc3c5861562421258127d862bf21070734baad39d49d7686e8a7
+    validation:
+      - argv: ["env", "PYTHONDONTWRITEBYTECODE=1", "QT_QPA_PLATFORM=offscreen", "PYTEST_QT_API=pyqt6", "python", "-m", "pytest", "-q", "tests/p3/test_live_sources.py"]
+        cwd: lane
+        timeout_seconds: 300
+      - argv: ["env", "PYTHONDONTWRITEBYTECODE=1", "QT_QPA_PLATFORM=offscreen", "PYTEST_QT_API=pyqt6", "python", "-m", "pytest", "-q", "tests/test_live.py", "tests/acceptance/test_no_later_scope.py"]
+        cwd: lane
+        timeout_seconds: 300
+    interfaces:
+      produces:
+        - id: appio.p3.live-sources.v1
+          signature: "backwards-compatible LiveCollector(proc_root: str | Path = \"/proc\", cgroup_root: str | Path = \"/sys/fs/cgroup\", database_path: str | Path = \"history.db\", clock: object | None = None, *, source: Literal[\"gui\",\"iod\"] = \"gui\", baseline_only: bool = False, resume_handover: HandoverOffer | None = None); quiesce() -> HandoverOffer for a running collector whose destination is the other source; read-only last_frame: AggregatedFrame | None; next_seq accounts for a seq=0 seed. tick() still returns TickResult and close() remains idempotent.; exact publication order: read \u2192 stage \u2192 commit \u2192 assign state/frame/next_seq \u2192 notify. Quiesce prevents any later tick and captures the last committed cutoff; a collection never started cannot create a clean offer."
+          sha256: aa45785b4357b00141739acdba2c783e0fa90be076c6f6c4584137c428c6a25a
+          authority:
+            - docs/superpowers/plans/2026-10-22-app-io-monitor-p3-daemon.md#task-5-extend-the-existing-collector-for-daemon-and-handover-starts
+            - src/appio/live.py#LiveCollector
+            - src/appio/store.py#AppIoStore.record_tick
+      consumes:
+        - producer_task: T-004
+          interface_id: appio.p3.handover.v1
+          sha256: c0633252bb61622ff5e83248bcf59139901454d372095c3a9071989bb14663e7
+        - producer_source: baseline.live
+          interface_id: appio.baseline.live.v1
+          sha256: b9e5c4f67b6dd7b7200bf1d552f765b50d354b2d5c427716261f9b0ea33f0ead
+        - producer_source: baseline.store
+          interface_id: appio.baseline.store.v1
+          sha256: 4774682bf85ef052e6e8d5f4308eaee8f531795e76ff36fb0c0ae4cee96a74ce
+        - producer_source: baseline.sampler
+          interface_id: appio.baseline.sampler.v1
+          sha256: 4c73e4a1f7c2fc3c5861562421258127d862bf21070734baad39d49d7686e8a7
+  - id: T-006
+    plan_task: 6
+    title: "Run the root daemon with durable history and a fair socket loop"
+    implementer_tier: Capable
+    implementer_tier_line: "**Implementer tier:** Capable"
+    lane: daemon
+    sequence: 1
+    depends_on: [T-001, T-002, T-003, T-005]
+    owns:
+      - src/appio/iod.py
+      - data/systemd/appio-iod.service
+      - pyproject.toml
+      - tests/p3/test_iod.py
+      - tests/p3/test_iod_service.py
+    exclusive_resources: []
+    produces:
+      - id: appio.p3.daemon.v1
+        signature: "DaemonPaths(database: Path = Path(\"/var/lib/appio/iod.db\"), socket: Path = Path(\"/run/appio/iod.sock\"), proc_root: Path = Path(\"/proc\"), cgroup_root: Path = Path(\"/sys/fs/cgroup\")).; Daemon(paths: DaemonPaths, *, clock: Callable[[], tuple[int,int]], peer_reader: Callable, group_lookup: Callable, filesystem: object, selector: object, query_worker: object) with start() -> None, step() -> None, stop() -> None and committed_cursor: StreamCursor | None; main(argv: list[str] | None = None) -> int using only production dependencies and root enforcement.; fixed service runtime artifacts. GUI close/reconnect never controls daemon lifetime; service remains shipped disabled, with no socket-activation unit that would start it implicitly."
+        sha256: 047532657e53c3aef2e73e3f61d2bbbacc45b527c6300e1382e0208e6d30a730
+        authority:
+          - docs/superpowers/plans/2026-10-22-app-io-monitor-p3-daemon.md#task-6-run-the-root-daemon-with-durable-history-and-a-fair-socket-loop
+    consumes:
+      - producer_task: T-001
+        interface_id: appio.p3.protocol.v1
+        sha256: b09027a79fb3678b432f83838f55561849ab575176702c1ee524cba4e3320f0d
+      - producer_task: T-002
+        interface_id: appio.p3.transport.v1
+        sha256: d18ab9acbaad00f9b26389fe38c82171393dfb3b4276bf0e6a796cc6814d0233
+      - producer_task: T-003
+        interface_id: appio.p3.history.v1
+        sha256: 85f28e0aa6708a075f6f5d1d8938392ac8f0fe49372937b0a454cf467d1c3060
+      - producer_task: T-005
+        interface_id: appio.p3.live-sources.v1
+        sha256: aa45785b4357b00141739acdba2c783e0fa90be076c6f6c4584137c428c6a25a
+      - producer_source: baseline.store
+        interface_id: appio.baseline.store.v1
+        sha256: 4774682bf85ef052e6e8d5f4308eaee8f531795e76ff36fb0c0ae4cee96a74ce
+      - producer_source: baseline.stream
+        interface_id: appio.baseline.stream.v1
+        sha256: 91053cbba887817ad191661d6c6e24ec6e3359567129ef5d9637382a3f724eea
+      - producer_source: baseline.migrations
+        interface_id: appio.baseline.migrations.v1
+        sha256: 48d0d3430805e116012566f03973d1c7f0b489a48c0c37a16421043c540ea2c9
+    validation:
+      - argv: ["env", "PYTHONDONTWRITEBYTECODE=1", "QT_QPA_PLATFORM=offscreen", "PYTEST_QT_API=pyqt6", "python", "-m", "pytest", "-q", "tests/p3/test_iod.py", "tests/p3/test_iod_service.py"]
+        cwd: lane
+        timeout_seconds: 300
+    interfaces:
+      produces:
+        - id: appio.p3.daemon.v1
+          signature: "DaemonPaths(database: Path = Path(\"/var/lib/appio/iod.db\"), socket: Path = Path(\"/run/appio/iod.sock\"), proc_root: Path = Path(\"/proc\"), cgroup_root: Path = Path(\"/sys/fs/cgroup\")).; Daemon(paths: DaemonPaths, *, clock: Callable[[], tuple[int,int]], peer_reader: Callable, group_lookup: Callable, filesystem: object, selector: object, query_worker: object) with start() -> None, step() -> None, stop() -> None and committed_cursor: StreamCursor | None; main(argv: list[str] | None = None) -> int using only production dependencies and root enforcement.; fixed service runtime artifacts. GUI close/reconnect never controls daemon lifetime; service remains shipped disabled, with no socket-activation unit that would start it implicitly."
+          sha256: 047532657e53c3aef2e73e3f61d2bbbacc45b527c6300e1382e0208e6d30a730
+          authority:
+            - docs/superpowers/plans/2026-10-22-app-io-monitor-p3-daemon.md#task-6-run-the-root-daemon-with-durable-history-and-a-fair-socket-loop
+      consumes:
+        - producer_task: T-001
+          interface_id: appio.p3.protocol.v1
+          sha256: b09027a79fb3678b432f83838f55561849ab575176702c1ee524cba4e3320f0d
+        - producer_task: T-002
+          interface_id: appio.p3.transport.v1
+          sha256: d18ab9acbaad00f9b26389fe38c82171393dfb3b4276bf0e6a796cc6814d0233
+        - producer_task: T-003
+          interface_id: appio.p3.history.v1
+          sha256: 85f28e0aa6708a075f6f5d1d8938392ac8f0fe49372937b0a454cf467d1c3060
+        - producer_task: T-005
+          interface_id: appio.p3.live-sources.v1
+          sha256: aa45785b4357b00141739acdba2c783e0fa90be076c6f6c4584137c428c6a25a
+        - producer_source: baseline.store
+          interface_id: appio.baseline.store.v1
+          sha256: 4774682bf85ef052e6e8d5f4308eaee8f531795e76ff36fb0c0ae4cee96a74ce
+        - producer_source: baseline.stream
+          interface_id: appio.baseline.stream.v1
+          sha256: 91053cbba887817ad191661d6c6e24ec6e3359567129ef5d9637382a3f724eea
+        - producer_source: baseline.migrations
+          interface_id: appio.baseline.migrations.v1
+          sha256: 48d0d3430805e116012566f03973d1c7f0b489a48c0c37a16421043c540ea2c9
+  - id: T-007
+    plan_task: 7
+    title: "Constrain the polkit helper entry boundary"
+    implementer_tier: Advanced
+    implementer_tier_line: "**Implementer tier:** Advanced"
+    lane: privilege
+    sequence: 1
+    depends_on: []
+    owns:
+      - src/appio/setup_boundary.py
+      - data/libexec/appio-setup
+      - data/polkit/io.github.appio.setup.policy
+      - tests/p3/test_setup_boundary.py
+    exclusive_resources: []
+    produces:
+      - id: appio.p3.setup-boundary.v1
+        signature: "VERBS = frozenset({\"install-delegation\", \"enable\", \"disable\", \"status\", \"restart-user-manager\", \"export-history\"}); SetupIdentity(uid: int, gid: int, username: str, home: Path); Invocation(verb: str, identity: SetupIdentity); InvocationError(exit_code: int, reason: str).; parse_invocation(argv: list[str], *, environ: Mapping[str,str], euid: int, getpwuid: Callable[[int], object]) -> Invocation. argv includes the executable; exactly two elements are required. Invalid argv exits 2 before any filesystem/command operation. Missing/invalid PKEXEC identity or non-root execution fails closed with nonzero status.; CommandResult(returncode: int, stdout: str, stderr: str); CommandRunner.run(argv: tuple[str,...], *, uid: int = 0, gid: int = 0, env: Mapping[str,str] | None = None, timeout_seconds: float = 5.0) -> CommandResult; production runner never uses a shell.; SetupDeps(root: Path, runner: CommandRunner, effective_uid: Callable[[],int], getpwuid: Callable[[int],object], metadata: Callable[[int],object], chown: Callable[[int,int,int],None], clock_ns: Callable[[],int], event: Callable[[str],None]), where root defaults to / only in the production factory. The test event callback injects failures and records operations; it never appears in argv/environment. metadata receives a pinned descriptor and defaults to os.fstat, allowing tests to inject trusted ownership without changing the host; chown also receives an already-open descriptor and defaults to os.fchown, so export never reopens a user-controlled pathname to change ownership.; validate_trusted_runtime(paths: tuple[Path,...], *, metadata: Callable[[int],object], caller_uid: int) -> None, covering interpreter, appio module closure, parent directories and future BPF-object path only if such an object is actually used in P4."
+        sha256: 78ad8015fa31b564319b76f30939044f23951ea8373cd02426d4af485e5cab14
+        authority:
+          - docs/superpowers/plans/2026-10-22-app-io-monitor-p3-daemon.md#task-7-constrain-the-polkit-helper-entry-boundary
+    consumes: []
+    validation:
+      - argv: ["env", "PYTHONDONTWRITEBYTECODE=1", "QT_QPA_PLATFORM=offscreen", "PYTEST_QT_API=pyqt6", "python", "-m", "pytest", "-q", "tests/p3/test_setup_boundary.py"]
+        cwd: lane
+        timeout_seconds: 300
+    interfaces:
+      produces:
+        - id: appio.p3.setup-boundary.v1
+          signature: "VERBS = frozenset({\"install-delegation\", \"enable\", \"disable\", \"status\", \"restart-user-manager\", \"export-history\"}); SetupIdentity(uid: int, gid: int, username: str, home: Path); Invocation(verb: str, identity: SetupIdentity); InvocationError(exit_code: int, reason: str).; parse_invocation(argv: list[str], *, environ: Mapping[str,str], euid: int, getpwuid: Callable[[int], object]) -> Invocation. argv includes the executable; exactly two elements are required. Invalid argv exits 2 before any filesystem/command operation. Missing/invalid PKEXEC identity or non-root execution fails closed with nonzero status.; CommandResult(returncode: int, stdout: str, stderr: str); CommandRunner.run(argv: tuple[str,...], *, uid: int = 0, gid: int = 0, env: Mapping[str,str] | None = None, timeout_seconds: float = 5.0) -> CommandResult; production runner never uses a shell.; SetupDeps(root: Path, runner: CommandRunner, effective_uid: Callable[[],int], getpwuid: Callable[[int],object], metadata: Callable[[int],object], chown: Callable[[int,int,int],None], clock_ns: Callable[[],int], event: Callable[[str],None]), where root defaults to / only in the production factory. The test event callback injects failures and records operations; it never appears in argv/environment. metadata receives a pinned descriptor and defaults to os.fstat, allowing tests to inject trusted ownership without changing the host; chown also receives an already-open descriptor and defaults to os.fchown, so export never reopens a user-controlled pathname to change ownership.; validate_trusted_runtime(paths: tuple[Path,...], *, metadata: Callable[[int],object], caller_uid: int) -> None, covering interpreter, appio module closure, parent directories and future BPF-object path only if such an object is actually used in P4."
+          sha256: 78ad8015fa31b564319b76f30939044f23951ea8373cd02426d4af485e5cab14
+          authority:
+            - docs/superpowers/plans/2026-10-22-app-io-monitor-p3-daemon.md#task-7-constrain-the-polkit-helper-entry-boundary
+      consumes: []
+  - id: T-008
+    plan_task: 8
+    title: "Install delegation and pending state with safe atomic writes"
+    implementer_tier: Advanced
+    implementer_tier_line: "**Implementer tier:** Advanced"
+    lane: privilege
+    sequence: 2
+    depends_on: [T-007]
+    owns:
+      - src/appio/setup_files.py
+      - src/appio/setup_delegation.py
+      - tests/p3/test_setup_files.py
+      - tests/p3/test_setup_delegation.py
+    exclusive_resources: []
+    produces:
+      - id: appio.p3.delegation.v1
+        signature: "SafeRootFS(deps: SetupDeps) with atomic_write(path: str, content: bytes, *, mode: int = 0o644) -> None, read_bounded(path: str, *, max_bytes: int) -> bytes, and locked() -> ContextManager[None]. Only the fixed configuration/state/probe/export roots in this plan may be addressed by production callers.; SetupState(version: int, pending_by_uid: Mapping[int,bool]); load_setup_state(fs: SafeRootFS) -> SetupState; set_pending(fs: SafeRootFS, uid: int, pending: bool) -> None, persisted at /var/lib/appio/setup-state.json root:root 0600 under a helper-operation lock.; install_delegation(identity: SetupIdentity, *, deps: SetupDeps, fs: SafeRootFS) -> dict, returning versioned JSON with delegation_installed, pending_activation, uid and bounded diagnostics; no answering=True claim."
+        sha256: 24a62364df90d7daa0af3da308ac701d1b618512755cde8562ee3bbb64b2f425
+        authority:
+          - docs/superpowers/plans/2026-10-22-app-io-monitor-p3-daemon.md#task-8-install-delegation-and-pending-state-with-safe-atomic-writes
+    consumes:
+      - producer_task: T-007
+        interface_id: appio.p3.setup-boundary.v1
+        sha256: 78ad8015fa31b564319b76f30939044f23951ea8373cd02426d4af485e5cab14
+    validation:
+      - argv: ["env", "PYTHONDONTWRITEBYTECODE=1", "QT_QPA_PLATFORM=offscreen", "PYTEST_QT_API=pyqt6", "python", "-m", "pytest", "-q", "tests/p3/test_setup_files.py", "tests/p3/test_setup_delegation.py"]
+        cwd: lane
+        timeout_seconds: 300
+    interfaces:
+      produces:
+        - id: appio.p3.delegation.v1
+          signature: "SafeRootFS(deps: SetupDeps) with atomic_write(path: str, content: bytes, *, mode: int = 0o644) -> None, read_bounded(path: str, *, max_bytes: int) -> bytes, and locked() -> ContextManager[None]. Only the fixed configuration/state/probe/export roots in this plan may be addressed by production callers.; SetupState(version: int, pending_by_uid: Mapping[int,bool]); load_setup_state(fs: SafeRootFS) -> SetupState; set_pending(fs: SafeRootFS, uid: int, pending: bool) -> None, persisted at /var/lib/appio/setup-state.json root:root 0600 under a helper-operation lock.; install_delegation(identity: SetupIdentity, *, deps: SetupDeps, fs: SafeRootFS) -> dict, returning versioned JSON with delegation_installed, pending_activation, uid and bounded diagnostics; no answering=True claim."
+          sha256: 24a62364df90d7daa0af3da308ac701d1b618512755cde8562ee3bbb64b2f425
+          authority:
+            - docs/superpowers/plans/2026-10-22-app-io-monitor-p3-daemon.md#task-8-install-delegation-and-pending-state-with-safe-atomic-writes
+      consumes:
+        - producer_task: T-007
+          interface_id: appio.p3.setup-boundary.v1
+          sha256: 78ad8015fa31b564319b76f30939044f23951ea8373cd02426d4af485e5cab14
+  - id: T-009
+    plan_task: 9
+    title: "Prove accounting activation and require an explicit session choice"
+    implementer_tier: Advanced
+    implementer_tier_line: "**Implementer tier:** Advanced"
+    lane: activation
+    sequence: 1
+    depends_on: [T-007, T-008]
+    owns:
+      - src/appio/activation.py
+      - tests/p3/test_activation.py
+    exclusive_resources: []
+    produces:
+      - id: appio.p3.activation.v1
+        signature: "ProbeEvidence(delegation_present: bool, filesystem_supported: bool, expected_bytes: int, observed_bytes: int | None, device: str | None, command_exit: int | None, cleanup_complete: bool); activation_passes(evidence: ProbeEvidence) -> bool; ActivationResult(pending_activation: bool, state: str, evidence: ProbeEvidence | None).; probe_accounting(identity: SetupIdentity, *, deps: SetupDeps, fs: SafeRootFS) -> ActivationResult; choose_activation(choice: Literal[\"restart\",\"reboot\"], identity: SetupIdentity, *, deps: SetupDeps, fs: SafeRootFS) -> ActivationResult. The reboot choice only persists pending; it never calls reboot. The restart choice invokes the fixed root systemctl unit for that UID only after separate UI consent."
+        sha256: 0e35986d38c04d886962f35a18c632f5f01bbe1b362a32ebbc8976bbc67e3bb5
+        authority:
+          - docs/superpowers/plans/2026-10-22-app-io-monitor-p3-daemon.md#task-9-prove-accounting-activation-and-require-an-explicit-session-choice
+    consumes:
+      - producer_task: T-007
+        interface_id: appio.p3.setup-boundary.v1
+        sha256: 78ad8015fa31b564319b76f30939044f23951ea8373cd02426d4af485e5cab14
+      - producer_task: T-008
+        interface_id: appio.p3.delegation.v1
+        sha256: 24a62364df90d7daa0af3da308ac701d1b618512755cde8562ee3bbb64b2f425
+      - producer_source: baseline.cgroups
+        interface_id: appio.baseline.cgroups.v1
+        sha256: 8422a57d72831af365592326beec2fecb39b33dee18212f539d77631ffc0bab6
+    validation:
+      - argv: ["env", "PYTHONDONTWRITEBYTECODE=1", "QT_QPA_PLATFORM=offscreen", "PYTEST_QT_API=pyqt6", "python", "-m", "pytest", "-q", "tests/p3/test_activation.py"]
+        cwd: lane
+        timeout_seconds: 300
+    interfaces:
+      produces:
+        - id: appio.p3.activation.v1
+          signature: "ProbeEvidence(delegation_present: bool, filesystem_supported: bool, expected_bytes: int, observed_bytes: int | None, device: str | None, command_exit: int | None, cleanup_complete: bool); activation_passes(evidence: ProbeEvidence) -> bool; ActivationResult(pending_activation: bool, state: str, evidence: ProbeEvidence | None).; probe_accounting(identity: SetupIdentity, *, deps: SetupDeps, fs: SafeRootFS) -> ActivationResult; choose_activation(choice: Literal[\"restart\",\"reboot\"], identity: SetupIdentity, *, deps: SetupDeps, fs: SafeRootFS) -> ActivationResult. The reboot choice only persists pending; it never calls reboot. The restart choice invokes the fixed root systemctl unit for that UID only after separate UI consent."
+          sha256: 0e35986d38c04d886962f35a18c632f5f01bbe1b362a32ebbc8976bbc67e3bb5
+          authority:
+            - docs/superpowers/plans/2026-10-22-app-io-monitor-p3-daemon.md#task-9-prove-accounting-activation-and-require-an-explicit-session-choice
+      consumes:
+        - producer_task: T-007
+          interface_id: appio.p3.setup-boundary.v1
+          sha256: 78ad8015fa31b564319b76f30939044f23951ea8373cd02426d4af485e5cab14
+        - producer_task: T-008
+          interface_id: appio.p3.delegation.v1
+          sha256: 24a62364df90d7daa0af3da308ac701d1b618512755cde8562ee3bbb64b2f425
+        - producer_source: baseline.cgroups
+          interface_id: appio.baseline.cgroups.v1
+          sha256: 8422a57d72831af365592326beec2fecb39b33dee18212f539d77631ffc0bab6
+  - id: T-010
+    plan_task: 10
+    title: "Implement enable/disable, durable user exports and helper dispatch"
+    implementer_tier: Capable
+    implementer_tier_line: "**Implementer tier:** Capable"
+    lane: privilege
+    sequence: 3
+    depends_on: [T-006, T-007, T-008, T-009]
+    owns:
+      - src/appio/history_export.py
+      - src/appio/setup_service.py
+      - tests/p3/test_history_export.py
+      - tests/p3/test_setup_service.py
+    exclusive_resources: []
+    produces:
+      - id: appio.p3.service-export.v1
+        signature: "ExportResult(path: Path, boot_id: str | None, iod_epoch: int | None, seq: int | None, cutoff_mono_ns: int | None); export_history(identity: SetupIdentity, *, deps: SetupDeps, source: Path = Path(\"/var/lib/appio/iod.db\")) -> ExportResult. Only trusted production code selects the fixed source; argv cannot select it.; dispatch(invocation: Invocation, *, deps: SetupDeps) -> dict; main(argv: list[str] | None = None, *, deps: SetupDeps | None = None) -> int. Main prints one bounded version-1 JSON result to stdout, diagnostics to stderr and the actual nonzero exit on failure. The production shim supplies no dependency overrides.; result keys version, verb, uid, enabled, answering, pending_activation, state, export_path, export_cutoff, error; unavailable values are null. answering distinguishes the helper's root probe from an invoking GUI's successful verified connection; the UI always performs its own direct probe."
+        sha256: a12a6e94279ac6fb74e9743c8453a455a4a310b60c1ccba6fdab3c5d07405d1f
+        authority:
+          - docs/superpowers/plans/2026-10-22-app-io-monitor-p3-daemon.md#task-10-implement-enabledisable-durable-user-exports-and-helper-dispatch
+    consumes:
+      - producer_task: T-006
+        interface_id: appio.p3.daemon.v1
+        sha256: 047532657e53c3aef2e73e3f61d2bbbacc45b527c6300e1382e0208e6d30a730
+      - producer_task: T-007
+        interface_id: appio.p3.setup-boundary.v1
+        sha256: 78ad8015fa31b564319b76f30939044f23951ea8373cd02426d4af485e5cab14
+      - producer_task: T-008
+        interface_id: appio.p3.delegation.v1
+        sha256: 24a62364df90d7daa0af3da308ac701d1b618512755cde8562ee3bbb64b2f425
+      - producer_task: T-009
+        interface_id: appio.p3.activation.v1
+        sha256: 0e35986d38c04d886962f35a18c632f5f01bbe1b362a32ebbc8976bbc67e3bb5
+      - producer_source: baseline.durable
+        interface_id: appio.baseline.durable.v1
+        sha256: 1a66e00307b93ffc5b76df1b7962ad52f8903cb53564281081944a69a5bb6274
+      - producer_source: baseline.migrations
+        interface_id: appio.baseline.migrations.v1
+        sha256: 48d0d3430805e116012566f03973d1c7f0b489a48c0c37a16421043c540ea2c9
+      - producer_source: baseline.contracts
+        interface_id: appio.baseline.contracts.v1
+        sha256: a1e8f1389518a87295483233e50ada6167ad1fe51a18244b37a25793e75cb700
+    validation:
+      - argv: ["env", "PYTHONDONTWRITEBYTECODE=1", "QT_QPA_PLATFORM=offscreen", "PYTEST_QT_API=pyqt6", "python", "-m", "pytest", "-q", "tests/p3/test_history_export.py", "tests/p3/test_setup_service.py"]
+        cwd: lane
+        timeout_seconds: 300
+    interfaces:
+      produces:
+        - id: appio.p3.service-export.v1
+          signature: "ExportResult(path: Path, boot_id: str | None, iod_epoch: int | None, seq: int | None, cutoff_mono_ns: int | None); export_history(identity: SetupIdentity, *, deps: SetupDeps, source: Path = Path(\"/var/lib/appio/iod.db\")) -> ExportResult. Only trusted production code selects the fixed source; argv cannot select it.; dispatch(invocation: Invocation, *, deps: SetupDeps) -> dict; main(argv: list[str] | None = None, *, deps: SetupDeps | None = None) -> int. Main prints one bounded version-1 JSON result to stdout, diagnostics to stderr and the actual nonzero exit on failure. The production shim supplies no dependency overrides.; result keys version, verb, uid, enabled, answering, pending_activation, state, export_path, export_cutoff, error; unavailable values are null. answering distinguishes the helper's root probe from an invoking GUI's successful verified connection; the UI always performs its own direct probe."
+          sha256: a12a6e94279ac6fb74e9743c8453a455a4a310b60c1ccba6fdab3c5d07405d1f
+          authority:
+            - docs/superpowers/plans/2026-10-22-app-io-monitor-p3-daemon.md#task-10-implement-enabledisable-durable-user-exports-and-helper-dispatch
+      consumes:
+        - producer_task: T-006
+          interface_id: appio.p3.daemon.v1
+          sha256: 047532657e53c3aef2e73e3f61d2bbbacc45b527c6300e1382e0208e6d30a730
+        - producer_task: T-007
+          interface_id: appio.p3.setup-boundary.v1
+          sha256: 78ad8015fa31b564319b76f30939044f23951ea8373cd02426d4af485e5cab14
+        - producer_task: T-008
+          interface_id: appio.p3.delegation.v1
+          sha256: 24a62364df90d7daa0af3da308ac701d1b618512755cde8562ee3bbb64b2f425
+        - producer_task: T-009
+          interface_id: appio.p3.activation.v1
+          sha256: 0e35986d38c04d886962f35a18c632f5f01bbe1b362a32ebbc8976bbc67e3bb5
+        - producer_source: baseline.durable
+          interface_id: appio.baseline.durable.v1
+          sha256: 1a66e00307b93ffc5b76df1b7962ad52f8903cb53564281081944a69a5bb6274
+        - producer_source: baseline.migrations
+          interface_id: appio.baseline.migrations.v1
+          sha256: 48d0d3430805e116012566f03973d1c7f0b489a48c0c37a16421043c540ea2c9
+        - producer_source: baseline.contracts
+          interface_id: appio.baseline.contracts.v1
+          sha256: a1e8f1389518a87295483233e50ada6167ad1fe51a18244b37a25793e75cb700
+  - id: T-011
+    plan_task: 11
+    title: "Build a verified reconnecting read-through daemon client"
+    implementer_tier: Advanced
+    implementer_tier_line: "**Implementer tier:** Advanced"
+    lane: client
+    sequence: 1
+    depends_on: [T-001, T-002, T-003, T-004, T-006]
+    owns:
+      - src/appio/iodclient.py
+      - tests/p3/test_iodclient.py
+    exclusive_resources: []
+    produces:
+      - id: appio.p3.client.v1
+        signature: "CursorTracker() with accept(cursor: StreamCursor) -> bool, current: StreamCursor | None, begin_connection() -> None, accept_status(message: dict) -> None. Accepts only the root-verified status-advertised boot/epoch, and monotone seq within that generation; a new connection must re-establish authority before samples are accepted.; GapNotice(boot_id: str, iod_epoch: int, seq: int, from_mono_ns: int | None, to_mono_ns: int | None, reason: str); ClientState(verified: bool, answering: bool, cursor: StreamCursor | None, capabilities: Capabilities | None, pending_activation: bool | None, last_error: str | None).; IodClient(socket_path: Path, *, peer_reader: Callable, path_verifier: Callable, clock_ns: Callable[[],int], on_gap: Callable[[GapNotice],None], on_change: Callable[[],None]) with connect() -> None, pump() -> None, query(request: QueryRequest) -> concurrent.futures.Future[dict], close() -> None, state: ClientState. Transport is nonblocking, with injected connectors in tests; futures never block the Qt thread.; AppRegistry.id_for(app_key: str) -> int and AppRegistry.key_for(app_id: int) -> str, stable presentation IDs for local/remote AppKeys; bounded read-through result cache keyed by complete request and committed remote generation, not by local integer IDs."
+        sha256: 451f2883259b5333ae74a32f4c3bcb6e3720ce24f71699efc419455f9efe1ba0
+        authority:
+          - docs/superpowers/plans/2026-10-22-app-io-monitor-p3-daemon.md#task-11-build-a-verified-reconnecting-read-through-daemon-client
+    consumes:
+      - producer_task: T-001
+        interface_id: appio.p3.protocol.v1
+        sha256: b09027a79fb3678b432f83838f55561849ab575176702c1ee524cba4e3320f0d
+      - producer_task: T-002
+        interface_id: appio.p3.transport.v1
+        sha256: d18ab9acbaad00f9b26389fe38c82171393dfb3b4276bf0e6a796cc6814d0233
+      - producer_task: T-003
+        interface_id: appio.p3.history.v1
+        sha256: 85f28e0aa6708a075f6f5d1d8938392ac8f0fe49372937b0a454cf467d1c3060
+      - producer_task: T-004
+        interface_id: appio.p3.handover.v1
+        sha256: c0633252bb61622ff5e83248bcf59139901454d372095c3a9071989bb14663e7
+      - producer_task: T-006
+        interface_id: appio.p3.daemon.v1
+        sha256: 047532657e53c3aef2e73e3f61d2bbbacc45b527c6300e1382e0208e6d30a730
+      - producer_source: baseline.contracts
+        interface_id: appio.baseline.contracts.v1
+        sha256: a1e8f1389518a87295483233e50ada6167ad1fe51a18244b37a25793e75cb700
+      - producer_source: baseline.durable
+        interface_id: appio.baseline.durable.v1
+        sha256: 1a66e00307b93ffc5b76df1b7962ad52f8903cb53564281081944a69a5bb6274
+    validation:
+      - argv: ["env", "PYTHONDONTWRITEBYTECODE=1", "QT_QPA_PLATFORM=offscreen", "PYTEST_QT_API=pyqt6", "python", "-m", "pytest", "-q", "tests/p3/test_iodclient.py"]
+        cwd: lane
+        timeout_seconds: 300
+    interfaces:
+      produces:
+        - id: appio.p3.client.v1
+          signature: "CursorTracker() with accept(cursor: StreamCursor) -> bool, current: StreamCursor | None, begin_connection() -> None, accept_status(message: dict) -> None. Accepts only the root-verified status-advertised boot/epoch, and monotone seq within that generation; a new connection must re-establish authority before samples are accepted.; GapNotice(boot_id: str, iod_epoch: int, seq: int, from_mono_ns: int | None, to_mono_ns: int | None, reason: str); ClientState(verified: bool, answering: bool, cursor: StreamCursor | None, capabilities: Capabilities | None, pending_activation: bool | None, last_error: str | None).; IodClient(socket_path: Path, *, peer_reader: Callable, path_verifier: Callable, clock_ns: Callable[[],int], on_gap: Callable[[GapNotice],None], on_change: Callable[[],None]) with connect() -> None, pump() -> None, query(request: QueryRequest) -> concurrent.futures.Future[dict], close() -> None, state: ClientState. Transport is nonblocking, with injected connectors in tests; futures never block the Qt thread.; AppRegistry.id_for(app_key: str) -> int and AppRegistry.key_for(app_id: int) -> str, stable presentation IDs for local/remote AppKeys; bounded read-through result cache keyed by complete request and committed remote generation, not by local integer IDs."
+          sha256: 451f2883259b5333ae74a32f4c3bcb6e3720ce24f71699efc419455f9efe1ba0
+          authority:
+            - docs/superpowers/plans/2026-10-22-app-io-monitor-p3-daemon.md#task-11-build-a-verified-reconnecting-read-through-daemon-client
+      consumes:
+        - producer_task: T-001
+          interface_id: appio.p3.protocol.v1
+          sha256: b09027a79fb3678b432f83838f55561849ab575176702c1ee524cba4e3320f0d
+        - producer_task: T-002
+          interface_id: appio.p3.transport.v1
+          sha256: d18ab9acbaad00f9b26389fe38c82171393dfb3b4276bf0e6a796cc6814d0233
+        - producer_task: T-003
+          interface_id: appio.p3.history.v1
+          sha256: 85f28e0aa6708a075f6f5d1d8938392ac8f0fe49372937b0a454cf467d1c3060
+        - producer_task: T-004
+          interface_id: appio.p3.handover.v1
+          sha256: c0633252bb61622ff5e83248bcf59139901454d372095c3a9071989bb14663e7
+        - producer_task: T-006
+          interface_id: appio.p3.daemon.v1
+          sha256: 047532657e53c3aef2e73e3f61d2bbbacc45b527c6300e1382e0208e6d30a730
+        - producer_source: baseline.contracts
+          interface_id: appio.baseline.contracts.v1
+          sha256: a1e8f1389518a87295483233e50ada6167ad1fe51a18244b37a25793e75cb700
+        - producer_source: baseline.durable
+          interface_id: appio.baseline.durable.v1
+          sha256: 1a66e00307b93ffc5b76df1b7962ad52f8903cb53564281081944a69a5bb6274
+  - id: T-012
+    plan_task: 12
+    title: "Coordinate one collector and route history by proven ownership"
+    implementer_tier: Capable
+    implementer_tier_line: "**Implementer tier:** Capable"
+    lane: ownership
+    sequence: 3
+    depends_on: [T-004, T-005, T-010, T-011]
+    owns:
+      - src/appio/collector_owner.py
+      - src/appio/history_router.py
+      - tests/p3/test_collector_owner.py
+      - tests/p3/test_history_router.py
+    exclusive_resources: []
+    produces:
+      - id: appio.p3.ownership-router.v1
+        signature: "ServiceFacts(enabled: bool | None, active: Literal[\"absent\",\"inactive\",\"active\",\"unknown\"], daemon_verified: bool, answering: bool, pending_activation: bool | None); OwnerDecision(owner: Literal[\"gui\",\"iod\",\"unknown\"], may_collect_local: bool, state: str); decide_owner(facts: ServiceFacts) -> OwnerDecision.; GuiLease(path: Path) with acquire() -> bool, release() -> None, holding an exclusive flock on a per-UID runtime file through a pinned safe parent; lease failure yields a viewer, never a second writer.; CollectorCoordinator(*, local_factory: Callable[[],LiveCollector], client: IodClient, history: HistoryRouter, lease: GuiLease, clock: Callable[[],tuple[int,int]]) with reconcile(facts: ServiceFacts) -> OwnerDecision, tick_local() -> None, accept_export(result: ExportResult) -> None, close() -> None. Transitions are serialized on one owner thread; local construction is lazy.; HistorySegment(collector_id: str, owner: str, boot_id: str, start_ns: int, end_ns: int, proven: bool); HistoryRouter(local: QueryService, client: IodClient, registry: AppRegistry) with prepare(window: Window) -> None, ready(window: Window) -> bool, ranking(window: Window, metric: str) -> list[AppTotal], disk_share(app_id: int, window: Window) -> DiskShare, series(app_id: int, window: Window) -> Series, and view_state: str. The synchronous accessors read completed cached results; prepare schedules remote work and never blocks Qt."
+        sha256: 6e6ab2b6ef9d6bee37216eacf0b36a14bb317dede8a24347a3a91fbab961e5cb
+        authority:
+          - docs/superpowers/plans/2026-10-22-app-io-monitor-p3-daemon.md#task-12-coordinate-one-collector-and-route-history-by-proven-ownership
+    consumes:
+      - producer_task: T-004
+        interface_id: appio.p3.handover.v1
+        sha256: c0633252bb61622ff5e83248bcf59139901454d372095c3a9071989bb14663e7
+      - producer_task: T-005
+        interface_id: appio.p3.live-sources.v1
+        sha256: aa45785b4357b00141739acdba2c783e0fa90be076c6f6c4584137c428c6a25a
+      - producer_task: T-010
+        interface_id: appio.p3.service-export.v1
+        sha256: a12a6e94279ac6fb74e9743c8453a455a4a310b60c1ccba6fdab3c5d07405d1f
+      - producer_task: T-011
+        interface_id: appio.p3.client.v1
+        sha256: 451f2883259b5333ae74a32f4c3bcb6e3720ce24f71699efc419455f9efe1ba0
+      - producer_source: baseline.contracts
+        interface_id: appio.baseline.contracts.v1
+        sha256: a1e8f1389518a87295483233e50ada6167ad1fe51a18244b37a25793e75cb700
+      - producer_source: baseline.query
+        interface_id: appio.baseline.query.v1
+        sha256: fe11bd2c423afa9fd841bab4745d4e4b57250962087c3185f9a7dc4693b07968
+      - producer_source: baseline.ownership
+        interface_id: appio.baseline.ownership.v1
+        sha256: 4af2acd0ef57d8e1e54035caf1f9f38a84edcfa4722f7107428eb0f7a0401c3c
+      - producer_source: baseline.durable
+        interface_id: appio.baseline.durable.v1
+        sha256: 1a66e00307b93ffc5b76df1b7962ad52f8903cb53564281081944a69a5bb6274
+    validation:
+      - argv: ["env", "PYTHONDONTWRITEBYTECODE=1", "QT_QPA_PLATFORM=offscreen", "PYTEST_QT_API=pyqt6", "python", "-m", "pytest", "-q", "tests/p3/test_collector_owner.py", "tests/p3/test_history_router.py"]
+        cwd: lane
+        timeout_seconds: 300
+    interfaces:
+      produces:
+        - id: appio.p3.ownership-router.v1
+          signature: "ServiceFacts(enabled: bool | None, active: Literal[\"absent\",\"inactive\",\"active\",\"unknown\"], daemon_verified: bool, answering: bool, pending_activation: bool | None); OwnerDecision(owner: Literal[\"gui\",\"iod\",\"unknown\"], may_collect_local: bool, state: str); decide_owner(facts: ServiceFacts) -> OwnerDecision.; GuiLease(path: Path) with acquire() -> bool, release() -> None, holding an exclusive flock on a per-UID runtime file through a pinned safe parent; lease failure yields a viewer, never a second writer.; CollectorCoordinator(*, local_factory: Callable[[],LiveCollector], client: IodClient, history: HistoryRouter, lease: GuiLease, clock: Callable[[],tuple[int,int]]) with reconcile(facts: ServiceFacts) -> OwnerDecision, tick_local() -> None, accept_export(result: ExportResult) -> None, close() -> None. Transitions are serialized on one owner thread; local construction is lazy.; HistorySegment(collector_id: str, owner: str, boot_id: str, start_ns: int, end_ns: int, proven: bool); HistoryRouter(local: QueryService, client: IodClient, registry: AppRegistry) with prepare(window: Window) -> None, ready(window: Window) -> bool, ranking(window: Window, metric: str) -> list[AppTotal], disk_share(app_id: int, window: Window) -> DiskShare, series(app_id: int, window: Window) -> Series, and view_state: str. The synchronous accessors read completed cached results; prepare schedules remote work and never blocks Qt."
+          sha256: 6e6ab2b6ef9d6bee37216eacf0b36a14bb317dede8a24347a3a91fbab961e5cb
+          authority:
+            - docs/superpowers/plans/2026-10-22-app-io-monitor-p3-daemon.md#task-12-coordinate-one-collector-and-route-history-by-proven-ownership
+      consumes:
+        - producer_task: T-004
+          interface_id: appio.p3.handover.v1
+          sha256: c0633252bb61622ff5e83248bcf59139901454d372095c3a9071989bb14663e7
+        - producer_task: T-005
+          interface_id: appio.p3.live-sources.v1
+          sha256: aa45785b4357b00141739acdba2c783e0fa90be076c6f6c4584137c428c6a25a
+        - producer_task: T-010
+          interface_id: appio.p3.service-export.v1
+          sha256: a12a6e94279ac6fb74e9743c8453a455a4a310b60c1ccba6fdab3c5d07405d1f
+        - producer_task: T-011
+          interface_id: appio.p3.client.v1
+          sha256: 451f2883259b5333ae74a32f4c3bcb6e3720ce24f71699efc419455f9efe1ba0
+        - producer_source: baseline.contracts
+          interface_id: appio.baseline.contracts.v1
+          sha256: a1e8f1389518a87295483233e50ada6167ad1fe51a18244b37a25793e75cb700
+        - producer_source: baseline.query
+          interface_id: appio.baseline.query.v1
+          sha256: fe11bd2c423afa9fd841bab4745d4e4b57250962087c3185f9a7dc4693b07968
+        - producer_source: baseline.ownership
+          interface_id: appio.baseline.ownership.v1
+          sha256: 4af2acd0ef57d8e1e54035caf1f9f38a84edcfa4722f7107428eb0f7a0401c3c
+        - producer_source: baseline.durable
+          interface_id: appio.baseline.durable.v1
+          sha256: 1a66e00307b93ffc5b76df1b7962ad52f8903cb53564281081944a69a5bb6274
+  - id: T-013
+    plan_task: 13
+    title: "Add the single settings switch, consent and status deep links"
+    implementer_tier: Advanced
+    implementer_tier_line: "**Implementer tier:** Advanced"
+    lane: gui
+    sequence: 1
+    depends_on: [T-007, T-009, T-010, T-012]
+    owns:
+      - src/appio/setup_client.py
+      - src/appio/ui/collector_window.py
+      - src/appio/__main__.py
+      - tests/p3/test_setup_client.py
+      - tests/p3/test_collector_window.py
+      - tests/p3/test_p3_entry.py
+    exclusive_resources: []
+    produces:
+      - id: appio.p3.gui.v1
+        signature: "SetupReply(exit_code: int, stderr_first_line: str, body: dict | None); SetupClient(*, launch: Callable[[tuple[str,...]], Future[CommandResult]], probe: Callable[[],ServiceFacts]) with invoke(verb: str) -> Future[SetupReply], refresh() -> ServiceFacts. Only explicit consent handlers call invoke; periodic refresh uses unprivileged service/socket checks, not repeated pkexec authentication.; CollectorWindow(coordinator: CollectorCoordinator, history: HistoryRouter, setup: SetupClient) with open_settings(*, focus: str = \"system_services\") -> None, open_files_unavailable() -> None, refresh() -> None; exactly one checkable System services (root) control, located in Settings.; run_legacy_once(args: argparse.Namespace) -> int in __main__.py, extracting only the existing collector construction/tick/finally-close branch; run_interactive(args: argparse.Namespace) -> int in the new P3 window module. Interactive code must branch before constructing any local collector; the coordinator's lazy factory owns that decision.; a P3 interactive launcher using asynchronous helper/client work and Qt queued signals, leaving appio --once and direct AppIoWindow construction in the P1/P2 execution boundary. --offscreen is still applied before Qt construction."
+        sha256: bbe111b22fce3877da2ee297689931723ecaa9960a68000bb0258a35e56675ed
+        authority:
+          - docs/superpowers/plans/2026-10-22-app-io-monitor-p3-daemon.md#task-13-add-the-single-settings-switch-consent-and-status-deep-links
+    consumes:
+      - producer_task: T-007
+        interface_id: appio.p3.setup-boundary.v1
+        sha256: 78ad8015fa31b564319b76f30939044f23951ea8373cd02426d4af485e5cab14
+      - producer_task: T-009
+        interface_id: appio.p3.activation.v1
+        sha256: 0e35986d38c04d886962f35a18c632f5f01bbe1b362a32ebbc8976bbc67e3bb5
+      - producer_task: T-010
+        interface_id: appio.p3.service-export.v1
+        sha256: a12a6e94279ac6fb74e9743c8453a455a4a310b60c1ccba6fdab3c5d07405d1f
+      - producer_task: T-012
+        interface_id: appio.p3.ownership-router.v1
+        sha256: 6e6ab2b6ef9d6bee37216eacf0b36a14bb317dede8a24347a3a91fbab961e5cb
+      - producer_source: baseline.p2-window
+        interface_id: appio.baseline.p2-window.v1
+        sha256: cfce09b2c4bb48a2cdab0e6d25f6a81ccbc8dc9a5de3d16e5a72b3aa46f5bc96
+    validation:
+      - argv: ["env", "PYTHONDONTWRITEBYTECODE=1", "QT_QPA_PLATFORM=offscreen", "PYTEST_QT_API=pyqt6", "python", "-m", "pytest", "-q", "tests/p3/test_setup_client.py", "tests/p3/test_collector_window.py", "tests/p3/test_p3_entry.py"]
+        cwd: lane
+        timeout_seconds: 300
+      - argv: ["env", "PYTHONDONTWRITEBYTECODE=1", "QT_QPA_PLATFORM=offscreen", "PYTEST_QT_API=pyqt6", "python", "-m", "pytest", "-q", "tests/test_ui.py", "tests/test_live.py", "tests/acceptance/test_no_later_scope.py"]
+        cwd: lane
+        timeout_seconds: 300
+    interfaces:
+      produces:
+        - id: appio.p3.gui.v1
+          signature: "SetupReply(exit_code: int, stderr_first_line: str, body: dict | None); SetupClient(*, launch: Callable[[tuple[str,...]], Future[CommandResult]], probe: Callable[[],ServiceFacts]) with invoke(verb: str) -> Future[SetupReply], refresh() -> ServiceFacts. Only explicit consent handlers call invoke; periodic refresh uses unprivileged service/socket checks, not repeated pkexec authentication.; CollectorWindow(coordinator: CollectorCoordinator, history: HistoryRouter, setup: SetupClient) with open_settings(*, focus: str = \"system_services\") -> None, open_files_unavailable() -> None, refresh() -> None; exactly one checkable System services (root) control, located in Settings.; run_legacy_once(args: argparse.Namespace) -> int in __main__.py, extracting only the existing collector construction/tick/finally-close branch; run_interactive(args: argparse.Namespace) -> int in the new P3 window module. Interactive code must branch before constructing any local collector; the coordinator's lazy factory owns that decision.; a P3 interactive launcher using asynchronous helper/client work and Qt queued signals, leaving appio --once and direct AppIoWindow construction in the P1/P2 execution boundary. --offscreen is still applied before Qt construction."
+          sha256: bbe111b22fce3877da2ee297689931723ecaa9960a68000bb0258a35e56675ed
+          authority:
+            - docs/superpowers/plans/2026-10-22-app-io-monitor-p3-daemon.md#task-13-add-the-single-settings-switch-consent-and-status-deep-links
+      consumes:
+        - producer_task: T-007
+          interface_id: appio.p3.setup-boundary.v1
+          sha256: 78ad8015fa31b564319b76f30939044f23951ea8373cd02426d4af485e5cab14
+        - producer_task: T-009
+          interface_id: appio.p3.activation.v1
+          sha256: 0e35986d38c04d886962f35a18c632f5f01bbe1b362a32ebbc8976bbc67e3bb5
+        - producer_task: T-010
+          interface_id: appio.p3.service-export.v1
+          sha256: a12a6e94279ac6fb74e9743c8453a455a4a310b60c1ccba6fdab3c5d07405d1f
+        - producer_task: T-012
+          interface_id: appio.p3.ownership-router.v1
+          sha256: 6e6ab2b6ef9d6bee37216eacf0b36a14bb317dede8a24347a3a91fbab961e5cb
+        - producer_source: baseline.p2-window
+          interface_id: appio.baseline.p2-window.v1
+          sha256: cfce09b2c4bb48a2cdab0e6d25f6a81ccbc8dc9a5de3d16e5a72b3aa46f5bc96
+  - id: T-014
+    plan_task: 14
+    title: "Verify the P3 round trip and document separate privileged acceptance"
+    implementer_tier: Advanced
+    implementer_tier_line: "**Implementer tier:** Advanced"
+    lane: acceptance
+    sequence: 1
+    depends_on: [T-001, T-002, T-003, T-004, T-005, T-006, T-007, T-008, T-009, T-010, T-011, T-012, T-013]
+    owns:
+      - tests/p3/acceptance_harness.py
+      - tests/p3/test_p3_acceptance.py
+      - tests/p3/test_p3_adversarial.py
+      - docs/acceptance/appio-p3-root.md
+      - tools/acceptance/appio-p3-root.py
+    exclusive_resources: []
+    produces:
+      - id: appio.p3.acceptance.v1
+        signature: "test-only P3Harness(root: Path) context manager with enable() -> None, advance(seconds: int) -> None, open_gui() -> None, close_gui() -> None, disable_and_export() -> ExportResult, daemon_rows() -> tuple, export_rows(path: Path) -> tuple, query(window: Window) -> object, and commands: list[tuple[str,...]]. It composes real production service/store/protocol/client/coordinator code, fixture proc/cgroup data, actual unprivileged AF_UNIX transports, virtual time and injected credentials/filesystem metadata/command runner. All simulated privilege/session side effects are recorded rather than executed.; an optional root acceptance script outside pytest discovery; dry-run by default. Real execution requires --run; destructive user-manager testing additionally requires --allow-session-termination. These flags belong to the acceptance script only and are not helper options."
+        sha256: 3ed0f7859f2a14e9eb9baef3e8a595568ac41922ea0f4addd8c88a6eaba59de4
+        authority:
+          - docs/superpowers/plans/2026-10-22-app-io-monitor-p3-daemon.md#task-14-verify-the-p3-round-trip-and-document-separate-privileged-acceptance
+    consumes:
+      - producer_task: T-001
+        interface_id: appio.p3.protocol.v1
+        sha256: b09027a79fb3678b432f83838f55561849ab575176702c1ee524cba4e3320f0d
+      - producer_task: T-002
+        interface_id: appio.p3.transport.v1
+        sha256: d18ab9acbaad00f9b26389fe38c82171393dfb3b4276bf0e6a796cc6814d0233
+      - producer_task: T-003
+        interface_id: appio.p3.history.v1
+        sha256: 85f28e0aa6708a075f6f5d1d8938392ac8f0fe49372937b0a454cf467d1c3060
+      - producer_task: T-004
+        interface_id: appio.p3.handover.v1
+        sha256: c0633252bb61622ff5e83248bcf59139901454d372095c3a9071989bb14663e7
+      - producer_task: T-005
+        interface_id: appio.p3.live-sources.v1
+        sha256: aa45785b4357b00141739acdba2c783e0fa90be076c6f6c4584137c428c6a25a
+      - producer_task: T-006
+        interface_id: appio.p3.daemon.v1
+        sha256: 047532657e53c3aef2e73e3f61d2bbbacc45b527c6300e1382e0208e6d30a730
+      - producer_task: T-007
+        interface_id: appio.p3.setup-boundary.v1
+        sha256: 78ad8015fa31b564319b76f30939044f23951ea8373cd02426d4af485e5cab14
+      - producer_task: T-008
+        interface_id: appio.p3.delegation.v1
+        sha256: 24a62364df90d7daa0af3da308ac701d1b618512755cde8562ee3bbb64b2f425
+      - producer_task: T-009
+        interface_id: appio.p3.activation.v1
+        sha256: 0e35986d38c04d886962f35a18c632f5f01bbe1b362a32ebbc8976bbc67e3bb5
+      - producer_task: T-010
+        interface_id: appio.p3.service-export.v1
+        sha256: a12a6e94279ac6fb74e9743c8453a455a4a310b60c1ccba6fdab3c5d07405d1f
+      - producer_task: T-011
+        interface_id: appio.p3.client.v1
+        sha256: 451f2883259b5333ae74a32f4c3bcb6e3720ce24f71699efc419455f9efe1ba0
+      - producer_task: T-012
+        interface_id: appio.p3.ownership-router.v1
+        sha256: 6e6ab2b6ef9d6bee37216eacf0b36a14bb317dede8a24347a3a91fbab961e5cb
+      - producer_task: T-013
+        interface_id: appio.p3.gui.v1
+        sha256: bbe111b22fce3877da2ee297689931723ecaa9960a68000bb0258a35e56675ed
+      - producer_source: baseline.contracts
+        interface_id: appio.baseline.contracts.v1
+        sha256: a1e8f1389518a87295483233e50ada6167ad1fe51a18244b37a25793e75cb700
+      - producer_source: baseline.store
+        interface_id: appio.baseline.store.v1
+        sha256: 4774682bf85ef052e6e8d5f4308eaee8f531795e76ff36fb0c0ae4cee96a74ce
+      - producer_source: baseline.migrations
+        interface_id: appio.baseline.migrations.v1
+        sha256: 48d0d3430805e116012566f03973d1c7f0b489a48c0c37a16421043c540ea2c9
+    validation:
+      - argv: ["env", "PYTHONDONTWRITEBYTECODE=1", "QT_QPA_PLATFORM=offscreen", "PYTEST_QT_API=pyqt6", "python", "-m", "pytest", "-q", "tests/p3/test_p3_acceptance.py", "tests/p3/test_p3_adversarial.py"]
+        cwd: lane
+        timeout_seconds: 300
+      - argv: ["env", "PYTHONDONTWRITEBYTECODE=1", "QT_QPA_PLATFORM=offscreen", "PYTEST_QT_API=pyqt6", "python", "-m", "pytest", "-q"]
+        cwd: lane
+        timeout_seconds: 600
+      - argv: ["python", "tools/acceptance/appio-p3-root.py"]
+        cwd: lane
+        timeout_seconds: 300
+    interfaces:
+      produces:
+        - id: appio.p3.acceptance.v1
+          signature: "test-only P3Harness(root: Path) context manager with enable() -> None, advance(seconds: int) -> None, open_gui() -> None, close_gui() -> None, disable_and_export() -> ExportResult, daemon_rows() -> tuple, export_rows(path: Path) -> tuple, query(window: Window) -> object, and commands: list[tuple[str,...]]. It composes real production service/store/protocol/client/coordinator code, fixture proc/cgroup data, actual unprivileged AF_UNIX transports, virtual time and injected credentials/filesystem metadata/command runner. All simulated privilege/session side effects are recorded rather than executed.; an optional root acceptance script outside pytest discovery; dry-run by default. Real execution requires --run; destructive user-manager testing additionally requires --allow-session-termination. These flags belong to the acceptance script only and are not helper options."
+          sha256: 3ed0f7859f2a14e9eb9baef3e8a595568ac41922ea0f4addd8c88a6eaba59de4
+          authority:
+            - docs/superpowers/plans/2026-10-22-app-io-monitor-p3-daemon.md#task-14-verify-the-p3-round-trip-and-document-separate-privileged-acceptance
+      consumes:
+        - producer_task: T-001
+          interface_id: appio.p3.protocol.v1
+          sha256: b09027a79fb3678b432f83838f55561849ab575176702c1ee524cba4e3320f0d
+        - producer_task: T-002
+          interface_id: appio.p3.transport.v1
+          sha256: d18ab9acbaad00f9b26389fe38c82171393dfb3b4276bf0e6a796cc6814d0233
+        - producer_task: T-003
+          interface_id: appio.p3.history.v1
+          sha256: 85f28e0aa6708a075f6f5d1d8938392ac8f0fe49372937b0a454cf467d1c3060
+        - producer_task: T-004
+          interface_id: appio.p3.handover.v1
+          sha256: c0633252bb61622ff5e83248bcf59139901454d372095c3a9071989bb14663e7
+        - producer_task: T-005
+          interface_id: appio.p3.live-sources.v1
+          sha256: aa45785b4357b00141739acdba2c783e0fa90be076c6f6c4584137c428c6a25a
+        - producer_task: T-006
+          interface_id: appio.p3.daemon.v1
+          sha256: 047532657e53c3aef2e73e3f61d2bbbacc45b527c6300e1382e0208e6d30a730
+        - producer_task: T-007
+          interface_id: appio.p3.setup-boundary.v1
+          sha256: 78ad8015fa31b564319b76f30939044f23951ea8373cd02426d4af485e5cab14
+        - producer_task: T-008
+          interface_id: appio.p3.delegation.v1
+          sha256: 24a62364df90d7daa0af3da308ac701d1b618512755cde8562ee3bbb64b2f425
+        - producer_task: T-009
+          interface_id: appio.p3.activation.v1
+          sha256: 0e35986d38c04d886962f35a18c632f5f01bbe1b362a32ebbc8976bbc67e3bb5
+        - producer_task: T-010
+          interface_id: appio.p3.service-export.v1
+          sha256: a12a6e94279ac6fb74e9743c8453a455a4a310b60c1ccba6fdab3c5d07405d1f
+        - producer_task: T-011
+          interface_id: appio.p3.client.v1
+          sha256: 451f2883259b5333ae74a32f4c3bcb6e3720ce24f71699efc419455f9efe1ba0
+        - producer_task: T-012
+          interface_id: appio.p3.ownership-router.v1
+          sha256: 6e6ab2b6ef9d6bee37216eacf0b36a14bb317dede8a24347a3a91fbab961e5cb
+        - producer_task: T-013
+          interface_id: appio.p3.gui.v1
+          sha256: bbe111b22fce3877da2ee297689931723ecaa9960a68000bb0258a35e56675ed
+        - producer_source: baseline.contracts
+          interface_id: appio.baseline.contracts.v1
+          sha256: a1e8f1389518a87295483233e50ada6167ad1fe51a18244b37a25793e75cb700
+        - producer_source: baseline.store
+          interface_id: appio.baseline.store.v1
+          sha256: 4774682bf85ef052e6e8d5f4308eaee8f531795e76ff36fb0c0ae4cee96a74ce
+        - producer_source: baseline.migrations
+          interface_id: appio.baseline.migrations.v1
+          sha256: 48d0d3430805e116012566f03973d1c7f0b489a48c0c37a16421043c540ea2c9
+lanes:
+  - id: protocol
+    task_ids: [T-001]
+  - id: transport
+    task_ids: [T-002]
+  - id: history
+    task_ids: [T-003]
+  - id: ownership
+    task_ids: [T-004, T-005, T-012]
+  - id: daemon
+    task_ids: [T-006]
+  - id: privilege
+    task_ids: [T-007, T-008, T-010]
+  - id: activation
+    task_ids: [T-009]
+  - id: client
+    task_ids: [T-011]
+  - id: gui
+    task_ids: [T-013]
+  - id: acceptance
+    task_ids: [T-014]

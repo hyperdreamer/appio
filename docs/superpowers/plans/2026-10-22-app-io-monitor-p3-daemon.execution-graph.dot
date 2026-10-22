@@ -1,0 +1,89 @@
+// Generated from execution-graph.yaml plus the pinned plan; inspection only.
+digraph appio_p3_daemon {
+  rankdir=LR;
+  node [shape=box];
+  subgraph cluster_protocol {
+    label="protocol";
+    "T-001" [label="Task 1: Define protocol-1 framing and typed read-only messages\nAdvanced"];
+  }
+  subgraph cluster_transport {
+    label="transport";
+    "T-002" [label="Task 2: Verify Unix peers and bound slow-client queues\nAdvanced"];
+  }
+  subgraph cluster_history {
+    label="history";
+    "T-003" [label="Task 3: Serve bounded historical queries without changing query semantics\nCapable"];
+  }
+  subgraph cluster_ownership {
+    label="ownership";
+    "T-004" [label="Task 4: Persist atomic handover baselines and exclusive ownership\nCapable"];
+    "T-005" [label="Task 5: Extend the existing collector for daemon and handover starts\nAdvanced"];
+    "T-012" [label="Task 12: Coordinate one collector and route history by proven ownership\nCapable"];
+  }
+  subgraph cluster_daemon {
+    label="daemon";
+    "T-006" [label="Task 6: Run the root daemon with durable history and a fair socket loop\nCapable"];
+  }
+  subgraph cluster_privilege {
+    label="privilege";
+    "T-007" [label="Task 7: Constrain the polkit helper entry boundary\nAdvanced"];
+    "T-008" [label="Task 8: Install delegation and pending state with safe atomic writes\nAdvanced"];
+    "T-010" [label="Task 10: Implement enable/disable, durable user exports and helper dispatch\nCapable"];
+  }
+  subgraph cluster_activation {
+    label="activation";
+    "T-009" [label="Task 9: Prove accounting activation and require an explicit session choice\nAdvanced"];
+  }
+  subgraph cluster_client {
+    label="client";
+    "T-011" [label="Task 11: Build a verified reconnecting read-through daemon client\nAdvanced"];
+  }
+  subgraph cluster_gui {
+    label="gui";
+    "T-013" [label="Task 13: Add the single settings switch, consent and status deep links\nAdvanced"];
+  }
+  subgraph cluster_acceptance {
+    label="acceptance";
+    "T-014" [label="Task 14: Verify the P3 round trip and document separate privileged acceptance\nAdvanced"];
+  }
+  "T-001" -> "T-002";
+  "T-001" -> "T-003";
+  "T-004" -> "T-005";
+  "T-001" -> "T-006";
+  "T-002" -> "T-006";
+  "T-003" -> "T-006";
+  "T-005" -> "T-006";
+  "T-007" -> "T-008";
+  "T-007" -> "T-009";
+  "T-008" -> "T-009";
+  "T-006" -> "T-010";
+  "T-007" -> "T-010";
+  "T-008" -> "T-010";
+  "T-009" -> "T-010";
+  "T-001" -> "T-011";
+  "T-002" -> "T-011";
+  "T-003" -> "T-011";
+  "T-004" -> "T-011";
+  "T-006" -> "T-011";
+  "T-004" -> "T-012";
+  "T-005" -> "T-012";
+  "T-010" -> "T-012";
+  "T-011" -> "T-012";
+  "T-007" -> "T-013";
+  "T-009" -> "T-013";
+  "T-010" -> "T-013";
+  "T-012" -> "T-013";
+  "T-001" -> "T-014";
+  "T-002" -> "T-014";
+  "T-003" -> "T-014";
+  "T-004" -> "T-014";
+  "T-005" -> "T-014";
+  "T-006" -> "T-014";
+  "T-007" -> "T-014";
+  "T-008" -> "T-014";
+  "T-009" -> "T-014";
+  "T-010" -> "T-014";
+  "T-011" -> "T-014";
+  "T-012" -> "T-014";
+  "T-013" -> "T-014";
+}
