@@ -372,7 +372,9 @@ class AppIoWindow(QMainWindow):
             f"Residual: {UNAVAILABLE} - {RESIDUAL_NOTE}"
         )
         self._coverage_label.setText("coverage: unavailable")
-        self._detail_state.setText("window: since boot; no applications observed")
+        self._detail_state.setText(
+            f"window: {self._active_window.kind}; no applications observed"
+        )
 
 
 __all__ = ["AppIoWindow", "QueryService"]

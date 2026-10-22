@@ -318,6 +318,24 @@ def test_peak_none_is_unavailable_and_measured_zero_is_zero(qtbot) -> None:
     assert format_peak(0) == "0 B/s"
 
 
+def test_empty_supported_range_labels_the_active_window(qtbot) -> None:
+    window, _ = build(qtbot, [])
+    assert "window: since_boot" in label(window, "detail_state").text()
+
+    window.set_window(
+        Window(
+            kind="range",
+            boot_id=BOOT,
+            start_mono_ns=0,
+            end_mono_ns=MAX_RANGE_NS,
+        )
+    )
+
+    detail = label(window, "detail_state").text()
+    assert detail.startswith("window: range")
+    assert "since boot" not in detail
+
+
 # --------------------------------------------------------------------------
 # 5. Disabled launch and over-365-day ranges carry the exact A22 text.
 # --------------------------------------------------------------------------
