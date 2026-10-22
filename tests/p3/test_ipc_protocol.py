@@ -291,6 +291,34 @@ def test_request_id_at_64_bytes_is_accepted():
     assert validate_request(status_message(request_id="x" * 64)).request_id == "x" * 64
 
 
+def test_request_id_with_a_lone_surrogate_is_a_typed_rejection():
+    # ``json.loads`` accepts the \ud800 escape, so a hostile frame can carry a
+    # string that has no UTF-8 encoding. That must be a ProtocolError like every
+    # other malformed field, not an escaped UnicodeEncodeError.
+    payload = b'{"protocol":1,"type":"status","request_id":"\\ud800"}'
+    (decoded,) = FrameDecoder().feed(struct.pack("!I", len(payload)) + payload)
+    error = protocol_error_of(lambda: validate_request(decoded))
+    assert error.reason == "invalid_request_id"
+
+
+def test_cursor_boot_id_with_a_lone_surrogate_is_a_typed_rejection():
+    error = protocol_error_of(
+        lambda: validate_request(
+            subscribe_message(since={"boot_id": "\ud800", "iod_epoch": 1, "seq": 1})
+        )
+    )
+    assert error.reason == "invalid_field"
+
+
+def test_search_with_a_lone_surrogate_is_a_typed_rejection():
+    error = protocol_error_of(
+        lambda: validate_request(
+            query_message(kind="files", app_key="exe:/x", search="\ud800")
+        )
+    )
+    assert error.reason == "invalid_field"
+
+
 @pytest.mark.parametrize(
     "protocol",
     [2, 0, "1", 1.0, True, None],

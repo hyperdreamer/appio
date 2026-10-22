@@ -171,6 +171,23 @@ def _text(value: object, field_name: str) -> str:
     return value
 
 
+def _utf8_len(text: str, field_name: str) -> int:
+    """Return the UTF-8 length, rejecting text that has no UTF-8 encoding.
+
+    ``json.loads`` accepts a lone-surrogate escape such as ``"\\ud800"`` and
+    produces a ``str`` that cannot be encoded. A hostile frame must still leave
+    through the typed rejection path, so the encoding error is converted here
+    instead of escaping as an unhandled exception.
+    """
+
+    try:
+        return len(text.encode("utf-8"))
+    except UnicodeEncodeError as exc:
+        raise ProtocolError(
+            "invalid_field", f"{field_name} is not valid Unicode text"
+        ) from exc
+
+
 def _bounded_text(
     value: object, field_name: str, max_bytes: int, *, allow_empty: bool = False
 ) -> str:
@@ -179,8 +196,7 @@ def _bounded_text(
         raise ProtocolError("invalid_field", f"{field_name} must be non-empty")
     if "\x00" in text:
         raise ProtocolError("invalid_field", f"{field_name} must not contain NUL")
-    encoded = text.encode("utf-8")
-    if len(encoded) > max_bytes:
+    if _utf8_len(text, field_name) > max_bytes:
         raise ProtocolError(
             "invalid_field", f"{field_name} exceeds {max_bytes} UTF-8 bytes"
         )
@@ -421,7 +437,7 @@ def _search(value: object) -> str | None:
         raise ProtocolError("invalid_field", str(exc)) from exc
     if search is None or search == "":
         return search
-    if len(search.encode("utf-8")) > _MAX_SEARCH_BYTES:
+    if _utf8_len(search, "query.search") > _MAX_SEARCH_BYTES:
         raise ProtocolError(
             "invalid_field", f"search exceeds {_MAX_SEARCH_BYTES} UTF-8 bytes"
         )
