@@ -1,0 +1,252 @@
+#!/usr/bin/python -I
+"""The one fixed polkit entry point for ``appio-setup``.
+
+polkit executes exactly this file, bound by
+``org.freedesktop.policykit.exec.path=/usr/bin/appio-setup``. This shim is
+deliberately stdlib-only and must stay that way: importing the ``appio`` package
+before its module closure has been verified would execute whatever code happens
+to be importable, which is the loader threat this boundary exists to close.
+
+Order matters and is the security property:
+
+1. reject anything but exactly one known verb (exit 2, before any filesystem or
+   account access);
+2. require effective UID 0;
+3. derive the beneficiary from ``PKEXEC_UID`` and refuse root or a malformed UID;
+4. drop unsafe import roots, resolve the installed ``appio`` package *without
+   executing it*, and verify that the interpreter and every module file, plus
+   every ancestor directory, is root-owned and not group/other writable;
+5. only then import ``appio.setup_service`` and dispatch.
+
+There are no options, no test mode and no environment variable that widens the
+verb set, the identity source or the verified paths.
+"""
+
+import importlib.util
+import os
+import re
+import stat
+import sys
+
+VERBS = frozenset(
+    {
+        "install-delegation",
+        "enable",
+        "disable",
+        "status",
+        "restart-user-manager",
+        "export-history",
+    }
+)
+
+_MAX_UID = 2**32 - 2
+_MAX_PATH_BYTES = 4096
+_CANONICAL_UID = re.compile(r"(?:0|[1-9][0-9]{0,9})", re.ASCII)
+_WRITABLE_BITS = 0o022
+_USAGE = (
+    "usage: appio-setup <install-delegation|enable|disable|status|"
+    "restart-user-manager|export-history>"
+)
+
+
+def _fail(exit_code, message, quiet=False):
+    if not quiet:
+        sys.stderr.write("appio-setup: " + message + "\n")
+    raise SystemExit(exit_code)
+
+
+def _parse_caller_uid(environ):
+    raw = environ.get("PKEXEC_UID")
+    if raw is None:
+        _fail(1, "missing PKEXEC_UID; run this helper through pkexec")
+    if not isinstance(raw, str) or not _CANONICAL_UID.fullmatch(raw):
+        _fail(1, "invalid PKEXEC_UID")
+    uid = int(raw)
+    if uid < 1 or uid > _MAX_UID:
+        _fail(1, "invalid PKEXEC_UID")
+    if uid == 0:
+        _fail(1, "refusing to run for the root account")
+    return uid
+
+
+def _open_no_follow(path, *, directory, dir_fd=None, quiet=False):
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
+    if directory:
+        flags |= os.O_DIRECTORY
+    try:
+        return os.open(path, flags, dir_fd=dir_fd)
+    except OSError as exc:
+        _fail(
+            1,
+            "untrusted runtime: cannot open " + str(path) + ": " + str(exc.strerror),
+            quiet,
+        )
+
+
+def _require_trusted(descriptor, label, caller_uid, quiet=False):
+    info = os.fstat(descriptor)
+    if (
+        info.st_uid != 0
+        or info.st_uid == caller_uid
+        or (stat.S_IMODE(info.st_mode) & _WRITABLE_BITS)
+    ):
+        _fail(
+            1,
+            "untrusted runtime: " + str(label) + " is not root-owned and non-writable",
+            quiet,
+        )
+
+
+def _open_verified_directory(path, caller_uid, quiet=False):
+    """Open every component below ``/`` with O_NOFOLLOW and verify each one."""
+
+    if (
+        not isinstance(path, str)
+        or not path.startswith("/")
+        or path.startswith("//")
+        or len(path.encode("utf-8")) > _MAX_PATH_BYTES
+    ):
+        _fail(1, "untrusted runtime: invalid directory " + str(path), quiet)
+    parts = [part for part in path.split("/") if part not in ("", ".")]
+    if any(part == ".." for part in parts):
+        _fail(1, "untrusted runtime: non-normalized directory " + path, quiet)
+    descriptor = _open_no_follow("/", directory=True, quiet=quiet)
+    try:
+        _require_trusted(descriptor, "/", caller_uid, quiet)
+        for part in parts:
+            child = _open_no_follow(part, directory=True, dir_fd=descriptor, quiet=quiet)
+            os.close(descriptor)
+            descriptor = child
+            _require_trusted(descriptor, part, caller_uid, quiet)
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _verify_runtime_path(path, caller_uid, quiet=False):
+    parent, name = os.path.split(path)
+    if name in ("", ".", ".."):
+        _fail(1, "untrusted runtime: invalid path " + str(path), quiet)
+    directory = _open_verified_directory(parent, caller_uid, quiet)
+    try:
+        descriptor = _open_no_follow(name, directory=False, dir_fd=directory, quiet=quiet)
+        try:
+            info = os.fstat(descriptor)
+            if not (stat.S_ISREG(info.st_mode) or stat.S_ISDIR(info.st_mode)):
+                _fail(1, "untrusted runtime: " + path + " is not a regular file", quiet)
+            _require_trusted(descriptor, path, caller_uid, quiet)
+        finally:
+            os.close(descriptor)
+    finally:
+        os.close(directory)
+
+
+def _is_trusted_import_root(entry, caller_uid):
+    """May ``entry`` stay on ``sys.path`` while root imports appio?"""
+
+    if not isinstance(entry, str) or entry in ("", ".") or not os.path.isabs(entry):
+        return False
+    # A symlinked root can be swapped between this check and the import, so it is
+    # not a stable trust decision; drop it rather than resolve it.
+    if os.path.islink(entry):
+        return False
+    real = os.path.realpath(entry)
+    if not os.path.isabs(real) or not os.path.exists(real):
+        return False
+    try:
+        if os.path.isdir(real):
+            descriptor = _open_verified_directory(real, caller_uid, quiet=True)
+            os.close(descriptor)
+            return True
+        if os.path.isfile(real):
+            _verify_runtime_path(real, caller_uid, quiet=True)
+            return True
+    except (SystemExit, OSError):
+        return False
+    return False
+
+
+def _trusted_import_roots(entries, caller_uid):
+    """Keep only import roots that are root-owned and not group/other writable.
+
+    The appio closure check alone is not enough: a caller-writable ``sys.path``
+    entry can shadow a stdlib module that ``appio.setup_service`` imports after
+    that check, which would still execute caller code as root.
+    """
+
+    return [entry for entry in entries if _is_trusted_import_root(entry, caller_uid)]
+
+
+def _find_package_paths(caller_uid):
+    """Resolve ``appio`` without executing it, then list its module closure."""
+
+    script_directory = os.path.dirname(os.path.abspath(__file__))
+    # ``-I`` already omits the script directory, but the shim is also reachable
+    # as ``python path/to/appio-setup``; never let this file's directory, the
+    # caller's cwd, or any other untrusted import root survive.
+    sys.path[:] = [
+        entry
+        for entry in _trusted_import_roots(sys.path, caller_uid)
+        if entry != script_directory
+    ]
+
+    spec = importlib.util.find_spec("appio")
+    if spec is None or spec.origin is None or not spec.submodule_search_locations:
+        _fail(1, "appio is not installed for the system interpreter")
+
+    origin = os.path.abspath(spec.origin)
+    package_directory = os.path.dirname(origin)
+    paths = [origin, package_directory]
+
+    for directory, subdirectories, filenames in os.walk(package_directory, followlinks=False):
+        subdirectories.sort()
+        filenames.sort()
+        for name in list(subdirectories):
+            candidate = os.path.join(directory, name)
+            if os.path.islink(candidate):
+                _fail(1, "untrusted runtime: " + candidate + " is a symlink")
+        for name in filenames:
+            if not name.endswith((".py", ".pyc")):
+                continue
+            candidate = os.path.join(directory, name)
+            info = os.lstat(candidate)
+            if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+                _fail(1, "untrusted runtime: " + candidate + " is not a regular file")
+            paths.append(candidate)
+    return paths
+
+
+def main(argv):
+    if len(argv) != 2 or argv[1] not in VERBS:
+        _fail(2, _USAGE)
+    if os.geteuid() != 0:
+        _fail(1, "root privileges are required; run this helper through pkexec")
+
+    caller_uid = _parse_caller_uid(os.environ)
+    runtime_paths = _find_package_paths(caller_uid)
+
+    # The kernel resolved the shebang before Python started, so for the
+    # interpreter we verify the binary that was actually executed (its real
+    # path). Module paths are never resolved: a symlinked module must be refused,
+    # not followed.
+    _verify_runtime_path(os.path.realpath(sys.executable), caller_uid)
+    for path in runtime_paths:
+        _verify_runtime_path(path, caller_uid)
+
+    try:
+        from appio.setup_service import main as dispatch
+    except Exception as exc:  # noqa: BLE001 - fail closed with a bounded message
+        _fail(1, "the appio setup service is unavailable: " + type(exc).__name__)
+
+    return dispatch()
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv))
+    except SystemExit:
+        raise
+    except Exception as exc:  # noqa: BLE001 - never leak a traceback to the caller
+        sys.stderr.write("appio-setup: internal error: " + type(exc).__name__ + "\n")
+        sys.exit(1)
