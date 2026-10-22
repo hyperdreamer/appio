@@ -30,6 +30,7 @@ from .contracts import (
     AppKey,
     CounterVector,
     HookHits,
+    validate_file_uuid,
     validate_sqlite_integer,
 )
 from .identity import validate_app_key
@@ -810,6 +811,7 @@ class FileEntry:
         _integer(self.inode, "file.inode")
         _integer(self.generation, "file.generation", maximum=_MAX_GENERATION)
         _bool_integer(self.identity_weak, "file.identity_weak")
+        validate_file_uuid(self.fs_uuid, self.identity_weak, "file")
         _text(self.basename, "file.basename")
         if not isinstance(self.aliases, tuple):
             raise ValueError("file.aliases must be a tuple")

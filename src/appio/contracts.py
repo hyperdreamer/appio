@@ -208,6 +208,15 @@ def _require_text(value: object, field: str) -> str:
     return value
 
 
+def validate_file_uuid(fs_uuid: object, identity_weak: bool | int, field: str) -> str:
+    """Missing UUIDs are represented by empty text and an explicitly weak identity."""
+    if not isinstance(fs_uuid, str):
+        raise ValueError(f"{field}.fs_uuid must be a string")
+    if fs_uuid == "" and not identity_weak:
+        raise ValueError(f"{field}.identity_weak must be true when fs_uuid is empty")
+    return fs_uuid
+
+
 def _require_bool(value: object, field: str) -> bool:
     if not isinstance(value, bool):
         raise ValueError(f"{field} must be a boolean")
@@ -743,7 +752,8 @@ class FileObservation:
 
     def __post_init__(self) -> None:
         _require_text(self.app_key, "file_observation.app_key")
-        _require_text(self.fs_uuid, "file_observation.fs_uuid")
+        _require_bool(self.identity_weak, "file_observation.identity_weak")
+        validate_file_uuid(self.fs_uuid, self.identity_weak, "file_observation")
         _require_text(self.dev, "file_observation.dev")
         validate_sqlite_integer(self.inode, "file_observation.inode")
         validate_sqlite_integer(self.generation, "file_observation.generation")

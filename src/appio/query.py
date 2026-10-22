@@ -37,6 +37,7 @@ from appio.contracts import (
     validate_sqlite_integer,
     validate_window,
 )
+from appio.ownership import device_interval_start, intersects, ownership_exclusions, uncertain_intervals
 from appio.reconcile import rate_bps
 from appio.tier import select_tier
 
@@ -383,7 +384,7 @@ class QueryService:
                 dev_sql = "SELECT app_id,boot_id,dev,rbytes,wbytes FROM app_boot_dev_total WHERE boot_id=? ORDER BY dev"
             for row in self.connection.execute(sql, params):
                 aid, read_bytes, write_bytes, rchar, wchar = row[:5]
-                peaks = (None, None, None) if window.kind == "lifetime" else row[5:8]
+                peaks = (None, None, None)
                 cov = row[-1]
                 item = data[aid]
                 item["read"], item["write"], item["rchar"], item["wchar"] = read_bytes, write_bytes, rchar, wchar
@@ -398,6 +399,9 @@ class QueryService:
             return data
 
         if tier == "raw":
+            uncertain = uncertain_intervals(self.connection, boot_id)
+            excluded = {source: uncertain + intervals for source, intervals in ownership_exclusions(self.connection, boot_id).items()}
+            excluded_receipts = set()
             width = RAW_BUCKET_NS
             first, last = _ceil_bucket(start, width), (end // width) * width
             coverage_rows = []
@@ -408,11 +412,20 @@ class QueryService:
                     + ("AND app_id=? " if app_id is not None else "") + "ORDER BY app_id,ts_mono_ns,source,epoch,seq,launch_id",
                     (boot_id, first, last, *((app_id,) if app_id is not None else ())),
                 ).fetchall()
-                for aid, ts, rchar, wchar, read_bytes, write_bytes, interval_start, observed_ns, observed_mono, kind, spans, source, epoch, seq in rows:
+                accepted_rows = []
+                for row in rows:
+                    aid, ts, rchar, wchar, read_bytes, write_bytes, interval_start, observed_ns, observed_mono, kind, spans, source, epoch, seq = row
                     item = data[aid]
                     receipt = (source, epoch, seq, aid)
                     key = (ts // width) * width
                     bucket = item["buckets"].setdefault(key, {"read": 0, "write": 0, "peaks": [None, None, None], "spans": False})
+                    item["evidence"] += 1
+                    item["sample_receipts"].add(receipt)
+                    item["evidence_buckets"].add(key)
+                    if intersects(interval_start, observed_mono, ts, excluded[source]):
+                        excluded_receipts.add(receipt)
+                        continue
+                    accepted_rows.append(row)
                     item["read"] += read_bytes
                     item["write"] += write_bytes
                     item["rchar"] += rchar
@@ -421,11 +434,8 @@ class QueryService:
                     bucket["write"] += write_bytes
                     bucket["spans"] = bucket["spans"] or bool(spans)
                     item["coverage"]["spans_suspend"] = item["coverage"]["spans_suspend"] or bool(spans)
-                    item["evidence"] += 1
-                    item["sample_receipts"].add(receipt)
-                    item["evidence_buckets"].add(key)
                 groups = defaultdict(list)
-                for row in rows:
+                for row in accepted_rows:
                     aid, ts, *tail = row
                     interval_start, observed_ns, observed_mono, kind = tail[4:8]
                     receipt = (tail[-3], tail[-2], tail[-1])
@@ -470,11 +480,14 @@ class QueryService:
                     item["buckets"].setdefault(key, {"read": 0, "write": 0, "peaks": [None, None, None], "spans": False})
             if first < last:
                 dev_rows = self.connection.execute(
-                    "SELECT app_id,ts_mono_ns,dev,rbytes,wbytes FROM sample_dev WHERE boot_id=? AND ts_mono_ns>=? AND ts_mono_ns<? "
+                    "SELECT app_id,ts_mono_ns,dev,rbytes,wbytes,source,epoch,seq FROM sample_dev WHERE boot_id=? AND ts_mono_ns>=? AND ts_mono_ns<? "
                     + ("AND app_id=? " if app_id is not None else "") + "ORDER BY app_id,ts_mono_ns,dev",
                     (boot_id, first, last, *((app_id,) if app_id is not None else ())),
                 ).fetchall()
-                for aid, ts, dev, rb, wb in dev_rows:
+                for aid, ts, dev, rb, wb, source, epoch, seq in dev_rows:
+                    interval_start = device_interval_start(self.connection, boot_id, source, epoch, ts)
+                    if (source, epoch, seq, aid) in excluded_receipts or intersects(interval_start, ts, ts, excluded[source]):
+                        continue
                     item = data[aid]
                     key = (ts // width) * width
                     bucket = item["buckets"].setdefault(key, {"read": 0, "write": 0, "peaks": [None, None, None], "spans": False})

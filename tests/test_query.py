@@ -100,6 +100,92 @@ def test_every_public_query_rejects_overlong_bounded_range_with_exact_a22_messag
         db.close()
 
 
+@pytest.mark.parametrize("missing_receipts", [False, True])
+def test_b2_explicit_uncertain_overlap_excludes_both_raw_contributions(file_db, missing_receipts):
+    # Falsifier: treating an overlap gap as coverage-only returns 20 rather than 0.
+    for source in ("gui", "iod"):
+        file_db.execute(
+            "INSERT INTO sample VALUES('boot-A',?,1,0,1,0,10000000000,20000000000,0,20000000000,"
+            "1010.0,10,0,10,0,'normal',0,0)", (source,),
+        )
+        file_db.execute("INSERT INTO sample_coverage VALUES('boot-A',?,1,0,1,20000000000,?)",
+                        (source, coverage_json()))
+        file_db.execute("INSERT INTO collector_interval VALUES(?,'boot-A',1,0,20000000000)", (source,))
+    file_db.execute("INSERT INTO gap VALUES(1,'boot-A','gui',1,0,0,20000000000,'overlap_uncertain')")
+    if missing_receipts:
+        file_db.execute("DELETE FROM sample_coverage")
+    file_db.commit()
+    result, = QueryService(file_db).ranking(Window("range", "boot-A", 0, 30_000_000_000), "read_bytes")
+    assert result.read_bytes == 0
+    assert result.rchar == 0
+    assert not result.coverage.complete
+    assert result.coverage.overlap_uncertain_intervals == 1
+
+
+def test_b2_writer_excludes_overlap_from_every_tier_and_preserves_uncertainty(tmp_path):
+    # Falsifier: filtering raw queries alone leaves rollups/totals at 20 after pruning.
+    from appio.quota import QuotaPruner
+    from appio.store import AppIoStore
+    from test_store import BOOT, NS, process, record, tick
+
+    store = AppIoStore(tmp_path / "overlap.sqlite")
+    store.start_boot(BOOT, 1, 0, 1000.0, "gui")
+    for source in ("gui", "iod"):
+        store.start_collector(source, BOOT, 0)
+    states = {}
+    for source in ("gui", "iod"):
+        _, states[source] = record(store, None, tick(0, 0, [process()], source=source))
+    for source in ("gui", "iod"):
+        record(store, states[source], tick(1, 20 * NS, [process(counters=(10, 0, 10, 0))], source=source))
+    db = store.connection
+    service = QueryService(db)
+    windows = (
+        Window("range", BOOT, 0, 30 * NS),
+        Window("range", BOOT, 0, 2 * DAY),
+        Window("range", BOOT, 0, 31 * DAY),
+        Window("lifetime"),
+    )
+    try:
+        for window in windows:
+            result, = service.ranking(window, "read_bytes")
+            assert result.read_bytes == 0
+            assert result.rchar == 0
+            assert not result.coverage.complete
+            assert result.coverage.overlap_uncertain_intervals >= 1
+        assert db.execute("SELECT count(*) FROM gap WHERE reason='overlap_uncertain'").fetchone()[0] == 1
+        for age in (2 * DAY, 31 * DAY, 366 * DAY):
+            pruned = QuotaPruner(db, []).expire(BOOT, age)
+            assert pruned.complete, pruned.reason
+            result, = service.ranking(Window("lifetime"), "read_bytes")
+            assert result.read_bytes == 0
+            assert result.coverage.overlap_uncertain_intervals >= 1
+            assert not result.coverage.complete
+        assert db.execute("SELECT count(*) FROM sample").fetchone()[0] == 0
+        assert db.execute("SELECT count(*) FROM gap").fetchone()[0] == 0
+        assert db.execute("SELECT count(*) FROM rollup_app").fetchone()[0] == 0
+        assert db.execute("SELECT read_bytes FROM app_boot_total").fetchone()[0] == 0
+    finally:
+        db.close()
+
+
+def test_b4_totals_only_boot_peaks_are_unavailable_despite_persisted_values(file_db):
+    # Falsifier: only lifetime peaks are suppressed, exposing the stored (0, 4, 5).
+    from appio.ui.formatting import format_peak
+
+    cutoff = MAX_RANGE_NS + 2
+    file_db.execute("INSERT INTO app_boot_total VALUES('boot-A',1,7,8,9,10,0,4,5,?)", (coverage_json(),))
+    file_db.execute("INSERT INTO sampler_checkpoint VALUES('gui','boot-A',1,0,?,'{}')", (cutoff,))
+    file_db.commit()
+    service = QueryService(file_db)
+    window = Window("since_boot", "boot-A", end_mono_ns=cutoff)
+    result, = service.ranking(window, "total_bytes")
+    assert result.coverage.tier == "totals_only"
+    assert (result.peak_read_bps, result.peak_write_bps, result.peak_total_bps) == (None, None, None)
+    assert format_peak(result.peak_total_bps) == "unavailable"
+    assert service.series(1, window).points == ()
+    assert file_db.execute("SELECT peak_read_bps,peak_write_bps,peak_total_bps FROM app_boot_total").fetchone() == (0, 4, 5)
+
+
 def test_raw_query_keeps_task_totals_numeric_when_device_attribution_is_missing(tmp_path):
     # Falsifier: unknown D is converted to zero and yields a fabricated residual.
     db = open_database(tmp_path / "unknown-device.sqlite")
@@ -214,7 +300,7 @@ def test_exact_full_boot_cutoff_uses_totals_but_historical_prefix_does_not(tmp_p
         exact = service.ranking(Window("since_boot", "boot-A", end_mono_ns=cutoff), "total_bytes")
         assert [(item.read_bytes, item.write_bytes) for item in exact] == [(7, 8)]
         assert exact[0].coverage.tier == "totals_only"
-        assert (exact[0].peak_read_bps, exact[0].peak_write_bps, exact[0].peak_total_bps) == (0, 4, 5)
+        assert (exact[0].peak_read_bps, exact[0].peak_write_bps, exact[0].peak_total_bps) == (None, None, None)
         with pytest.raises(WindowUnavailableError) as error:
             service.ranking(Window("since_boot", "boot-A", end_mono_ns=cutoff - 1), "total_bytes")
         assert error.value.reason == "unsupported_window"

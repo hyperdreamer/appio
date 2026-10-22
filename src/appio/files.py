@@ -73,22 +73,6 @@ class CapturedName:
 
 
 @dataclass(frozen=True)
-class _SnapshotObservation(FileObservation):
-    """Snapshot transport also supports the signed contract's empty UUID.
-
-    The upstream FileObservation constructor currently rejects an empty UUID.
-    Validate through FileEntry here rather than weakening or editing that module.
-    """
-    def __post_init__(self) -> None:
-        validate_app_key(self.app_key)
-        if type(self.identity_weak) is not bool:
-            raise ValueError("identity_weak must be a boolean")
-        FileEntry(self.fs_uuid, self.dev, self.inode, self.generation,
-                  int(self.identity_weak), self.basename, (), self.state,
-                  self.reads, self.writes, self.bytes_r, self.bytes_w, self.last_seen_mono_ns)
-
-
-@dataclass(frozen=True)
 class _HourlySnapshot(HourlyFileSnapshot):
     pending_state: FileHourState
     captured_names: tuple[CapturedName, ...]
@@ -127,8 +111,7 @@ class HourlyAccumulator:
                         coverage: FileCoverageInput) -> None:
         """Stage one candidate, or an explicit zero-F monitored app receipt.
 
-        FileEntry is accepted for a missing-UUID observation until the shared
-        FileObservation constructor is corrected by its owning lane. None records
+        FileEntry also accepts canonical durable observations. None records
         coverage for a monitored app with no supported file observations.
         """
         if not isinstance(receipt, Receipt) or not isinstance(coverage, FileCoverageInput):
@@ -148,8 +131,6 @@ class HourlyAccumulator:
                 entry = observation
             else:
                 raise ValueError("observation must be FileObservation, FileEntry or None")
-            if entry.fs_uuid == "" and not entry.identity_weak:
-                entry = replace(entry, identity_weak=1)
             if not self.hour_start_mono_ns <= entry.last_seen_mono_ns < self.hour_start_mono_ns + FILE_HOUR_NS:
                 raise ValueError("last_seen_mono_ns must be inside the half-open hour")
         previous = self._apps.get(app_key)
@@ -249,7 +230,7 @@ class HourlyAccumulator:
                 counted_omitted_bytes_r=checked_sum(cov.counted_omitted_bytes_r, *(e.bytes_r for e in omitted), field="counted_omitted_bytes_r"),
                 counted_omitted_bytes_w=checked_sum(cov.counted_omitted_bytes_w, *(e.bytes_w for e in omitted), field="counted_omitted_bytes_w"),
                 weak_identity_rows=max(cov.weak_identity_rows, sum(e.identity_weak for e in ranked)))
-            observations = tuple(_SnapshotObservation(key, e.fs_uuid, e.dev, e.inode, e.generation,
+            observations = tuple(FileObservation(key, e.fs_uuid, e.dev, e.inode, e.generation,
                                                       e.basename, e.state, bool(e.identity_weak),
                                                       e.reads, e.writes, e.bytes_r, e.bytes_w, e.last_seen_mono_ns)
                                  for e in kept)

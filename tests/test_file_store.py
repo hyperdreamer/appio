@@ -177,6 +177,25 @@ def test_missing_uuid_materializes_as_weak_without_losing_retained_bytes(db):
     assert db.execute("SELECT weak_identity_rows FROM file_coverage").fetchone()[0] == 1
 
 
+def test_b5_public_missing_uuid_survives_pending_round_trip_and_finalization(db):
+    # Falsifier: a private FileEntry workaround hides public transport rejection.
+    row = observation(99, fs_uuid="", identity_weak=True, bytes_r=8, last_seen_mono_ns=10)
+    acc = HourlyAccumulator("boot-A", 0)
+    acc.add_observation(R, APP, row, ZERO)
+    store = FileHourStore(db)
+    store.apply_pending(acc.finalize())
+    text = db.execute("SELECT state_json FROM file_hour_state").fetchone()[0]
+    restored = HourlyAccumulator.from_state(decode_file_hour_state(text, "boot-A", 0))
+    result, = restored.finalize().apps[0][1]
+    assert (result.fs_uuid, result.identity_weak, result.bytes_r) == ("", True, 8)
+    assert store.finalize_hour(restored.finalize()) is True
+    assert store.finalize_hour(restored.finalize()) is False
+    assert db.execute("SELECT fs_uuid,identity_weak FROM path").fetchone() == ("", 1)
+    assert db.execute("SELECT bytes_r FROM file_sample").fetchone()[0] == 8
+    assert db.execute("SELECT weak_identity_rows FROM file_coverage").fetchone()[0] == 1
+    assert db.execute("SELECT bytes_r FROM app_boot_file_total").fetchone()[0] == 8
+
+
 def test_plain_snapshot_overflow_keeps_counter_error_and_persists_diagnostic(db):
     # Falsifier: diagnostic handling masks CounterOverflowError for public transport snapshots.
     from appio.contracts import HourlyFileSnapshot

@@ -26,6 +26,10 @@ from .durable import (
 )
 from .launch import LaunchIdentity, LaunchState, ProcessState, ReapCredit
 from .migrations import migrate_empty, open_database
+from .ownership import (
+    device_interval_start, intersects, ownership_exclusions, subtract_intervals,
+    uncertain_intervals,
+)
 from .procs import ProcessIdentity
 from .reconcile import rate_bps
 from .sampler import AggregatedFrame, AppDelta, FrameCoverage, SamplerState, StaleFrameError
@@ -257,17 +261,143 @@ class AppIoStore:
         return epoch
 
     def _collector_interval(self, source: str, boot_id: str, epoch: int, start: int, end: int) -> None:
+        previous = self.connection.execute(
+            "SELECT to_mono_ns FROM collector_interval WHERE source=? AND boot_id=? AND epoch=?",
+            (source, boot_id, epoch),
+        ).fetchone()
+        beginning = previous[0] if previous else start
         self.connection.execute(
             "INSERT INTO collector_interval (source,boot_id,epoch,from_mono_ns,to_mono_ns) VALUES (?,?,?,?,?) "
             "ON CONFLICT(source,boot_id,epoch) DO UPDATE SET to_mono_ns=excluded.to_mono_ns",
             (source, boot_id, epoch, start, end),
         )
+        exclusions = ownership_exclusions(self.connection, boot_id)
+        for left, right in exclusions[source]:
+            if max(beginning, left) < min(end, right):
+                self._exclude_contributions(boot_id, max(beginning, left), min(end, right), source=source)
+        others = self.connection.execute(
+            "SELECT source,from_mono_ns,to_mono_ns FROM collector_interval WHERE boot_id=? "
+            "AND NOT (source=? AND epoch=?) AND from_mono_ns<? AND to_mono_ns>?",
+            (boot_id, source, epoch, end, beginning),
+        ).fetchall()
+        active = self.connection.execute("SELECT last_seq FROM collector_epoch WHERE source=?", (source,)).fetchone()
+        seq = active[0] if active and active[0] is not None else 0
+        for other_source, left, right in others:
+            for overlap_start, overlap_end in subtract_intervals(
+                max(beginning, left), min(end, right), exclusions[source] + exclusions[other_source],
+            ):
+                for new_start, new_end in subtract_intervals(overlap_start, overlap_end, uncertain_intervals(self.connection, boot_id)):
+                    self._insert_gap(boot_id, source, epoch, seq, new_start, new_end, "overlap_uncertain")
+        # An explicit earlier gap must also exclude a newly arriving contributor.
+        for left, right in uncertain_intervals(self.connection, boot_id):
+            if left < end and right > beginning:
+                self._exclude_contributions(boot_id, left, right)
 
     def _insert_gap(self, boot_id: str, source: str, epoch: int, seq: int, start: int, end: int, reason: str) -> None:
+        if reason == "overlap_uncertain" and self.connection.execute(
+            "SELECT 1 FROM gap WHERE boot_id=? AND reason=? AND from_mono_ns=? AND to_mono_ns=?",
+            (boot_id, reason, start, end),
+        ).fetchone():
+            return
         self.connection.execute(
             "INSERT INTO gap (boot_id,source,epoch,seq,from_mono_ns,to_mono_ns,reason) VALUES (?,?,?,?,?,?,?)",
             (boot_id, source, epoch, seq, start, end, reason),
         )
+        if reason == "overlap_uncertain":
+            self._exclude_contributions(boot_id, start, end)
+            # Coverage-only buckets keep the overlap representable after raw expiry.
+            for (app_id,) in self.connection.execute("SELECT app_id FROM app_boot_total WHERE boot_id=?", (boot_id,)).fetchall():
+                for width in (60, 3600):
+                    first = bucket_start_mono_ns(start, width * _NS)
+                    last = bucket_start_mono_ns(end - 1, width * _NS)
+                    for bucket in range(first, last + 1, width * _NS):
+                        self._accumulate("rollup_app", {"boot_id": boot_id, "app_id": app_id,
+                                         "bucket_start_mono_ns": bucket, "bucket_secs": width},
+                                         dict.fromkeys(_COUNTERS, 0), peaks=dict.fromkeys(_PEAKS))
+
+    def _subtract(self, table, keys, amounts):
+        fields = tuple(amounts)
+        where = " AND ".join(f"{key}=?" for key in keys)
+        row = self.connection.execute(f"SELECT {','.join(fields)} FROM {table} WHERE {where}", tuple(keys.values())).fetchone()
+        if row is None:
+            raise ValueError(f"ownership exclusion requires materialized {table}")
+        values = tuple(_integer(old - amounts[field], f"{table}.{field}") for old, field in zip(row, fields, strict=True))
+        self.connection.execute(f"UPDATE {table} SET " + ",".join(f"{field}=?" for field in fields) + f" WHERE {where}",
+                                (*values, *keys.values()))
+
+    def _remaining_peaks(self, boot_id, app_id, bucket, width):
+        groups = defaultdict(list)
+        for source, epoch, seq, ts, observed, start, duration, kind, read, write in self.connection.execute(
+            "SELECT source,epoch,seq,ts_mono_ns,observed_mono_ns,interval_start_mono_ns,observed_ns,delta_kind,read_bytes,write_bytes "
+            "FROM sample WHERE boot_id=? AND app_id=? AND ts_mono_ns>=? AND ts_mono_ns<?",
+            (boot_id, app_id, bucket, bucket + width * _NS),
+        ):
+            groups[(source, epoch, seq, ts, observed)].append((start, duration, kind, read, write))
+        peaks = dict.fromkeys(_PEAKS)
+        for entries in groups.values():
+            if entries[0][0] is None or len({(row[0], row[1]) for row in entries}) != 1 or any(row[2] == "baseline" for row in entries):
+                continue
+            read, write = sum(row[3] for row in entries), sum(row[4] for row in entries)
+            for field, amount in zip(_PEAKS, (read, write, read + write), strict=True):
+                peaks[field] = _nullable_max(peaks[field], rate_bps(amount, entries[0][1]))
+        return peaks
+
+    def _exclude_contributions(self, boot_id, beginning, end, *, source=None):
+        """Retract both owners' indivisible deltas atomically, without replaying totals.
+
+        Excluded source rows are removed while their coverage receipts remain.
+        Subtraction preserves history that was already pruned from raw storage.
+        Repeating this operation cannot subtract the same contribution twice.
+        """
+        by_app, buckets = {}, {}
+        source_sql = " AND source=?" if source is not None else ""
+        params = (boot_id, *((source,) if source is not None else ()))
+        rows = self.connection.execute(
+            "SELECT source,epoch,seq,app_id,launch_id,ts_mono_ns,observed_mono_ns,interval_start_mono_ns,rchar,wchar,read_bytes,write_bytes "
+            "FROM sample WHERE boot_id=?" + source_sql, params,
+        ).fetchall()
+        receipts = set()
+        for owner, epoch, seq, app, launch, ts, observed, start, *amounts in rows:
+            if not intersects(start, observed, ts, [(beginning, end)]):
+                continue
+            receipts.add((owner, epoch, seq, app))
+            target = by_app.setdefault(app, dict.fromkeys(_COUNTERS, 0))
+            for field, amount in zip(_COUNTERS, amounts, strict=True):
+                target[field] += amount
+            for width in (60, 3600):
+                key = (app, width, bucket_start_mono_ns(ts, width * _NS))
+                target = buckets.setdefault(key, dict.fromkeys(_COUNTERS, 0))
+                for field, amount in zip(_COUNTERS, amounts, strict=True):
+                    target[field] += amount
+            self.connection.execute("DELETE FROM sample WHERE boot_id=? AND source=? AND epoch=? AND seq=? AND app_id=? AND launch_id=? AND ts_mono_ns=?",
+                                    (boot_id, owner, epoch, seq, app, launch, ts))
+        for app, amounts in by_app.items():
+            self._subtract("app_boot_total", {"boot_id": boot_id, "app_id": app}, amounts)
+            self._subtract("app_lifetime_total", {"app_id": app}, amounts)
+        for (app, width, bucket), amounts in buckets.items():
+            keys = {"boot_id": boot_id, "app_id": app, "bucket_secs": width, "bucket_start_mono_ns": bucket}
+            self._subtract("rollup_app", keys, amounts)
+            peaks = self._remaining_peaks(boot_id, app, bucket, width)
+            self.connection.execute("UPDATE rollup_app SET peak_read_bps=?,peak_write_bps=?,peak_total_bps=? "
+                                    "WHERE boot_id=? AND app_id=? AND bucket_secs=? AND bucket_start_mono_ns=?",
+                                    (*peaks.values(), *keys.values()))
+        for app in by_app:
+            peaks = self.connection.execute("SELECT max(peak_read_bps),max(peak_write_bps),max(peak_total_bps) "
+                                            "FROM rollup_app WHERE boot_id=? AND app_id=? AND bucket_secs=3600", (boot_id, app)).fetchone()
+            self.connection.execute("UPDATE app_boot_total SET peak_read_bps=?,peak_write_bps=?,peak_total_bps=? WHERE boot_id=? AND app_id=?",
+                                    (*peaks, boot_id, app))
+        devices = self.connection.execute("SELECT source,epoch,seq,app_id,ts_mono_ns,dev,rbytes,wbytes FROM sample_dev WHERE boot_id=?" + source_sql, params).fetchall()
+        for owner, epoch, seq, app, ts, dev, read, write in devices:
+            start = device_interval_start(self.connection, boot_id, owner, epoch, ts)
+            if (owner, epoch, seq, app) not in receipts and not intersects(start, ts, ts, [(beginning, end)]):
+                continue
+            amounts = {"rbytes": read, "wbytes": write}
+            self._subtract("app_boot_dev_total", {"boot_id": boot_id, "app_id": app, "dev": dev}, amounts)
+            for width in (60, 3600):
+                self._subtract("rollup_dev", {"boot_id": boot_id, "app_id": app, "bucket_secs": width,
+                               "bucket_start_mono_ns": bucket_start_mono_ns(ts, width * _NS), "dev": dev}, amounts)
+            self.connection.execute("DELETE FROM sample_dev WHERE boot_id=? AND source=? AND epoch=? AND seq=? AND app_id=? AND dev=?",
+                                    (boot_id, owner, epoch, seq, app, dev))
 
     def record_gap(self, boot_id: str, source: str, epoch: int, seq: int, from_mono_ns: int, to_mono_ns: int, reason: str = "collector_gap") -> None:
         FrameIdentity(boot_id, source, epoch, seq)

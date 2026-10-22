@@ -403,6 +403,111 @@ def test_shared_cgroup_never_materializes_an_arbitrary_device_owner():
     assert all(item["device_state"] == "incomplete" for item in coverage(db, "app_boot_total"))
 
 
+def test_b2_overlap_retracts_devices_and_peaks_but_keeps_adjacent_valid_deltas():
+    # Falsifier: retracting one owner, an entire bucket, or bytes without its peak/device contribution.
+    from appio.contracts import Window
+    from appio.query import QueryService
+
+    store = initialized()
+    db = store.connection
+    try:
+        _, gui = record(store, None, tick(0, T0, [process()], cgroups=(group(100, 10),)))
+        _, gui = record(store, gui, tick(1, T1, [process(counters=(50, 20, 30, 20))], cgroups=(group(130, 30),)))
+        store.start_collector("iod", BOOT, T1)
+        _, iod = record(store, None, tick(0, T1, [process()], source="iod", cgroups=(group(100, 10),)))
+        _, gui = record(store, gui, tick(2, T2, [process(counters=(250, 220, 230, 220))], cgroups=(group(330, 230),)))
+        record(store, iod, tick(1, T2, [process(counters=(200, 200, 200, 200))], source="iod", cgroups=(group(300, 210),)))
+        record(store, gui, tick(3, T2 + 10 * NS, [process(counters=(260, 225, 240, 225))], cgroups=(group(340, 235),)))
+        for window in (Window("range", BOOT, 0, 140 * NS), Window("range", BOOT, 0, 2 * 86400 * NS),
+                       Window("range", BOOT, 0, 31 * 86400 * NS), Window("lifetime")):
+            result, = QueryService(db).ranking(window, "total_bytes")
+            assert (result.rchar, result.wchar, result.read_bytes, result.write_bytes) == (60, 25, 40, 25)
+            assert not result.coverage.complete
+            assert result.coverage.overlap_uncertain_intervals == 1
+        assert db.execute("SELECT peak_read_bps,peak_write_bps,peak_total_bps FROM app_boot_total").fetchone() == (3, 2, 5)
+        assert db.execute("SELECT rbytes,wbytes FROM app_boot_dev_total WHERE dev='259:0'").fetchone() == (40, 25)
+        for secs in (60, 3600):
+            assert db.execute("SELECT sum(rbytes),sum(wbytes) FROM rollup_dev WHERE bucket_secs=? AND dev='259:0'", (secs,)).fetchone() == (40, 25)
+        before = snapshot(db)
+        store.record_gap(BOOT, "gui", 1, 2, T1, T2, "overlap_uncertain")
+        assert snapshot(db) == before
+    finally:
+        db.close()
+
+
+def test_b2_handover_cutoff_selects_the_authoritative_source_on_each_side():
+    # Falsifier: treating a ratified handover as an uncertain overlap drops valid bytes.
+    from appio.durable import HandoverState
+
+    store = initialized()
+    db = store.connection
+    try:
+        db.execute("INSERT INTO handover VALUES(?,?,?,?,?)", (BOOT, "gui", "iod", T1, canonical_json(HandoverState(BOOT, T1, (), ()))))
+        db.commit()
+        _, gui = record(store, None, tick(0, T0, [process()]))
+        store.start_collector("iod", BOOT, T0)
+        _, iod = record(store, None, tick(0, T0, [process()], source="iod"))
+        _, gui = record(store, gui, tick(1, T1, [process(counters=(10, 0, 10, 0))]))
+        _, iod = record(store, iod, tick(1, T1, [process(counters=(10, 0, 10, 0))], source="iod"))
+        record(store, gui, tick(2, T2, [process(counters=(20, 0, 20, 0))]))
+        record(store, iod, tick(2, T2, [process(counters=(30, 0, 30, 0))], source="iod"))
+        assert db.execute("SELECT rchar,read_bytes FROM app_boot_total").fetchone() == (30, 30)
+        assert db.execute("SELECT count(*) FROM gap WHERE reason='overlap_uncertain'").fetchone()[0] == 0
+        assert db.execute("SELECT source,ts_mono_ns,read_bytes FROM sample WHERE read_bytes>0 ORDER BY ts_mono_ns").fetchall() == [("gui", T1, 10), ("iod", T2, 20)]
+    finally:
+        db.close()
+
+
+def test_b2_overlap_retraction_keeps_totals_from_already_pruned_history():
+    # Falsifier: rebuilding corrected totals from retained raw rows erases valid older bytes.
+    from appio.quota import QuotaPruner
+
+    store = initialized()
+    db = store.connection
+    try:
+        _, gui = record(store, None, tick(0, T0, [process()]))
+        _, gui = record(store, gui, tick(1, T1, [process(counters=(7, 0, 7, 0))]))
+        assert QuotaPruner(db, []).expire(BOOT, 2 * 86400 * NS).complete
+        assert db.execute("SELECT count(*) FROM sample").fetchone()[0] == 0
+        now = 2 * 86400 * NS
+        _, gui = record(store, gui, tick(2, now, [process(counters=(7, 0, 7, 0))]))
+        store.start_collector("iod", BOOT, now)
+        _, iod = record(store, None, tick(0, now, [process()], source="iod"))
+        record(store, gui, tick(3, now + 20 * NS, [process(counters=(17, 0, 17, 0))]))
+        record(store, iod, tick(1, now + 20 * NS, [process(counters=(10, 0, 10, 0))], source="iod"))
+        assert db.execute("SELECT rchar,read_bytes FROM app_boot_total").fetchone() == (7, 7)
+        assert db.execute("SELECT rchar,read_bytes FROM app_lifetime_total").fetchone() == (7, 7)
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize("failure", ["DELETE FROM sample WHERE", "UPDATE app_lifetime_total SET"])
+def test_b2_retraction_failure_rolls_back_ownership_totals_and_receipt(tmp_path, failure):
+    # Falsifier: a correction commits one owner's deletion or advances the rejected receipt.
+    db = sqlite3.connect(tmp_path / "ownership-fault.sqlite", factory=FaultConnection)
+    store = initialized(db)
+    try:
+        store.start_collector("iod", BOOT, T0)
+        _, gui = record(store, None, tick(0, T0, [process()]))
+        _, iod = record(store, None, tick(0, T0, [process()], source="iod"))
+        record(store, gui, tick(1, T1, [process(counters=(10, 0, 10, 0))]))
+        frame, staged = aggregate_tick(iod, tick(1, T1, [process(counters=(10, 0, 10, 0))], source="iod"))
+        before, published = snapshot(db), store.sampler_state
+        db.failure = failure
+        with pytest.raises(RuntimeError, match="injected store failure"):
+            store.record_tick(frame, staged)
+        assert db.seen_failure
+        assert not db.in_transaction
+        assert snapshot(db) == before
+        assert store.sampler_state is published
+        db.failure = None
+        store.record_tick(frame, staged)
+        assert db.execute("SELECT read_bytes FROM app_boot_total").fetchone()[0] == 0
+        assert db.execute("SELECT last_seq FROM collector_epoch WHERE source='iod'").fetchone()[0] == 1
+    finally:
+        db.close()
+
+
 def test_record_gap_is_half_open_and_preserves_the_declared_stream():
     """Falsified by changing endpoints/source or accepting an empty/inverted gap."""
     store = initialized()

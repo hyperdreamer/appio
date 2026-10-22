@@ -694,6 +694,32 @@ def test_file_observation_constructs_without_database_local_ids() -> None:
     assert not hasattr(observation, "path_id")
 
 
+def test_b5_public_missing_uuid_requires_weak_identity() -> None:
+    # Falsifier: the public transport rejects the mandated empty/weak UUID pair.
+    from dataclasses import replace
+
+    observation = FileObservation("unit:app-demo.service", "", "259:0", 42, 0,
+                                  "weak.txt", "unresolved", True, 1, 0, 8, 0, 10)
+    assert (observation.fs_uuid, observation.identity_weak, observation.bytes_r) == ("", True, 8)
+    with pytest.raises(ValueError, match="identity_weak"):
+        replace(observation, identity_weak=False)
+    for invalid in (None, 7, [], b"uuid"):
+        with pytest.raises(ValueError):
+            replace(observation, fs_uuid=invalid)
+    assert replace(observation, fs_uuid="strong-uuid", identity_weak=False).identity_weak is False
+
+
+def test_b5_durable_missing_uuid_cannot_claim_strong_identity() -> None:
+    # Falsifier: FileEntry accepts empty UUID with identity_weak=0 behind transport validation.
+    from dataclasses import replace
+    from appio.durable import FileEntry
+
+    entry = FileEntry("", "259:0", 42, 0, 1, "weak.txt", (), "unresolved", 1, 0, 8, 0, 10)
+    assert (entry.fs_uuid, entry.identity_weak) == ("", 1)
+    with pytest.raises(ValueError, match="identity_weak"):
+        replace(entry, identity_weak=0)
+
+
 def test_file_coverage_input_and_unknown_owner_input_construct() -> None:
     """Fails if either transport coverage record drops a declared field."""
 

@@ -10,9 +10,11 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 import sqlite3
 
-from appio.contracts import validate_sqlite_integer
-from appio.durable import decode_file_hour_state
+from appio.contracts import FILE_HOUR_NS, validate_sqlite_integer
+from appio.durable import canonical_json, decode_file_hour_state
 from appio.file_store import _decode_coverage
+from appio.files import checked_sum
+from appio.ownership import ownership_settled
 
 DAY_NS = 86_400_000_000_000
 DEFAULT_QUOTA_BYTES = 1_500_000_000
@@ -199,6 +201,12 @@ class QuotaPruner:
             coverage = c.execute("SELECT coverage_json FROM sample_coverage WHERE boot_id=? AND source=? AND epoch=? AND seq=? AND app_id=?", unit.primary_key).fetchone()
             if coverage is None:
                 return False
+            has_contributions = any(c.execute(
+                f"SELECT 1 FROM {table} WHERE boot_id=? AND source=? AND epoch=? AND seq=? AND app_id=? LIMIT 1",
+                unit.primary_key,
+            ).fetchone() for table in ("sample", "sample_dev"))
+            if has_contributions and not ownership_settled(c, unit.boot, unit.primary_key[1], unit.mono):
+                return False
             buckets = {(60, unit.mono // 60_000_000_000 * 60_000_000_000): [0, 0, 0, 0],
                        (3600, unit.mono // 3_600_000_000_000 * 3_600_000_000_000): [0, 0, 0, 0]}
             counters = [0, 0, 0, 0]
@@ -235,10 +243,10 @@ class QuotaPruner:
                 return False
             for app_id, text in apps:
                 try:
-                    if _decode_coverage(text)[field] == 0:
+                    if _decode_coverage(text)[field] == 0 and reason != "overlap_uncertain":
                         return False
                     life = c.execute("SELECT coverage_json FROM app_lifetime_total WHERE app_id=?", (app_id,)).fetchone()
-                    if life is None or _decode_coverage(life[0])[field] == 0:
+                    if life is None or (_decode_coverage(life[0])[field] == 0 and reason != "overlap_uncertain"):
                         return False
                     for secs in (60, 3600):
                         width = secs * 1_000_000_000
@@ -247,19 +255,87 @@ class QuotaPruner:
                         rows = c.execute("SELECT bucket_start_mono_ns,coverage_json FROM rollup_app WHERE boot_id=? AND app_id=? AND bucket_secs=? AND bucket_start_mono_ns BETWEEN ? AND ? ORDER BY bucket_start_mono_ns", (unit.boot, app_id, secs, first, last))
                         expected = first
                         for start, text in rows:
-                            if start != expected or _decode_coverage(text)[field] == 0:
+                            if start != expected or (_decode_coverage(text)[field] == 0 and reason != "overlap_uncertain"):
                                 return False
                             expected += width
                         if expected != last + width:
                             return False
                 except (ValueError, TypeError):
                     return False
-            return True
+            return self._file_gap_materializable(unit.boot, beginning, end)
         row = c.execute("SELECT read_bytes,write_bytes,rchar,wchar,peak_read_bps,peak_write_bps,peak_total_bps,coverage_json FROM rollup_app WHERE boot_id=? AND app_id=? AND bucket_secs=? AND bucket_start_mono_ns=?", unit.primary_key).fetchone()
         if row is None or not self._process_totals(unit.boot, unit.app_id, row[:7], row[7]):
             return False
         return all(self._device_total(unit.boot, unit.app_id, dev, (rb, wb))
                    for dev, rb, wb in c.execute("SELECT dev,rbytes,wbytes FROM rollup_dev WHERE boot_id=? AND app_id=? AND bucket_secs=? AND bucket_start_mono_ns=?", unit.primary_key))
+
+    def _preserve_overlap_gap(self, boot, beginning, end):
+        """Replace the disappearing live process overlay in retained tiers."""
+        for table, keys, condition, params in (
+            ("app_boot_total", "boot_id,app_id", "boot_id=?", (boot,)),
+            ("app_lifetime_total", "app_id", "app_id IN (SELECT app_id FROM app_boot_total WHERE boot_id=?)", (boot,)),
+            ("rollup_app", "boot_id,app_id,bucket_start_mono_ns,bucket_secs",
+             "boot_id=? AND bucket_start_mono_ns<? AND bucket_start_mono_ns+bucket_secs*1000000000>?", (boot, end, beginning)),
+        ):
+            rows = self.connection.execute(f"SELECT {keys},coverage_json FROM {table} WHERE {condition}", params).fetchall()
+            for *values, text in rows:
+                obj = _decode_coverage(text)
+                for field in ("gap_intervals", "overlap_uncertain_intervals"):
+                    obj[field] = checked_sum(obj[field], 1, field=field)
+                where = " AND ".join(f"{key}=?" for key in keys.split(","))
+                self.connection.execute(f"UPDATE {table} SET coverage_json=? WHERE {where}", (canonical_json(obj), *values))
+
+    def _file_gap_rows(self, boot, beginning, end):
+        """Every retained hourly source and never-pruned file coverage source."""
+        first = beginning // FILE_HOUR_NS * FILE_HOUR_NS
+        last = (end - 1) // FILE_HOUR_NS * FILE_HOUR_NS
+        for table, keys, bounds, params in (
+            ("file_coverage", "boot_id,app_id,ts_mono_ns", " AND ts_mono_ns BETWEEN ? AND ?", (boot, first, last)),
+            ("file_overflow_unknown", "boot_id,ts_mono_ns", " AND ts_mono_ns BETWEEN ? AND ?", (boot, first, last)),
+            ("app_boot_file_coverage", "boot_id,app_id", "", (boot,)),
+            ("boot_file_overflow_unknown", "boot_id", "", (boot,)),
+        ):
+            for row in self.connection.execute(f"SELECT {keys},coverage_json FROM {table} WHERE boot_id=?{bounds}", params).fetchall():
+                yield table, keys.split(","), row[:-1], row[-1]
+
+    def _file_gap_materializable(self, boot, beginning, end):
+        try:
+            for _, _, _, text in self._file_gap_rows(boot, beginning, end):
+                _decode_coverage(text)
+            for hour, text in self.connection.execute(
+                "SELECT ts_mono_ns,state_json FROM file_hour_state WHERE boot_id=? AND ts_mono_ns<? AND ts_mono_ns>?",
+                (boot, end, beginning - FILE_HOUR_NS),
+            ):
+                decode_file_hour_state(text, boot, hour)
+        except (ValueError, TypeError):
+            return False
+        return True
+
+    def _preserve_file_gap(self, boot, beginning, end, reason):
+        """Transfer the live overlay exactly once, in the gap deletion transaction.
+
+        A rollback restores both the gap and these updates; a committed retry
+        cannot find the deleted gap. File counters and hook columns stay exact.
+        """
+        fields = ("gap_intervals", "overlap_uncertain_intervals") if reason == "overlap_uncertain" else ("gap_intervals",)
+        for table, keys, values, text in self._file_gap_rows(boot, beginning, end):
+            obj = _decode_coverage(text)
+            for field in fields:
+                obj[field] = checked_sum(obj[field], 1, field=field)
+            where = " AND ".join(f"{key}=?" for key in keys)
+            self.connection.execute(f"UPDATE {table} SET coverage_json=? WHERE {where}", (canonical_json(obj), *values))
+        pending = self.connection.execute(
+            "SELECT ts_mono_ns,state_json FROM file_hour_state WHERE boot_id=? AND ts_mono_ns<? AND ts_mono_ns>?",
+            (boot, end, beginning - FILE_HOUR_NS),
+        ).fetchall()
+        def coverage(obj):
+            return replace(obj, complete=0, **{field: checked_sum(getattr(obj, field), 1, field=field) for field in fields})
+        for hour, text in pending:
+            state = decode_file_hour_state(text, boot, hour)
+            state = replace(state, apps=tuple(replace(app, coverage=coverage(app.coverage)) for app in state.apps),
+                            unknown_owner=replace(state.unknown_owner, coverage=coverage(state.unknown_owner.coverage)))
+            self.connection.execute("UPDATE file_hour_state SET state_json=? WHERE boot_id=? AND ts_mono_ns=?",
+                                    (canonical_json(state), boot, hour))
 
     def _checkpoint(self) -> bool:
         row = self.connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
@@ -300,6 +376,10 @@ class QuotaPruner:
             stats = replace(stats, unknown_overflow_files=values[0], unknown_overflow_bytes_r=values[1], unknown_overflow_bytes_w=values[2])
             c.execute("DELETE FROM file_overflow_unknown WHERE boot_id=? AND ts_mono_ns=?", pk)
         elif unit.kind == "gap":
+            beginning, end, reason = c.execute("SELECT from_mono_ns,to_mono_ns,reason FROM gap WHERE gap_id=?", pk).fetchone()
+            self._preserve_file_gap(unit.boot, beginning, end, reason)
+            if reason == "overlap_uncertain":
+                self._preserve_overlap_gap(unit.boot, beginning, end)
             c.execute("DELETE FROM gap WHERE gap_id=?", pk)
         else:
             boot, app, secs, start = pk

@@ -242,6 +242,134 @@ def test_gap_with_persisted_tier_coverage_expires_without_losing_its_effects(db)
     assert [json.loads(row[0])["gap_intervals"] for row in db.execute("SELECT coverage_json FROM rollup_app")] == [1, 1]
 
 
+@pytest.mark.parametrize("reason", ["collector_gap", "overlap_uncertain"])
+def test_b3_gap_expiry_preserves_hourly_and_boot_file_uncertainty(db, reason):
+    # Falsifier: process materialization alone lets F flip from (False, 1) to (True, 0).
+    from appio.contracts import Window
+    from appio.query import QueryService
+
+    seed_core_with_materialization(db)
+    acc = HourlyAccumulator("boot-A", 0)
+    acc.add_observation(R, APP, observation(bytes_r=50), ZERO)
+    FileHourStore(db).finalize_hour(acc.finalize())
+    gap_json = coverage_json(gap_intervals=1, overlap_uncertain_intervals=int(reason == "overlap_uncertain"))
+    for table in ("app_boot_total", "app_lifetime_total", "rollup_app"):
+        db.execute(f"UPDATE {table} SET coverage_json=?", (gap_json,))
+    db.execute("INSERT INTO gap VALUES(1,'boot-A','gui',1,1,0,1,?)", (reason,))
+    db.commit()
+    service = QueryService(db)
+    hourly = Window("range", "boot-A", 0, FILE_HOUR_NS)
+    lifetime = Window("lifetime")
+
+    def coverages(window):
+        return (service.file_coverage(1, window).coverage,
+                service.file_table(1, window, "bytes_total", "desc", None).coverage,
+                service.unknown_owner_file_coverage(window).coverage)
+
+    for window in (hourly, lifetime):
+        assert [(c.complete, c.gap_intervals) for c in coverages(window)] == [(False, 1)] * 3
+    pruner = QuotaPruner(db, [])
+    result = pruner.expire("boot-A", 2 * DAY)
+    assert result.complete, result.reason
+    assert db.execute("SELECT count(*) FROM gap").fetchone()[0] == 0
+    assert db.execute("SELECT count(*) FROM file_coverage").fetchone()[0] == 1
+    for window in (hourly, lifetime):
+        after = coverages(window)
+        assert [(c.complete, c.gap_intervals) for c in after] == [(False, 1)] * 3
+        assert [c.overlap_uncertain_intervals for c in after] == [int(reason == "overlap_uncertain")] * 3
+    before = [db.execute(f"SELECT coverage_json FROM {table}").fetchall() for table in
+              ("file_coverage", "app_boot_file_coverage", "file_overflow_unknown", "boot_file_overflow_unknown")]
+    assert pruner.expire("boot-A", 2 * DAY).complete
+    assert before == [db.execute(f"SELECT coverage_json FROM {table}").fetchall() for table in
+                      ("file_coverage", "app_boot_file_coverage", "file_overflow_unknown", "boot_file_overflow_unknown")]
+    assert pruner.expire("boot-A", 15 * DAY).complete
+    assert db.execute("SELECT count(*) FROM file_coverage").fetchone()[0] == 0
+    assert [(c.complete, c.gap_intervals) for c in coverages(lifetime)] == [(False, 1)] * 3
+
+
+def test_b2_lagging_collector_cannot_prune_bytes_before_late_overlap_is_resolved(tmp_path):
+    # Falsifier: raw history disappears while another active stream can still reveal its overlap.
+    from appio.store import AppIoStore
+    from test_store import BOOT, NS, process, record, snapshot, tick
+
+    store = AppIoStore(tmp_path / "lagging-owner.sqlite")
+    db = store.connection
+    try:
+        store.start_boot(BOOT, 1, 0, 1000.0, "gui")
+        for source in ("gui", "iod"):
+            store.start_collector(source, BOOT, 0)
+        _, gui = record(store, None, tick(0, 0, [process()]))
+        _, iod = record(store, None, tick(0, 0, [process()], source="iod"))
+        record(store, gui, tick(1, 20 * NS, [process(counters=(10, 0, 10, 0))]))
+        before = snapshot(db)
+        pruned = QuotaPruner(db, []).expire(BOOT, 2 * DAY)
+        assert not pruned.complete
+        assert pruned.reason == "missing_materialization"
+        assert pruned.deleted == ()
+        assert snapshot(db) == before
+        record(store, iod, tick(1, 2 * DAY + 20 * NS, [process(counters=(10, 0, 10, 0))], source="iod"))
+        assert db.execute("SELECT read_bytes FROM app_boot_total").fetchone()[0] == 0
+        assert db.execute("SELECT read_bytes FROM app_lifetime_total").fetchone()[0] == 0
+        assert QuotaPruner(db, []).expire(BOOT, 2 * DAY + 21 * NS).complete
+    finally:
+        db.close()
+
+
+def test_b3_gap_transfer_survives_pending_hour_finalization(db):
+    # Falsifier: a gap deleted before finalization leaves pending and boot file coverage complete.
+    from appio.contracts import Window
+    from appio.durable import decode_file_hour_state
+    from appio.query import QueryService
+
+    seed_core_with_materialization(db)
+    acc = HourlyAccumulator("boot-A", 0)
+    acc.add_observation(R, APP, observation(bytes_r=50), ZERO)
+    files = FileHourStore(db)
+    files.apply_pending(acc.finalize())
+    for table in ("app_boot_total", "app_lifetime_total", "rollup_app"):
+        db.execute(f"UPDATE {table} SET coverage_json=?", (coverage_json(gap_intervals=1),))
+    db.execute("INSERT INTO gap VALUES(1,'boot-A','gui',1,1,0,1,'collector_gap')")
+    db.commit()
+    assert QuotaPruner(db, []).expire("boot-A", 2 * DAY).complete
+    text, = db.execute("SELECT state_json FROM file_hour_state").fetchone()
+    state = decode_file_hour_state(text, "boot-A", 0)
+    assert (state.apps[0].coverage.complete, state.apps[0].coverage.gap_intervals) == (0, 1)
+    assert (state.unknown_owner.coverage.complete, state.unknown_owner.coverage.gap_intervals) == (0, 1)
+    assert files.finalize_hour(HourlyAccumulator.from_state(state).finalize())
+    service = QueryService(db)
+    for window in (Window("range", "boot-A", 0, FILE_HOUR_NS), Window("lifetime")):
+        result = service.file_coverage(1, window)
+        assert (result.coverage.complete, result.coverage.gap_intervals) == (False, 1)
+        unknown = service.unknown_owner_file_coverage(window)
+        assert (unknown.coverage.complete, unknown.coverage.gap_intervals) == (False, 1)
+
+
+def test_b3_gap_delete_fault_rolls_back_file_transfer_before_retry(db):
+    # Falsifier: coverage updates survive a failed deletion and a retry counts the gap twice.
+    import sqlite3
+
+    seed_core_with_materialization(db)
+    acc = HourlyAccumulator("boot-A", 0)
+    acc.add_observation(R, APP, observation(), ZERO)
+    FileHourStore(db).finalize_hour(acc.finalize())
+    for table in ("app_boot_total", "app_lifetime_total", "rollup_app"):
+        db.execute(f"UPDATE {table} SET coverage_json=?", (coverage_json(gap_intervals=1),))
+    db.execute("INSERT INTO gap VALUES(1,'boot-A','gui',1,1,0,1,'collector_gap')")
+    db.execute("CREATE TEMP TRIGGER fail_gap_delete BEFORE DELETE ON main.gap BEGIN SELECT RAISE(ABORT,'gap delete fault'); END")
+    db.commit()
+    tables = ("file_coverage", "app_boot_file_coverage", "file_overflow_unknown", "boot_file_overflow_unknown")
+    before = [db.execute(f"SELECT * FROM {table}").fetchall() for table in tables]
+    with pytest.raises(sqlite3.IntegrityError, match="gap delete fault"):
+        QuotaPruner(db, []).expire("boot-A", 2 * DAY)
+    assert not db.in_transaction
+    assert db.execute("SELECT count(*) FROM gap").fetchone()[0] == 1
+    assert [db.execute(f"SELECT * FROM {table}").fetchall() for table in tables] == before
+    db.execute("DROP TRIGGER fail_gap_delete")
+    db.commit()
+    assert QuotaPruner(db, []).expire("boot-A", 2 * DAY).complete
+    assert [json.loads(db.execute(f"SELECT coverage_json FROM {table}").fetchone()[0])["gap_intervals"] for table in tables] == [1] * 4
+
+
 def test_long_gap_requires_coverage_in_every_overlapped_bucket(db):
     # Falsifier: preserving only the end bucket still loses uncertainty in earlier buckets.
     seed_core_with_materialization(db)
