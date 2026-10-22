@@ -25,6 +25,7 @@ from .durable import (
     decode_sampler_checkpoint,
 )
 from .launch import LaunchIdentity, LaunchState, ProcessState, ReapCredit
+from .handover import HandoverOffer, IncompleteHandoverError
 from .migrations import migrate_empty, open_database
 from .ownership import (
     device_interval_start, intersects, ownership_exclusions, subtract_intervals,
@@ -193,12 +194,14 @@ class AppIoStore:
         else:
             self.connection = open_database(Path(connection_or_path))
         self.sampler_state: SamplerState | None = None
+        self._owns_transaction = False
 
     @contextmanager
     def _transaction(self) -> Iterator[None]:
         if self.connection.in_transaction:
             raise ValueError("store operation requires a connection without an active transaction")
         self.connection.execute("BEGIN IMMEDIATE")
+        self._owns_transaction = True
         try:
             yield
             self.connection.execute("COMMIT")
@@ -206,6 +209,8 @@ class AppIoStore:
             if self.connection.in_transaction:
                 self.connection.execute("ROLLBACK")
             raise
+        finally:
+            self._owns_transaction = False
 
     def start_boot(self, boot_id: str, boot_order: int, started_mono_ns: int, started_wall: float, source: str) -> None:
         FrameIdentity(boot_id, source, 1, 0)
@@ -358,6 +363,16 @@ class AppIoStore:
         ).fetchall()
         receipts = set()
         for owner, epoch, seq, app, launch, ts, observed, start, *amounts in rows:
+            if source is None and start is None:
+                # A restored delta has no rate duration in schema v1. For
+                # uncertainty, the epoch start is only a conservative lower
+                # bound: exclude the whole delta, never invent a rate or split it.
+                interval = self.connection.execute(
+                    "SELECT from_mono_ns FROM collector_interval WHERE boot_id=? AND source=? AND epoch=?",
+                    (boot_id, owner, epoch),
+                ).fetchone()
+                if interval is not None and interval[0] <= observed:
+                    start = interval[0]
             if not intersects(start, observed, ts, [(beginning, end)]):
                 continue
             receipts.add((owner, epoch, seq, app))
@@ -410,71 +425,226 @@ class AppIoStore:
         with self._transaction():
             self._insert_gap(boot_id, source, epoch, seq, from_mono_ns, to_mono_ns, reason)
 
-    def record_tick(self, frame: AggregatedFrame, next_state: SamplerState) -> None:
-        """Commit a complete frame or raise without publishing its staged state.
-
-        Duplicate/stale identity is checked before examining any payload. On
-        overflow, the transaction is rolled back before a diagnostic transaction
-        starts. A diagnostic failure propagates, and a rejected epoch cannot
-        continue until start_collector establishes a new epoch and restart gap.
-        """
+    def _record_tick_in_transaction(self, frame: AggregatedFrame, next_state: SamplerState) -> None:
+        """Write one receipt and frame inside the store's own outer transaction."""
+        if not self._owns_transaction or not self.connection.in_transaction:
+            raise ValueError("tick writer requires a store-owned transaction")
         if not isinstance(frame, AggregatedFrame) or not isinstance(next_state, SamplerState):
             raise TypeError("record_tick requires an AggregatedFrame and SamplerState")
         identity = FrameIdentity(frame.boot_id, frame.source, frame.epoch, frame.seq)
+        active = self.connection.execute(
+            "SELECT boot_id,epoch,last_seq,allocated_mono_ns FROM collector_epoch WHERE source=?", (frame.source,)
+        ).fetchone()
+        if active is None or tuple(active[:2]) != (frame.boot_id, frame.epoch) or (active[2] is not None and frame.seq <= active[2]):
+            raise StaleFrameError("duplicate or stale frame identity")
+        if active[2] is None and frame.seq != 0:
+            raise StaleFrameError("the first frame in an epoch must have seq=0")
+        if not accept_frame(self.connection, identity):
+            raise StaleFrameError("duplicate or stale frame receipt")
+        if self.connection.execute(
+            "SELECT 1 FROM store_diagnostic WHERE boot_id=? AND source=? AND epoch=? LIMIT 1",
+            (frame.boot_id, frame.source, frame.epoch),
+        ).fetchone() is not None:
+            raise ValueError("counter_overflow recovery requires a new collector epoch and explicit gap")
+        previous = self.connection.execute(
+            "SELECT checkpoint_mono_ns FROM sampler_checkpoint WHERE source=? AND boot_id=?", (frame.source, frame.boot_id)
+        ).fetchone()
+        if frame.observed_mono_ns < active[3] or (previous is not None and frame.observed_mono_ns < previous[0]):
+            raise ValueError("frame observation precedes its durable evidence")
+        checkpoint_text = self._checkpoint_text(frame, next_state)
+        self._clock_observation(frame)
+        ids = self._app_ids(frame, next_state)
+        launches = self._launch_ids(frame, next_state, ids)
+        coverages: dict[str, FrameCoverage] = {}
+        deltas: dict[str, list[AppDelta]] = defaultdict(list)
+        devices: dict[str, list] = defaultdict(list)
+        for item in frame.coverage:
+            if item.app_key in coverages or item.observed_mono_ns != frame.observed_mono_ns:
+                raise ValueError("coverage must occur once per app at the observed frame timestamp")
+            coverages[item.app_key] = item
+        for delta in frame.deltas:
+            deltas[delta.app_key].append(delta)
+        for item in frame.device_deltas:
+            devices[item.app_key].append(item.delta)
+        required = set(deltas) | set(devices) | {process.app_key for process in next_state.processes}
+        if not required <= coverages.keys():
+            raise ValueError("each observed app requires one frame coverage receipt")
+        for key in sorted(coverages, key=lambda value: value.encode("utf-8")):
+            with _app_context(key):
+                self._record_app(frame, ids[key], deltas[key], devices[key], coverages[key], launches)
+        self.connection.execute(
+            "INSERT INTO sampler_checkpoint (source,boot_id,epoch,seq,checkpoint_mono_ns,state_json) VALUES (?,?,?,?,?,?) "
+            "ON CONFLICT(source) DO UPDATE SET boot_id=excluded.boot_id,epoch=excluded.epoch,seq=excluded.seq,"
+            "checkpoint_mono_ns=excluded.checkpoint_mono_ns,state_json=excluded.state_json",
+            (frame.source, frame.boot_id, frame.epoch, frame.seq, frame.observed_mono_ns, checkpoint_text),
+        )
+        if frame.observed_mono_ns > active[3]:
+            self._collector_interval(frame.source, frame.boot_id, frame.epoch, active[3], frame.observed_mono_ns)
+
+    def record_tick(self, frame: AggregatedFrame, next_state: SamplerState) -> None:
+        """Commit a complete frame or raise without publishing its staged state."""
         try:
             with self._transaction():
-                active = self.connection.execute(
-                    "SELECT boot_id,epoch,last_seq,allocated_mono_ns FROM collector_epoch WHERE source=?", (frame.source,)
-                ).fetchone()
-                if active is None or tuple(active[:2]) != (frame.boot_id, frame.epoch) or (active[2] is not None and frame.seq <= active[2]):
-                    raise StaleFrameError("duplicate or stale frame identity")
-                if active[2] is None and frame.seq != 0:
-                    raise StaleFrameError("the first frame in an epoch must have seq=0")
-                if not accept_frame(self.connection, identity):
-                    raise StaleFrameError("duplicate or stale frame receipt")
-                if self.connection.execute(
-                    "SELECT 1 FROM store_diagnostic WHERE boot_id=? AND source=? AND epoch=? LIMIT 1",
-                    (frame.boot_id, frame.source, frame.epoch),
-                ).fetchone() is not None:
-                    raise ValueError("counter_overflow recovery requires a new collector epoch and explicit gap")
-                previous = self.connection.execute(
-                    "SELECT checkpoint_mono_ns FROM sampler_checkpoint WHERE source=? AND boot_id=?", (frame.source, frame.boot_id)
-                ).fetchone()
-                if frame.observed_mono_ns < active[3] or (previous is not None and frame.observed_mono_ns < previous[0]):
-                    raise ValueError("frame observation precedes its durable evidence")
-                checkpoint_text = self._checkpoint_text(frame, next_state)
-                self._clock_observation(frame)
-                ids = self._app_ids(frame, next_state)
-                launches = self._launch_ids(frame, next_state, ids)
-                coverages: dict[str, FrameCoverage] = {}
-                deltas: dict[str, list[AppDelta]] = defaultdict(list)
-                devices: dict[str, list] = defaultdict(list)
-                for item in frame.coverage:
-                    if item.app_key in coverages or item.observed_mono_ns != frame.observed_mono_ns:
-                        raise ValueError("coverage must occur once per app at the observed frame timestamp")
-                    coverages[item.app_key] = item
-                for delta in frame.deltas:
-                    deltas[delta.app_key].append(delta)
-                for item in frame.device_deltas:
-                    devices[item.app_key].append(item.delta)
-                required = set(deltas) | set(devices) | {process.app_key for process in next_state.processes}
-                if not required <= coverages.keys():
-                    raise ValueError("each observed app requires one frame coverage receipt")
-                for key in sorted(coverages, key=lambda value: value.encode("utf-8")):
-                    with _app_context(key):
-                        self._record_app(frame, ids[key], deltas[key], devices[key], coverages[key], launches)
-                self.connection.execute(
-                    "INSERT INTO sampler_checkpoint (source,boot_id,epoch,seq,checkpoint_mono_ns,state_json) VALUES (?,?,?,?,?,?) "
-                    "ON CONFLICT(source) DO UPDATE SET boot_id=excluded.boot_id,epoch=excluded.epoch,seq=excluded.seq,"
-                    "checkpoint_mono_ns=excluded.checkpoint_mono_ns,state_json=excluded.state_json",
-                    (frame.source, frame.boot_id, frame.epoch, frame.seq, frame.observed_mono_ns, checkpoint_text),
-                )
-                if frame.observed_mono_ns > active[3]:
-                    self._collector_interval(frame.source, frame.boot_id, frame.epoch, active[3], frame.observed_mono_ns)
+                self._record_tick_in_transaction(frame, next_state)
         except CounterOverflowError as error:
             self._diagnose_overflow(frame, error)
             raise
         self.sampler_state = next_state
+
+    def _validate_handover_offer(self, offer: HandoverOffer) -> None:
+        """Validate the outgoing durable frontier before any handover write."""
+        from .durable import HandoverState, decode_handover
+
+        if not isinstance(offer, HandoverOffer):
+            raise TypeError("install_handover requires a HandoverOffer")
+        state = decode_handover(canonical_json(offer.state), offer.state.boot_id, offer.state.cutoff_mono_ns)
+        boot = self.connection.execute("SELECT boot_id FROM boot WHERE boot_id=?", (state.boot_id,)).fetchone()
+        if boot is None:
+            raise ValueError("handover requires an initialized boot row")
+        active = self.connection.execute(
+            "SELECT boot_id,epoch,last_seq,allocated_mono_ns FROM collector_epoch WHERE source=?",
+            (offer.from_source,),
+        ).fetchone()
+        if active is None or tuple(active[:3]) != (state.boot_id, offer.outgoing_epoch, offer.outgoing_seq):
+            raise ValueError("handover outgoing epoch or sequence is not the active durable frontier")
+        if offer.interval_start_mono_ns < active[3] or offer.state.cutoff_mono_ns <= offer.interval_start_mono_ns:
+            raise ValueError("handover interval is outside the outgoing epoch")
+        checkpoint = self.connection.execute(
+            "SELECT source,boot_id,epoch,seq,checkpoint_mono_ns,state_json FROM sampler_checkpoint WHERE source=?",
+            (offer.from_source,),
+        ).fetchone()
+        if checkpoint is None:
+            raise IncompleteHandoverError("handover outgoing checkpoint is missing")
+        row = SamplerCheckpointRow(*checkpoint[:5])
+        checkpoint_state = decode_sampler_checkpoint(checkpoint[5], row)
+        if (checkpoint_state.boot_id, checkpoint_state.epoch, checkpoint_state.last_seq,
+                checkpoint_state.checkpoint_mono_ns) != (state.boot_id, offer.outgoing_epoch,
+                offer.outgoing_seq, state.cutoff_mono_ns):
+            raise IncompleteHandoverError("handover cutoff is not the outgoing checkpoint frontier")
+        checkpoint_handover = HandoverState(
+            checkpoint_state.boot_id, checkpoint_state.checkpoint_mono_ns,
+            checkpoint_state.processes, checkpoint_state.devices,
+        )
+        if canonical_json(checkpoint_handover) != canonical_json(state):
+            raise ValueError("handover baselines do not match the outgoing checkpoint")
+        cutoff_receipt = self.connection.execute(
+            "SELECT 1 FROM sample_coverage WHERE boot_id=? AND source=? AND epoch=? AND seq=? "
+            "AND ts_mono_ns=? LIMIT 1",
+            (state.boot_id, offer.from_source, offer.outgoing_epoch, offer.outgoing_seq, state.cutoff_mono_ns),
+        ).fetchone()
+        if cutoff_receipt is None:
+            raise IncompleteHandoverError("handover cutoff interval evidence is missing or pruned")
+        # Schema v1 stores a rate-unknown delta as a point. At this exact
+        # cutoff the unchanged raw query would select the incoming owner,
+        # while materialized totals would retain the outgoing bytes.
+        if self.connection.execute(
+            "SELECT 1 FROM sample WHERE boot_id=? AND source=? AND epoch=? AND ts_mono_ns>=? "
+            "AND interval_start_mono_ns IS NULL "
+            "AND (rchar>0 OR wchar>0 OR read_bytes>0 OR write_bytes>0) LIMIT 1",
+            (state.boot_id, offer.from_source, offer.outgoing_epoch, state.cutoff_mono_ns),
+        ).fetchone() is not None:
+            raise IncompleteHandoverError("handover cutoff lacks whole-delta interval evidence")
+        interval = self.connection.execute(
+            "SELECT from_mono_ns,to_mono_ns FROM collector_interval "
+            "WHERE source=? AND boot_id=? AND epoch=?",
+            (offer.from_source, state.boot_id, offer.outgoing_epoch),
+        ).fetchone()
+        if interval is None or tuple(interval) != (offer.interval_start_mono_ns, state.cutoff_mono_ns):
+            raise IncompleteHandoverError("handover outgoing interval evidence is incomplete")
+        if self.connection.execute(
+            "SELECT 1 FROM store_diagnostic WHERE boot_id=? AND source=? AND epoch=? LIMIT 1",
+            (state.boot_id, offer.from_source, offer.outgoing_epoch),
+        ).fetchone() is not None:
+            raise IncompleteHandoverError("handover outgoing epoch contains an overflow diagnostic")
+
+        prior = self.connection.execute(
+            "SELECT from_source,to_source,cutoff_mono_ns FROM handover WHERE boot_id=? "
+            "ORDER BY cutoff_mono_ns DESC LIMIT 1", (state.boot_id,),
+        ).fetchone()
+        if prior is not None:
+            if prior[1] != offer.from_source or prior[2] != offer.interval_start_mono_ns:
+                raise IncompleteHandoverError("handover ownership chain has a missing predecessor")
+        else:
+            # A first clean handover cannot retroactively settle a concurrent
+            # contributor or a gap whose bytes have already left raw storage.
+            other = self.connection.execute(
+                "SELECT source,from_mono_ns,to_mono_ns FROM collector_interval "
+                "WHERE boot_id=? AND source<>? AND from_mono_ns<? LIMIT 1",
+                (state.boot_id, offer.from_source, state.cutoff_mono_ns),
+            ).fetchone()
+            if other is not None:
+                raise IncompleteHandoverError("handover has an unrecorded overlapping owner")
+        if self.connection.execute(
+            "SELECT 1 FROM gap WHERE boot_id=? AND from_mono_ns<? AND to_mono_ns>? "
+            "AND reason IN ('collector_gap','quota_exhausted') LIMIT 1",
+            (state.boot_id, state.cutoff_mono_ns, offer.interval_start_mono_ns),
+        ).fetchone() is not None:
+            raise IncompleteHandoverError("handover interval contains an unclosed gap")
+        incoming = self.connection.execute(
+            "SELECT boot_id,allocated_mono_ns FROM collector_epoch WHERE source=?", (offer.to_source,),
+        ).fetchone()
+        checkpoint = self.connection.execute(
+            "SELECT boot_id,checkpoint_mono_ns FROM sampler_checkpoint WHERE source=?", (offer.to_source,),
+        ).fetchone()
+        if any(row is not None and row[0] == state.boot_id and row[1] > state.cutoff_mono_ns
+               for row in (incoming, checkpoint)):
+            raise ValueError("handover cutoff precedes incoming durable evidence")
+        diagnostic = self.connection.execute(
+            "SELECT max(ts_mono_ns) FROM store_diagnostic WHERE boot_id=? AND source=?",
+            (state.boot_id, offer.to_source),
+        ).fetchone()[0]
+        if diagnostic is not None and diagnostic > state.cutoff_mono_ns:
+            raise ValueError("handover cutoff precedes incoming overflow evidence")
+
+    def install_handover(self, offer: HandoverOffer, *, wall_ns: int) -> CollectorEpoch:
+        """Atomically install a validated cutoff and an incoming zero-byte receipt."""
+        from dataclasses import replace
+        from .handover import seed_handover
+
+        if not isinstance(offer, HandoverOffer):
+            raise TypeError("install_handover requires a HandoverOffer")
+        _contract_integer(wall_ns, "handover.wall_ns", nonnegative=False)
+        if self.connection.in_transaction:
+            raise ValueError("store operation requires a connection without an active transaction")
+        canonical = canonical_json(offer.state)
+        with self._transaction():
+            existing = self.connection.execute(
+                "SELECT from_source,to_source,cutoff_mono_ns,baselines_json FROM handover "
+                "WHERE boot_id=? AND cutoff_mono_ns=?",
+                (offer.state.boot_id, offer.state.cutoff_mono_ns),
+            ).fetchone()
+            if existing is not None:
+                if tuple(existing[:3]) != (offer.from_source, offer.to_source, offer.state.cutoff_mono_ns) or existing[3] != canonical:
+                    raise ValueError("conflicting handover already exists at this cutoff")
+                current = self.connection.execute(
+                    "SELECT source,boot_id,epoch,last_seq,allocated_mono_ns FROM collector_epoch WHERE source=?",
+                    (offer.to_source,),
+                ).fetchone()
+                if current is None or current[1] != offer.state.boot_id or current[4] < offer.state.cutoff_mono_ns:
+                    raise IncompleteHandoverError("existing handover has no durable incoming epoch")
+                return CollectorEpoch(*current)
+
+            self._validate_handover_offer(offer)
+            self.connection.execute(
+                "INSERT INTO handover (boot_id,from_source,to_source,cutoff_mono_ns,baselines_json) VALUES (?,?,?,?,?)",
+                (offer.state.boot_id, offer.from_source, offer.to_source, offer.state.cutoff_mono_ns, canonical),
+            )
+            # Reassert the outgoing interval in this transaction so the cutoff
+            # evidence and ownership row share one commit boundary.
+            self._collector_interval(
+                offer.from_source, offer.state.boot_id, offer.outgoing_epoch,
+                offer.interval_start_mono_ns, offer.state.cutoff_mono_ns,
+            )
+            incoming = allocate_epoch(
+                self.connection, offer.to_source, offer.state.boot_id, offer.state.cutoff_mono_ns,
+            )
+            seed_frame, seeded_state = seed_handover(
+                offer, incoming_epoch=incoming.epoch, wall_ns=wall_ns,
+            )
+            self._record_tick_in_transaction(seed_frame, seeded_state)
+            result = replace(incoming, last_seq=0)
+        self.sampler_state = seeded_state
+        return result
 
     def _checkpoint_text(self, frame: AggregatedFrame, state: SamplerState) -> str:
         value = state.to_checkpoint()
