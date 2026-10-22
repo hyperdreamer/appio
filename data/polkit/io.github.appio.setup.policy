@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC
+ "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<policyconfig>
+  <vendor>appio</vendor>
+
+  <!--
+    One action, one executable, one verb set. The exec.path annotation is what
+    makes polkit run /usr/bin/appio-setup as root; it must never point at a
+    user-writable path or at a generic interpreter. auth_admin is required for
+    every session state, never the cached keep variant: the helper changes a
+    root-owned system service configuration, and a cached authorization would
+    let a later caller reuse it without a prompt.
+  -->
+  <action id="io.github.appio.setup">
+    <description>Manage the appio system I/O service</description>
+    <message>Authentication is required to change the appio system service configuration.</message>
+    <icon_name>drive-harddisk</icon_name>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/bin/appio-setup</annotate>
+    <annotate key="org.freedesktop.policykit.exec.allow_gui">true</annotate>
+  </action>
+</policyconfig>
