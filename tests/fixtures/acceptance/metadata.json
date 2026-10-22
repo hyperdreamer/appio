@@ -1,0 +1,36 @@
+{
+  "app_metadata": {
+    "icon_path": null,
+    "name": "fixture",
+    "scope": "user"
+  },
+  "boot_id": "11111111-2222-4333-8444-555555555555",
+  "cgroup_ids": {
+    "/fixture-shared": 104,
+    "/user.slice/user-1000.slice/user@1000.service/app.slice/app-chromium@fixture.service": 101,
+    "/user.slice/user-1000.slice/user@1000.service/app.slice/app-pidreuse.scope": 102,
+    "/user.slice/user-1000.slice/user@1000.service/app.slice/app-shared.scope": 103
+  },
+  "clk_tck": 100,
+  "dumpability": {
+    "413": false
+  },
+  "eacces_io": [
+    "proc/t0/413/io",
+    "proc/t1/413/io",
+    "proc/t2/413/io"
+  ],
+  "epoch": 1,
+  "observed_mono_ns": [
+    100000000000,
+    110000000000,
+    120000000000
+  ],
+  "sequences": [
+    0,
+    1,
+    2
+  ],
+  "source": "gui",
+  "wall_offset_ns": 1000000000000
+}
