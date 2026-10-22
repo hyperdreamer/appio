@@ -283,13 +283,23 @@ def test_fixture_to_since_boot_query_and_screen(collected, qtbot):
         "screen_device": label(window, "device_value"),
         "screen_residual": label(window, "residual_value"),
     }
+    # Ratified policy (PM ruling, 2026-10-21): this fixture's since_boot window is [0, 130 s)
+    # while the collector only owns time from T0 = 100 s, so 100 s of the requested window was
+    # never observed. Per spec 4.2 (since_boot starts at boot zero), 8.2 "a required missing
+    # interval makes Coverage.complete false" and 8.2 "an incomplete/unavailable D result sets
+    # device totals and all residuals to None", the correct result is UNAVAILABLE device data -
+    # NOT the stored 290. The store is still required to hold the truth (stored_device below),
+    # and the UI is still required to say so honestly rather than print 0.
     assert observed == {
         "stored_task": (200, 100, 300), "stored_device": (170, 120, 290),
-        "task": (200, 100, 300), "device": (170, 120, 290), "residual": (30, -20, 10),
+        "task": (200, 100, 300), "device": (None, None, None), "residual": (None, None, None),
         "coverage_counts": (3, 1), "screen_total": "300 B", "screen_read": "200 B",
-        "screen_write": "100 B", "screen_device": "290 B",
-        "screen_residual": "Residual: +10 B - difference between accounting points",
+        "screen_write": "100 B", "screen_device": "unavailable",
+        "screen_residual": "Residual: unavailable - difference between accounting points",
     }
+    # The incompleteness must be disclosed, not merely implied by a missing number.
+    assert total.coverage.complete is False
+    assert share.coverage.complete is False
 
 
 @pytest.mark.parametrize("component,task,device,residual", [
