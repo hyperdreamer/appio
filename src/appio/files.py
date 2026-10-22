@@ -1,9 +1,9 @@
 """Deterministic synthetic file-hour accumulation, without a live file producer.
 
-Contributions must already have passed stream receipt/ownership selection. Coverage
-is a receipt-level quantity: repeating it beside each file in a frame counts it
-once for that app. All candidates remain in canonical pending state; top-N is a
-pure projection applied only when the hour closes.
+Contributions must already have passed stream receipt/ownership selection and
+arrive in accepted frame order. Coverage is a receipt-level quantity: repeating
+it beside each file in a frame counts it once for that app. All candidates remain
+in canonical pending state; top-N is applied only when the hour closes.
 """
 from __future__ import annotations
 
@@ -45,11 +45,6 @@ def merge_coverage(a: FileCoverageInput, b: FileCoverageInput) -> FileCoverageIn
                               for name in HOOKS}),
         complete=a.complete and b.complete,
     )
-
-
-def _receipt_key(receipt: Receipt) -> tuple[int, int, bytes]:
-    # Used only to resolve simultaneous observations, not to infer stream ownership.
-    return receipt.epoch, receipt.seq, receipt.source.encode("utf-8")
 
 
 def top_key(entry: FileEntry, path_id: int = 0) -> tuple:
@@ -105,7 +100,6 @@ class _App:
     files: dict[tuple, FileEntry]
     coverage: FileCoverageInput
     last_receipt: Receipt
-    last_order: tuple
     receipt_coverage: dict[Receipt, FileCoverageInput | None]
 
 
@@ -160,11 +154,14 @@ class HourlyAccumulator:
                 raise ValueError("last_seen_mono_ns must be inside the half-open hour")
         previous = self._apps.get(app_key)
         app = _App(dict(previous.files), previous.coverage, previous.last_receipt,
-                   previous.last_order, dict(previous.receipt_coverage)) if previous else _App({}, ZERO_COVERAGE, receipt, (-1,), {})
+                   dict(previous.receipt_coverage)) if previous else _App({}, ZERO_COVERAGE, receipt, {})
         names = dict(self._names)
         if receipt not in app.receipt_coverage:
             app.coverage = merge_coverage(app.coverage, coverage)
             app.receipt_coverage[receipt] = coverage
+            # LAST describes the file; provenance describes the latest accepted
+            # contributing frame, including coverage-only and handover frames.
+            app.last_receipt = receipt
         elif app.receipt_coverage[receipt] not in (None, coverage) and coverage != ZERO_COVERAGE:
             raise ValueError("conflicting coverage for the same app receipt")
         if entry is not None:
@@ -190,9 +187,6 @@ class HourlyAccumulator:
                                    last_mono_ns=max(prior_name.last_mono_ns, name.last_mono_ns),
                                    state=max((name.state, prior_name.state), key=("resolved", "truncated", "unresolved").index))
                 names[name.path_key] = name
-        order = ((entry.last_seen_mono_ns if entry else self.hour_start_mono_ns), *_receipt_key(receipt))
-        if order > app.last_order:
-            app.last_receipt, app.last_order = receipt, order
         # Publish only after every counter and identity has validated.
         self._apps[app_key], self._names = app, names
 
@@ -206,8 +200,7 @@ class HourlyAccumulator:
         updated = UnknownOwnerInput(**values, complete=self._unknown.complete and unknown.complete)
         self._unknown = updated
         self._unknown_seen.add(receipt)
-        if self._unknown_receipt is None or _receipt_key(receipt) > _receipt_key(self._unknown_receipt):
-            self._unknown_receipt = receipt
+        self._unknown_receipt = receipt
 
     def state(self) -> FileHourState:
         apps = tuple(FileHourApp(key, tuple(sorted(app.files.values(), key=lambda entry: entry.identity)),
@@ -232,10 +225,8 @@ class HourlyAccumulator:
         state = decode_file_hour_state(canonical_json(state), state.boot_id, state.hour_start_mono_ns)
         result = cls(state.boot_id, state.hour_start_mono_ns)
         for app in state.apps:
-            last_time = max((e.last_seen_mono_ns for e in app.files), default=state.hour_start_mono_ns)
             result._apps[app.app_key] = _App({e.identity: e for e in app.files}, _input_coverage(app.coverage),
-                                           app.last_receipt, (last_time, *_receipt_key(app.last_receipt)),
-                                           {app.last_receipt: None})
+                                           app.last_receipt, {app.last_receipt: None})
         u = state.unknown_owner
         result._unknown = UnknownOwnerInput(u.overflow_files, u.overflow_bytes_r, u.overflow_bytes_w,
                                            u.coverage.gap_intervals, u.coverage.overlap_uncertain_intervals, bool(u.coverage.complete))

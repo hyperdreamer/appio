@@ -170,6 +170,24 @@ def test_each_full_identity_component_decides_a_production_cutoff(changes):
         assert (selected.dev, selected.inode, selected.generation, selected.identity_weak, selected.fs_uuid) == (base.dev, base.inode, base.generation, base.identity_weak, base.fs_uuid)
 
 
+def test_latest_accepted_receipt_advances_on_coverage_only_and_collector_handover():
+    # Falsifier: file LAST or unrelated stream sequence magnitudes select provenance.
+    acc = HourlyAccumulator("boot-A", 0)
+    early = Receipt("gui", 9, 100)
+    later = Receipt("gui", 9, 101)
+    handed_over = Receipt("iod", 1, 0)
+    acc.add_observation(early, APP, observation(last_seen_mono_ns=1000), ZERO)
+    acc.add_observation(later, APP, None, replace(ZERO, skipped_nonfile=1))
+    assert acc.state().apps[0].last_receipt == later
+    acc.add_observation(handed_over, APP, observation(last_seen_mono_ns=1001), ZERO)
+    acc.add_unknown_owner(early, UnknownOwnerInput(1, 2, 3, 0, 0, True))
+    acc.add_unknown_owner(handed_over, UnknownOwnerInput(1, 4, 5, 0, 0, True))
+    assert acc.state().apps[0].last_receipt == handed_over
+    assert acc.state().unknown_owner.last_receipt == handed_over
+    restored = HourlyAccumulator.from_state(acc.state())
+    assert restored.state() == acc.state()
+
+
 def test_receipt_coverage_hooks_sum_once_per_frame_and_incompleteness_survives_restore():
     # Falsifier: copy frame coverage per candidate, omit hook counters, or lose a false completeness bit.
     acc = HourlyAccumulator("boot-A", 0)
