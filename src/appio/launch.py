@@ -59,8 +59,6 @@ class ProcessState:
     last_observed_mono_ns: int | None = None
     had_reset: bool = False
     reap_incomplete: bool = False
-    rate_uncovered_intervals: tuple[tuple[int, int], ...] = ()
-    rate_unknown: bool = False
 
 
 @dataclass(frozen=True)
@@ -141,10 +139,7 @@ def assign_launches(
             record.app_key_inputs.desktop_id,
         )
         parent = by_pid.get(record.ppid)
-        prior_launch = prior_member_launch.get(identity)
-        if prior_launch is not None and prior_launch.app_key == app_key:
-            launch = prior_launch
-        elif parent is not None:
+        if parent is not None:
             parent_key = resolve_app(
                 parent.app_key_inputs.cgroup_path,
                 parent.app_key_inputs.exe,
@@ -157,7 +152,11 @@ def assign_launches(
         elif record.ppid in (0, 1):
             launch = LaunchIdentity(identity, app_key)
         else:
-            launch = LaunchIdentity(None, app_key)
+            prior_launch = prior_member_launch.get(identity)
+            if prior_launch is not None and prior_launch.app_key == app_key:
+                launch = prior_launch
+            else:
+                launch = LaunchIdentity(None, app_key)
         visiting.remove(identity)
         assignments[identity] = launch
         return launch
