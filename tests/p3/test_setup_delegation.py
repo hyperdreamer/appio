@@ -261,6 +261,38 @@ def test_a_controller_only_in_the_existing_file_is_never_removed(root: Path):
     assert b"cpuset" in rebase(root, SERVICE_DROPIN).read_bytes()
 
 
+def test_install_refuses_a_non_canonical_existing_service_dropin(root: Path):
+    # F-1: the install path must stop at a hostile pre-existing service drop-in
+    # before writing either file, and must name that fixed operation so Task 10
+    # can report the exact failure.
+    seeded = b"[Unit]\nDescription=admin owned\n"
+    rebase(root, SERVICE_DROPIN).write_bytes(seeded)
+    deps, fs, runner, timeline = harness(root)
+    result = install_delegation(identity(), deps=deps, fs=fs)
+    assert result["error"] == "inspect-existing-service-dropin:unexpected_content"
+    assert result["delegation_installed"] is False
+    assert result["pending_activation"] is True
+    assert runner.calls == [GETENT, SHOW]
+    assert fs.written_paths() == [str(STATE_FILE)]
+    assert rebase(root, SERVICE_DROPIN).read_bytes() == seeded
+    assert not rebase(root, USER_MANAGER_DROPIN).exists()
+
+
+def test_install_refuses_a_non_canonical_existing_manager_dropin(root: Path):
+    # The manager drop-in is checked by SafeRootFS when it is replaced; the
+    # failure must be attributed to that write and must preserve the file.
+    seeded = b"[Manager]\nDefaultTasksMax=infinity\n"
+    rebase(root, USER_MANAGER_DROPIN).write_bytes(seeded)
+    deps, fs, runner, timeline = harness(root)
+    result = install_delegation(identity(), deps=deps, fs=fs)
+    assert result["error"] == "write-user-manager-dropin:write_failed"
+    assert result["delegation_installed"] is False
+    assert result["pending_activation"] is True
+    assert runner.calls == [GETENT, SHOW]
+    assert rebase(root, USER_MANAGER_DROPIN).read_bytes() == seeded
+    assert rebase(root, SERVICE_DROPIN).read_bytes() == SERVICE_PAYLOAD
+
+
 # --------------------------------------------------------------------------- #
 # Threat: group installation widens membership or targets a claimed username.
 # --------------------------------------------------------------------------- #
