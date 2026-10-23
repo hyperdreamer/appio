@@ -392,9 +392,9 @@ class P3Harness:
         from appio.ui.collector_window import CollectorWindow
         local_path = self.root / "gui.db"
         local = AppIoStore(local_path)
-        # Same boot identity for remote-only GUI composition; no local samples.
-        if local.connection.execute("SELECT count(*) FROM boot").fetchone()[0] == 0:
-            local.start_boot(BOOT, 1, 10*NS, (STAMP+10*NS)/NS, "gui")
+        # A daemon-owned GUI starts with a genuinely empty local history DB. Its
+        # boot identity must come from the verified daemon status, not from a
+        # synthetic local boot row (which would conceal the production bug).
         gaps, holder = [], {}
 
         def on_gap(notice):

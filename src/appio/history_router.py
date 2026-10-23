@@ -6,9 +6,12 @@ estimated overlap from precomputed totals. Pruned mixed histories are unavailabl
 rather than guessed. Exports remain separate stores; AppKey joins the results.
 
 Protocol v1 does not carry collector_interval/handover rows. A remote whole-window
-answer is usable without an export only when its coverage proves the whole
-window. Incomplete remote answers cannot establish a cross-store cutoff and are
-explicitly unavailable, even when they contain plausible numeric totals.
+answer is authoritative when the daemon returns a non-empty, snapshot-bound
+result; its coverage may honestly be incomplete because process observation can
+lose identities or intervals. The GUI preserves those numeric retained bytes
+and their incomplete coverage instead of requiring a privileged export. Empty
+answers and paginated answers still cannot prove that no history was retained,
+so they remain unavailable without an independent ownership source.
 """
 from __future__ import annotations
 
@@ -525,9 +528,19 @@ class HistoryRouter:
                             raise ValueError("remote history snapshot identity required")
                         if response.get("next_cursor") is not None:
                             raise ValueError("paginated remote ownership is not proved atomically")
-                        if not rows or not all(row.coverage.complete for row in rows):
+                        if not rows:
                             raise ValueError("remote ownership evidence required")
+                        # Incomplete coverage is an honest property of the
+                        # daemon's retained observations (reaps, gaps, or
+                        # inaccessible identities), not proof that the answer
+                        # is unusable. Keep the rows and let their contracts
+                        # disclose the uncertainty. Only an empty answer lacks
+                        # enough evidence to distinguish "no apps" from a
+                        # missing/unretained history window.
                         self._remote = [replace(row, app_id=self.registry.id_for(row.app_key)) for row in rows]
+                        self._not_retained = self._not_retained or any(
+                            row.coverage.unavailable_reason == "not_retained" for row in rows
+                        )
                         for row in self._remote:
                             self._queue.extend([QueryRequest("totals", window, row.app_key),
                                                 QueryRequest("series", window, row.app_key)])
