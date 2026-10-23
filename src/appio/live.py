@@ -9,7 +9,7 @@ clock without opening the host process table or clock.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import hashlib
 import math
 from pathlib import Path
@@ -17,8 +17,21 @@ import time
 from typing import Literal
 
 from .cgroups import CgroupObservation, read_cgroup_fixture
+from .handover import (
+    HandoverOffer,
+    IncompleteHandoverError,
+    baseline_seed,
+    capture_handover,
+    seed_handover,
+)
 from .procs import ProcReader, ProcessVanished, StableProcRecord
-from .sampler import FrameCoverage, SamplerState, TickInput, aggregate_tick
+from .sampler import (
+    AggregatedFrame,
+    FrameCoverage,
+    SamplerState,
+    TickInput,
+    aggregate_tick,
+)
 from .store import AppIoStore
 
 __all__ = [
@@ -30,6 +43,7 @@ __all__ = [
 
 _NS = 1_000_000_000
 _SOURCE = "gui"
+_SOURCES = ("gui", "iod")
 _ROW_TABLES = ("sample", "sample_dev", "sample_coverage")
 
 
@@ -196,12 +210,47 @@ def _coverage_summary(coverage: tuple[FrameCoverage, ...]) -> CoverageSummary:
     )
 
 
+def _other_source(source: Literal["gui", "iod"]) -> Literal["gui", "iod"]:
+    """The single destination a source change can hand over to."""
+
+    return "iod" if source == "gui" else "gui"
+
+
+def _mark_unmeasured(frame: AggregatedFrame) -> AggregatedFrame:
+    """Flag every app in a frame whose window no collector measured.
+
+    The stage keeps the computed bookkeeping; only the coverage caveat changes,
+    so a query cannot read this frame as complete coverage.
+    """
+
+    return replace(
+        frame,
+        coverage=tuple(
+            replace(
+                item,
+                partial_intervals=max(item.partial_intervals, 1),
+                reap_incomplete=True,
+                gap_intervals=max(item.gap_intervals, 1),
+            )
+            for item in frame.coverage
+        ),
+    )
+
+
 class LiveCollector:
     """Own one live process stream and commit one complete frame per tick.
 
     ``proc_root``, ``cgroup_root``, and ``database_path`` are all explicit so a
     caller can use the same object with a fixture tree.  ``clock`` returns a
     boottime and wall-clock pair; a callable is the simplest injectable form.
+
+    ``source`` selects the stream this collector owns.  ``baseline_only`` starts
+    a fresh authority: the epoch is allocated at the first sampled baseline and
+    that sample emits no bytes, so counters that accumulated before this
+    collector started never become measured io.  ``resume_handover`` installs a
+    validated outgoing cutoff and continues the incoming stream from sequence
+    zero; an offer whose ownership chain cannot be proven degrades to the same
+    conservative baseline instead of installing a misleading handover row.
     """
 
     def __init__(
@@ -212,15 +261,29 @@ class LiveCollector:
         clock: object | None = None,
         *,
         source: Literal["gui", "iod"] = _SOURCE,
+        baseline_only: bool = False,
+        resume_handover: HandoverOffer | None = None,
     ) -> None:
-        if source != _SOURCE:
-            raise ValueError("LiveCollector currently owns the gui collector stream")
+        if source not in _SOURCES:
+            raise ValueError("LiveCollector accepts only the gui and iod source tokens")
+        if not isinstance(baseline_only, bool):
+            raise ValueError("baseline_only must be a boolean")
+        if resume_handover is not None:
+            if not isinstance(resume_handover, HandoverOffer):
+                raise ValueError("resume_handover must be a HandoverOffer or None")
+            if resume_handover.to_source != source:
+                raise ValueError(
+                    "resume_handover must name this collector's source as its destination"
+                )
+            if baseline_only:
+                raise ValueError("resume_handover already establishes the incoming baseline")
         self.proc_root = Path(proc_root)
         self.cgroup_root = Path(cgroup_root)
         self.database_path = Path(database_path)
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
         self.clock: object = SystemClock() if clock is None else clock
         self.source = source
+        self.baseline_only = baseline_only
         self.boot_id = _boot_id_from_proc_root(self.proc_root)
         initial_mono_ns, initial_wall_ns = _read_clock(self.clock)
 
@@ -240,24 +303,95 @@ class LiveCollector:
                 initial_wall_ns / _NS,
                 self.source,
             )
-        elif tuple(boot[3:]) != (self.source,):
-            raise ValueError(
-                f"boot {self.boot_id!r} belongs to source {boot[3]!r}, not {self.source!r}"
-            )
+        # A boot row records the source that created it and stays immutable, so
+        # an imported root-origin export keeps ``boot.source`` exactly as it is.
+        # Stream ownership lives in collector_epoch, collector_interval and the
+        # sampler checkpoint, each keyed by this collector's own source.
 
-        epoch = self.store.start_collector(self.source, self.boot_id, initial_mono_ns)
-        self.epoch = epoch.epoch
-        self._state: SamplerState | None = self.store.restore_checkpoint(
-            self.source, self.boot_id
-        )
-        self._next_seq = 0
+        self._state: SamplerState | None = None
+        self._last_frame: AggregatedFrame | None = None
         self._last_result: TickResult | None = None
         self._last_observed_mono_ns: int | None = None
+        self._next_seq = 0
+        self._epoch: int | None = None
+        self._deferred_baseline = False
+        self._pending_gap_from: int | None = None
+        self._offer: HandoverOffer | None = None
+        self._handover_fallback_reason: str | None = None
+        self._quiesced = False
         self._closed = False
+
+        if resume_handover is not None:
+            self._install_incoming(resume_handover, initial_wall_ns)
+        elif baseline_only:
+            # Allocation waits for the sampled baseline so the epoch, the
+            # baseline and the first interval all share one observation.
+            self._deferred_baseline = True
+        else:
+            epoch = self.store.start_collector(self.source, self.boot_id, initial_mono_ns)
+            self._epoch = epoch.epoch
+            self._next_seq = 0
+            self._state = self.store.restore_checkpoint(self.source, self.boot_id)
+
+    def _install_incoming(self, offer: HandoverOffer, wall_ns: int) -> None:
+        """Install a proven cutoff, or degrade to a conservative fresh baseline.
+
+        A store rejection means the offer contradicts durable evidence: the
+        cutoff receipt is gone, the ownership chain has a hole, another owner
+        overlaps the interval, or the cutoff is behind evidence this source
+        already committed. Every one of those is an unclean transfer, so the
+        collector takes a fresh baseline and records the unmeasured absence.
+        The reason stays readable rather than silent.
+        """
+
+        try:
+            epoch = self.store.install_handover(offer, wall_ns=wall_ns)
+        except (IncompleteHandoverError, ValueError) as error:
+            self._handover_fallback_reason = f"{type(error).__name__}: {error}"
+            self._deferred_baseline = True
+            self._pending_gap_from = offer.state.cutoff_mono_ns
+            return
+        self._epoch = epoch.epoch
+        self._state = self.store.restore_checkpoint(self.source, self.boot_id)
+        self._next_seq = 0 if epoch.last_seq is None else epoch.last_seq + 1
+        # Re-derive the seed from the durable checkpoint. The cutoff, baselines,
+        # deltas and coverage are the committed ones, and the wall-clock offset
+        # is the persisted mapping for that observation, so a repeated
+        # installation yields exactly the frame the store committed.
+        cutoff = offer.state.cutoff_mono_ns
+        self._last_frame = seed_handover(
+            offer,
+            incoming_epoch=epoch.epoch,
+            wall_ns=self._committed_wall_ns(cutoff, wall_ns),
+        )[0]
+        self._last_observed_mono_ns = self._last_frame.observed_mono_ns
+        self._pending_gap_from = cutoff
+
+    def _committed_wall_ns(self, observed_mono_ns: int, fallback_wall_ns: int) -> int:
+        """The wall reading this observation maps to in the persisted clock map."""
+
+        mapping = self.store.connection.execute(
+            "SELECT wall_offset_ns FROM clock_map WHERE boot_id=? AND segment_start_mono_ns<=? "
+            "ORDER BY segment_start_mono_ns DESC LIMIT 1",
+            (self.boot_id, observed_mono_ns),
+        ).fetchone()
+        return fallback_wall_ns if mapping is None else observed_mono_ns + mapping[0]
 
     @property
     def sampler_state(self) -> SamplerState | None:
         return self._state
+
+    @property
+    def handover_fallback_reason(self) -> str | None:
+        """Why an incoming offer degraded to a fresh baseline, if it did."""
+
+        return self._handover_fallback_reason
+
+    @property
+    def last_frame(self) -> AggregatedFrame | None:
+        """The last frame this collector's stream committed, including a seed."""
+
+        return self._last_frame
 
     @property
     def last_result(self) -> TickResult | None:
@@ -270,6 +404,12 @@ class LiveCollector:
     @property
     def next_seq(self) -> int:
         return self._next_seq
+
+    @property
+    def epoch(self) -> int | None:
+        """The active epoch, or ``None`` until a deferred baseline is sampled."""
+
+        return self._epoch
 
     def _read_processes(
         self, reader: ProcReader
@@ -330,19 +470,79 @@ class LiveCollector:
             for table in _ROW_TABLES
         )
 
+    def _gap_floor(self) -> int:
+        """The latest boundary this source already accounts for durably."""
+
+        row = self.store.connection.execute(
+            "SELECT max(value) FROM ("
+            " SELECT checkpoint_mono_ns AS value FROM sampler_checkpoint"
+            "  WHERE source=? AND boot_id=?"
+            " UNION ALL SELECT to_mono_ns FROM gap WHERE source=? AND boot_id=?)",
+            (self.source, self.boot_id, self.source, self.boot_id),
+        ).fetchone()
+        return 0 if row is None or row[0] is None else row[0]
+
+    def _record_handover_gap(self, epoch: int, seq: int, observed_mono_ns: int) -> None:
+        """Record the absence between an installed cutoff and the first sample.
+
+        ``start_collector`` already closes an interval inherited from this
+        source, so only the part no durable evidence covers is added here. That
+        keeps a repeated installation from recording the same absence twice.
+        The gap commits before the frame, so no frame receipt can claim coverage
+        that the gap contradicts.
+        """
+
+        start = self._pending_gap_from
+        if start is None:
+            return
+        floor = max(start, self._gap_floor())
+        if floor < observed_mono_ns:
+            self.store.record_gap(
+                self.boot_id, self.source, epoch, seq, floor, observed_mono_ns, "collector_gap"
+            )
+
+    def _gap_intersects(self, start_mono_ns: int, end_mono_ns: int) -> bool:
+        return self.store.connection.execute(
+            "SELECT 1 FROM gap WHERE boot_id=? AND source=? "
+            "AND from_mono_ns<? AND to_mono_ns>? LIMIT 1",
+            (self.boot_id, self.source, end_mono_ns, start_mono_ns),
+        ).fetchone() is not None
+
+    def _cross_gap_frame(self, tick: TickInput) -> tuple[AggregatedFrame, SamplerState]:
+        """Advance bookkeeping across an installed cutoff without emitting bytes.
+
+        The restored baseline sits at the cutoff, and a cumulative delta cannot
+        be split across the absence that follows it without inventing a rate and
+        a byte count. The bookkeeping still advances, so the next sample is
+        measured from this one.
+        """
+
+        frame, next_state = aggregate_tick(self._state, tick)
+        return replace(frame, deltas=(), device_deltas=()), next_state
+
     def tick(self) -> TickResult:
         """Read the host once, aggregate it, and commit one sampler frame."""
 
         if self._closed:
             raise RuntimeError("LiveCollector is closed")
+        if self._quiesced:
+            raise RuntimeError("LiveCollector is quiesced; its cutoff offer is final")
         observed_mono_ns, wall_ns = _read_clock(self.clock)
+        epoch = self._epoch
+        previous: SamplerState | None = None
+        if self._deferred_baseline:
+            # One timestamp pair serves the allocation, the baseline and the
+            # frame. Same-boot evidence is restored for its credits only.
+            previous = self.store.restore_checkpoint(self.source, self.boot_id)
+            epoch = self.store.start_collector(self.source, self.boot_id, observed_mono_ns).epoch
+        assert epoch is not None
         reader = ProcReader(self.proc_root, boot_id=self.boot_id)
         records, unresolved, vanished = self._read_processes(reader)
         cgroups = self._read_cgroups(records)
         tick = TickInput(
             boot_id=self.boot_id,
             source=self.source,
-            epoch=self.epoch,
+            epoch=epoch,
             seq=self._next_seq,
             observed_mono_ns=observed_mono_ns,
             wall_ns=wall_ns,
@@ -351,12 +551,35 @@ class LiveCollector:
             unresolved_pids=unresolved,
             vanished_pids=vanished,
         )
-        frame, next_state = aggregate_tick(self._state, tick)
+        # An installed cutoff is only a cross-gap start when the sample comes
+        # after it; a sample at the cutoff itself is an ordinary first frame.
+        cross_gap = (
+            self._pending_gap_from is not None and self._pending_gap_from < observed_mono_ns
+        )
+        if self._deferred_baseline:
+            frame, next_state = baseline_seed(tick, previous=previous)
+        elif cross_gap:
+            frame, next_state = self._cross_gap_frame(tick)
+        else:
+            frame, next_state = aggregate_tick(self._state, tick)
+        if cross_gap:
+            frame = _mark_unmeasured(frame)
+            self._record_handover_gap(epoch, frame.seq, observed_mono_ns)
+        elif self._deferred_baseline and previous is not None and self._gap_intersects(
+            previous.checkpoint_mono_ns, observed_mono_ns
+        ):
+            frame = _mark_unmeasured(frame)
         before = self._row_counts()
         self.store.record_tick(frame, next_state)
         after = self._row_counts()
+        # Publication order: the durable commit comes first, then the state,
+        # frame and sequence a reader may act on.
         self._state = next_state
-        self._next_seq += 1
+        self._last_frame = frame
+        self._next_seq = frame.seq + 1
+        self._epoch = frame.epoch
+        self._deferred_baseline = False
+        self._pending_gap_from = None
         self._last_observed_mono_ns = observed_mono_ns
         result = TickResult(
             apps_observed=len(frame.coverage),
@@ -394,6 +617,48 @@ class LiveCollector:
             if interval_seconds:
                 time.sleep(interval_seconds)
         return tuple(results)
+
+    def quiesce(self) -> HandoverOffer:
+        """Freeze this collector and capture its last committed interval.
+
+        Call this from the collector's single owner thread: there is no lock, and
+        a concurrent :meth:`tick` could commit a frame after the offered cutoff.
+
+        The offer is durable evidence, so it is built only from committed rows:
+        an epoch, a sequence, a checkpoint and the collector interval that ends
+        at that checkpoint.  A stream without a measured interval cannot offer a
+        cutoff, and a quiesced collector never ticks again.
+        """
+
+        if self._closed:
+            raise RuntimeError("LiveCollector is closed")
+        if self._offer is not None:
+            self._quiesced = True
+            return self._offer
+        state = self._state
+        if state is None or self._last_frame is None:
+            raise IncompleteHandoverError(
+                "a collector that has not committed a frame cannot offer a cutoff"
+            )
+        interval = self.store.connection.execute(
+            "SELECT from_mono_ns,to_mono_ns FROM collector_interval "
+            "WHERE source=? AND boot_id=? AND epoch=?",
+            (self.source, self.boot_id, state.epoch),
+        ).fetchone()
+        if interval is None or interval[1] != state.checkpoint_mono_ns:
+            raise IncompleteHandoverError(
+                "no measured collector interval ends at the committed cutoff"
+            )
+        self._offer = HandoverOffer(
+            self.source,
+            _other_source(self.source),
+            state.epoch,
+            state.last_seq,
+            interval[0],
+            capture_handover(state),
+        )
+        self._quiesced = True
+        return self._offer
 
     def close(self) -> None:
         if not self._closed:
