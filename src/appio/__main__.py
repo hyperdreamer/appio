@@ -5,11 +5,8 @@ from __future__ import annotations
 import argparse
 import os
 from pathlib import Path
-import sys
 
-from .contracts import RAW_BUCKET_NS, Window
 from .live import LiveCollector
-from .query import QueryService
 
 
 def _default_database() -> Path:
@@ -48,10 +45,23 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _display_end(observed_mono_ns: int) -> int:
-    """Expose the current raw bucket through the half-open query window."""
+def run_legacy_once(args: argparse.Namespace) -> int:
+    """Collect one sample on the P1/P2 boundary and exit.
 
-    return (observed_mono_ns // RAW_BUCKET_NS + 1) * RAW_BUCKET_NS
+    This is the only collector branch the legacy entry point may construct: no P3
+    composition, no daemon client and no privilege module is imported here.
+    """
+
+    collector = LiveCollector(
+        proc_root=args.proc_root,
+        cgroup_root=args.cgroup_root,
+        database_path=args.db,
+    )
+    try:
+        collector.tick()
+    finally:
+        collector.close()
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -63,60 +73,16 @@ def main(argv: list[str] | None = None) -> int:
         # This must happen before QApplication is imported or constructed.
         os.environ["QT_QPA_PLATFORM"] = "offscreen"
 
-    database_path = args.db if args.db is not None else _default_database()
-    collector = LiveCollector(
-        proc_root=args.proc_root,
-        cgroup_root=args.cgroup_root,
-        database_path=database_path,
-    )
+    args.db = args.db if args.db is not None else _default_database()
+
     if args.once:
-        try:
-            collector.tick()
-        finally:
-            collector.close()
-        return 0
+        return run_legacy_once(args)
 
-    try:
-        collector.tick()
-    except BaseException:
-        collector.close()
-        raise
+    # The P3 composition (client, coordinator, router and window) is imported only
+    # on the interactive path, and it is what decides whether to collect locally.
+    from appio.ui.collector_window import run_interactive
 
-    from PyQt6.QtCore import QTimer
-    from PyQt6.QtWidgets import QApplication
-    from appio.ui.main_window import AppIoWindow
-
-    app = QApplication([sys.argv[0]])
-    app.setDesktopFileName("appio")
-    query_service = QueryService(collector.store)
-    end_mono_ns = collector.last_observed_mono_ns
-    if end_mono_ns is None:
-        raise RuntimeError("the initial live tick did not produce an observation timestamp")
-    window = AppIoWindow(query_service, collector.boot_id, _display_end(end_mono_ns))
-    window.show()
-
-    timer = QTimer(window)
-    timer.setInterval(max(0, round(args.interval * 1000)))
-
-    def collect_and_refresh() -> None:
-        try:
-            collector.tick()
-            observed = collector.last_observed_mono_ns
-            if observed is not None:
-                window.set_window(
-                    Window(kind="since_boot", boot_id=collector.boot_id, end_mono_ns=_display_end(observed))
-                )
-        except BaseException as error:
-            print(f"appio: live collection stopped: {error}", file=sys.stderr)
-            timer.stop()
-            app.exit(1)
-
-    timer.timeout.connect(collect_and_refresh)
-    timer.start()
-    try:
-        return app.exec()
-    finally:
-        collector.close()
+    return run_interactive(args)
 
 
 if __name__ == "__main__":
