@@ -1,0 +1,643 @@
+"""Read-only, ownership-proved history views over independent schema-v1 stores.
+
+Private SQLite snapshots retract excluded *whole* raw deltas through the existing
+store accounting machinery before QueryService runs. We never subtract an
+estimated overlap from precomputed totals. Pruned mixed histories are unavailable
+rather than guessed. Exports remain separate stores; AppKey joins the results.
+
+Protocol v1 does not carry collector_interval/handover rows. A remote whole-window
+answer is usable without an export only when its coverage proves the whole
+window. Incomplete remote answers cannot establish a cross-store cutoff and are
+explicitly unavailable, even when they contain plausible numeric totals.
+"""
+from __future__ import annotations
+
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, replace
+import json
+from pathlib import Path
+import sqlite3
+from types import SimpleNamespace
+
+from .contracts import (
+    AppTotal, DiskShare, Series, Window, SQLITE_INT_MAX,
+    validate_enum, validate_sqlite_integer,
+)
+from .durable import decode_handover
+from .iodclient import AppRegistry, GapNotice, IodClient
+from .ipc_models import QueryRequest
+from .ownership import ownership_exclusions, subtract_intervals
+from .query import QueryService, _model_coverage, _reduce_coverage
+from .store import AppIoStore, _empty_coverage
+
+_COUNTERS = ("rchar", "wchar", "read_bytes", "write_bytes")
+_PEAKS = ("peak_read_bps", "peak_write_bps", "peak_total_bps")
+_METRICS = ("total_bytes", "read_bytes", "write_bytes", "rchar", "wchar")
+
+
+@dataclass(frozen=True)
+class HistorySegment:
+    collector_id: str
+    owner: str
+    boot_id: str
+    start_ns: int
+    end_ns: int
+    proven: bool
+
+    def __post_init__(self):
+        if not self.collector_id or not self.boot_id:
+            raise ValueError("segment requires collector and boot identities")
+        validate_enum(self.owner, ("gui", "iod", "unknown"), "segment.owner")
+        validate_sqlite_integer(self.start_ns, "segment.start_ns")
+        validate_sqlite_integer(self.end_ns, "segment.end_ns")
+        if self.end_ns <= self.start_ns or type(self.proven) is not bool:
+            raise ValueError("segment must be a nonempty half-open interval")
+
+
+def _peak(values):
+    known = [value for value in values if value is not None]
+    return max(known) if known else None
+
+
+def _coverage(rows, *, gaps=0, overlaps=0, unavailable=False):
+    # Use the established component-wise coverage reducer (sum counts/vectors,
+    # OR flags, and retain unavailable device state), not numeric averaging.
+    reduced = _empty_coverage() | {"device_states": [], "invalid": False}
+    for row in rows:
+        value = _empty_coverage()
+        for key in value:
+            if key == "file":
+                continue  # P3 process-only coverage has the canonical zero file placeholder
+            field = getattr(row, key)
+            value[key] = (dict(zip(_COUNTERS, field, strict=True))
+                          if key in ("reap_unapplied", "reap_unobserved")
+                          else int(field) if type(field) is bool else field)
+        _reduce_coverage(reduced, json.dumps(value))
+    reduced["gap_intervals"] += gaps
+    reduced["overlap_uncertain_intervals"] += overlaps
+    tier = rows[0].tier if rows else "raw"
+    reason = "not_retained" if unavailable else next(
+        (row.unavailable_reason for row in rows if row.unavailable_reason), None)
+    return _model_coverage(reduced, tier, base_complete=bool(rows) and all(row.complete for row in rows)
+                           and not gaps and not overlaps and not reason,
+                           unavailable_reason=reason)
+
+
+class HistoryRouter:
+    def __init__(self, local: QueryService, client: IodClient, registry: AppRegistry):
+        self.local, self.client, self.registry = local, client, registry
+        self._sources = {"local": (local, "gui")}
+        self.segments: tuple[HistorySegment, ...] = ()
+        self.boundaries: tuple[tuple[str, int, str, str], ...] = ()
+        self.view_state = "unavailable"
+        self._window = None
+        self._generation = 0
+        self._ready = False
+        self._views = []
+        self._ranking = []
+        self._remote = None
+        self._pending = None
+        self._queue = []
+        self._remote_parts = {}
+        self._gap_ranges = []
+        self._overlap_ranges = []
+        self._not_retained = False
+        self._chronology_unproved = False
+        self.transport_issues: list[GapNotice] = []
+        self._all_segments = ()
+        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="appio-history")
+        self._local_future = None
+        self._local_generation = None
+        self._cached_parts = {}
+        self._remote_snapshot = None
+        self._closed = False
+
+    def invalidate(self) -> None:
+        self._generation += 1
+        self._local_generation = -1
+        if self._local_future is not None:
+            self._local_future.cancel()
+        self._ready = False
+        self.view_state = "unavailable"
+
+    def add_source(self, service: QueryService, *, collector_id: str, owner: str) -> None:
+        if not collector_id or collector_id == "local":
+            raise ValueError("an imported collector requires its own identity")
+        validate_enum(owner, ("gui", "iod"), "owner")
+        self._sources[collector_id] = (service, owner)
+        self.invalidate()
+
+    def record_transport_gap(self, notice: GapNotice) -> None:
+        """Persist bounded visibility loss locally, without creating root gaps."""
+        self.transport_issues.append(notice)
+        if (not notice.boot_id or notice.from_mono_ns is None or notice.to_mono_ns is None
+                or notice.from_mono_ns < 0):
+            return
+        connection = self.local.connection
+        if connection.execute("SELECT 1 FROM boot WHERE boot_id=?", (notice.boot_id,)).fetchone() is None:
+            return
+        exists = connection.execute("SELECT 1 FROM gap WHERE boot_id=? AND source='gui' "
+            "AND from_mono_ns=? AND to_mono_ns=? AND reason='gui_absent'",
+            (notice.boot_id, notice.from_mono_ns, notice.to_mono_ns)).fetchone()
+        if not exists:
+            epoch = connection.execute("SELECT epoch FROM collector_epoch WHERE source='gui'").fetchone()
+            AppIoStore(connection).record_gap(notice.boot_id, "gui", epoch[0] if epoch else 1,
+                0, notice.from_mono_ns, notice.to_mono_ns, "gui_absent")
+        self.invalidate()
+
+    def _close_views(self):
+        for _, service in self._views:
+            service.connection.close()
+        self._views = []
+
+    def close(self):
+        self.invalidate()
+        self._close_views()
+        self._queue = []
+        self._closed = True
+        self._executor.shutdown(wait=False, cancel_futures=True)
+
+    def _plan(self, window):
+        evidence, cuts, gaps = [], defaultdict(dict), set()
+        retained = {}
+        predecessors = defaultdict(set)
+        boots = {window.boot_id: (0, 0)} if window.boot_id is not None else {}
+        for name, (service, _) in self._sources.items():
+            db = service.connection
+            chronology = db.execute("SELECT boot_id,boot_order FROM boot ORDER BY boot_order").fetchall()
+            for boot, order in chronology:
+                boots.setdefault(boot, (len(boots), order))
+            for (earlier, _), (later, _) in zip(chronology, chronology[1:]):
+                predecessors[later].add(earlier)
+            for owner, boot, epoch, start, end in db.execute(
+                    "SELECT source,boot_id,epoch,from_mono_ns,to_mono_ns FROM collector_interval"):
+                if window.boot_id is None or boot == window.boot_id:
+                    evidence.append((name, owner, boot, epoch, start, end))
+                    if (name, boot) not in retained:
+                        retained[(name, boot)] = self._raw_complete(db, boot)
+            for boot, outgoing, incoming, at, text in db.execute("SELECT * FROM handover"):
+                decode_handover(text, boot, at)
+                item = (outgoing, incoming, text)
+                if at in cuts[boot] and cuts[boot][at] != item:
+                    raise ValueError("conflicting handover evidence")
+                cuts[boot][at] = item
+            gaps.update(tuple(row) for row in db.execute(
+                "SELECT boot_id,source,from_mono_ns,to_mono_ns,reason FROM gap"))
+        # Each store's boot_order is authoritative only inside that store.
+        # Shared boot IDs join these partial orders, never CLOCK_BOOTTIME or
+        # wall-clock values from unrelated boots. Disconnected orders stay explicit.
+        chronology, remaining = [], set(boots)
+        active_boots = {row[2] for row in evidence}
+        while remaining:
+            available = [boot for boot in remaining if not predecessors[boot] & remaining]
+            if not available:
+                raise ValueError("conflicting boot chronology evidence")
+            if (window.boot_id is None and len(available) > 1 and
+                    len(active_boots & remaining) > 1):
+                self._chronology_unproved = True
+            chosen = min(available, key=boots.get)
+            chronology.append(chosen)
+            remaining.remove(chosen)
+        selected = []
+        for boot in chronology:
+            entries = [row for row in evidence if row[2] == boot]
+            beginning = min((row[4] for row in entries), default=0)
+            ending = max((row[5] for row in entries), default=0)
+            if boot == window.boot_id:
+                beginning = min(beginning, window.start_mono_ns or 0)
+                ending = max(ending, window.end_mono_ns or 0)
+            if beginning >= ending:
+                continue
+            points = {beginning, ending}
+            for row in entries:
+                points.update(at for at in row[4:] if beginning < at < ending)
+            chain = sorted(cuts[boot].items())
+            exclusions = {"gui": [], "iod": []}
+            if chain:
+                # The producer owns cutoff semantics. Require a complete chain
+                # in one durable source, rather than stitch unrelated offers.
+                for service, _ in self._sources.values():
+                    count = service.connection.execute("SELECT count(*) FROM handover WHERE boot_id=?", (boot,)).fetchone()[0]
+                    if count == len(chain):
+                        exclusions = ownership_exclusions(service.connection, boot)
+                        break
+                else:
+                    raise ValueError("no complete preceding ownership chain")
+            for index, (at, (outgoing, incoming, _)) in enumerate(chain):
+                if index and chain[index-1][1][1] != outgoing:
+                    raise ValueError("handover chain has a missing predecessor")
+                if beginning < at < ending:
+                    points.add(at)
+            for gap_boot, _, left, right, _ in gaps:
+                if gap_boot == boot:
+                    points.update(at for at in (left, right) if beginning < at < ending)
+            ordered = sorted(points)
+            for left, right in zip(ordered, ordered[1:]):
+                candidates = [row for row in entries if row[4] <= left and row[5] >= right]
+                candidates = [row for row in candidates if not any(
+                    a < right and b > left for a, b in exclusions[row[1]])]
+                ambiguous = len({(row[1], row[3]) for row in candidates}) > 1
+                persisted = [row for row in gaps if row[0] == boot and row[2] < right and row[3] > left]
+                uncertain = ambiguous or any(row[4] == "overlap_uncertain" for row in persisted)
+                if uncertain:
+                    self._overlap_ranges.append((boot, left, right))
+                # GUI visibility loss cannot override authoritative root evidence.
+                owners = {candidate[1] for candidate in candidates}
+                missing = any(row[1] in owners and
+                              (row[4] != "gui_absent" or "iod" not in owners)
+                              for row in persisted)
+                if not candidates or uncertain or missing:
+                    segment = HistorySegment("unproved", "unknown", boot, left, right, False)
+                    self._gap_ranges.append((boot, left, right))
+                else:
+                    # Prefer a single freshest copy of a collector epoch. Multiple
+                    # exports of the same receipt are mirrors, not additive data.
+                    chosen = max(candidates, key=lambda row: (retained[(row[0], boot)],
+                                                              row[5], row[0] == "local", row[0]))
+                    segment = HistorySegment(chosen[0], chosen[1], boot, left, right, True)
+                if (selected and selected[-1].collector_id == segment.collector_id
+                        and selected[-1].owner == segment.owner and selected[-1].boot_id == boot
+                        and selected[-1].end_ns == left and selected[-1].proven == segment.proven):
+                    selected[-1] = replace(selected[-1], end_ns=right)
+                else:
+                    selected.append(segment)
+        self._all_segments = tuple(selected)
+        scoped = []
+        for segment in selected:
+            if window.boot_id is not None and segment.boot_id != window.boot_id:
+                continue
+            left = max(segment.start_ns, window.start_mono_ns or 0)
+            right = min(segment.end_ns, window.end_mono_ns or SQLITE_INT_MAX)
+            if left < right:
+                scoped.append(replace(segment, start_ns=left, end_ns=right))
+        self.segments = tuple(scoped)
+        self._gap_ranges = [(s.boot_id, s.start_ns, s.end_ns) for s in scoped if not s.proven]
+        self._overlap_ranges = [(boot, max(left, window.start_mono_ns or 0),
+                                 min(right, window.end_mono_ns or SQLITE_INT_MAX))
+            for boot, left, right in self._overlap_ranges
+            if (window.boot_id is None or boot == window.boot_id)
+            and left < (window.end_mono_ns or SQLITE_INT_MAX) and right > (window.start_mono_ns or 0)]
+        self.boundaries = tuple((a.boot_id, a.end_ns, a.owner, b.owner)
+            for a, b in zip(scoped, scoped[1:]) if a.boot_id == b.boot_id and a.end_ns == b.start_ns
+            and a.proven and b.proven and a.owner != b.owner)
+
+    @staticmethod
+    def _raw_complete(db, boot):
+        for field in _COUNTERS:
+            if db.execute(f"SELECT 1 FROM app_boot_total t WHERE boot_id=? AND {field}<>"
+                          f"(SELECT coalesce(sum(s.{field}),0) FROM sample s WHERE s.boot_id=t.boot_id "
+                          "AND s.app_id=t.app_id) LIMIT 1", (boot,)).fetchone():
+                return False
+        for field, raw in (("rbytes", "rbytes"), ("wbytes", "wbytes")):
+            if db.execute(f"SELECT 1 FROM app_boot_dev_total t WHERE boot_id=? AND {field}<>"
+                          f"(SELECT coalesce(sum(s.{raw}),0) FROM sample_dev s WHERE s.boot_id=t.boot_id "
+                          "AND s.app_id=t.app_id AND s.dev=t.dev) LIMIT 1", (boot,)).fetchone():
+                return False
+        return True
+
+    def _materialize(self):
+        for name, (service, _) in self._sources.items():
+            if not any(s.collector_id == name and s.proven for s in self._all_segments):
+                # A discarded mirror is not missing evidence for the chosen one.
+                if self._all_segments and all(s.proven for s in self._all_segments):
+                    continue
+                if any(s.proven for s in self._all_segments) and name != "local":
+                    continue
+            copy = sqlite3.connect(":memory:")
+            try:
+                if service.connection.in_transaction:
+                    raise ValueError("history source has an uncommitted transaction")
+                service.connection.backup(copy)
+                store = AppIoStore(copy)
+                for (boot,) in copy.execute("SELECT boot_id FROM boot").fetchall():
+                    if self._window is not None and self._window.boot_id is not None and boot != self._window.boot_id:
+                        continue
+                    allowed = [(s.start_ns, s.end_ns) for s in self._all_segments
+                               if s.collector_id == name and s.boot_id == boot and s.proven]
+                    intervals = copy.execute("SELECT from_mono_ns,to_mono_ns FROM collector_interval "
+                                             "WHERE boot_id=?", (boot,)).fetchall()
+                    if not intervals and copy.execute(
+                            "SELECT 1 FROM app_boot_total WHERE boot_id=? LIMIT 1", (boot,)).fetchone():
+                        # A legacy aggregate is not an ownership receipt. With
+                        # no interval horizon, lifetime cannot even bound a gap.
+                        self._not_retained = True
+                    # Correct only when a whole persisted interval is not selected.
+                    needs_correction = (not intervals or any(
+                        list(subtract_intervals(start, end, allowed)) for start, end in intervals))
+                    if needs_correction and not self._raw_complete(copy, boot):
+                        self._not_retained = True
+                        self.segments = tuple(replace(s, proven=False) if s.collector_id == name
+                                              and s.boot_id == boot else s for s in self.segments)
+                        allowed = []
+                        # Omit only this uncorrectable boot, preserving other
+                        # boots' exact lifetime contributions and their peaks.
+                        for app, *amounts in copy.execute(
+                            "SELECT app_id,rchar,wchar,read_bytes,write_bytes FROM app_boot_total WHERE boot_id=?", (boot,)).fetchall():
+                            store._subtract("app_lifetime_total", {"app_id": app},
+                                            dict(zip(_COUNTERS, amounts, strict=True)))
+                        for table in ("sample", "sample_dev", "sample_coverage", "rollup_app", "rollup_dev",
+                                      "app_boot_total", "app_boot_dev_total"):
+                            copy.execute(f"DELETE FROM {table} WHERE boot_id=?", (boot,))
+                        copy.commit()
+                        continue
+                    horizon = max([end for _, end in intervals] + [0,
+                        copy.execute("SELECT coalesce(max(observed_mono_ns),0) FROM sample WHERE boot_id=?",
+                                     (boot,)).fetchone()[0]])
+                    # The existing retraction preserves integer conservation and
+                    # peaks. Work only on the private snapshot, never an export.
+                    with store._transaction():
+                        for left, right in subtract_intervals(0, min(horizon+1, SQLITE_INT_MAX), allowed):
+                            store._exclude_contributions(boot, left, right)
+                        for source, epoch, seq, at in copy.execute(
+                            "SELECT DISTINCT source,epoch,seq,ts_mono_ns FROM sample_coverage WHERE boot_id=?",
+                            (boot,)).fetchall():
+                            if not any(left <= at <= right for left, right in allowed):
+                                copy.execute("DELETE FROM sample_coverage WHERE boot_id=? AND source=? "
+                                    "AND epoch=? AND seq=?", (boot, source, epoch, seq))
+                # Gap provenance is deduplicated and overlaid by the routing plan,
+                # rather than counted once for every copy of a daemon export.
+                copy.execute("DELETE FROM gap")
+                copy.commit()
+                self._views.append((name, QueryService(copy)))
+                copy = None
+            finally:
+                if copy is not None:
+                    copy.close()
+
+    @staticmethod
+    def _read_local(paths, window):
+        """Run SQLite and cached detail construction entirely off the UI thread."""
+        sources = []
+        worker = None
+        try:
+            for name, path, owner in paths:
+                source = sqlite3.connect(Path(path).as_uri() + "?mode=ro", uri=True, timeout=0.2)
+                copy = sqlite3.connect(":memory:")
+                try:
+                    source.backup(copy)
+                finally:
+                    source.close()
+                sources.append((name, QueryService(copy), owner))
+            worker = HistoryRouter(sources[0][1], SimpleNamespace(state=None), AppRegistry())
+            worker._sources = {name: (service, owner) for name, service, owner in sources}
+            worker._window = window
+            worker._plan(window)
+            worker._materialize()
+            worker.boundaries = tuple(boundary for boundary in worker.boundaries if all(
+                any(s.boot_id == boundary[0] and s.proven and s.owner == owner and
+                    (s.end_ns == boundary[1] if index == 2 else s.start_ns == boundary[1])
+                    for s in worker.segments)
+                for index, owner in enumerate(boundary[2:], 2)))
+            worker._build_ranking(window)
+            worker._ready = True
+            details = {}
+            for row in worker._ranking:
+                for kind, method in (("totals", worker.disk_share), ("series", worker.series)):
+                    try:
+                        details[(kind, row.app_key)] = method(row.app_id, window)
+                    except (ValueError, RuntimeError) as error:
+                        # An A22-disabled series is not a zero-filled timeline.
+                        details[(kind, row.app_key)] = error
+            return {"ranking": worker._ranking, "parts": details, "segments": worker.segments,
+                "boundaries": worker.boundaries, "gaps": worker._gap_ranges,
+                "overlaps": worker._overlap_ranges, "not_retained": worker._not_retained,
+                "chronology_unproved": worker._chronology_unproved}
+        finally:
+            if worker is not None:
+                worker.close()
+            for _, service, _ in sources:
+                service.connection.close()
+
+    def prepare(self, window: Window) -> None:
+        self.local._precheck(window)
+        if self._closed:
+            raise RuntimeError("history router is closed")
+        self._generation += 1
+        self._window, self._ready = window, False
+        self.segments, self.boundaries = (), ()
+        self._gap_ranges, self._overlap_ranges = [], []
+        self._ranking, self._remote_parts, self._queue, self._cached_parts = [], {}, [], {}
+        self._remote = self._remote_snapshot = None
+        self._not_retained = self._chronology_unproved = False
+        self.view_state = "loading"
+        if self._local_future is not None:
+            self._local_future.cancel()
+        paths = []
+        for name, (service, owner) in self._sources.items():
+            if service.connection.in_transaction:
+                raise ValueError("history source has an uncommitted transaction")
+            path = service.connection.execute("PRAGMA database_list").fetchone()[2]
+            if not path:
+                raise ValueError("asynchronous history requires a file-backed SQLite source")
+            paths.append((name, path, owner))
+        self._local_generation = self._generation
+        self._local_future = self._executor.submit(self._read_local, paths, window)
+        state = self.client.state
+        if state is not None and state.verified and state.answering:
+            self._queue.append(QueryRequest("ranking", window))
+            self._dispatch()
+
+    def _consume_local(self):
+        if self._local_generation is None:
+            return self._local_future is not None
+        if self._local_generation != self._generation:
+            return False
+        if self._local_future is None or not self._local_future.done():
+            return False
+        data = self._local_future.result()
+        self.segments, self.boundaries = data["segments"], data["boundaries"]
+        self._gap_ranges, self._overlap_ranges = data["gaps"], data["overlaps"]
+        self._not_retained = self._not_retained or data["not_retained"]
+        self._chronology_unproved = data["chronology_unproved"]
+        self._ranking = [replace(row, app_id=self.registry.id_for(row.app_key)) for row in data["ranking"]]
+        self._cached_parts = data["parts"]
+        self._local_generation = None
+        return True
+
+    def _build_ranking(self, window):
+        grouped = defaultdict(list)
+        for name, service in self._views:
+            for row in service.ranking(window, "total_bytes"):
+                grouped[row.app_key].append(row)
+        self._ranking = []
+        for key, rows in grouped.items():
+            amounts = {field: sum(getattr(row, field) for row in rows) for field in _COUNTERS}
+            self._ranking.append(replace(rows[0], app_id=self.registry.id_for(key), **amounts,
+                total_bytes=amounts["read_bytes"]+amounts["write_bytes"],
+                **{field: _peak(getattr(row, field) for row in rows) for field in _PEAKS},
+                coverage=self._combine_coverage([row.coverage for row in rows])))
+
+    def _combine_coverage(self, rows):
+        coverage = _coverage(rows, gaps=len(self._merged_ranges(self._gap_ranges)),
+            overlaps=len(self._merged_ranges(self._overlap_ranges)), unavailable=self._not_retained)
+        return replace(coverage, complete=False) if self._chronology_unproved else coverage
+
+    @staticmethod
+    def _merged_ranges(ranges):
+        merged = []
+        for boot, left, right in sorted(ranges):
+            if merged and merged[-1][0] == boot and merged[-1][2] >= left:
+                merged[-1] = (boot, merged[-1][1], max(merged[-1][2], right))
+            else:
+                merged.append((boot, left, right))
+        return merged
+
+    def _dispatch(self):
+        if self._pending is None and self._queue:
+            request = self._queue.pop(0)
+            self._pending = (self._generation, request, self.client.query(request))
+
+    def _finish(self):
+        self._ready = True
+        self.view_state = "incomplete: not_retained" if self._not_retained else (
+            "incomplete: ownership gap" if self._gap_ranges else (
+                "incomplete: boot chronology unproved" if self._chronology_unproved else "ready"))
+
+    def ready(self, window: Window) -> bool:
+        if window != self._window:
+            return False
+        if self._ready:
+            return True
+        while self._pending is not None and self._pending[0] != self._generation and self._pending[2].done():
+            # Discard an obsolete response before waiting on this scope's disk work.
+            self._pending = None
+            self._dispatch()
+        try:
+            local_ready = self._consume_local()
+        except Exception:
+            self.view_state = "unavailable: local history evidence"
+            raise
+        if not local_ready:
+            return False
+        while self._pending is not None and self._pending[2].done():
+            generation, request, future = self._pending
+            self._pending = None
+            if generation == self._generation:
+                try:
+                    response = future.result()
+                    if request.kind == "ranking":
+                        rows = response["result"]
+                        if window.kind == "lifetime" or any(row.total_bytes or row.rchar or row.wchar for row in self._ranking):
+                            raise ValueError("remote query cannot prove a mixed-store cutoff")
+                        self._remote_snapshot = response.get("snapshot")
+                        if self._remote_snapshot is None:
+                            raise ValueError("remote history snapshot identity required")
+                        if response.get("next_cursor") is not None:
+                            raise ValueError("paginated remote ownership is not proved atomically")
+                        if not rows or not all(row.coverage.complete for row in rows):
+                            raise ValueError("remote ownership evidence required")
+                        self._remote = [replace(row, app_id=self.registry.id_for(row.app_key)) for row in rows]
+                        for row in self._remote:
+                            self._queue.extend([QueryRequest("totals", window, row.app_key),
+                                                QueryRequest("series", window, row.app_key)])
+                    else:
+                        value = response["result"]
+                        if value.window != window or response.get("snapshot") != self._remote_snapshot:
+                            raise ValueError("remote history answered a different scope or snapshot")
+                        self._remote_parts[(request.kind, request.app_key)] = value
+                except Exception:
+                    # Keep only locally proved/exported contributions. No stale
+                    # remote result may populate a new window or widen its scope.
+                    self._remote = None
+                    self._queue = []
+                    self._not_retained = True
+            self._dispatch()
+        self._dispatch()
+        if self._pending is None and not self._queue:
+            self._finish()
+        return self._ready
+
+    def _require(self, window):
+        if not self.ready(window):
+            raise RuntimeError("history is not ready for this window")
+
+    def ranking(self, window: Window, metric: str) -> list[AppTotal]:
+        validate_enum(metric, _METRICS, "metric")
+        self._require(window)
+        rows = self._remote if self._remote is not None else self._ranking
+        if self._not_retained:
+            rows = [replace(row, coverage=replace(row.coverage, complete=False,
+                                                   unavailable_reason="not_retained")) for row in rows]
+        return sorted(rows, key=lambda row: (-getattr(row, "total_bytes" if metric == "total_bytes" else metric),
+                                             row.app_key.encode("utf-8")))
+
+    def _app_parts(self, app_id, window, method):
+        self._require(window)
+        key = self.registry.key_for(app_id)
+        kind = "totals" if method == "disk_share" else "series"
+        if self._remote is not None:
+            return [self._remote_parts[(kind, key)]]
+        if self._local_future is not None:
+            value = self._cached_parts[(kind, key)]
+            if isinstance(value, Exception):
+                raise value
+            return [value]
+        parts = []
+        for _, service in self._views:
+            row = service.connection.execute("SELECT app_id FROM app WHERE key=?", (key,)).fetchone()
+            if row is not None:
+                parts.append(getattr(service, method)(row[0], window))
+        if not parts:
+            raise KeyError(app_id)
+        return parts
+
+    def disk_share(self, app_id: int, window: Window) -> DiskShare:
+        parts = self._app_parts(app_id, window, "disk_share")
+        coverage = (self._combine_coverage([part.coverage for part in parts])
+                    if self._remote is None and self._local_future is None else parts[0].coverage)
+        if self._not_retained:
+            coverage = replace(coverage, complete=False, unavailable_reason="not_retained")
+        devices = {}
+        for part in parts:
+            for row in part.devices:
+                key = (row.boot_id, row.dev)
+                if key in devices:
+                    old = devices[key]
+                    row = replace(row, rbytes=row.rbytes+old.rbytes, wbytes=row.wbytes+old.wbytes,
+                                  total_bytes=row.total_bytes+old.total_bytes)
+                devices[key] = row
+        available = all(part.device_read_bytes is not None for part in parts)
+        task_read, task_write = (sum(getattr(part, field) for part in parts)
+                                 for field in ("task_read_bytes", "task_write_bytes"))
+        read, write = ((sum(row.rbytes for row in devices.values()), sum(row.wbytes for row in devices.values()))
+                       if available else (None, None))
+        return replace(parts[0], app_id=app_id, window=window, task_read_bytes=task_read,
+            task_write_bytes=task_write, task_total_bytes=task_read+task_write, devices=tuple(devices.values()),
+            device_read_bytes=read, device_write_bytes=write, device_total_bytes=None if read is None else read+write,
+            residual_read=None if read is None else task_read-read,
+            residual_write=None if write is None else task_write-write,
+            residual_total=None if read is None else task_read+task_write-read-write, coverage=coverage)
+
+    def series(self, app_id: int, window: Window) -> Series:
+        parts = self._app_parts(app_id, window, "series")
+        if len({part.tier for part in parts}) != 1:
+            raise RuntimeError("mixed retention tiers cannot represent one series")
+        points, devices, residuals = {}, {}, {}
+        for part in parts:
+            for row in part.points:
+                key = (row.bucket_start_mono_ns, row.bucket_secs)
+                old = points.get(key)
+                points[key] = row if old is None else replace(row,
+                    read_bytes=row.read_bytes+old.read_bytes, write_bytes=row.write_bytes+old.write_bytes,
+                    **{field: _peak((getattr(row, field), getattr(old, field))) for field in _PEAKS},
+                    spans_suspend=row.spans_suspend or old.spans_suspend)
+            for row in part.device_points:
+                key = (row.bucket_start_mono_ns, row.bucket_secs, row.dev)
+                old = devices.get(key)
+                devices[key] = row if old is None else replace(row, rbytes=row.rbytes+old.rbytes,
+                                                               wbytes=row.wbytes+old.wbytes)
+            for row in part.residual_points:
+                key = (row.bucket_start_mono_ns, row.bucket_secs)
+                old = residuals.get(key)
+                residuals[key] = row if old is None else replace(row, **{
+                    field: None if getattr(row, field) is None or getattr(old, field) is None
+                    else getattr(row, field)+getattr(old, field) for field in ("read", "write", "total")})
+        return replace(parts[0], app_id=app_id, window=window,
+            points=tuple(points[key] for key in sorted(points)),
+            device_points=tuple(devices[key] for key in sorted(devices)),
+            residual_points=tuple(residuals[key] for key in sorted(residuals)),
+            coverage=(self._combine_coverage([part.coverage for part in parts])
+                      if self._remote is None and self._local_future is None else
+                      replace(parts[0].coverage, complete=False, unavailable_reason="not_retained")
+                      if self._not_retained else parts[0].coverage))
