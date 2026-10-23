@@ -1,0 +1,1064 @@
+"""The single P3 shell: one privileged switch, navigation everywhere else.
+
+Ownership of privilege is deliberate and narrow. Exactly one checkable control --
+``System services (root)`` in Settings -- can change machine-wide collection, and
+it only ever *requests* a change through a consent dialog and
+``/usr/bin/pkexec /usr/bin/appio-setup <verb>``. Every other affordance in this
+window (the status banner, the unavailable Files entry) navigates to that one
+control and changes no state at all.
+
+The switch renders the *probe*, never the last click: clicking restores the
+probed position immediately, and the displayed state is recomputed from
+``SetupClient.refresh()`` after every operation. The four honest service states
+(``off``, ``on, answering``, ``enabled, not answering``, ``on, needs activation``)
+come from :func:`appio.collector_owner.decide_owner`; a helper's accounting
+verdict may refine the activation dimension but never overrides the GUI's own
+observation that the daemon is silent.
+
+The P2 :class:`~appio.ui.main_window.AppIoWindow` is embedded unchanged and is
+only rendered after :meth:`HistoryRouter.ready` is true for the exact window that
+was prepared; until then its numeric detail is hidden and a loading text is shown.
+"""
+
+from __future__ import annotations
+
+from concurrent.futures import Future
+import os
+from pathlib import Path
+import subprocess
+import sys
+import threading
+import time
+from typing import TYPE_CHECKING, Callable
+
+from PyQt6.QtCore import QObject, Qt, QTimer, pyqtSignal
+from PyQt6.QtWidgets import (
+    QCheckBox,
+    QDialog,
+    QHBoxLayout,
+    QLabel,
+    QMainWindow,
+    QPushButton,
+    QRadioButton,
+    QStackedWidget,
+    QVBoxLayout,
+    QWidget,
+)
+
+from ..activation import (
+    ACTIVATION_CHOICES,
+    CHOICE_REBOOT_LABEL,
+    CHOICE_RESTART_LABEL,
+    RESTART_CHOICE_WARNING,
+    STATE_INACTIVE,
+    STATE_NOT_DELEGATED,
+)
+from ..collector_owner import CollectorCoordinator, GuiLease, ServiceFacts, decide_owner
+from ..contracts import RAW_BUCKET_NS, Window
+from ..history_export import ExportResult
+from ..history_router import HistoryRouter
+from ..ipc_models import validate_server_message
+from ..ipc_protocol import FrameDecoder, MAX_OUTBOUND, ProtocolError, encode_frame
+from ..ipc_security import read_peer, require_root_server
+from ..live import LiveCollector, SystemClock
+from ..setup_boundary import CommandResult
+from ..setup_client import SetupClient, SetupReply
+
+__all__ = [
+    "ACTIVATION_INACTIVE",
+    "ACTIVATION_STATES",
+    "CHOICE_REBOOT_LABEL",
+    "CHOICE_RESTART_LABEL",
+    "COLLECTOR_STATE_NEEDS_ACTIVATION",
+    "COLLECTOR_STATE_OFF",
+    "COLLECTOR_STATE_ON_ANSWERING",
+    "COLLECTOR_STATE_SILENT",
+    "CollectorWindow",
+    "ConsentDialog",
+    "FILES_UNAVAILABLE",
+    "RESTART_CHOICE_WARNING",
+    "SOCKET_PATH",
+    "SettingsDialog",
+    "consent_text",
+    "display_state",
+    "parse_unit_facts",
+    "production_probe",
+    "run_interactive",
+]
+
+#: The four honest service states the switch may display. They are the exact
+#: strings :func:`appio.collector_owner.decide_owner` produces, so no second
+#: vocabulary can drift from the owner decision.
+COLLECTOR_STATE_OFF = "off"
+COLLECTOR_STATE_ON_ANSWERING = "on, answering"
+COLLECTOR_STATE_SILENT = "enabled, not answering"
+COLLECTOR_STATE_NEEDS_ACTIVATION = "on, needs activation"
+COLLECTOR_STATE_UNAVAILABLE = "unavailable"
+
+#: The activation verdicts a root probe may add. They never claim the daemon is
+#: answering: only the GUI's own socket observation may do that.
+ACTIVATION_INACTIVE = STATE_INACTIVE
+ACTIVATION_STATES = frozenset({STATE_INACTIVE, STATE_NOT_DELEGATED})
+
+FILES_UNAVAILABLE = "file activity is unavailable"
+
+#: The fixed socket. The GUI never builds this from user input.
+SOCKET_PATH = Path("/run/appio/iod.sock")
+UNIT_SHOW_ARGV = (
+    "/usr/bin/systemctl",
+    "show",
+    "appio-iod.service",
+    "--property=UnitFileState,ActiveState",
+    "--no-pager",
+)
+HELPER_TIMEOUT_SECONDS = 120.0
+STATUS_TIMEOUT_SECONDS = 2.0
+MAX_HELPER_OUTPUT = 64 * 1024
+CONSENT_COMMAND_PREFIX = "/usr/bin/pkexec /usr/bin/appio-setup"
+
+_ENABLED_STATES: dict[str, bool] = {
+    "enabled": True,
+    "enabled-runtime": True,
+    "linked": True,
+    "linked-runtime": True,
+    "alias": True,
+    "disabled": False,
+    "masked": False,
+    "masked-runtime": False,
+    "static": False,
+    "indirect": False,
+}
+_ACTIVE_STATES: dict[str, str] = {
+    "active": "active",
+    "inactive": "inactive",
+    "failed": "inactive",
+    "absent": "absent",
+    "not-found": "absent",
+}
+
+#: A quiesce request, not a claim about the service: local collection stops and
+#: ownership stays unknown until the helper and the probe report something real.
+QUIESCE_FACTS = ServiceFacts(None, "unknown", False, False, None)
+
+
+# --------------------------------------------------------------------------- #
+# Consent and question dialogs (plain QDialogs; never exec(), never modal-block)
+# --------------------------------------------------------------------------- #
+
+
+class _TextDialog(QDialog):
+    """A dialog whose body text can be asserted without reading pixels."""
+
+    def __init__(self, parent: QWidget | None, title: str, text: str) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.setModal(True)
+        self._text = text
+        self._layout = QVBoxLayout(self)
+        self._label = QLabel(text)
+        self._label.setObjectName(f"{title.lower().replace(' ', '_')}_body")
+        self._label.setWordWrap(True)
+        self._layout.addWidget(self._label)
+        self._body = QVBoxLayout()
+        self._layout.addLayout(self._body)
+        self._buttons = QHBoxLayout()
+        self._layout.addLayout(self._buttons)
+
+    def body_text(self) -> str:
+        return self._text
+
+    def add_body_widget(self, widget: QWidget) -> None:
+        self._body.addWidget(widget)
+
+    def add_button(self, caption: str, object_name: str) -> QPushButton:
+        button = QPushButton(caption)
+        button.setObjectName(object_name)
+        button.setAutoDefault(False)
+        self._buttons.addWidget(button)
+        return button
+
+
+class ConsentDialog(_TextDialog):
+    """One consent dialog, naming the exact commands before any elevation."""
+
+    def __init__(self, parent: QWidget | None, verb: str) -> None:
+        captions = {
+            "enable": "Install delegation and enable",
+            "disable": "Disable system services",
+            "status": "Run the activation check",
+        }
+        super().__init__(parent, "Consent", consent_text(verb))
+        self.verb = verb
+        self.accept_button = self.add_button(captions[verb], "consent_accept")
+        self.cancel_button = self.add_button("Cancel", "consent_cancel")
+        self.accept_button.clicked.connect(self.accept)
+        self.cancel_button.clicked.connect(self.reject)
+
+
+class ActivationChoiceDialog(_TextDialog):
+    """Restart now or activate after a reboot; the warning stays next to the label."""
+
+    chosen = pyqtSignal(str)
+
+    def __init__(self, parent: QWidget | None) -> None:
+        lines = [
+            "The IO accounting drop-ins are installed. They only take effect for a user",
+            "manager started after installation, and this host keeps your user manager",
+            "running with Linger, so logging out and back in changes nothing.",
+            "",
+            "Choose how to pick them up. Nothing restarts or reboots on its own; the",
+            "choice only decides which commands run after enabling succeeds.",
+            "",
+        ]
+        for _key, label, warning in ACTIVATION_CHOICES:
+            lines.append(f"- {label}" + (f" — {warning}" if warning else ""))
+        super().__init__(parent, "Activation", "\n".join(lines))
+        self._radios: dict[str, QRadioButton] = {}
+        for key, label, warning in ACTIVATION_CHOICES:
+            radio = QRadioButton(label)
+            radio.setObjectName(f"activation_choice_{key}")
+            radio.setToolTip(warning or "")
+            self.add_body_widget(radio)
+            if warning:
+                warning_label = QLabel(warning)
+                warning_label.setObjectName(f"activation_choice_{key}_warning")
+                warning_label.setWordWrap(True)
+                self.add_body_widget(warning_label)
+            self._radios[key] = radio
+        self._radios["restart"].setChecked(True)
+        self.continue_button = self.add_button("Continue", "activation_continue")
+        self.not_now_button = self.add_button("Not now", "activation_cancel")
+        self.continue_button.clicked.connect(self._accept_choice)
+        self.not_now_button.clicked.connect(self.reject)
+
+    def choose(self, key: str) -> None:
+        if key not in self._radios:
+            raise ValueError("unknown activation choice")
+        self._radios[key].setChecked(True)
+        self._accept_choice()
+
+    def selected(self) -> str:
+        for key, radio in self._radios.items():
+            if radio.isChecked():
+                return key
+        return "restart"
+
+    def _accept_choice(self) -> None:
+        self.chosen.emit(self.selected())
+        self.accept()
+
+
+class RestartConfirmationDialog(_TextDialog):
+    """A second, distinct confirmation for the command that ends the session."""
+
+    def __init__(self, parent: QWidget | None) -> None:
+        text = (
+            f"{CHOICE_RESTART_LABEL} runs "
+            "/usr/bin/pkexec /usr/bin/appio-setup restart-user-manager, which restarts "
+            f"your user manager as root.\n\n{RESTART_CHOICE_WARNING}\n\n"
+            "Everything open in this session closes, including this window. Enablement "
+            "has already succeeded, so the service stays enabled after the restart."
+        )
+        super().__init__(parent, "Restart confirmation", text)
+        self.accept_button = self.add_button("Restart user manager now", "restart_accept")
+        self.cancel_button = self.add_button("Keep it pending", "restart_cancel")
+        self.accept_button.clicked.connect(self.accept)
+        self.cancel_button.clicked.connect(self.reject)
+
+
+def consent_text(verb: str) -> str:
+    """The exact, verb-specific disclosure shown before any elevation."""
+
+    if verb == "enable":
+        return (
+            "Turning on System services lets appio measure I/O for every process on this "
+            "machine, not only the programs that belong to you. It installs machine-wide "
+            "collection with persistent root-owned history: device and per-application "
+            "counters are written to a root database and shared with the appio group.\n\n"
+            "This changes the system manager's IO accounting and delegation drop-ins and "
+            "gives your account the appio group, so you can read the shared history. Group "
+            "membership applies to new sessions only. Turning the service off later stops "
+            "it and writes a user-readable export of the daemon's history to your home "
+            "directory, so the record is never confiscated.\n\n"
+            "These exact commands run through polkit, with no path, username or test "
+            "argument:\n"
+            f"  {CONSENT_COMMAND_PREFIX} install-delegation\n"
+            f"  {CONSENT_COMMAND_PREFIX} enable\n\n"
+            "After they succeed you choose, in a separate question, whether to restart your "
+            "user manager now or activate after a reboot. Nothing restarts or reboots "
+            "without that explicit choice."
+        )
+    if verb == "disable":
+        return (
+            "Turning off System services stops the machine-wide daemon and disables it at "
+            "boot. The delegation drop-ins and the appio group membership stay installed; "
+            "only the service is stopped. Before it stops, its history is exported to a "
+            "database you own in your home directory, so the record remains readable.\n\n"
+            "This exact command runs through polkit, with no path, username or test "
+            "argument:\n"
+            f"  {CONSENT_COMMAND_PREFIX} disable"
+        )
+    if verb == "status":
+        return (
+            "Checking activation runs one accounting probe as root. It writes 16 MiB to a "
+            "fixed probe file and measures the device bytes your user manager accounted "
+            "for, then records whether IO accounting actually works for your account. It "
+            "changes no setting and does not start, stop or restart anything.\n\n"
+            "This exact command runs through polkit, with no path, username or test "
+            "argument:\n"
+            f"  {CONSENT_COMMAND_PREFIX} status"
+        )
+    raise ValueError("consent is defined only for the fixed verbs enable, disable and status")
+
+
+def display_state(facts: ServiceFacts, probe_state: str | None = None) -> str:
+    """The banner/status text: the owner decision, refined only by a root probe.
+
+    ``probe_state`` may add ``delegation present, accounting inactive`` or
+    ``not delegated`` because the GUI cannot observe device accounting itself.
+    It may never change whether the daemon answers: that is this process's own
+    socket observation, and a root helper being able to connect says nothing
+    about whether this session can.
+    """
+
+    state = decide_owner(facts).state
+    if probe_state in ACTIVATION_STATES and facts.enabled is not False:
+        return probe_state
+    return state
+
+
+# --------------------------------------------------------------------------- #
+# Settings: the one place that owns the switch
+# --------------------------------------------------------------------------- #
+
+
+class SettingsDialog(QDialog):
+    """``Settings`` owns the single privileged control and its probed status line."""
+
+    ROWS: tuple[str, ...] = ("system_services",)
+    STATUS_CAPTION = "System services (root)"
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Settings")
+        self.setModal(False)
+        self.focused_row = ""
+        layout = QVBoxLayout(self)
+
+        row = QWidget()
+        row.setObjectName("system_services_row")
+        row_layout = QHBoxLayout(row)
+        row_layout.setContentsMargins(0, 0, 0, 0)
+        self.switch = QCheckBox(self.STATUS_CAPTION)
+        self.switch.setObjectName("system_services_switch")
+        self.switch.setAccessibleName(self.STATUS_CAPTION)
+        self.switch.setToolTip(
+            "Probed state of the machine-wide collector. Only this control can change it."
+        )
+        self.status_label = QLabel(COLLECTOR_STATE_UNAVAILABLE)
+        self.status_label.setObjectName("system_services_status")
+        self.status_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.recheck = QPushButton("Check activation")
+        self.recheck.setObjectName("system_services_recheck")
+        self.recheck.setToolTip("Ask root to probe accounting once; no setting changes.")
+        row_layout.addWidget(self.switch)
+        row_layout.addWidget(self.status_label, 1)
+        row_layout.addWidget(self.recheck)
+        layout.addWidget(row)
+        layout.addStretch(1)
+
+    def focus_row(self, key: str) -> None:
+        if key not in self.ROWS:
+            raise ValueError("unknown settings row")
+        self.focused_row = key
+        self.switch.setFocus(Qt.FocusReason.TabFocusReason)
+
+    def show_switch(self, enabled: bool | None, *, busy: bool, unavailable: bool) -> None:
+        """Render the probe. Signal blocking keeps a refresh from re-elevating."""
+
+        self.switch.blockSignals(True)
+        try:
+            self.switch.setChecked(enabled is True)
+        finally:
+            self.switch.blockSignals(False)
+        self.switch.setEnabled(enabled is not None and not busy and not unavailable)
+
+
+# --------------------------------------------------------------------------- #
+# The shell
+# --------------------------------------------------------------------------- #
+
+
+class _ReplyBridge(QObject):
+    """Carries a completed helper future from a worker thread to the Qt thread."""
+
+    delivered = pyqtSignal(object)
+
+
+class CollectorWindow(QMainWindow):
+    """The P3 shell: a status banner, one Settings switch, and navigation only."""
+
+    def __init__(
+        self,
+        coordinator: CollectorCoordinator,
+        history: HistoryRouter,
+        setup: SetupClient,
+        *,
+        clock_ns: Callable[[], int] | None = None,
+        pump: Callable[[], None] | None = None,
+        refresh_interval_ms: int = 1000,
+    ) -> None:
+        super().__init__()
+        self.coordinator = coordinator
+        self.history = history
+        self.setup = setup
+        self._clock_ns = clock_ns or (lambda: time.clock_gettime_ns(time.CLOCK_BOOTTIME))
+        self._pump = pump
+        self._facts: ServiceFacts | None = None
+        self._probe_state: str | None = None
+        self._busy = False
+        self._operation: tuple[str, Callable[[SetupReply], None] | None] | None = None
+        self._activation_choice: str | None = None
+        self._unsupported_reason: str | None = None
+        self._view: "AppIoWindow | None" = None
+        self._prepared: Window | None = None
+        self._closed = False
+        self.state_text = COLLECTOR_STATE_UNAVAILABLE
+
+        self.consent: ConsentDialog | None = None
+        self.choice: ActivationChoiceDialog | None = None
+        self.restart_confirmation: RestartConfirmationDialog | None = None
+
+        self.setWindowTitle("appio")
+        self._build_ui()
+
+        self._bridge = _ReplyBridge(self)
+        self._bridge.delivered.connect(self._on_reply)
+
+        self._poll_timer = QTimer(self)
+        self._poll_timer.setInterval(100)
+        self._poll_timer.timeout.connect(self._poll_history)
+        self._timer = QTimer(self)
+        self._timer.setInterval(max(0, int(refresh_interval_ms)))
+        self._timer.timeout.connect(self.refresh)
+        self._timer.start()
+
+    # -- construction -----------------------------------------------------
+
+    def _build_ui(self) -> None:
+        central = QWidget(self)
+        outer = QVBoxLayout(central)
+
+        banner = QWidget()
+        banner.setObjectName("status_banner")
+        banner_layout = QHBoxLayout(banner)
+        banner_layout.setContentsMargins(0, 0, 0, 0)
+        self.banner_status = QLabel(COLLECTOR_STATE_UNAVAILABLE)
+        self.banner_status.setObjectName("banner_status")
+        self.banner_status.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.banner_open_settings = QPushButton("Open settings")
+        self.banner_open_settings.setObjectName("banner_open_settings")
+        self.banner_open_settings.setToolTip("Opens Settings at the System services switch.")
+        self.files_nav = QPushButton("Files")
+        self.files_nav.setObjectName("files_nav")
+        banner_layout.addWidget(self.banner_status, 1)
+        banner_layout.addWidget(self.banner_open_settings)
+        banner_layout.addWidget(self.files_nav)
+        outer.addWidget(banner)
+
+        self.error_label = QLabel("")
+        self.error_label.setObjectName("setup_error")
+        self.error_label.setWordWrap(True)
+        self.error_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.error_label.setVisible(False)
+        outer.addWidget(self.error_label)
+
+        self.stack = QStackedWidget()
+        self.history_page = QWidget()
+        history_layout = QVBoxLayout(self.history_page)
+        self.history_state = QLabel("waiting for the first sample")
+        self.history_state.setObjectName("history_state")
+        self.history_state.setWordWrap(True)
+        history_layout.addWidget(self.history_state)
+        self._view_slot = QVBoxLayout()
+        history_layout.addLayout(self._view_slot, 1)
+        self.stack.addWidget(self.history_page)
+
+        self.files_page = QWidget()
+        files_layout = QVBoxLayout(self.files_page)
+        self.files_message = QLabel(
+            f"In this version {FILES_UNAVAILABLE}. appio does not record which files were "
+            "read or written, and system services does not provide that data either; it "
+            "only measures device and per-application counters. The Files view arrives with "
+            "the per-file collector, not with this switch."
+        )
+        self.files_message.setObjectName("files_message")
+        self.files_message.setWordWrap(True)
+        self.files_open_settings = QPushButton("Open settings")
+        self.files_open_settings.setObjectName("files_open_settings")
+        self.files_open_settings.setToolTip(
+            "Opens Settings at the System services switch. Changes no state."
+        )
+        files_layout.addWidget(self.files_message)
+        files_layout.addWidget(self.files_open_settings)
+        files_layout.addStretch(1)
+        self.stack.addWidget(self.files_page)
+        self.stack.setCurrentWidget(self.history_page)
+        outer.addWidget(self.stack, 1)
+
+        self.setCentralWidget(central)
+        self.resize(980, 620)
+
+        self.settings = SettingsDialog(self)
+        self.settings.recheck.clicked.connect(self._on_recheck_clicked)
+        self.settings.switch.clicked.connect(self._on_switch_clicked)
+        self.banner_open_settings.clicked.connect(self._open_settings_default)
+        self.files_open_settings.clicked.connect(self._open_settings_default)
+        self.files_nav.clicked.connect(self.open_files_unavailable)
+
+    def _open_settings_default(self) -> None:
+        # QPushButton.clicked carries a checked flag; the deep link takes no argument.
+        self.open_settings()
+
+    # -- public navigation surface ----------------------------------------
+
+    @property
+    def busy(self) -> bool:
+        return self._busy
+
+    def open_settings(self, *, focus: str = "system_services") -> None:
+        """Focus the one settings row. Never invokes, reconciles or queries."""
+
+        if focus not in SettingsDialog.ROWS:
+            raise ValueError("unknown settings row")
+        self.settings.show()
+        self.settings.raise_()
+        self.settings.activateWindow()
+        self.settings.focus_row(focus)
+
+    def open_files_unavailable(self) -> None:
+        """Show the unavailable Files entry. Never invokes or changes state."""
+
+        self.stack.setCurrentWidget(self.files_page)
+
+    def refresh(self) -> None:
+        """Probe (unprivileged), reconcile ownership, then render only proven data."""
+
+        if self._closed:
+            return
+        try:
+            if self._pump is not None:
+                self._pump()
+            facts = self.setup.refresh()
+            self._facts = facts
+            if not self._busy:
+                self.coordinator.reconcile(facts)
+                self.coordinator.tick_local()
+            self._render(facts)
+            if not self._busy:
+                self._render_history()
+        except Exception as error:  # a timer callback must never kill the window
+            self._show_error(f"appio: {error}")
+
+    def shutdown(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        for timer in (self._timer, self._poll_timer):
+            timer.stop()
+        for dialog in (self.consent, self.choice, self.restart_confirmation, self.settings):
+            if dialog is not None:
+                dialog.close()
+        try:
+            self.coordinator.close()
+        finally:
+            self.history.close()
+
+    # -- rendering --------------------------------------------------------
+
+    def _render(self, facts: ServiceFacts) -> None:
+        state = display_state(facts, self._probe_state)
+        self.state_text = state
+        self.banner_status.setText(state)
+        self.settings.status_label.setText(state)
+        self.settings.show_switch(
+            facts.enabled,
+            busy=self._busy,
+            unavailable=self._unsupported_reason is not None,
+        )
+
+    def _show_error(self, message: str) -> None:
+        self.error_label.setText(message)
+        self.error_label.setVisible(True)
+
+    def _clear_error(self) -> None:
+        self.error_label.setText("")
+        self.error_label.setVisible(False)
+
+    def _current_window(self) -> Window | None:
+        connection = getattr(getattr(self.history, "local", None), "connection", None)
+        if connection is None:
+            return None
+        row = connection.execute(
+            "SELECT boot_id FROM boot ORDER BY boot_order DESC LIMIT 1"
+        ).fetchone()
+        if row is None or not row[0]:
+            return None
+        now = self._clock_ns()
+        end = (now // RAW_BUCKET_NS + 1) * RAW_BUCKET_NS
+        return Window(kind="since_boot", boot_id=str(row[0]), end_mono_ns=end)
+
+    def _render_history(self) -> None:
+        window = self._current_window()
+        if window is None:
+            self._hide_view()
+            self.history_state.setText("waiting for the first sample")
+            self.history_state.setVisible(True)
+            self._poll_timer.stop()
+            return
+        self._prepared = window
+        self.history.prepare(window)
+        if self.history.ready(window):
+            self._show_ready(window)
+            return
+        self._hide_view()
+        self.history_state.setText(f"loading history ({self.history.view_state})")
+        self.history_state.setVisible(True)
+        # Poll readiness only while something is being prepared: no idle wakeups.
+        if not self._poll_timer.isActive():
+            self._poll_timer.start()
+
+    def _poll_history(self) -> None:
+        """Fast readiness poll; never prepares a new scope and never queries."""
+
+        if self._closed or self._prepared is None or self._busy:
+            return
+        if self._view is not None and self._view.isVisible():
+            return
+        try:
+            if self.history.ready(self._prepared):
+                self._show_ready(self._prepared)
+        except Exception as error:
+            self._show_error(f"appio: {error}")
+
+    def _show_ready(self, window: Window) -> None:
+        if self._view is None:
+            # The P2 view renders its own first frame through the same contracts.
+            self._view = self._ensure_view(window)
+        else:
+            self._view.set_window(window)
+        self.history_state.setText("")
+        self.history_state.setVisible(False)
+        self._view.setVisible(True)
+        self._poll_timer.stop()
+
+    def _ensure_view(self, window: Window) -> "AppIoWindow":
+        from .main_window import AppIoWindow
+
+        view = AppIoWindow(self.history, window.boot_id, window.end_mono_ns)
+        self._view_slot.addWidget(view)
+        return view
+
+    def _hide_view(self) -> None:
+        if self._view is not None:
+            self._view.setVisible(False)
+
+    @property
+    def view(self) -> "AppIoWindow | None":
+        return self._view
+
+    @property
+    def history_visible(self) -> bool:
+        return self._view is not None and self._view.isVisible()
+
+    # -- the switch: probe first, consent, then one operation --------------
+
+    def _on_switch_clicked(self) -> None:
+        # A click is a request, never a state. Restore the probed position first so
+        # no dismissal, failure or pending future can leave a lie on screen.
+        if self._facts is not None:
+            self._render(self._facts)
+        if self._busy:
+            return
+        wanted = "disable" if self._facts is not None and self._facts.enabled is True else "enable"
+        self._open_consent(wanted)
+
+    def _on_recheck_clicked(self) -> None:
+        if self._busy or self._unsupported_reason is not None:
+            return
+        self._open_consent("status")
+
+    def _open_consent(self, verb: str) -> None:
+        if self._busy:
+            return
+        self.consent = ConsentDialog(self, verb)
+        self.consent.accepted.connect(lambda: self._begin(verb))
+        self.consent.show()
+        self.consent.raise_()
+        self.consent.activateWindow()
+
+    def _begin(self, verb: str) -> None:
+        if self._busy:
+            return
+        self._clear_error()
+        if verb == "enable":
+            if not self._quiesce_local():
+                return
+            self._start("install-delegation", self._after_install)
+        elif verb == "disable":
+            self._start("disable", self._after_disable)
+        else:
+            self._start("status", self._after_status)
+
+    def _quiesce_local(self) -> bool:
+        """Stop the local writer before enabling the daemon; claim nothing else.
+
+        A failed quiesce aborts the elevation: enabling a daemon while this process
+        still holds the writer lease would create two collectors for one boot.
+        """
+
+        try:
+            self.coordinator.reconcile(QUIESCE_FACTS)
+        except Exception as error:
+            self._show_error(f"appio: {error}")
+            return False
+        return True
+
+    def _start(self, verb: str, on_success: Callable[[SetupReply], None] | None) -> None:
+        if self._busy:
+            return
+        self._busy = True
+        self._operation = (verb, on_success)
+        if self._facts is not None:
+            self._render(self._facts)
+        try:
+            future = self.setup.invoke(verb)
+        except BaseException as error:
+            self._busy = False
+            self._operation = None
+            self._show_error(f"appio: {error}")
+            if self._facts is not None:
+                self._render(self._facts)
+            return
+        future.add_done_callback(self._bridge.delivered.emit)
+
+    def _on_reply(self, future) -> None:
+        # Reached only through the queued bridge signal, so widgets are mutated on
+        # Qt's thread even when the helper future completes on a worker thread.
+        operation, self._operation = self._operation, None
+        self._busy = False
+        _verb, on_success = operation if operation is not None else ("", None)
+        try:
+            reply = future.result()
+        except Exception as error:
+            self._fail(str(error))
+            return
+        if self._apply_body(reply.body):
+            self._clear_error()
+        if reply.exit_code != 0:
+            self._fail(reply)
+            return
+        self._clear_error()
+        if on_success is not None:
+            on_success(reply)
+        else:
+            self.refresh()
+        self._render(self._facts if self._facts is not None else QUIESCE_FACTS)
+
+    def _apply_body(self, body: dict | None) -> bool:
+        """Take the root probe's accounting verdict; never its 'answering'."""
+
+        if body is None:
+            return False
+        state = body.get("state")
+        if state in ACTIVATION_STATES:
+            self._probe_state = state
+            return True
+        if body.get("enabled") is False:
+            self._probe_state = None
+        return False
+
+    def _fail(self, failure: SetupReply | str) -> None:
+        self._activation_choice = None
+        if isinstance(failure, SetupReply):
+            reply = failure
+            body = reply.body if isinstance(reply.body, dict) else {}
+            detail = reply.stderr_first_line or str(body.get("error") or "") or "no detail"
+            self._show_error(f"Appio setup failed (exit {reply.exit_code}): {detail}")
+            reason = body.get("error")
+            if isinstance(reason, str) and reason.startswith("unsupported:"):
+                self._unsupported_reason = reason
+            if reply.exit_code == 127:
+                # pkexec could not find the helper at all: the switch cannot work.
+                self._unsupported_reason = "appio-setup is not available"
+        else:
+            self._show_error(f"appio: {failure}")
+        try:
+            self.refresh()
+        except Exception:
+            pass
+        self._render(self._facts if self._facts is not None else QUIESCE_FACTS)
+
+    # -- enable, choice and restart ---------------------------------------
+
+    def _after_install(self, reply: SetupReply) -> None:
+        self.choice = ActivationChoiceDialog(self)
+        self.choice.chosen.connect(self._on_choice)
+        self.choice.rejected.connect(self._on_choice_cancelled)
+        self.choice.show()
+        self.choice.raise_()
+        self.choice.activateWindow()
+
+    def _on_choice(self, key: str) -> None:
+        self._activation_choice = key
+        self._start("enable", self._after_enable)
+
+    def _on_choice_cancelled(self) -> None:
+        self._activation_choice = None
+        self.refresh()
+
+    def _after_enable(self, reply: SetupReply) -> None:
+        self.refresh()
+        if self._activation_choice == "restart":
+            self.restart_confirmation = RestartConfirmationDialog(self)
+            self.restart_confirmation.accepted.connect(self._restart_confirmed)
+            self.restart_confirmation.show()
+            self.restart_confirmation.raise_()
+            self.restart_confirmation.activateWindow()
+
+    def _restart_confirmed(self) -> None:
+        self._start("restart-user-manager", None)
+
+    # -- disable and export import ---------------------------------------
+
+    def _after_disable(self, reply: SetupReply) -> None:
+        body = reply.body or {}
+        exported = self._export_from_body(body)
+        if exported is None:
+            self._show_error(
+                "appio: the helper reported no verified export metadata; nothing was imported"
+            )
+        else:
+            try:
+                self.coordinator.accept_export(exported)
+            except Exception as error:
+                self._show_error(f"appio: export import refused: {error}")
+        self.refresh()
+
+    @staticmethod
+    def _export_from_body(body: dict) -> ExportResult | None:
+        path = body.get("export_path")
+        cutoff = body.get("export_cutoff")
+        if not isinstance(path, str) or not path:
+            return None
+        if not isinstance(cutoff, dict):
+            return None
+        boot_id = cutoff.get("boot_id")
+        epoch = cutoff.get("iod_epoch")
+        seq = cutoff.get("seq")
+        cutoff_ns = cutoff.get("cutoff_mono_ns")
+        if not isinstance(boot_id, str) or not boot_id:
+            return None
+        for value in (epoch, seq, cutoff_ns):
+            if type(value) is not int or value < 0:
+                return None
+        return ExportResult(path=Path(path), boot_id=boot_id, iod_epoch=epoch, seq=seq,
+                            cutoff_mono_ns=cutoff_ns)
+
+    # -- explicit status recheck ------------------------------------------
+
+    def _after_status(self, reply: SetupReply) -> None:
+        self.refresh()
+
+
+# --------------------------------------------------------------------------- #
+# Unprivileged production probe (systemd unit state + socket status)
+# --------------------------------------------------------------------------- #
+
+
+def parse_unit_facts(stdout: str) -> tuple[bool | None, str]:
+    """Map ``systemctl show`` output to (enabled, active) without inventing either."""
+
+    if not isinstance(stdout, str):
+        return None, "unknown"
+    rows: dict[str, str] = {}
+    for line in stdout.splitlines():
+        if not line.strip():
+            continue  # systemctl may end its output with a blank line
+        key, separator, value = line.partition("=")
+        if not separator or key in rows:
+            return None, "unknown"
+        rows[key] = value.strip()
+    if set(rows) != {"UnitFileState", "ActiveState"}:
+        return None, "unknown"
+    return _ENABLED_STATES.get(rows["UnitFileState"]), _ACTIVE_STATES.get(
+        rows["ActiveState"], "unknown"
+    )
+
+
+def _run_systemctl_show(argv: tuple[str, ...]) -> CommandResult:
+    completed = subprocess.run(list(argv), capture_output=True, text=True, timeout=5.0)
+    return CommandResult(completed.returncode, completed.stdout[:MAX_HELPER_OUTPUT],
+                         completed.stderr[:MAX_HELPER_OUTPUT])
+
+
+def _read_daemon_status(*, timeout_seconds: float = STATUS_TIMEOUT_SECONDS) -> dict | None:
+    """Observe the root daemon from *this* session. No root, no queue, no writes."""
+
+    import socket
+
+    deadline = time.monotonic() + max(0.0, timeout_seconds)
+    request_id = "gui-status"
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+        client.settimeout(max(0.001, deadline - time.monotonic()))
+        client.connect(str(SOCKET_PATH))
+        require_root_server(read_peer(client))
+        client.sendall(encode_frame({"protocol": 1, "type": "status", "request_id": request_id}))
+        decoder = FrameDecoder(max_bytes=MAX_OUTBOUND)
+        while time.monotonic() < deadline:
+            client.settimeout(max(0.001, deadline - time.monotonic()))
+            data = client.recv(65536)
+            if not data:
+                return None
+            for message in decoder.feed(data):
+                value = validate_server_message(message)
+                if value["type"] != "status" or value.get("request_id") != request_id:
+                    return None
+                return value
+    return None
+
+
+def production_probe(
+    *,
+    command: Callable[[tuple[str, ...]], CommandResult] | None = None,
+    status_reader: Callable[[], dict | None] | None = None,
+) -> ServiceFacts:
+    """The periodic probe: unprivileged, bounded, and honest about ignorance."""
+
+    run = command or _run_systemctl_show
+    read_status = status_reader or _read_daemon_status
+    enabled: bool | None = None
+    active = "unknown"
+    try:
+        result = run(UNIT_SHOW_ARGV)
+    except (OSError, subprocess.SubprocessError):
+        result = None
+    if isinstance(result, CommandResult) and result.returncode == 0:
+        enabled, active = parse_unit_facts(result.stdout)
+    status: object = None
+    try:
+        status = read_status()
+    except (OSError, ValueError, ProtocolError):
+        status = None
+    if isinstance(status, dict) and status.get("answering") is True:
+        pending = status.get("pending_activation")
+        return ServiceFacts(enabled, active, True, True,
+                            pending if type(pending) is bool else None)
+    return ServiceFacts(enabled, active, False, False, None)
+
+
+# --------------------------------------------------------------------------- #
+# Interactive entry (the only place that composes the P3 objects)
+# --------------------------------------------------------------------------- #
+
+
+def _launch_helper(argv: tuple[str, ...]) -> Future:
+    """Run one fixed pkexec vector in a worker, bounded, never through a shell."""
+
+    reply: Future = Future()
+
+    def work() -> None:
+        try:
+            completed = subprocess.run(list(argv), capture_output=True, text=True,
+                                       timeout=HELPER_TIMEOUT_SECONDS)
+            reply.set_result(CommandResult(
+                completed.returncode,
+                (completed.stdout or "")[:MAX_HELPER_OUTPUT],
+                (completed.stderr or "")[:MAX_HELPER_OUTPUT],
+            ))
+        except BaseException as error:
+            reply.set_exception(error)
+
+    threading.Thread(target=work, name="appio-setup", daemon=True).start()
+    return reply
+
+
+def _wake_object() -> QObject:
+    class _Wake(QObject):
+        woke = pyqtSignal()
+
+    return _Wake()
+
+
+def _gui_lease_path() -> Path:
+    """The per-user runtime directory; a private subdirectory holds the lease."""
+
+    runtime = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+    directory = Path(runtime) / "appio"
+    try:
+        directory.mkdir(mode=0o700, exist_ok=True)
+    except OSError:
+        pass
+    return directory / "collector.lock"
+
+
+def run_interactive(args) -> int:
+    """Compose the P3 window and run Qt. Only this path imports P3 modules."""
+
+    from PyQt6.QtWidgets import QApplication
+
+    from ..iodclient import AppRegistry, IodClient
+    from ..query import QueryService
+    from ..store import AppIoStore
+
+    application = QApplication.instance() or QApplication([sys.argv[0]])
+    application.setDesktopFileName("appio")
+
+    database_path = Path(args.db)
+    store = AppIoStore(database_path)
+    local_service = QueryService(store)
+    registry = AppRegistry()
+    wake = _wake_object()
+    router_holder: dict[str, HistoryRouter] = {}
+
+    def on_gap(notice) -> None:
+        router = router_holder.get("router")
+        if router is not None:
+            router.record_transport_gap(notice)
+
+    client = IodClient(SOCKET_PATH, on_gap=on_gap, on_change=wake.woke.emit)
+    router = HistoryRouter(local_service, client, registry)
+    router_holder["router"] = router
+
+    def local_factory() -> LiveCollector:
+        # The coordinator's lazy factory owns the decision to collect locally.
+        return LiveCollector(
+            proc_root=args.proc_root,
+            cgroup_root=args.cgroup_root,
+            database_path=database_path,
+            source="gui",
+            baseline_only=True,
+        )
+
+    coordinator = CollectorCoordinator(
+        local_factory=local_factory,
+        client=client,
+        history=router,
+        lease=GuiLease(_gui_lease_path()),
+        clock=SystemClock(),
+    )
+    window = CollectorWindow(
+        coordinator,
+        router,
+        SetupClient(launch=_launch_helper, probe=production_probe),
+        pump=client.pump,
+        refresh_interval_ms=max(1, int(round(args.interval * 1000))),
+    )
+    wake.woke.connect(window.refresh)
+    window.show()
+    window.refresh()
+    try:
+        return application.exec()
+    finally:
+        window.shutdown()
+        store.connection.close()
