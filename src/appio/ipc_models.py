@@ -104,7 +104,10 @@ _KIND_REQUIRED: dict[str, frozenset[str]] = {
 }
 _KIND_OPTIONAL: dict[str, frozenset[str]] = {
     # `sort` is either a Metric or the pinned default `bytes_total`.
-    "ranking": frozenset({"metric", "sort", "direction", "limit", "coverage_kind"}),
+    # `cursor` is required for wire continuation: a paged ranking request carries the
+    # cursor the previous page returned (see appio.iod_history), so omitting it here
+    # rejected every continuation and closed the connection mid-query.
+    "ranking": frozenset({"metric", "sort", "direction", "limit", "coverage_kind", "cursor"}),
     "series": frozenset({"limit", "cursor", "coverage_kind"}),
     "files": frozenset({"sort", "direction", "search", "cursor", "limit", "coverage_kind"}),
     "coverage": frozenset({"app_key", "coverage_kind"}),

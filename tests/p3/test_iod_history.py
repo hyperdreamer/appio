@@ -544,9 +544,13 @@ def test_totals_only_does_not_materialize_expired_raw_rows(db):
 
 
 def test_protocol_producer_ranking_cursor_gap_is_explicit(db):
-    # Characterize the dependency blocker; this lane may not edit ipc_models.py.
+    # This test used to CHARACTERIZE the dependency blocker: ranking + cursor was
+    # rejected with invalid_selector, which closed the connection mid-continuation.
+    # The defect is now fixed (cursor is a ranking selector and the client sends it),
+    # so the characterization inverts: the request must be accepted and the cursor
+    # must survive validation, or paging silently restarts at page one.
     message = {"protocol": 1, "type": "query", "request_id": "page",
                "query": {"kind": "ranking", "window": {"kind": "lifetime"}, "cursor": "opaque"}}
-    with pytest.raises(ProtocolError) as error:
-        validate_request(message)
-    assert error.value.reason == "invalid_selector"
+    request = validate_request(message)
+    assert request.query.kind == "ranking"
+    assert request.query.cursor == "opaque"
