@@ -567,6 +567,10 @@ def _query_wire(request: QueryRequest) -> dict[str, Any]:
         query["sort"] = request.sort
         query["direction"] = request.direction
         query["limit"] = request.limit
+        if request.cursor is not None:
+            # Continuation: a paged ranking must carry the cursor the previous
+            # page returned, or the server answers page one again forever.
+            query["cursor"] = request.cursor
     elif request.kind in ("series", "files"):
         query["limit"] = request.limit
         if request.cursor is not None:
