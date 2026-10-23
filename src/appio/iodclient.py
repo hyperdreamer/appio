@@ -525,7 +525,7 @@ _SELECTOR_DEFAULTS: dict[str, Any] = {
 }
 
 _KIND_SELECTORS: dict[str, frozenset[str]] = {
-    "ranking": frozenset({"metric", "sort", "direction", "limit"}),
+    "ranking": frozenset({"metric", "sort", "direction", "limit", "cursor"}),
     "series": frozenset({"limit", "cursor"}),
     "files": frozenset({"sort", "direction", "search", "cursor", "limit"}),
     "coverage": frozenset({"coverage_kind"}),
