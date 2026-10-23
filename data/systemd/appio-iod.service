@@ -1,0 +1,24 @@
+[Unit]
+Description=Application I/O collector
+After=local-fs.target
+
+[Service]
+Type=simple
+User=root
+Group=appio
+ExecStart=/usr/bin/appio-iod
+UMask=0077
+StateDirectory=appio
+StateDirectoryMode=0711
+RuntimeDirectory=appio
+RuntimeDirectoryMode=0750
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+ReadWritePaths=/var/lib/appio /run/appio
+Restart=on-failure
+TimeoutStopSec=5s
+
+[Install]
+WantedBy=multi-user.target

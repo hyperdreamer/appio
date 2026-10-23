@@ -1291,8 +1291,17 @@ def test_no_second_helper_entry_point_is_generated():
     # The helper must be the single fixed shim, not a setuptools console script
     # whose name or arguments a package metadata change could widen.
     project = tomllib.loads((WORKTREE / "pyproject.toml").read_text(encoding="utf-8"))
-    assert list(project["project"]["scripts"]) == ["appio"]
+    scripts = project["project"]["scripts"]
+    # The threat is that the PRIVILEGED HELPER becomes a console script, whose name or
+    # arguments a metadata change could widen. Unprivileged entry points are allowed and
+    # must stay inside the appio package; the helper stays the single fixed shim executed
+    # via policykit exec.path (asserted above).
+    assert "appio-setup" not in scripts
+    assert "appio-helper" not in scripts
     assert "appio-setup" not in (WORKTREE / "pyproject.toml").read_text(encoding="utf-8")
+    assert set(scripts) <= {"appio", "appio-iod"}, scripts
+    for name, target in scripts.items():
+        assert target.startswith("appio."), (name, target)
 
 
 def test_no_test_seam_environment_variable_or_argv_option_exists():
