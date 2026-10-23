@@ -596,17 +596,29 @@ class CollectorWindow(QMainWindow):
         self.error_label.setVisible(False)
 
     def _current_window(self) -> Window | None:
-        connection = getattr(getattr(self.history, "local", None), "connection", None)
-        if connection is None:
-            return None
-        row = connection.execute(
-            "SELECT boot_id FROM boot ORDER BY boot_order DESC LIMIT 1"
-        ).fetchone()
-        if row is None or not row[0]:
-            return None
+        # A daemon-owned GUI may have no local boot row at all: the GUI is a
+        # read-through client in that state.  Only the root-verified status
+        # cursor establishes which boot the first remote query may name.
+        client = getattr(self.history, "client", None)
+        state = getattr(client, "state", None)
+        if (state is not None and state.verified and state.answering):
+            cursor = state.cursor
+            if cursor is None:
+                return None
+            boot_id = cursor.boot_id
+        else:
+            connection = getattr(getattr(self.history, "local", None), "connection", None)
+            if connection is None:
+                return None
+            row = connection.execute(
+                "SELECT boot_id FROM boot ORDER BY boot_order DESC LIMIT 1"
+            ).fetchone()
+            if row is None or not row[0]:
+                return None
+            boot_id = str(row[0])
         now = self._clock_ns()
         end = (now // RAW_BUCKET_NS + 1) * RAW_BUCKET_NS
-        return Window(kind="since_boot", boot_id=str(row[0]), end_mono_ns=end)
+        return Window(kind="since_boot", boot_id=boot_id, end_mono_ns=end)
 
     def _render_history(self) -> None:
         window = self._current_window()
@@ -1032,12 +1044,16 @@ def run_interactive(args) -> int:
 
     def local_factory() -> LiveCollector:
         # The coordinator's lazy factory owns the decision to collect locally.
+        # An accepted export is a pending incoming handover, not a reason to
+        # discard the persisted cutoff and start a fresh baseline.
+        offer = coordinator.resume_handover
         return LiveCollector(
             proc_root=args.proc_root,
             cgroup_root=args.cgroup_root,
             database_path=database_path,
             source="gui",
-            baseline_only=True,
+            baseline_only=offer is None,
+            resume_handover=offer,
         )
 
     coordinator = CollectorCoordinator(

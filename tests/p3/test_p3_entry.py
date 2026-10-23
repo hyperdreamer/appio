@@ -13,8 +13,12 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+from types import SimpleNamespace
 
 import pytest
+
+from appio.collector_owner import ServiceFacts
+from appio.iodclient import ClientState
 
 SRC = Path(__file__).parents[2] / "src"
 
@@ -140,6 +144,79 @@ def test_offscreen_is_applied_before_the_interactive_branch(tmp_path, monkeypatc
     finally:
         sys.modules.pop("appio.ui.collector_window", None)
     assert seen == ["offscreen"]
+
+
+def test_interactive_composition_forwards_a_pending_handover_to_the_factory(tmp_path, monkeypatch, qapp):
+    """The shipped entry must use the coordinator's incoming handover seam."""
+    from PyQt6.QtWidgets import QApplication
+    from appio.ui import collector_window
+
+    class Signal:
+        def emit(self):
+            pass
+
+        def connect(self, callback):
+            pass
+
+    class Client:
+        def __init__(self, *args, **kwargs):
+            self.state = ClientState()
+
+        def close(self):
+            pass
+
+        def pump(self):
+            pass
+
+    class Collector:
+        def __init__(self, **kwargs):
+            calls.append(kwargs)
+            self.source = kwargs["source"]
+            self.baseline_only = kwargs["baseline_only"]
+            self.last_frame = object()
+            self.handover_fallback_reason = None
+
+        def quiesce(self):
+            return None
+
+        def close(self):
+            pass
+
+    calls = []
+    holder = {}
+    offer = object()
+
+    class Window:
+        def __init__(self, coordinator, history, setup, **kwargs):
+            holder["coordinator"] = coordinator
+            holder["history"] = history
+            coordinator.resume_handover = offer
+            coordinator.reconcile(ServiceFacts(False, "inactive", False, False, False))
+
+        def show(self):
+            pass
+
+        def refresh(self):
+            pass
+
+        def shutdown(self):
+            holder["coordinator"].close()
+            holder["history"].close()
+
+    monkeypatch.setattr(QApplication, "exec", lambda self: 0)
+    monkeypatch.setattr("appio.iodclient.IodClient", Client)
+    monkeypatch.setattr(collector_window, "LiveCollector", Collector)
+    monkeypatch.setattr(collector_window, "CollectorWindow", Window)
+    monkeypatch.setattr(collector_window, "_wake_object", lambda: SimpleNamespace(woke=Signal()))
+    monkeypatch.setattr(collector_window, "_gui_lease_path", lambda: tmp_path / "runtime" / "collector.lock")
+    (tmp_path / "runtime").mkdir()
+
+    assert collector_window.run_interactive(SimpleNamespace(
+        db=tmp_path / "gui.db", proc_root=tmp_path / "proc", cgroup_root=tmp_path / "cgroup",
+        interval=5.0)) == 0
+    assert len(calls) == 1
+    assert calls[0]["baseline_only"] is False
+    assert calls[0]["resume_handover"] is offer
 
 
 def test_interactive_composition_construction_is_deferred_to_the_factory(tmp_path):

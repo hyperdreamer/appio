@@ -38,10 +38,13 @@ def test_fixture_tick_sqlite_socket_client_router_and_window_match(tmp_path, qap
         h.advance(10)
         assert h.totals() == (200, 100, 60, 40)
         h.open_gui()
+        # The GUI database is genuinely empty. Its initial scope must come from
+        # the verified daemon status rather than a synthetic local boot row.
+        assert h.gui.window._prepared is not None
+        assert h.gui.window._prepared.boot_id == BOOT
         scope = Window("range", BOOT, 10 * NS, 20 * NS)
-        # Incomplete protocol-v1 remote coverage cannot prove ownership. An
-        # actual helper export supplies intervals; values still cross the socket.
-        h.import_history()
+        # A successful daemon query is authoritative even when its measured
+        # coverage is honestly incomplete; no privileged export is required.
         rows = h.query(scope)
         row, = rows
         assert (row.app_key, row.rchar, row.wchar, row.read_bytes, row.write_bytes) == (APP, 160, 80, 48, 32)

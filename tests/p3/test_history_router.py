@@ -401,7 +401,7 @@ def test_signed_residuals_are_not_clamped_when_device_evidence_is_available(tmp_
     assert sum(point.read for point in timeline.residual_points) == -2
 
 
-@pytest.mark.parametrize("variant", ["empty", "partial", "paginated"])
+@pytest.mark.parametrize("variant", ["empty", "paginated"])
 def test_remote_evidence_rejections_have_no_numeric_fallback(tmp_path, variant):
     local = AppIoStore(tmp_path / "empty.db")
     local.start_boot(BOOT, 1, 0, 1000.0, "gui")
@@ -421,6 +421,49 @@ def test_remote_evidence_rejections_have_no_numeric_fallback(tmp_path, variant):
     assert history.ready(scope)
     assert history.ranking(scope, "total_bytes") == []
     assert "not_retained" in history.view_state
+
+
+def test_incomplete_remote_history_is_retained_with_honest_coverage(tmp_path):
+    local = AppIoStore(tmp_path / "empty.db")
+    remote, _ = source(tmp_path / "remote.db", "iod")
+    scope = window(100, 120)
+    service = QueryService(remote)
+    expected = service.ranking(scope, "total_bytes")
+    assert expected and not expected[0].coverage.complete
+
+    history = router(local)
+    history.client.state = ClientState(verified=True, answering=True)
+    history.prepare(scope)
+
+    def answer_pending():
+        for request, future in history.client.pending:
+            if future.done():
+                continue
+            if request.kind == "ranking":
+                result = expected
+            else:
+                app_id = remote.connection.execute(
+                    "SELECT app_id FROM app WHERE key=?", (request.app_key,)
+                ).fetchone()[0]
+                result = getattr(service, "disk_share" if request.kind == "totals" else "series")(
+                    app_id, scope
+                )
+            future.set_result({"kind": request.kind, "result": result, "snapshot": "fixed"})
+
+    for _ in range(4):
+        answer_pending()
+        work = getattr(history, "_local_future", None)
+        if work is not None:
+            work.result(timeout=10)
+        if history.ready(scope):
+            break
+    assert history.ready(scope)
+    rows = history.ranking(scope, "total_bytes")
+    assert [(row.app_key, row.read_bytes, row.write_bytes) for row in rows] == [
+        ("exe:/usr/bin/shared", 20, 20)]
+    assert not rows[0].coverage.complete
+    assert rows[0].coverage.unavailable_reason is None
+    assert "not_retained" not in history.view_state
 
 
 def test_empty_or_partial_remote_answer_cannot_replace_proved_local_bytes(tmp_path):
