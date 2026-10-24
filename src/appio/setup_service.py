@@ -355,10 +355,12 @@ def probe_daemon_status(*, deps: SetupDeps, timeout_seconds: float = STATUS_TIME
         except BoundaryError:
             # The runtime directory is created by the unit's RuntimeDirectory= the
             # first time the service starts, so on a fresh install it legitimately
-            # does not exist. That is "not answering", not a failed verb: reporting
-            # it as an error made install-delegation look broken after it had already
-            # written both drop-ins and appended the group.
-            return False
+            # does not exist yet. That is "not answering *yet*", not a failed verb and
+            # not a reason to stop observing: `enable` starts the unit and then asks,
+            # so the absence has to consume the budget instead of ending the poll. It
+            # previously returned instantly, which made enable exit 1 with
+            # enable:daemon_not_answering while the daemon answered a second later.
+            pass
         except OSError:
             pass  # Startup may not have published the socket yet.
         remaining = deadline - time.monotonic()

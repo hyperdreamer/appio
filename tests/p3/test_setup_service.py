@@ -456,3 +456,41 @@ def test_a_fresh_host_without_a_runtime_directory_reports_not_answering(tmp_path
     # A positive budget is required: with 0.0 the deadline is already spent and the
     # loop never runs, which would make this test pass without exercising anything.
     assert service.probe_daemon_status(deps=deps, timeout_seconds=0.05) is False
+
+
+def test_the_probe_waits_for_a_runtime_directory_that_appears_mid_budget(tmp_path, monkeypatch):
+    # Host acceptance finding H3: `enable` failed with enable:daemon_not_answering
+    # while the daemon answered seconds later, because the probe returned False on the
+    # first missing /run/appio instead of continuing to poll within its deadline.
+    # "Not there yet" must consume budget, not end the observation.
+    import appio.setup_service as service
+    from appio.setup_boundary import CommandResult, SetupDeps, SetupIdentity
+
+    root = tmp_path / "root"
+    (root / "var/lib/appio").mkdir(parents=True, mode=0o711)
+    identity = SetupIdentity(os.getuid(), os.getgid(), "alice", Path("/home/alice"))
+
+    def metadata(fd):
+        real = os.fstat(fd)
+        return SimpleNamespace(st_uid=0, st_gid=identity.gid, st_mode=real.st_mode,
+                               st_dev=real.st_dev, st_ino=real.st_ino,
+                               st_nlink=real.st_nlink, st_size=real.st_size)
+
+    record = lambda uid: SimpleNamespace(pw_uid=uid, pw_gid=identity.gid, pw_name="alice",
+                                        pw_dir=str(identity.home))
+    deps = SetupDeps(root, SimpleNamespace(run=lambda *a, **k: CommandResult(0, "", "")),
+                     lambda: 0, record, metadata, lambda fd, uid, gid: None,
+                     lambda: 123456789, lambda event: None)
+
+    seen: list[float] = []
+
+    def verify(_deps):
+        # First poll: no runtime directory yet. Later polls: same failure, but the
+        # point is that the loop kept going and used its budget.
+        seen.append(1.0)
+        raise __import__("appio.setup_boundary", fromlist=["TargetError"]).TargetError(1, "untrusted_parent:missing")
+
+    monkeypatch.setattr(service, "_verify_socket_paths", verify)
+    monkeypatch.setattr(service.time, "sleep", lambda _s: None)
+    assert service.probe_daemon_status(deps=deps, timeout_seconds=0.06) is False
+    assert len(seen) > 1, f"the probe gave up after {len(seen)} poll(s) instead of retrying"
