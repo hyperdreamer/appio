@@ -352,6 +352,13 @@ def probe_daemon_status(*, deps: SetupDeps, timeout_seconds: float = STATUS_TIME
                         return value["answering"]
         except (PermissionError, ProtocolError, ValueError):
             return False
+        except BoundaryError:
+            # The runtime directory is created by the unit's RuntimeDirectory= the
+            # first time the service starts, so on a fresh install it legitimately
+            # does not exist. That is "not answering", not a failed verb: reporting
+            # it as an error made install-delegation look broken after it had already
+            # written both drop-ins and appended the group.
+            return False
         except OSError:
             pass  # Startup may not have published the socket yet.
         remaining = deadline - time.monotonic()

@@ -428,3 +428,31 @@ def test_protocol_probe_rejects_invalid_frames_and_bounds_fragment_deadline(expo
         worker.join(timeout=1)
     assert service.time.monotonic() - start < 0.5
     assert not worker.is_alive()
+
+
+def test_a_fresh_host_without_a_runtime_directory_reports_not_answering(tmp_path):
+    # Host acceptance finding: /run/appio exists only after the unit first starts, so
+    # on a fresh install every verb that reports `answering` died with
+    # "untrusted_parent:missing" instead of answering false. install-delegation had
+    # already written both drop-ins and appended the group by then, so the failure
+    # appeared to condemn a step that had actually succeeded.
+    from appio.setup_boundary import CommandResult, SetupDeps, SetupIdentity
+
+    root = tmp_path / "root"
+    (root / "var/lib/appio").mkdir(parents=True, mode=0o711)
+    identity = SetupIdentity(os.getuid(), os.getgid(), "alice", Path("/home/alice"))
+
+    def metadata(fd):
+        real = os.fstat(fd)
+        return SimpleNamespace(st_uid=0, st_gid=identity.gid, st_mode=real.st_mode,
+                               st_dev=real.st_dev, st_ino=real.st_ino,
+                               st_nlink=real.st_nlink, st_size=real.st_size)
+
+    record = lambda uid: SimpleNamespace(pw_uid=uid, pw_gid=identity.gid, pw_name="alice",
+                                        pw_dir=str(identity.home))
+    deps = SetupDeps(root, SimpleNamespace(run=lambda *a, **k: CommandResult(0, "", "")),
+                     lambda: 0, record, metadata, lambda fd, uid, gid: None,
+                     lambda: 123456789, lambda event: None)
+    # A positive budget is required: with 0.0 the deadline is already spent and the
+    # loop never runs, which would make this test pass without exercising anything.
+    assert service.probe_daemon_status(deps=deps, timeout_seconds=0.05) is False
