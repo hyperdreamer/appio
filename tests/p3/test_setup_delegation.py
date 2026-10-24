@@ -261,6 +261,37 @@ def test_a_controller_only_in_the_existing_file_is_never_removed(root: Path):
     assert b"cpuset" in rebase(root, SERVICE_DROPIN).read_bytes()
 
 
+def test_an_uninspectable_delegate_property_does_not_block_installation(root: Path):
+    # Host acceptance finding (systemd 262): `systemctl show user@.service
+    # --property=Delegate --value` exits 1 with "Unit name user@.service is neither
+    # a valid invocation ID nor unit name", because a template needs an instance.
+    # The observation is advisory - the required controller set is unioned in
+    # regardless - so an uninspectable unit must not abort the install on a fresh
+    # host. Before the fix this returned inspect-delegates:exit_1 and wrote nothing.
+    observed_failure = CommandResult(
+        1, "", "Failed to get properties: Unit name user@.service is neither a valid "
+               "invocation ID nor unit name."
+    )
+    table = results()
+    table[SHOW] = observed_failure
+    deps = make_deps(root, runner=FakeRunner(table))
+    fs = RecordingFS(SafeRootFS(deps))
+    result = install_delegation(identity(), deps=deps, fs=fs)
+    assert result["delegation_installed"] is True, result
+    assert result.get("error") is None
+    # pending state first, then both fixed drop-ins - and nothing else.
+    assert fs.written_paths() == [
+        str(STATE_FILE), str(SERVICE_DROPIN), str(USER_MANAGER_DROPIN)
+    ]
+    written = rebase(root, SERVICE_DROPIN).read_bytes()
+    delegate = next(
+        line.split(b"=", 1)[1].split() for line in written.splitlines()
+        if line.startswith(b"Delegate=")
+    )
+    # io must be delegated; order is whatever the existing file and observation imply.
+    assert {b"cpu", b"io", b"memory", b"pids"} <= set(delegate), delegate
+
+
 def test_install_refuses_a_non_canonical_existing_service_dropin(root: Path):
     # F-1: the install path must stop at a hostile pre-existing service drop-in
     # before writing either file, and must name that fixed operation so Task 10

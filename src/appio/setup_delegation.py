@@ -332,7 +332,37 @@ def _require_group(deps: SetupDeps, identity: SetupIdentity, diagnostics: list[s
 def _observed_delegated_controllers(
     deps: SetupDeps, identity: SetupIdentity, diagnostics: list[str]
 ) -> frozenset[str]:
-    result = _run(deps, SHOW_DELEGATES_ARGV, "inspect-delegates", identity, diagnostics)
+    """Read the currently delegated controllers. Advisory, never fatal.
+
+    The observation exists to prove the installed state to a human, not to gate
+    the write: ``install_delegation`` unions ``REQUIRED_DELEGATE_CONTROLLERS``
+    into the content it writes, so a host that cannot answer the query still
+    reaches the intended end state. A template unit needs an instance, and on
+    systemd 262 ``systemctl show user@.service`` exits 1 with "neither a valid
+    invocation ID nor unit name"; a host without that unit fails the same way.
+    Treating either as fatal blocked installation on a real machine while the
+    fixtures - which fake a successful answer - could never show it.
+    """
+    result = _run(deps, SHOW_DELEGATES_ARGV, "inspect-delegates", identity, diagnostics, allow_failure=True)
+    returncode = getattr(result, "returncode", 0)
+    if isinstance(returncode, int) and returncode != 0:
+        detail = _first_line(getattr(result, "stderr", "") or getattr(result, "stdout", ""))
+        if not _is_uninstantiable_unit(detail):
+            # Anything else - an unreachable bus, a broken manager - means the host
+            # cannot be configured or reloaded, so writing drop-ins would be a claim
+            # nobody can verify. Stay fatal.
+            raise _error(
+                "inspect-delegates",
+                f"exit_{returncode}",
+                identity,
+                pending=True,
+                diagnostics=diagnostics + [
+                    f"inspect-delegates:{detail}" if detail else "inspect-delegates:no_output"
+                ],
+            )
+        diagnostics.append(f"delegates:unobserved=exit_{returncode}")
+        diagnostics.append("inspect-delegates:unit_needs_instance")
+        return frozenset()
     text = str(getattr(result, "stdout", "") or "").strip()
     if not text:
         return frozenset()
@@ -378,12 +408,31 @@ def _existing_delegated_controllers(fs: SafeRootFS, identity: SetupIdentity) -> 
     return parsed
 
 
+#: A template unit cannot be inspected without an instance. systemd 262 answers
+#: ``systemctl show user@.service`` with "Unit name user@.service is neither a valid
+#: invocation ID nor unit name"; other builds report the unit as not found. That is a
+#: query-shape problem, not a broken host, so the observation degrades instead of
+#: failing the install: the required controller set is unioned into what we write.
+_UNINSTANTIABLE_UNIT_MARKERS: tuple[str, ...] = (
+    "is neither a valid invocation id nor unit name",
+    "not found",
+    "not loaded",
+)
+
+
+def _is_uninstantiable_unit(detail: str) -> bool:
+    lowered = detail.lower()
+    return any(marker in lowered for marker in _UNINSTANTIABLE_UNIT_MARKERS)
+
+
 def _run(
     deps: SetupDeps,
     argv: tuple[str, ...],
     operation: str,
     identity: SetupIdentity,
     diagnostics: list[str],
+    *,
+    allow_failure: bool = False,
 ) -> object:
     try:
         result = deps.runner.run(tuple(argv))
@@ -393,7 +442,7 @@ def _run(
             diagnostics=diagnostics + [_describe(exc)],
         ) from exc
     returncode = getattr(result, "returncode", None)
-    if returncode != 0:
+    if returncode != 0 and not allow_failure:
         detail = _first_line(getattr(result, "stderr", "") or getattr(result, "stdout", ""))
         raise _error(
             operation,
