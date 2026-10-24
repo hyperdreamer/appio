@@ -466,6 +466,49 @@ def test_incomplete_remote_history_is_retained_with_honest_coverage(tmp_path):
     assert "not_retained" not in history.view_state
 
 
+@pytest.mark.parametrize("local_boot,start,end,expected", [
+    (BOOT, 100, 110, 0),  # An owned, measured zero is still local history.
+    ("other-boot", 100, 110, 40),
+    (BOOT, 90, 100, 40),  # Half-open ownership ends at this window's start.
+    (BOOT, 120, 130, 40),  # Ownership starts at this window's end.
+])
+def test_remote_fallback_uses_scoped_ownership_not_filtered_counters(
+    tmp_path, local_boot, start, end, expected,
+):
+    local, _ = source(tmp_path / "local.db", boot=local_boot, start=start, end=end, amount=0)
+    remote, _ = source(tmp_path / "remote.db", "iod")
+    history = router(local)
+    service, scope = QueryService(remote), window(100, 120)
+    history.client.state = ClientState(verified=True, answering=True)
+    try:
+        history.prepare(scope)
+        history._local_future.result(timeout=10)
+        for _ in range(4):
+            for request, future in history.client.pending:
+                if future.done():
+                    continue
+                if request.kind == "ranking":
+                    value = service.ranking(scope, "total_bytes")
+                else:
+                    app_id = remote.connection.execute(
+                        "SELECT app_id FROM app WHERE key=?", (request.app_key,)
+                    ).fetchone()[0]
+                    value = getattr(service, "disk_share" if request.kind == "totals" else "series")(
+                        app_id, scope)
+                future.set_result({"kind": request.kind, "result": value, "snapshot": "fixed"})
+            if history.ready(scope):
+                break
+        assert history.ready(scope)
+        row, = history.ranking(scope, "total_bytes")
+        assert row.total_bytes == expected
+        assert row.coverage.overlap_uncertain_intervals == 0
+        assert not row.coverage.complete
+    finally:
+        history.close()
+        local.connection.close()
+        remote.connection.close()
+
+
 def test_empty_or_partial_remote_answer_cannot_replace_proved_local_bytes(tmp_path):
     local, _ = source(tmp_path / "local.db")
     history = router(local)

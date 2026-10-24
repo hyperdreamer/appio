@@ -11,7 +11,9 @@ result; its coverage may honestly be incomplete because process observation can
 lose identities or intervals. The GUI preserves those numeric retained bytes
 and their incomplete coverage instead of requiring a privileged export. Empty
 answers and paginated answers still cannot prove that no history was retained,
-so they remain unavailable without an independent ownership source.
+so they remain unavailable without an independent ownership source. A remote
+answer cannot supersede local ownership receipts or known overlap exclusions,
+even when excluding uncertain whole deltas has reduced every counter to zero.
 """
 from __future__ import annotations
 
@@ -105,6 +107,7 @@ class HistoryRouter:
         self._remote_parts = {}
         self._gap_ranges = []
         self._overlap_ranges = []
+        self._has_local_history = False
         self._not_retained = False
         self._chronology_unproved = False
         self.transport_issues: list[GapNotice] = []
@@ -187,6 +190,13 @@ class HistoryRouter:
                 cuts[boot][at] = item
             gaps.update(tuple(row) for row in db.execute(
                 "SELECT boot_id,source,from_mono_ns,to_mono_ns,reason FROM gap"))
+        # Preserve ownership evidence before materialization retracts whole
+        # deltas. Zero filtered counters do not prove that local history was
+        # absent, and the daemon cannot see another store's conflicting owner.
+        self._has_local_history = any(
+            name == "local" and start < (window.end_mono_ns or SQLITE_INT_MAX)
+            and end > (window.start_mono_ns or 0)
+            for name, _, _, _, start, end in evidence)
         # Each store's boot_order is authoritative only inside that store.
         # Shared boot IDs join these partial orders, never CLOCK_BOOTTIME or
         # wall-clock values from unrelated boots. Disconnected orders stay explicit.
@@ -404,7 +414,8 @@ class HistoryRouter:
                         details[(kind, row.app_key)] = error
             return {"ranking": worker._ranking, "parts": details, "segments": worker.segments,
                 "boundaries": worker.boundaries, "gaps": worker._gap_ranges,
-                "overlaps": worker._overlap_ranges, "not_retained": worker._not_retained,
+                "overlaps": worker._overlap_ranges, "local_history": worker._has_local_history,
+                "not_retained": worker._not_retained,
                 "chronology_unproved": worker._chronology_unproved}
         finally:
             if worker is not None:
@@ -420,6 +431,7 @@ class HistoryRouter:
         self._window, self._ready = window, False
         self.segments, self.boundaries = (), ()
         self._gap_ranges, self._overlap_ranges = [], []
+        self._has_local_history = False
         self._ranking, self._remote_parts, self._queue, self._cached_parts = [], {}, [], {}
         self._remote = self._remote_snapshot = None
         self._not_retained = self._chronology_unproved = False
@@ -451,6 +463,7 @@ class HistoryRouter:
         data = self._local_future.result()
         self.segments, self.boundaries = data["segments"], data["boundaries"]
         self._gap_ranges, self._overlap_ranges = data["gaps"], data["overlaps"]
+        self._has_local_history = data["local_history"]
         self._not_retained = self._not_retained or data["not_retained"]
         self._chronology_unproved = data["chronology_unproved"]
         self._ranking = [replace(row, app_id=self.registry.id_for(row.app_key)) for row in data["ranking"]]
@@ -521,7 +534,8 @@ class HistoryRouter:
                     response = future.result()
                     if request.kind == "ranking":
                         rows = response["result"]
-                        if window.kind == "lifetime" or any(row.total_bytes or row.rchar or row.wchar for row in self._ranking):
+                        if (window.kind == "lifetime" or self._has_local_history or self._overlap_ranges
+                                or any(row.total_bytes or row.rchar or row.wchar for row in self._ranking)):
                             raise ValueError("remote query cannot prove a mixed-store cutoff")
                         self._remote_snapshot = response.get("snapshot")
                         if self._remote_snapshot is None:
