@@ -106,6 +106,31 @@ def _source(source: Path, deps: SetupDeps) -> Iterator[tuple[int, str]]:
             os.close(parent)
 
 
+def _resolved_home_parts(deps: SetupDeps, identity: SetupIdentity) -> tuple[str, ...]:
+    """Split the account's home for the walk, resolving one administrator relocation.
+
+    An account's home may be a symlink - this machine maps ``/home/henry`` to
+    ``/data/home/henry-arch`` - and the walk opens every component ``O_NOFOLLOW``, so
+    an unresolved link made the export fail with ``destination:unsafe_or_unavailable``
+    and ``disable`` could not preserve history. Resolving the home once, under the
+    injected root, keeps every defence that matters: symlinks *below* the home are
+    still refused, and each resolved component is still checked for ownership and mode
+    by ``_check_directory``. Only the relocation itself is accepted, because an
+    administrator created it deliberately and the account cannot rewrite it.
+    """
+    declared = identity.home
+    candidate = Path(deps.root) / declared.relative_to("/")
+    try:
+        resolved = candidate.resolve(strict=True)
+    except (OSError, RuntimeError):
+        return declared.relative_to("/").parts
+    try:
+        inside = resolved.relative_to(Path(deps.root))
+    except ValueError:  # a link that leaves the injected root is not trusted
+        return declared.relative_to("/").parts
+    return inside.parts
+
+
 def _destination(identity: SetupIdentity, deps: SetupDeps, *, create: bool) -> int:
     """Walk from the injected root; retain the final directory descriptor.
 
@@ -117,7 +142,7 @@ def _destination(identity: SetupIdentity, deps: SetupDeps, *, create: bool) -> i
     try:
         descriptor = os.open(deps.root, _DIR_FLAGS)
         _check_directory(descriptor, identity, deps, home=False)
-        parts = identity.home.relative_to("/").parts
+        parts = _resolved_home_parts(deps, identity)
         for offset, part in enumerate((*parts, ".local", "share", "appio")):
             user_tree = offset >= len(parts)
             created = False

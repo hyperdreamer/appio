@@ -359,3 +359,30 @@ def test_handover_checkpoints_preserve_canonical_evidence_and_reject_invalid_row
     h.db.commit()
     with pytest.raises(ExportError, match="validation"):
         export_history(h.env.identity, deps=h.env.deps)
+
+
+def test_a_symlinked_home_directory_still_exports(history):
+    # Host acceptance finding H4: /home/henry is a symlink to /data/home/henry-arch on
+    # this machine, and the walk opened every home component with O_NOFOLLOW, so
+    # disable failed with destination:unsafe_or_unavailable and no history was
+    # preserved. An administrator may legitimately relocate a home; the walk must
+    # resolve it once and then keep refusing symlinks below it.
+    h = history
+    real = h.env.root / "data/alice"
+    real.mkdir(parents=True, mode=0o700)
+    os.chown(real, h.env.identity.uid, h.env.identity.gid)
+    os.chmod(real, 0o700)
+    # On a real host the relocated home is caller-owned; the fixture's metadata
+    # default only treats paths under the declared home as user-owned.
+    info = real.stat()
+    h.env.overrides[info.st_dev, info.st_ino] = (h.env.identity.uid, h.env.identity.gid,
+                                                 stat.S_IFDIR | 0o700)
+    linked = h.env.root / "home/alice"
+    for child in sorted(linked.rglob("*"), reverse=True):
+        child.unlink() if child.is_file() else child.rmdir()
+    linked.rmdir()
+    linked.symlink_to(real)
+    identity = replace(h.env.identity, home=Path("/home/alice"))
+    result = export_history(identity, deps=replace(h.env.deps, root=h.env.root))
+    assert result.path.name.endswith(".db")
+    assert (real / ".local/share/appio").is_dir()
