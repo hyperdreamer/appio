@@ -17,6 +17,7 @@ import time
 from typing import Literal
 
 from .cgroups import CgroupObservation, read_cgroup_fixture
+from .files import FileFrameContext
 from .handover import (
     HandoverOffer,
     IncompleteHandoverError,
@@ -311,6 +312,7 @@ class LiveCollector:
         self._state: SamplerState | None = None
         self._last_frame: AggregatedFrame | None = None
         self._last_result: TickResult | None = None
+        self._file_context: FileFrameContext | None = None
         self._last_observed_mono_ns: int | None = None
         self._next_seq = 0
         self._epoch: int | None = None
@@ -396,6 +398,15 @@ class LiveCollector:
     @property
     def last_result(self) -> TickResult | None:
         return self._last_result
+
+    @property
+    def file_context(self) -> FileFrameContext | None:
+        """Current committed owner evidence, unavailable after a rejected tick.
+
+        Restored checkpoints and handover seeds contain no current cgroup
+        enumeration, so they never create this context on their own.
+        """
+        return self._file_context
 
     @property
     def last_observed_mono_ns(self) -> int | None:
@@ -523,6 +534,9 @@ class LiveCollector:
     def tick(self) -> TickResult:
         """Read the host once, aggregate it, and commit one sampler frame."""
 
+        # Invalidate before any operation that can reject this tick. Consumers
+        # must never pair a new/failed drain with the previous owner mapping.
+        self._file_context = None
         if self._closed:
             raise RuntimeError("LiveCollector is closed")
         if self._quiesced:
@@ -569,6 +583,7 @@ class LiveCollector:
             previous.checkpoint_mono_ns, observed_mono_ns
         ):
             frame = _mark_unmeasured(frame)
+        file_context = FileFrameContext.from_frame(frame, records, cgroups)
         before = self._row_counts()
         self.store.record_tick(frame, next_state)
         after = self._row_counts()
@@ -576,6 +591,7 @@ class LiveCollector:
         # frame and sequence a reader may act on.
         self._state = next_state
         self._last_frame = frame
+        self._file_context = file_context
         self._next_seq = frame.seq + 1
         self._epoch = frame.epoch
         self._deferred_baseline = False
@@ -661,6 +677,7 @@ class LiveCollector:
         return self._offer
 
     def close(self) -> None:
+        self._file_context = None
         if not self._closed:
             self.store.connection.close()
             self._closed = True

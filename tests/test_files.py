@@ -209,3 +209,34 @@ def test_hourly_14_day_budget_matches_exact_specification_products():
         "rows_per_day": 256800, "bytes_per_day": 22598400,
         "retained_rows": 3595200, "retained_payload_bytes": 316377600,
     }
+
+
+def test_weak_and_strong_equal_uuid_identities_and_names_never_merge():
+    """Falsifier: remove identity_weak from either hourly or captured-name key."""
+    acc = HourlyAccumulator("boot-A", 0)
+    for weak, amount in ((True, 11), (False, 17)):
+        acc.add_observation(R, APP, observation(42, fs_uuid="same-uuid", identity_weak=weak,
+                            basename="same-name", bytes_r=amount, bytes_w=0), ZERO)
+    pending = acc.state().apps[0].files
+    assert [(e.identity_weak, e.bytes_r) for e in pending] == [(0, 17), (1, 11)]
+    assert len(acc.finalize().captured_names) == 2
+    restored = HourlyAccumulator.from_state(decode_file_hour_state(acc.state_json(), "boot-A", 0))
+    assert [(r.identity_weak, r.bytes_r) for r in restored.finalize().apps[0][1]] == [
+        (False, 17), (True, 11)]
+
+
+def test_canonical_name_is_bytewise_least_not_first_last_or_casefolded():
+    """Falsifier: key by name, choose last/first/max, normalize or sort casefolded."""
+    acc = HourlyAccumulator("boot-A", 0)
+    for seq, (name, time) in enumerate((("z.txt", 30), ("a.txt", 20),
+                                      ("Z.txt", 10), ("é.txt", 40),
+                                      ("e\u0301.txt", 50))):
+        acc.add_observation(Receipt("iod", 1, seq), APP,
+                            observation(42, basename=name, bytes_r=1, bytes_w=0,
+                                        last_seen_mono_ns=time), ZERO)
+    row, = acc.state().apps[0].files
+    assert row.basename == "Z.txt"
+    assert row.aliases == ("a.txt", "e\u0301.txt", "z.txt", "é.txt")
+    assert (row.bytes_r, row.last_seen_mono_ns) == (5, 50)
+    restored = HourlyAccumulator.from_state(decode_file_hour_state(acc.state_json(), "boot-A", 0))
+    assert restored.state().apps[0].files == (row,)
