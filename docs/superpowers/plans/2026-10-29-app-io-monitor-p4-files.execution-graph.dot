@@ -1,0 +1,25 @@
+// Generated from the P4 execution manifest; inspection artifact, do not hand edit.
+digraph appio_p4 {
+  graph [rankdir=LR];
+  node [shape=box];
+  "T-001" [label="Task 1: Build the CO-RE VFS producer and loader ABI\nFrontier"];
+  "T-002" [label="Task 2: Add the rootless lossless drain adapter\nAdvanced"];
+  "T-003" [label="Task 3: Attribute file events and preserve hourly identity state\nCapable"];
+  "T-004" [label="Task 4: Materialise file hours and enforce independent retention\nCapable"];
+  "T-005" [label="Task 5: Integrate F with the daemon and history routing\nFrontier"];
+  "T-006" [label="Task 6: Replace the unavailable page with the Files surface\nAdvanced"];
+  "T-007" [label="Task 7: Run the single opt-in privileged workload acceptance\nAdvanced"];
+  "T-001" -> "T-002";
+  "T-002" -> "T-003";
+  "T-003" -> "T-004";
+  "T-002" -> "T-005";
+  "T-003" -> "T-005";
+  "T-004" -> "T-005";
+  "T-005" -> "T-006";
+  "T-001" -> "T-007";
+  "T-002" -> "T-007";
+  "T-003" -> "T-007";
+  "T-004" -> "T-007";
+  "T-005" -> "T-007";
+  "T-006" -> "T-007";
+}
