@@ -363,7 +363,7 @@ def probe_accounting(
                         identity, deps=deps, probe_path=probe_path, unit=unit
                     )
                     facts.observed_bytes = _observed_writes(
-                        _locate_leaf(root, candidates), facts.device
+                        _locate_leaf(root, candidates), facts.device, root
                     )
     finally:
         facts.cleanup_complete = _cleanup(
@@ -562,7 +562,38 @@ def _run_probe(
     return returncode if isinstance(returncode, int) else None
 
 
-def _observed_writes(leaf: Path | None, device: str | None) -> int | None:
+_CONTROLLER_DEVICE = re.compile(r"[0-9]+:[0-9]+", re.ASCII)
+
+
+def _device_candidates(root: Path, device: str) -> tuple[str, ...]:
+    """The probe device, then its whole-disk ancestor when it is a partition.
+
+    cgroup v2 ``io.stat`` attributes a bio to the block device the request was issued
+    against, and kernels differ in whether a partition write is reported against the
+    partition (``259:5``) or its whole disk (``259:1``). This host reports the whole
+    disk, so an exact-only comparison found no row at all: activation was reported
+    "accounting inactive" forever while the accounting was byte-exact. sysfs is the
+    authority for the relation, not arithmetic on minor numbers.
+    """
+
+    tokens = [device]
+    entry = Path(root) / "sys/dev/block" / device
+    try:
+        resolved = Path(os.path.realpath(entry))
+    except OSError:  # pragma: no cover - realpath does not raise for a missing path
+        return tuple(tokens)
+    if not resolved.is_dir():
+        return tuple(tokens)
+    try:
+        parent_dev = (resolved.parent / "dev").read_text(encoding="ascii").strip()
+    except OSError:
+        return tuple(tokens)
+    if _CONTROLLER_DEVICE.fullmatch(parent_dev) and parent_dev != device:
+        tokens.append(parent_dev)
+    return tuple(tokens)
+
+
+def _observed_writes(leaf: Path | None, device: str | None, root: Path | None = None) -> int | None:
     """The unit's own ``wbytes`` for the verified device, or ``None``."""
 
     if leaf is None or device is None:
@@ -576,9 +607,11 @@ def _observed_writes(leaf: Path | None, device: str | None) -> int | None:
         # Malformed evidence is unmeasured evidence. It must not abort the probe
         # before cleanup, and it must never be repaired into a number.
         return None
-    for stat in stats:
-        if stat.dev == device:
-            return stat.wbytes
+    candidates = _device_candidates(Path(root), device) if root is not None else (device,)
+    for candidate in candidates:
+        for stat in stats:
+            if stat.dev == candidate:
+                return stat.wbytes
     return None
 
 

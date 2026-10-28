@@ -988,3 +988,31 @@ def test_io_in_controllers_alone_never_clears_pending(harness: Harness):
     assert harness.root.joinpath(
         USER_MANAGER.relative_to("/"), "cgroup.controllers"
     ).read_text(encoding="utf-8").split().count("io") == 1
+
+
+def test_writes_accounted_against_the_whole_disk_still_pass(harness: Harness):
+    # Host acceptance finding H6: on this machine / is the partition 259:5 but cgroup
+    # io.stat reports the probe's writes against the whole disk 259:1, so the exact
+    # device comparison found no row and activation reported "accounting inactive"
+    # for ever while the accounting was byte-exact (16777216 bytes, 0% deviation).
+    # sysfs is the authority for the partition -> whole-disk relation.
+    seed_pending(harness)
+    partition = harness.device
+    major = partition.split(":")[0]
+    whole = f"{major}:9001"
+    disk = harness.root / "sys/devices/fakedisk0"
+    (disk / "fakedisk0p1").mkdir(parents=True, exist_ok=True)
+    (disk / "dev").write_text(whole + "\n", encoding="ascii")
+    entry = harness.root / "sys/dev/block" / partition
+    entry.parent.mkdir(parents=True, exist_ok=True)
+    if not entry.exists():
+        entry.symlink_to(disk / "fakedisk0p1")
+    harness.runner.device_override = whole
+
+    result = harness.probe_now()
+
+    assert result.evidence.device == partition
+    assert result.evidence.observed_bytes == EXPECTED, result.evidence
+    assert result.state == STATE_ANSWERING
+    assert pending(harness) == {1000: False}
+    harness.assert_unit_cleaned()
