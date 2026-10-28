@@ -634,8 +634,11 @@ def _observe_while_alive(
             value = _observed_writes(leaf, device, root)
             if value is not None:
                 best = value if best is None else max(best, value)
-                if best >= EXPECTED_PROBE_BYTES // 2:
+                if best >= EXPECTED_PROBE_BYTES:
                     return best
+        elif best is not None:
+            # The unit finished: the cgroup is gone, so the last reading is final.
+            return best
         if time.monotonic() >= deadline:
             return best
         time.sleep(_PROBE_POLL_INTERVAL)
