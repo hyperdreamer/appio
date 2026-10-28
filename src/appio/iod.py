@@ -37,8 +37,11 @@ from .live import LiveCollector, SystemClock
 from .quota import QuotaPruner
 
 NS = 1_000_000_000
+SAMPLE_NS = 10 * NS
 TICK_NS = 2 * NS
-MAX_FLUSH_NS = 5 * NS
+MAX_FLUSH_NS = 30 * NS
+MAINTENANCE_NS = 60 * NS
+_STORAGE_ERRORS = frozenset({"quota_exhausted", "retention_incomplete", "maintenance_failed"})
 FRAME_TIMEOUT_NS = 2 * NS
 IO_BUDGET = 65536
 REQUEST_BUDGET = 8
@@ -225,7 +228,13 @@ class _Snapshot:
 
 class Daemon:
     def __init__(self, paths: DaemonPaths = DaemonPaths(), *, clock=None, peer_reader=read_peer,
-                 group_lookup=_groups, filesystem=None, selector=None, query_worker=None):
+                 group_lookup=_groups, filesystem=None, selector=None, query_worker=None,
+                 sample_ns=SAMPLE_NS, flush_ns=MAX_FLUSH_NS):
+        if type(sample_ns) is not int or sample_ns <= 0:
+            raise ValueError("sample_ns must be a positive integer")
+        if type(flush_ns) is not int or flush_ns <= sample_ns:
+            raise ValueError("flush_ns must exceed sample_ns")
+        self._sample_ns, self._flush_ns = sample_ns, flush_ns
         self.paths = paths
         self.clock = SystemClock() if clock is None else clock
         self.peer_reader, self.group_lookup = peer_reader, group_lookup
@@ -250,6 +259,8 @@ class Daemon:
         self._storage_error = None
         self._announced_error = None
         self._next_tick = 0
+        self._next_sample = 0
+        self._next_recovery = 0
         self._next_maintenance = 0
         self._ownership_start = None
 
@@ -355,6 +366,7 @@ class Daemon:
             self._quota_paused = False
             self._storage_error = None
             self._announced_error = None
+            self._next_recovery = 0
             self._sample()
             if self.last_error:
                 raise RuntimeError("initial collection failed")
@@ -362,7 +374,8 @@ class Daemon:
                 self.query_worker = HistoryWorker(self.paths.database)
             now = self.clock()[0]
             self._next_tick = now + TICK_NS
-            self._next_maintenance = now + 60 * NS
+            self._next_sample = self._committed_mono + self._sample_ns
+            self._next_maintenance = now + MAINTENANCE_NS
             self._ownership_start = self._committed_mono
             self._running = True
         except BaseException:
@@ -681,6 +694,11 @@ class Daemon:
 
     def _sample(self):
         started = self.clock()[0]
+        previous_mono = getattr(self, "_committed_mono", None)
+        # A recovery window belongs only to a persistent storage failure. Keep
+        # it through quiet ticks and successful pruning that commits no frame.
+        if self._storage_error in _STORAGE_ERRORS or self._next_recovery:
+            self._next_recovery = started + MAINTENANCE_NS
         try:
             if self._recover:
                 self._new_collector()
@@ -696,7 +714,9 @@ class Daemon:
         if self.last_error is None:
             self._announced_error = None
         self._publish()
-        if self.clock()[0] - started > MAX_FLUSH_NS:
+        if previous_mono is None or self._committed_mono > previous_mono:
+            self._next_recovery = 0
+        if self.clock()[0] - started > self._flush_ns:
             self._failure("collection_overdue")
             self._recover = True
             _LOG.warning("collection_overdue")
@@ -706,20 +726,32 @@ class Daemon:
             raise RuntimeError("daemon is not started")
         now = self.clock()[0]
         if now >= self._next_tick:
+            self._next_tick = now + TICK_NS
+        # Persistence has its own deadline; a responsiveness tick just before
+        # the boundary must not postpone a scheduled observation by another 2 s.
+        recovery_due = now >= self._next_recovery
+        if now >= self._next_sample and (recovery_due or not (self._quota_paused or self._recover)):
             if self._quota_paused:
+                if self._storage_error in _STORAGE_ERRORS:
+                    self._next_recovery = now + MAINTENANCE_NS
                 try:
                     quota = self._pruner.shrink_if_needed()
                     self._quota_paused = quota.sampling_paused
                     if not self._quota_paused:
                         self._storage_error = None
                 except (sqlite3.Error, OSError, ValueError):
+                    self._storage_error = "maintenance_failed"
                     self._failure("maintenance_failed")
+                    self._recover = True
+                    self._next_recovery = now + MAINTENANCE_NS
             if not self._quota_paused:
-                if now - self._committed_mono > MAX_FLUSH_NS:
+                if now - self._committed_mono > self._flush_ns:
                     self.last_error = "collection_overdue"
                     self._recover = True
                 self._sample()
-            self._next_tick = self.clock()[0] + TICK_NS
+            # Skip missed boundaries rather than fabricating catch-up frames.
+            elapsed = max(0, self.clock()[0] - self._next_sample)
+            self._next_sample += (elapsed // self._sample_ns + 1) * self._sample_ns
         if now >= self._next_maintenance:
             try:
                 retention = self._pruner.expire(self.collector.boot_id, now)
@@ -736,9 +768,13 @@ class Daemon:
                 self._failure("maintenance_failed")
                 self._quota_paused = True
                 self._recover = True
-            self._next_maintenance = self.clock()[0] + 60 * NS
+            self._next_maintenance = self.clock()[0] + MAINTENANCE_NS
         buffered = any(client.unfed or client.requests or (client.job and client.job.done()) for client in self.clients.values())
-        deadlines = [self._next_tick, *(client.partial_since + FRAME_TIMEOUT_NS for client in self.clients.values() if client.partial_since is not None)]
+        # A past sample boundary in a storage recovery window must not make the
+        # selector spin; the retry deadline is the earliest useful wakeup there.
+        sample_deadline = (max(self._next_sample, self._next_recovery)
+                           if self._quota_paused or self._recover else self._next_sample)
+        deadlines = [self._next_tick, sample_deadline, *(client.partial_since + FRAME_TIMEOUT_NS for client in self.clients.values() if client.partial_since is not None)]
         timeout = 0 if buffered else min(0.05, max(0, min(deadlines) - self.clock()[0]) / NS)
         events = self.selector.select(timeout)
         ready = {key.fd: mask for key, mask in events if key.data is not None}
@@ -807,8 +843,8 @@ class Daemon:
         if self._running and self.collector is not None and not self._quota_paused:
             # SIGTERM's handler only sets a flag. Final accounting runs here on
             # the owner thread, never reentrantly inside SQLite or a tick.
-            if self.clock()[0] > self._committed_mono:
-                if self.clock()[0] - self._committed_mono > MAX_FLUSH_NS:
+            if self.clock()[0] > self._committed_mono and self.clock()[0] >= self._next_recovery:
+                if self.clock()[0] - self._committed_mono > self._flush_ns:
                     self._recover = True
                 self._sample()
         self._release_resources()
