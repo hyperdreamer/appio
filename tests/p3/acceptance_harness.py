@@ -314,7 +314,7 @@ class P3Harness:
         unit = f"appio-probe-{self.clock.ns}"
         probe = probe_file_path(1000)
         expected = ("/usr/bin/systemd-run", "--user", f"--unit={unit}", "--property=Type=oneshot",
-            "--property=RemainAfterExit=yes", "/usr/bin/dd", "if=/dev/zero", f"of={probe}", "bs=1M", "count=16", "oflag=direct")
+            "--property=RemainAfterExit=yes", "--no-block", "/usr/bin/dd", "if=/dev/zero", f"of={probe}", "bs=1M", "count=16", "oflag=direct")
         leaf = self.cgroup / f"user.slice/user-1000.slice/user@1000.service/app.slice/{unit}.service"
         if argv == expected:
             assert (uid, gid) == (1000, 1000)

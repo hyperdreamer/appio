@@ -802,6 +802,7 @@ def test_probe_runs_as_the_validated_caller_with_a_fresh_user_bus(harness: Harne
             f"--unit={UNIT}",
             "--property=Type=oneshot",
             "--property=RemainAfterExit=yes",
+            "--no-block",
             DD,
             "if=/dev/zero",
             f"of={PROBE}",

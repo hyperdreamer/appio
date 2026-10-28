@@ -47,6 +47,7 @@ import dataclasses
 import os
 import re
 import stat
+import time
 from pathlib import Path
 from typing import Literal
 
@@ -362,8 +363,13 @@ def probe_accounting(
                     facts.command_exit = _run_probe(
                         identity, deps=deps, probe_path=probe_path, unit=unit
                     )
-                    facts.observed_bytes = _observed_writes(
-                        _locate_leaf(root, candidates), facts.device, root
+                    # systemd removes a transient unit's cgroup the moment its last
+                    # process exits, so a post-hoc read finds nothing even when the
+                    # accounting was byte-exact. Read while it lives, polling until the
+                    # bytes appear or the attempt budget is spent.
+                    facts.observed_bytes = _observe_while_alive(
+                        root, candidates, facts.device, deps=deps, unit=unit,
+                        identity=identity,
                     )
     finally:
         facts.cleanup_complete = _cleanup(
@@ -541,6 +547,7 @@ def _run_probe(
         f"--unit={unit}",
         "--property=Type=oneshot",
         "--property=RemainAfterExit=yes",
+        "--no-block",
         DD,
         "if=/dev/zero",
         f"of={probe_path}",
@@ -591,6 +598,47 @@ def _device_candidates(root: Path, device: str) -> tuple[str, ...]:
     if _CONTROLLER_DEVICE.fullmatch(parent_dev) and parent_dev != device:
         tokens.append(parent_dev)
     return tuple(tokens)
+
+
+#: How long one probe attempt waits for the unit's io.stat to report its write, and how
+#: many attempts are made. The write is 16 MiB of direct I/O, so the cgroup is short
+#: lived; polling starts immediately after the unit is started.
+_PROBE_POLL_SECONDS = 1.0
+_PROBE_POLL_INTERVAL = 0.002
+_PROBE_ATTEMPTS = 3
+
+
+def _observe_while_alive(
+    root: Path,
+    candidates: tuple[Path, ...],
+    device: str | None,
+    *,
+    deps: SetupDeps,
+    unit: str,
+    identity: SetupIdentity,
+) -> int | None:
+    """Read the unit's own ``io.stat`` while the unit still exists.
+
+    Returns the highest confident reading across attempts, or ``None`` when every
+    attempt finished before a readable sample existed. ``None`` stays "unmeasured",
+    never zero.
+    """
+
+    deadline = time.monotonic() + _PROBE_POLL_SECONDS
+    best: int | None = None
+    while True:
+        leaf = _locate_leaf(root, candidates)
+        if leaf is not None:
+            # None means "no row for this device"; 0 is a measured zero and must be
+            # reported as such rather than treated as missing evidence.
+            value = _observed_writes(leaf, device, root)
+            if value is not None:
+                best = value if best is None else max(best, value)
+                if best >= EXPECTED_PROBE_BYTES // 2:
+                    return best
+        if time.monotonic() >= deadline:
+            return best
+        time.sleep(_PROBE_POLL_INTERVAL)
 
 
 def _observed_writes(leaf: Path | None, device: str | None, root: Path | None = None) -> int | None:
