@@ -192,7 +192,11 @@ class ProbeRunner:
                     )
             if self.timed_out:
                 return CommandResult(-9, "", "appio-setup: command timed out after 5s")
-            return CommandResult(self.dd_exit, "", self.dd_stderr)
+            # A launcher that started the unit returns 0. The *write's* status lives on
+            # the unit (ExecMainStatus) and is answered by the show branch below. Making
+            # the launcher return dd's status would hide the very distinction the probe
+            # depends on --no-block to make.
+            return CommandResult(0, "", "")
         if call[0] == SYSTEMCTL and call[1] == "--user" and call[2] == "show":
             # The unit's own exit status. \`--no-block\` means the launcher status is
             # not the write's status, so the probe asks the unit.
@@ -455,6 +459,34 @@ def test_bytes_one_percent_over_tolerance_never_pass(harness: Harness):
 # --------------------------------------------------------------------------- #
 # Threat: a command exit status is mistaken for evidence.
 # --------------------------------------------------------------------------- #
+
+
+def test_the_poller_waits_for_the_write_to_finish_rather_than_its_first_bytes(tmp_path):
+    # Host acceptance found this in practice: a mid-write read returned 10485760 of
+    # 16777216 bytes and the probe reported "accounting inactive" while the accounting
+    # was exact. The poller must keep reading until the write completes, not return the
+    # first non-zero sample.
+    import appio.activation as activation
+
+    readings = iter([1024, 10485760, 16777216])
+    seen = []
+
+    def fake_observed(leaf, device, root):
+        value = next(readings, 16777216)
+        seen.append(value)
+        return value
+
+    leaf = tmp_path / "probe"
+    leaf.mkdir()
+    monkeypatch_target = activation._observed_writes
+    activation._observed_writes = fake_observed
+    try:
+        got = activation._observe_while_alive(
+            tmp_path, (Path("/probe"),), "0:0", deps=None, unit="u", identity=None
+        )
+    finally:
+        activation._observed_writes = monkeypatch_target
+    assert got == 16777216, f"poller returned {got} after readings {seen}"
 
 
 def test_dd_error_never_passes_even_when_bytes_match(harness: Harness):
