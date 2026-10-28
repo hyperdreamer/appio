@@ -35,6 +35,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import appio.activation as activation
 from appio.activation import (
     ACTIVATION_CHOICES,
     CHOICE_REBOOT_LABEL,
@@ -623,7 +624,11 @@ def test_stale_io_stat_from_a_preexisting_unit_is_never_counted(harness: Harness
 
     assert result.state == STATE_INACTIVE
     assert result.evidence.observed_bytes == 0
-    assert harness.runner.units == [f"appio-probe-{NONCE + 1}"]
+    # A stale reading is not evidence, so the probe retries a bounded number of times
+    # instead of accepting it. Every attempt must be a distinct unit name.
+    assert 1 <= len(harness.runner.units) <= activation._PROBE_ATTEMPTS, harness.runner.units
+    assert len(set(harness.runner.units)) == len(harness.runner.units)
+    assert harness.runner.units[0] == f"appio-probe-{NONCE + 1}"
     assert (stale / "io.stat").read_text(encoding="utf-8") == stale_text
 
 

@@ -360,26 +360,30 @@ def probe_accounting(
                 unit, candidates = _select_unit(root, identity.uid, deps)
                 if unit is not None:
                     facts.unit = unit
-                    launcher_exit = _run_probe(
-                        identity, deps=deps, probe_path=probe_path, unit=unit
-                    )
-                    # systemd removes a transient unit's cgroup the moment its last
-                    # process exits, so a post-hoc read finds nothing even when the
-                    # accounting was byte-exact. Read while it lives, polling until the
-                    # bytes appear or the attempt budget is spent.
-                    facts.observed_bytes = _observe_while_alive(
-                        root, candidates, facts.device, deps=deps, unit=unit,
-                        identity=identity,
-                    )
-                    # --no-block makes the launcher status irrelevant to the write, so
-                    # the unit's own status is what the verdict may rely on. A launcher
-                    # that could not even start the unit is still a failure.
-                    # A launcher that failed did not start the write at all, and its
-                    # own status is then the honest record. Otherwise the unit's status
-                    # is the write's status.
+                    # The write is deterministic, but the cgroup is removed the instant
+                    # the process exits, so a poll can catch a partial count (observed
+                    # 15 MiB of 16 on this host). A partial is not evidence: retry the
+                    # whole attempt a bounded number of times and keep the best reading.
+                    best: int | None = None
+                    launcher_exit = None
+                    for attempt in range(_PROBE_ATTEMPTS):
+                        attempt_unit = unit if attempt == 0 else f"{unit}-{attempt}"
+                        launcher_exit = _run_probe(
+                            identity, deps=deps, probe_path=probe_path, unit=attempt_unit
+                        )
+                        observed = _observe_while_alive(
+                            root, candidates, facts.device, deps=deps, unit=attempt_unit,
+                            identity=identity,
+                        )
+                        if observed is not None:
+                            best = observed if best is None else max(best, observed)
+                        _stop_probe_unit(identity, deps, attempt_unit)
+                        if best is not None and abs(best - EXPECTED_PROBE_BYTES) * 100 <= EXPECTED_PROBE_BYTES * 5:
+                            break
+                    facts.observed_bytes = best
                     facts.command_exit = (
                         launcher_exit if launcher_exit not in (0, None)
-                        else _probe_unit_status(deps, unit, identity)
+                        else _probe_unit_status(deps, attempt_unit, identity)
                     )
     finally:
         facts.cleanup_complete = _cleanup(
@@ -616,6 +620,19 @@ def _device_candidates(root: Path, device: str) -> tuple[str, ...]:
 _PROBE_POLL_SECONDS = 1.0
 _PROBE_POLL_INTERVAL = 0.002
 _PROBE_ATTEMPTS = 3
+
+
+def _stop_probe_unit(identity: SetupIdentity, deps: SetupDeps, unit: str) -> None:
+    """Stop and reset one attempt's unit so a retry cannot inherit its cgroup."""
+
+    for verb in ("stop", "reset-failed"):
+        try:
+            deps.runner.run(
+                (SYSTEMCTL, "--user", verb, f"{unit}.service"),
+                uid=identity.uid, gid=identity.gid, env=_caller_environment(identity.uid),
+            )
+        except Exception:  # a stop that cannot run must not abort the probe
+            return
 
 
 def _probe_unit_status(deps: SetupDeps, unit: str, identity: SetupIdentity) -> int | None:
