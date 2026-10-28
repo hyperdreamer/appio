@@ -275,3 +275,113 @@ def test_offscreen_window_against_real_query_service_renders_an_app_row(
         timeout=1000,
     )
     assert window.findChild(QListWidget, "app_list").count() >= 1
+
+
+def synthetic_file_collector(tmp_path, monkeypatch):
+    """Only synthetic stable records; even enumeration of the fake tree is bypassed."""
+    from appio.cgroups import CgroupObservation
+    from appio.procs import AppKeyInputs, IoReadOutcome, ProcessIdentity, StableProcRecord
+    proc = tmp_path / "proc"
+    proc.mkdir()
+    (proc / "boot_id").write_text(BOOT_ID)
+    path = "/app-chromium@fixture.service"
+    records = (StableProcRecord(ProcessIdentity(BOOT_ID, 1, 10), 0, 1000,
+               "/bin/chromium", path, AppKeyInputs(path, "/bin/chromium", None),
+               IoReadOutcome("readable", (0, 0, 0, 0), None, None)),)
+    cgroups = (CgroupObservation(BOOT_ID, 77, path, "not_delegated", ()),)
+    monkeypatch.setattr(LiveCollector, "_read_processes", lambda self, reader: (records, (), ()))
+    monkeypatch.setattr(LiveCollector, "_read_cgroups", lambda self, records: cgroups)
+    collector = LiveCollector(proc, tmp_path / "not-read", tmp_path / "db.sqlite",
+                              SequenceClock(*((t, 1_000_000_000 + t) for t in (1, 100, 200, 300))),
+                              source="iod")
+    return collector
+
+
+def test_file_context_publishes_only_after_commit_and_remains_immutable(tmp_path, monkeypatch):
+    """Falsifier: publish staged context, guess from dev deltas, or mutate old context."""
+    from dataclasses import FrozenInstanceError
+    collector = synthetic_file_collector(tmp_path, monkeypatch)
+    try:
+        assert collector.file_context is None
+        record_tick = collector.store.record_tick
+        def guarded_commit(frame, state):
+            assert collector.file_context is None
+            record_tick(frame, state)
+            assert collector.file_context is None
+        monkeypatch.setattr(collector.store, "record_tick", guarded_commit)
+        collector.tick()
+        first = collector.file_context
+        assert first is not None
+        assert (first.boot_id, first.epoch, first.seq, first.observed_mono_ns) == (BOOT_ID, 1, 0, 100)
+        assert first.app_keys == (APP_KEY,)
+        assert first.owners_by_cgroup == ((77, (APP_KEY,)),)
+        assert collector.last_frame.device_deltas == ()
+        with pytest.raises(FrozenInstanceError):
+            first.seq = 99
+        with pytest.raises(AttributeError):
+            collector.file_context = None
+        collector.tick()
+        assert collector.file_context is not first
+        assert (collector.file_context.seq, collector.file_context.observed_mono_ns) == (1, 200)
+        assert (first.seq, first.observed_mono_ns) == (0, 100)
+    finally:
+        collector.close()
+    assert collector.file_context is None
+
+
+def test_file_context_clears_on_failed_commit_and_reappears_on_retry(tmp_path, monkeypatch):
+    """Falsifier: expose prior/current owners after a frame fails durable acceptance."""
+    collector = synthetic_file_collector(tmp_path, monkeypatch)
+    try:
+        collector.tick()
+        previous = collector.last_frame
+        checkpoint = collector.store.connection.execute("SELECT * FROM sampler_checkpoint").fetchall()
+        commit = collector.store.record_tick
+        def reject(frame, state):
+            assert collector.file_context is None
+            raise sqlite3.OperationalError("synthetic commit rejection")
+        monkeypatch.setattr(collector.store, "record_tick", reject)
+        with pytest.raises(sqlite3.OperationalError, match="rejection"):
+            collector.tick()
+        assert collector.file_context is None
+        assert collector.last_frame is previous and collector.next_seq == 1
+        assert collector.store.connection.execute("SELECT * FROM sampler_checkpoint").fetchall() == checkpoint
+        monkeypatch.setattr(collector.store, "record_tick", commit)
+        collector.tick()
+        assert (collector.file_context.seq, collector.file_context.observed_mono_ns) == (1, 300)
+    finally:
+        collector.close()
+
+
+def test_file_context_clears_on_stale_frame_before_store_and_on_closed_tick(tmp_path, monkeypatch):
+    """Falsifier: leave the last owner map usable when aggregate_tick rejects seq."""
+    from appio.sampler import StaleFrameError
+    collector = synthetic_file_collector(tmp_path, monkeypatch)
+    try:
+        collector.tick()
+        assert collector.file_context is not None
+        collector._next_seq = 0
+        with pytest.raises(StaleFrameError):
+            collector.tick()
+        assert collector.file_context is None
+    finally:
+        collector.close()
+    with pytest.raises(RuntimeError, match="closed"):
+        collector.tick()
+    assert collector.file_context is None
+
+
+def test_restored_sampler_checkpoint_does_not_invent_a_file_context(tmp_path, monkeypatch):
+    """Falsifier: reconstruct current cgroup owners from a durable sampler seed."""
+    collector = synthetic_file_collector(tmp_path, monkeypatch)
+    collector.tick()
+    collector.close()
+    reopened = LiveCollector(tmp_path / "proc", tmp_path / "not-read", tmp_path / "db.sqlite",
+                             SequenceClock((400, 1_000_000_400), (500, 1_000_000_500)), source="iod")
+    try:
+        assert reopened.sampler_state is not None
+        assert reopened.file_context is None
+        reopened.tick()
+        assert (reopened.file_context.epoch, reopened.file_context.seq) == (2, 0)
+    finally:
+        reopened.close()

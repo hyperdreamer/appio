@@ -1,5 +1,7 @@
-"""Deterministic synthetic file-hour accumulation, without a live file producer.
+"""Pure file attribution and deterministic, boot-scoped file-hour accumulation.
 
+A committed frame supplies cgroup owners; an injected UUID lookup supplies only
+proved filesystem identities. No path reconstruction or host lookup occurs here.
 Contributions must already have passed stream receipt/ownership selection and
 arrive in accepted frame order. Coverage is a receipt-level quantity: repeating
 it beside each file in a frame counts it once for that app. All candidates remain
@@ -7,18 +9,26 @@ in canonical pending state; top-N is applied only when the hour closes.
 """
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, fields, replace
+from typing import TYPE_CHECKING
 
 from appio.contracts import (
     CounterOverflowError, FILE_HOUR_NS, FileCoverageInput, FileObservation,
     HookHits, HourlyFileSnapshot, SQLITE_INT_MAX, UnknownOwnerInput,
-    validate_sqlite_integer,
+    validate_file_uuid, validate_sqlite_integer,
 )
 from appio.durable import (
     FileEntry, FileHourApp, FileHourCoverage, FileHourState, Receipt,
     UnknownOwnerCoverage, UnknownOwnerState, canonical_json, decode_file_hour_state,
 )
-from appio.identity import validate_app_key
+from appio.identity import resolve_app, validate_app_key
+
+if TYPE_CHECKING:
+    from appio.bpf_fileio import FileDrain, FileEvent
+    from appio.cgroups import CgroupObservation
+    from appio.procs import StableProcRecord
+    from appio.sampler import AggregatedFrame
 
 HOOKS = tuple(f.name for f in fields(HookHits))
 FILE_COUNTERS = tuple(f.name for f in fields(FileCoverageInput)
@@ -55,6 +65,95 @@ def top_key(entry: FileEntry, path_id: int = 0) -> tuple:
 
 
 @dataclass(frozen=True)
+class FileFrameContext:
+    """Immutable owner evidence for exactly one successfully committed T/D frame.
+
+    Owners come from current stable readable/EACCES process records joined by
+    their exact cgroup path, never device deltas or restored process baselines.
+    Empty and shared owner sets remain explicit. Key 0 may occur in synthetic
+    evidence but attribution always reserves it for unknown-owner overflow.
+    """
+    boot_id: str
+    epoch: int
+    seq: int
+    observed_mono_ns: int
+    app_keys: tuple[str, ...]
+    owners_by_cgroup: tuple[tuple[int, tuple[str, ...]], ...]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.boot_id, str) or not self.boot_id or "\x00" in self.boot_id:
+            raise ValueError("file context boot_id must be nonempty text without NUL")
+        Receipt("iod", self.epoch, self.seq)
+        validate_sqlite_integer(self.observed_mono_ns, "file_context.observed_mono_ns")
+        if not isinstance(self.app_keys, tuple):
+            raise ValueError("file context app_keys must be an immutable tuple")
+        for key in self.app_keys:
+            validate_app_key(key)
+        if self.app_keys != tuple(sorted(set(self.app_keys), key=lambda key: key.encode("utf-8"))):
+            raise ValueError("file context app_keys must be bytewise sorted and unique")
+        if not isinstance(self.owners_by_cgroup, tuple):
+            raise ValueError("file context owners must be an immutable tuple")
+        previous = -1
+        for item in self.owners_by_cgroup:
+            if not isinstance(item, tuple) or len(item) != 2:
+                raise ValueError("file context owner entry must be a pair")
+            cgroup_id, owners = item
+            validate_sqlite_integer(cgroup_id, "file_context.cgroup_id")
+            if cgroup_id <= previous:
+                raise ValueError("file context cgroup IDs must be sorted and unique")
+            previous = cgroup_id
+            if not isinstance(owners, tuple) or any(key not in self.app_keys for key in owners):
+                raise ValueError("file context owners must be an immutable tuple of monitored apps")
+            if owners != tuple(sorted(set(owners), key=lambda key: key.encode("utf-8"))):
+                raise ValueError("file context owners must be bytewise sorted and unique")
+
+    @classmethod
+    def from_frame(cls, frame: AggregatedFrame, records: tuple[StableProcRecord, ...],
+                   cgroups: tuple[CgroupObservation, ...]) -> FileFrameContext:
+        """Build staged evidence; the collector publishes it only after commit."""
+        by_path: dict[str, set[str]] = {}
+        for record in records:
+            if record.identity.boot_id != frame.boot_id:
+                raise ValueError("file context process belongs to a different boot")
+            if record.io_outcome.status not in ("readable", "eacces"):
+                continue
+            inputs = record.app_key_inputs
+            key = resolve_app(inputs.cgroup_path, inputs.exe, inputs.desktop_id)
+            if record.cgroup_path is not None:
+                by_path.setdefault(record.cgroup_path, set()).add(key)
+        by_id: dict[int, set[str]] = {}
+        for cgroup in cgroups:
+            if cgroup.boot_id != frame.boot_id:
+                raise ValueError("file context cgroup belongs to a different boot")
+            by_id.setdefault(cgroup.cgroup_id, set()).update(by_path.get(cgroup.cgroup_path, ()))
+        return cls(frame.boot_id, frame.epoch, frame.seq, frame.observed_mono_ns,
+                   tuple(sorted({c.app_key for c in frame.coverage}, key=lambda key: key.encode("utf-8"))),
+                   tuple((cg, tuple(sorted(owners, key=lambda key: key.encode("utf-8"))))
+                         for cg, owners in sorted(by_id.items())))
+
+
+@dataclass(frozen=True)
+class FileIdentityResolver:
+    """Inject a proved UUID lookup, returning None/empty or OSError if unavailable.
+
+    The caller owns the proof that a UUID belongs to this supported filesystem.
+    dev_t and inode are never substituted for that UUID. No result is cached
+    across drains: a later proof creates a separate strong identity, not an
+    in-place promotion of earlier weak observations.
+    """
+    fs_uuid_for_dev: Callable[[str], str | None]
+
+    def resolve(self, dev: str) -> tuple[str, bool]:
+        try:
+            uuid = self.fs_uuid_for_dev(dev)
+        except OSError:
+            uuid = None
+        uuid = "" if uuid is None else uuid
+        weak = uuid == ""
+        return validate_file_uuid(uuid, weak, "file_identity"), weak
+
+
+@dataclass(frozen=True)
 class CapturedName:
     fs_uuid: str
     dev: str
@@ -70,6 +169,107 @@ class CapturedName:
     def path_key(self) -> tuple:
         return (self.fs_uuid, self.dev, self.inode, self.generation,
                 self.basename, self.identity_weak)
+
+
+@dataclass(frozen=True)
+class FileFrameContribution:
+    """Per-frame inputs for HourlyAccumulator, including explicit zero-F apps."""
+    apps: tuple[tuple[str, tuple[FileObservation, ...], FileCoverageInput], ...]
+    unknown_owner: UnknownOwnerInput
+    captured_names: tuple[CapturedName, ...]
+
+
+def _captured_basename(event: FileEvent, name_cap: int) -> tuple[str, str]:
+    try:
+        name = event.basename.decode("utf-8", errors="strict")
+    except UnicodeDecodeError:
+        name = ""
+    # Empty/invalid bytes cannot honestly be a filesystem name. Never use a
+    # replacement-decoded string or a full path as the captured basename.
+    if not name or "/" in name:
+        return "[unresolved]", "unresolved"
+    # The shipped wire length is clamped, so even exactly-cap-length captures
+    # cannot be proved full. A split multibyte character was handled above.
+    return name, "truncated" if event.name_len >= name_cap else "resolved"
+
+
+def attribute_file_drain(drain: FileDrain, context: FileFrameContext,
+                         resolver: FileIdentityResolver) -> FileFrameContribution:
+    """Attribute one synthetic/live drain without reading proc, sysfs or paths.
+
+    Only one distinct current owner is authoritative. Each unowned event adds
+    one unknown file (not its access count); unowned stats add only their
+    overflow counters. Hooks/skips never manufacture F candidates. Weak-row
+    counts are derived from distinct hourly identities at finalization, not
+    summed per drain. No ranking or top-100 truncation occurs at this boundary.
+    """
+    # Lazy import preserves the T/D-only application's no-BPF import boundary.
+    from .bpf_fileio import NAME_CAP, RESERVED_CGROUP_ID
+
+    if (drain.receipt.epoch, drain.receipt.seq) != (context.epoch, context.seq):
+        raise ValueError("file drain receipt does not match the committed frame")
+    owners = dict(context.owners_by_cgroup)
+
+    def owner(cgroup_id: int) -> str | None:
+        candidates = owners.get(cgroup_id, ())
+        if cgroup_id == RESERVED_CGROUP_ID or len(candidates) != 1:
+            return None
+        return candidates[0]
+
+    base = replace(ZERO_COVERAGE, complete=drain.complete,
+                   gap_intervals=int(not drain.complete))
+    coverages = dict.fromkeys(context.app_keys, base)
+    rows: dict[str, list[FileObservation]] = {key: [] for key in context.app_keys}
+    identities: dict[str, tuple[str, bool]] = {}
+    names: dict[tuple, CapturedName] = {}
+    unknown = replace(ZERO_UNKNOWN, complete=drain.complete,
+                      gap_intervals=int(not drain.complete))
+
+    def add_unknown(count: int, read: int, written: int) -> None:
+        nonlocal unknown
+        unknown = replace(unknown,
+            overflow_files=checked_sum(unknown.overflow_files, count, field="overflow_files"),
+            overflow_bytes_r=checked_sum(unknown.overflow_bytes_r, read, field="overflow_bytes_r"),
+            overflow_bytes_w=checked_sum(unknown.overflow_bytes_w, written, field="overflow_bytes_w"))
+
+    for event in drain.events:
+        key = owner(event.cgroup_id)
+        if key is None:
+            add_unknown(1, event.bytes_r, event.bytes_w)
+            continue
+        if event.dev not in identities:
+            identities[event.dev] = resolver.resolve(event.dev)
+        uuid, weak = identities[event.dev]
+        basename, state = _captured_basename(event, NAME_CAP)
+        row = FileObservation(key, uuid, event.dev, event.inode, event.generation,
+                              basename, state, weak, event.reads, event.writes,
+                              event.bytes_r, event.bytes_w, context.observed_mono_ns)
+        rows[key].append(row)
+        name = CapturedName(uuid, event.dev, event.inode, event.generation,
+                            int(weak), basename, state,
+                            context.observed_mono_ns, context.observed_mono_ns)
+        prior = names.get(name.path_key)
+        if prior is not None:
+            name = replace(name, state=max((prior.state, name.state),
+                           key=("resolved", "truncated", "unresolved").index))
+        names[name.path_key] = name
+    for item in drain.stats:
+        key = owner(item.cgroup_id)
+        if key is None:
+            add_unknown(item.overflow_files, item.overflow_bytes_r, item.overflow_bytes_w)
+        else:
+            cov = replace(ZERO_COVERAGE,
+                uncounted_overflow_files=item.overflow_files,
+                uncounted_overflow_bytes_r=item.overflow_bytes_r,
+                uncounted_overflow_bytes_w=item.overflow_bytes_w,
+                skipped_nonfile=item.skipped_nonfile,
+                skipped_unsupported_fs=item.skipped_unsupported_fs,
+                hook_hits=item.hook_hits)
+            coverages[key] = merge_coverage(coverages[key], cov)
+    return FileFrameContribution(
+        tuple((key, tuple(rows[key]), coverages[key]) for key in context.app_keys), unknown,
+        tuple(names[key] for key in sorted(names, key=lambda key: (
+            key[0].encode("utf-8"), key[1].encode("utf-8"), key[2], key[3], key[4].encode("utf-8"), key[5]))))
 
 
 @dataclass(frozen=True)
