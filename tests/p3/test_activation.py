@@ -193,6 +193,10 @@ class ProbeRunner:
             if self.timed_out:
                 return CommandResult(-9, "", "appio-setup: command timed out after 5s")
             return CommandResult(self.dd_exit, "", self.dd_stderr)
+        if call[0] == SYSTEMCTL and call[1] == "--user" and call[2] == "show":
+            # The unit's own exit status. \`--no-block\` means the launcher status is
+            # not the write's status, so the probe asks the unit.
+            return CommandResult(0, f"{self.dd_exit}\n", "")
         if call[0] == SYSTEMCTL and call[1] == "--user" and call[2] == "stop":
             if self.stop_raises:
                 raise InjectedFault("stop failed")

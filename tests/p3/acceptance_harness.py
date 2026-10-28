@@ -307,6 +307,8 @@ class P3Harness:
             self.daemon.stop()
             self.running = self.enabled = False
             return CommandResult(0, "", "")
+        if argv[0] == "/usr/bin/systemctl" and argv[1:3] == ("--user", "show") and "ExecMainStatus" in argv:
+            return CommandResult(0, "0\n", "")
         if argv == SHOW_ARGV:
             enabled, active = ("enabled" if self.enabled else "disabled"), ("active" if self.running else "inactive")
             substate = "running" if self.running else "dead"

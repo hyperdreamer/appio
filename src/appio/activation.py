@@ -360,7 +360,7 @@ def probe_accounting(
                 unit, candidates = _select_unit(root, identity.uid, deps)
                 if unit is not None:
                     facts.unit = unit
-                    facts.command_exit = _run_probe(
+                    launcher_exit = _run_probe(
                         identity, deps=deps, probe_path=probe_path, unit=unit
                     )
                     # systemd removes a transient unit's cgroup the moment its last
@@ -370,6 +370,16 @@ def probe_accounting(
                     facts.observed_bytes = _observe_while_alive(
                         root, candidates, facts.device, deps=deps, unit=unit,
                         identity=identity,
+                    )
+                    # --no-block makes the launcher status irrelevant to the write, so
+                    # the unit's own status is what the verdict may rely on. A launcher
+                    # that could not even start the unit is still a failure.
+                    # A launcher that failed did not start the write at all, and its
+                    # own status is then the honest record. Otherwise the unit's status
+                    # is the write's status.
+                    facts.command_exit = (
+                        launcher_exit if launcher_exit not in (0, None)
+                        else _probe_unit_status(deps, unit, identity)
                     )
     finally:
         facts.cleanup_complete = _cleanup(
@@ -606,6 +616,28 @@ def _device_candidates(root: Path, device: str) -> tuple[str, ...]:
 _PROBE_POLL_SECONDS = 1.0
 _PROBE_POLL_INTERVAL = 0.002
 _PROBE_ATTEMPTS = 3
+
+
+def _probe_unit_status(deps: SetupDeps, unit: str, identity: SetupIdentity) -> int | None:
+    """The probe unit's own ``ExecMainStatus``, or ``None`` when unreadable.
+
+    ``_run_probe`` starts the unit with ``--no-block`` so its cgroup survives long
+    enough to be observed; that means the launcher's exit status is *not* the write's
+    status. Reading the unit's own status is what keeps ``command_exit`` meaning what
+    ``activation_passes`` requires it to mean. Unreadable is ``None``, never zero.
+    """
+
+    argv = (SYSTEMCTL, "--user", "show", f"{unit}.service", "-p", "ExecMainStatus", "--value")
+    try:
+        result = deps.runner.run(
+            argv, uid=identity.uid, gid=identity.gid, env=_caller_environment(identity.uid)
+        )
+    except Exception:  # a runner that cannot answer is "no evidence"
+        return None
+    if getattr(result, "returncode", None) != 0:
+        return None
+    text = str(getattr(result, "stdout", "") or "").strip()
+    return int(text) if text.isdigit() else None
 
 
 def _observe_while_alive(
