@@ -262,6 +262,16 @@ def test_start_surfaces_a_bounded_verifier_diagnostic() -> None:
     assert "Permission denied" in str(error)
 
 
+def test_start_rejects_a_nonzero_error_with_a_ready_status() -> None:
+    """Falsifier: reading only the status field, so a loader that reports ready
+    while carrying an errno is treated as attached."""
+    source = BpfFileSource(VectorLoader(hello_error=-errno.EIO))
+    availability = source.start()
+    assert availability.file_io is False
+    assert "Input/output error" in availability.diagnostic
+    assert source.error is not None and source.error.errno == -errno.EIO
+
+
 def test_start_rejects_an_oversized_verifier_payload() -> None:
     """Falsifier: reading a declared verifier length without bounding it, which
     lets the loader choose our allocation size."""
@@ -270,6 +280,15 @@ def test_start_rejects_an_oversized_verifier_payload() -> None:
     assert availability.file_io is False
     assert str(DIAGNOSTIC_CAP) in availability.diagnostic
     assert "exceeds" in availability.diagnostic
+
+
+def test_start_rejects_trailing_bytes_after_the_verifier() -> None:
+    """Falsifier: accepting a HELLO frame with bytes past the declared verifier
+    length, which leaves undecoded bytes in the command stream."""
+    source = BpfFileSource(VectorLoader(verifier=b"ready", hello_trailing=b"\0\0"))
+    availability = source.start()
+    assert availability.file_io is False
+    assert "HELLO payload" in availability.diagnostic
 
 
 def test_start_after_a_failure_recovers_the_source() -> None:
@@ -559,6 +578,25 @@ def test_drain_rejects_an_out_of_range_unsigned_value_and_names_it(
     assert raw in str(caught.value)
 
 
+def test_drain_rejects_a_hook_mask_that_shrank_after_hello() -> None:
+    """Falsifier: believing the HELLO mask for the whole session, so a hook that
+    detached mid-session still yields a "complete" F drain."""
+    loader = VectorLoader(drain_hook_mask=HOOK_MASK_ALL & ~(1 << 4))
+    source = started(loader)
+    with pytest.raises(FileSourceError, match="vfs_iter_read"):
+        source.drain(Receipt("iod", 1, 1))
+    assert source.available is False
+
+
+def test_drain_rejects_a_changed_map_capacity() -> None:
+    """Falsifier: trusting the drain response's capacity only from HELLO, so a
+    reloaded object with a smaller map is treated as the same loss bound."""
+    source = started(VectorLoader(drain_map_capacity=MAX_MAP_ENTRIES - 1))
+    with pytest.raises(FileSourceError, match="map capacity"):
+        source.drain(Receipt("iod", 1, 1))
+    assert source.available is False
+
+
 def test_drain_rejects_a_drained_slot_outside_the_two_slots() -> None:
     """Falsifier: accepting a slot index the double buffer cannot have, which
     would mean the acknowledgement is not about our flip."""
@@ -796,6 +834,18 @@ def test_close_before_start_sends_nothing() -> None:
     assert source.close() is None
     assert loader.close_requests == 0
     assert source.close() is None
+
+
+def test_close_rejects_an_abi_mismatch() -> None:
+    """Falsifier: decoding a CLOSE acknowledgement from an ABI we do not know,
+    which is how a refused close would be mistaken for a clean one."""
+    loader = VectorLoader(close_abi_version=ABI_VERSION + 1)
+    source = started(loader)
+    with pytest.raises(FileSourceError) as caught:
+        source.close()
+    assert caught.value.errno == -errno.EPROTO
+    assert "ABI" in str(caught.value)
+    assert source.available is False
 
 
 def test_close_after_a_successful_drain_sends_one_close() -> None:

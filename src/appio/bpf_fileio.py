@@ -798,6 +798,10 @@ class VectorLoader:
         drain_abi_version: int | None = None,
         hook_mask: int = HOOK_MASK_ALL,
         map_capacity: int = MAX_MAP_ENTRIES,
+        drain_hook_mask: int | None = None,
+        drain_map_capacity: int | None = None,
+        close_abi_version: int | None = None,
+        hello_trailing: bytes = b"",
         hello_status: int = STATUS_OK,
         hello_error: int = 0,
         verifier: bytes = b"",
@@ -821,6 +825,10 @@ class VectorLoader:
         self.drain_abi_version = drain_abi_version
         self.hook_mask = hook_mask
         self.map_capacity = map_capacity
+        self.drain_hook_mask = drain_hook_mask
+        self.drain_map_capacity = drain_map_capacity
+        self.close_abi_version = close_abi_version
+        self.hello_trailing = hello_trailing
         self.hello_status = hello_status
         self.hello_error = hello_error
         self.verifier = verifier
@@ -878,7 +886,7 @@ class VectorLoader:
             abi, self.hello_status, self.hook_mask, self.map_capacity,
             self.hello_error, verifier_len,
         )
-        return header + self.verifier[:verifier_len]
+        return header + self.verifier[:verifier_len] + self.hello_trailing
 
     def flip_drain(self, epoch: int, seq: int) -> bytes:
         self.flip_requests.append((epoch, seq))
@@ -912,7 +920,8 @@ class VectorLoader:
         status = STATUS_OK if self.close_failure is None else STATUS_ERROR
         diagnostic_len = (len(self.diagnostic) if self.diagnostic_len_report is None
                           else self.diagnostic_len_report)
-        header = ACK_RESPONSE.pack(self.abi_version, status, error, diagnostic_len)
+        abi = self.abi_version if self.close_abi_version is None else self.close_abi_version
+        header = ACK_RESPONSE.pack(abi, status, error, diagnostic_len)
         return header + self.diagnostic[:diagnostic_len]
 
     # -- frame assembly ------------------------------------------------------
@@ -933,6 +942,10 @@ class VectorLoader:
         reported_slot = (
             drained_slot if self.drained_slot_report is None else self.drained_slot_report
         )
+        hook_mask = self.hook_mask if self.drain_hook_mask is None else self.drain_hook_mask
+        map_capacity = (
+            self.map_capacity if self.drain_map_capacity is None else self.drain_map_capacity
+        )
         event_count = (len(event_payload) // FILE_RECORD.size
                        if self.event_count_report is None else self.event_count_report)
         stats_count = (len(stats_payload) // CGROUP_STATS.size
@@ -940,7 +953,7 @@ class VectorLoader:
         diagnostic_len = (len(diagnostic) if self.diagnostic_len_report is None
                           else self.diagnostic_len_report)
         header = DRAIN_RESPONSE.pack(
-            abi, status, self.hook_mask, self.map_capacity, error, reported_slot,
+            abi, status, hook_mask, map_capacity, error, reported_slot,
             epoch, seq, event_count, stats_count, complete, diagnostic_len,
         )
         return header + event_payload + stats_payload + diagnostic[:diagnostic_len]
