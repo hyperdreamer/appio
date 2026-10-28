@@ -123,7 +123,7 @@ def write_io(root, amount):
 
 
 @pytest.fixture
-def runtime(tmp_path):
+def runtime(tmp_path, request):
     proc, cgroup = tmp_path / "proc", tmp_path / "cgroup"
     shutil.copytree(FIXTURES / "proc", proc, symlinks=True)
     shutil.copytree(FIXTURES / "cgroup/normal-t0", cgroup)
@@ -136,9 +136,12 @@ def runtime(tmp_path):
     paths = DaemonPaths(state / "iod.db", run / "iod.sock", proc, cgroup)
     clock, fs, worker = Clock(), FakeFilesystem(), DeferredWorker()
     peers = {}
+    # Group 1 — harness advance() defaults: behavioural vectors advance 2 s.
+    # Empty indirect parameters select the shipped cadence for regression pins.
+    cadence = getattr(request, "param", {"sample_ns": 2 * NS, "flush_ns": 5 * NS})
     daemon = Daemon(paths, clock=clock, peer_reader=lambda sock: peers.get(sock.fileno(), Peer(7, 0, 0)),
                     group_lookup=lambda uid: frozenset({987}) if uid == 1000 else frozenset(),
-                    filesystem=fs, selector=PollSelector(), query_worker=worker)
+                    filesystem=fs, selector=PollSelector(), query_worker=worker, **cadence)
     clients = []
 
     def connect(peer=None, stalled=False):
@@ -569,8 +572,10 @@ m = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(m)
 state, sock, proc, cgroup = map(Path, sys.argv[1:])
 clock = m.Clock()
+# Group 2 — embedded subprocess: match m.Clock.advance()'s 2 s test vector.
 daemon = m.Daemon(m.DaemonPaths(state, sock, proc, cgroup), clock=clock,
-                  filesystem=m.FakeFilesystem(), query_worker=m.DeferredWorker())
+                  filesystem=m.FakeFilesystem(), query_worker=m.DeferredWorker(),
+                  sample_ns=2 * m.NS, flush_ns=5 * m.NS)
 daemon.start()
 m.write_io(proc, 101)
 clock.advance()
@@ -749,5 +754,15 @@ def test_quota_pause_does_not_append_more_frames_and_resumes_with_gap(runtime, m
     paused = False
     r.clock.advance()
     pump(r)
+    # Group 1 — the 2 s harness must honour the persistent-storage retry window.
+    assert r.daemon.committed_cursor == before
+    r.clock.advance(58)
+    pump(r)
     assert r.daemon.committed_cursor == StreamCursor(BOOT, 2, 0)
     assert total(r.paths.database) == (0, 0, 0, 0)
+    # Real baseline commit progress reopens the ordinary 2 s cadence immediately.
+    write_io(r.proc, 106)
+    r.clock.advance()
+    pump(r)
+    assert r.daemon.committed_cursor == StreamCursor(BOOT, 2, 1)
+    assert total(r.paths.database) == (40, 20, 12, 8)

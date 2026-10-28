@@ -206,9 +206,11 @@ class P3Harness:
             # virtual boot time; a frozen execution clock keeps host CPU load
             # out of pagination assertions. Deadline expiry has separate tests.
             self.stack.enter_context(patch("appio.iod.HistoryRpc", partial(HistoryRpc, clock_ns=lambda: 0)))
+            # Group 3 — 2 s acceptance vectors retain their accounting cutoffs;
+            # the production-default cadence is pinned in test_iod_cadence_pins.
             self.daemon = Daemon(self.paths, clock=self.clock, filesystem=FixtureFilesystem(self),
                 peer_reader=lambda sock: Peer(7, 1000, 987), group_lookup=lambda uid: frozenset({987}),
-                selector=PollSelector())
+                selector=PollSelector(), sample_ns=2 * NS, flush_ns=5 * NS)
             # Drive the synchronous helper status read on this daemon's owner
             # thread. Only kernel credentials/transport scheduling are injected.
             self._status_transport()
