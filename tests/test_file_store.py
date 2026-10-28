@@ -95,7 +95,16 @@ def test_zero_hour_and_unknown_owner_have_independent_canonical_coverage(db):
     second.add_observation(Receipt("gui", 1, 1), APP, None, ZERO)
     store.finalize_hour(second.finalize())
     assert store.unknown_owner_for_hour("boot-A", FILE_HOUR_NS) == UnknownOwnerInput(0, 0, 0, 0, 0, True)
+    assert db.execute("SELECT count(*) FROM file_coverage").fetchone()[0] == 2
     assert db.execute("SELECT count(*) FROM file_overflow_unknown").fetchone()[0] == 2
+    assert db.execute("SELECT ts_mono_ns FROM file_overflow_unknown ORDER BY ts_mono_ns").fetchall() == [(0,), (FILE_HOUR_NS,)]
+    from appio.contracts import Window
+    from appio.query import QueryService
+    app_boot_text, = db.execute("SELECT coverage_json FROM app_boot_file_coverage WHERE boot_id='boot-A' AND app_id=1").fetchone()
+    assert json.loads(app_boot_text)["file"]["skipped_nonfile"] == 3
+    empty_hour = QueryService(db).file_table(1, Window("range", "boot-A", FILE_HOUR_NS, 2 * FILE_HOUR_NS), "bytes_total", "desc", None)
+    assert empty_hour.rows == ()
+    assert empty_hour.coverage.complete
 
 
 def test_file_coverage_columns_equal_json_and_boot_totals_keep_omissions_separate(db):
@@ -271,6 +280,33 @@ def test_frame_transaction_retains_control_of_successful_pending_and_finalizatio
     assert db.execute("SELECT count(*) FROM path").fetchone()[0] == 0
     assert db.execute("SELECT count(*) FROM file_sample").fetchone()[0] == 0
     assert db.execute("SELECT file_finalized_through_mono_ns FROM boot").fetchone()[0] == 0
+
+
+def test_finalize_state_deletion_fault_rolls_back_the_entire_hour(db):
+    # Falsifier: publish coverage, totals or the watermark if pending-state removal fails.
+    import sqlite3
+
+    acc = HourlyAccumulator("boot-A", 0)
+    acc.add_observation(R, APP, observation(bytes_r=17), ZERO)
+    store = FileHourStore(db)
+    store.apply_pending(acc.finalize())
+    tables = ("path", "file_sample", "file_coverage", "file_hour_state",
+              "app_boot_file_total", "app_boot_file_coverage", "file_overflow_unknown",
+              "boot_file_overflow_unknown", "boot")
+    before = {table: db.execute(f"SELECT * FROM {table}").fetchall() for table in tables}
+    db.execute("CREATE TEMP TRIGGER fail_file_state_delete BEFORE DELETE ON main.file_hour_state "
+               "BEGIN SELECT RAISE(ABORT,'pending delete fault'); END")
+    db.commit()
+
+    with pytest.raises(sqlite3.IntegrityError, match="pending delete fault"):
+        store.finalize_hour(acc.finalize())
+
+    assert not db.in_transaction
+    assert {table: db.execute(f"SELECT * FROM {table}").fetchall() for table in tables} == before
+    db.execute("DROP TRIGGER fail_file_state_delete")
+    db.commit()
+    assert store.finalize_hour(acc.finalize())
+    assert db.execute("SELECT count(*) FROM file_hour_state").fetchone() == (0,)
 
 
 def test_enclosing_frame_rolls_back_receipt_before_separate_overflow_diagnostic(db):
