@@ -818,6 +818,19 @@ class IodClient:
         """
 
         future: Future[dict] = Future()
+        # A22 is a local policy decision, not a daemon answer: a window the product has
+        # disabled must report its ratified reason whether or not a daemon is reachable.
+        # Checking connectivity first reported daemon_unavailable for a request that
+        # could never be served, which is the wrong explanation and hides the disabled
+        # control the UI is supposed to render.
+        try:
+            query = _query_wire(request)
+        except WindowUnavailableError as error:
+            future.set_exception(RequestRejected(error.reason, str(error)))
+            return future
+        except ProtocolError as error:
+            future.set_exception(RequestRejected(error.reason, _bounded_detail(error)))
+            return future
         if self._closed:
             future.set_exception(ClientClosed("client_closed"))
             return future
@@ -830,17 +843,6 @@ class IodClient:
             self._refused += 1
             future.set_exception(RequestRejected("too_many_requests", f"at most {self.max_pending}"))
             return future
-        try:
-            query = _query_wire(request)
-        except WindowUnavailableError as error:
-            # A22 is decided before any identity or wire access, locally or
-            # remotely. The reason and message are the ratified ones, verbatim.
-            future.set_exception(RequestRejected(error.reason, str(error)))
-            return future
-        except ProtocolError as error:
-            future.set_exception(RequestRejected(error.reason, _bounded_detail(error)))
-            return future
-
         # The key is the *complete* request plus the committed remote generation.
         # Presentation IDs never appear here, and a result read under an older
         # boot/epoch is unreachable rather than "still valid": its key can never

@@ -1032,3 +1032,28 @@ def test_default_connector_reaches_a_real_listener(tmp_path):
         client.close()
     finally:
         listener.close()
+
+
+def test_a_disabled_window_reports_its_reason_even_when_disconnected():
+    # Contract review finding: a launch/>365d request from an unconnected client returned
+    # daemon_unavailable, which is the wrong explanation for a window the product has
+    # disabled -- no daemon could ever serve it. A22 is local policy and precedes
+    # connectivity, exactly as the server-side validator does.
+    from appio.contracts import LAUNCH_WINDOW_MESSAGE, Window
+    from appio.iodclient import IodClient, RequestRejected
+
+    client = IodClient("/nonexistent.sock", on_gap=lambda notice: None, on_change=lambda: None)
+    try:
+        future = client.query(QueryRequest(kind="ranking", window=Window("launch", "boot-1", launch_id=7)))
+        with pytest.raises(RequestRejected) as error:
+            future.result()
+        assert error.value.reason == "launch_attribution"
+        assert LAUNCH_WINDOW_MESSAGE in str(error.value)
+
+        # A perfectly serviceable window still reports the honest transport state.
+        ok = client.query(QueryRequest(kind="ranking", window=Window("lifetime")))
+        with pytest.raises(Exception) as transport:
+            ok.result()
+        assert getattr(transport.value, "reason", "") == "daemon_unavailable"
+    finally:
+        client.close()
