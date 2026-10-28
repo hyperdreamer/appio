@@ -490,6 +490,18 @@ def test_the_poller_waits_for_the_write_to_finish_rather_than_its_first_bytes(tm
     assert got == 16777216, f"poller returned {got} after readings {seen}"
 
 
+def test_each_retry_attempt_has_its_own_unit_cgroup():
+    # A retry that reused the first attempt's cgroup path read nothing at all, so every
+    # retry reported None and the probe could never recover from a partial first read.
+    # The invariant the retry loop relies on: distinct unit names give distinct paths.
+    import appio.activation as activation
+
+    first = activation._unit_cgroup_candidates(1000, "appio-probe-500")
+    retry = activation._unit_cgroup_candidates(1000, "appio-probe-500-1")
+    assert first and retry
+    assert set(first).isdisjoint(set(retry)), (first, retry)
+
+
 def test_dd_error_never_passes_even_when_bytes_match(harness: Harness):
     harness.runner.dd_exit = 1
     harness.runner.dd_stderr = "dd: failed to open: Operation not permitted"

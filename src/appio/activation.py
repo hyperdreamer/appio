@@ -368,18 +368,29 @@ def probe_accounting(
                     launcher_exit = None
                     for attempt in range(_PROBE_ATTEMPTS):
                         attempt_unit = unit if attempt == 0 else f"{unit}-{attempt}"
+                        # Baseline per attempt. A discarded attempt still writes bytes,
+                        # so a probe-wide delta counts them twice and lands outside the
+                        # 5% window even when each attempt was exact (32 MiB observed).
+                        before = _slice_written_bytes(root, identity.uid, facts.device)
                         launcher_exit = _run_probe(
                             identity, deps=deps, probe_path=probe_path, unit=attempt_unit
                         )
                         observed = _observe_while_alive(
-                            root, candidates, facts.device, deps=deps, unit=attempt_unit,
+                            root, _unit_cgroup_candidates(identity.uid, attempt_unit),
+                            facts.device, deps=deps, unit=attempt_unit,
                             identity=identity,
                         )
-                        if observed is not None:
-                            best = observed if best is None else max(best, observed)
-                        _stop_probe_unit(identity, deps, attempt_unit)
+                        # The slice outlives the unit, so its delta is the reliable
+                        # reading; the per-unit poll corroborates when it lands exactly.
+                        delta = _settled_slice_delta(root, identity.uid, facts.device, before)
+                        candidate = delta if delta is not None else observed
+                        if candidate is not None:
+                            best = candidate if best is None else max(best, candidate)
                         if best is not None and abs(best - EXPECTED_PROBE_BYTES) * 100 <= EXPECTED_PROBE_BYTES * 5:
+                            # Accepted: leave the unit alone so its ExecMainStatus can
+                            # still be read; cleanup stops it later.
                             break
+                        _stop_probe_unit(identity, deps, attempt_unit)
                     facts.observed_bytes = best
                     facts.command_exit = (
                         launcher_exit if launcher_exit not in (0, None)
@@ -620,6 +631,9 @@ def _device_candidates(root: Path, device: str) -> tuple[str, ...]:
 _PROBE_POLL_SECONDS = 1.0
 _PROBE_POLL_INTERVAL = 0.002
 _PROBE_ATTEMPTS = 3
+#: How long the slice counter is re-sampled after the attempt, and how often.
+_SLICE_SETTLE_READS = 100
+_SLICE_SETTLE_INTERVAL = 0.005
 
 
 def _stop_probe_unit(identity: SetupIdentity, deps: SetupDeps, unit: str) -> None:
@@ -655,6 +669,52 @@ def _probe_unit_status(deps: SetupDeps, unit: str, identity: SetupIdentity) -> i
         return None
     text = str(getattr(result, "stdout", "") or "").strip()
     return int(text) if text.isdigit() else None
+
+
+def _settled_slice_delta(
+    root: Path, uid: int, device: str | None, before: int | None
+) -> int | None:
+    """One attempt's slice write delta, sampled until it stops growing."""
+
+    if before is None:
+        return None
+    best: int | None = None
+    for _ in range(_SLICE_SETTLE_READS):
+        reading = _slice_written_bytes(root, uid, device)
+        if reading is not None:
+            delta = reading - before
+            if best is None or delta > best:
+                best = delta
+            if best >= EXPECTED_PROBE_BYTES * 95 // 100:
+                break
+        time.sleep(_SLICE_SETTLE_INTERVAL)
+    return best
+
+
+def _slice_written_bytes(root: Path, uid: int, device: str | None) -> int | None:
+    """Cumulative writes charged to the caller's ``app.slice``, for one device.
+
+    The slice outlives every transient unit inside it, so its counter is still readable
+    after the probe's cgroup has been removed. A per-bio counter is only momentarily at
+    its final value, which is why polling a dying cgroup returns partials (14, 15, 11.5
+    MiB of 16 were observed) and why the slice delta is the reliable reading.
+    """
+
+    if device is None:
+        return None
+    slice_path = _user_manager_cgroup(uid) / "app.slice" / "io.stat"
+    text = _read_text(_install_root(Path(root), slice_path))
+    if text is None:
+        return None
+    try:
+        stats = parse_io_stat(text, cgroup_id=0)
+    except ValueError:
+        return None
+    for candidate in _device_candidates(Path(root), device):
+        for stat in stats:
+            if stat.dev == candidate:
+                return stat.wbytes
+    return None
 
 
 def _observe_while_alive(
