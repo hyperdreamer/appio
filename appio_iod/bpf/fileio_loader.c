@@ -124,6 +124,18 @@ static int write_full(int fd, const void *buffer, size_t length)
 
 static void unload_object(struct loader_state *state)
 {
+    /* These inner-map fds are ours (bpf_map_get_fd_by_id); close them or every
+       reload leaks four descriptors. */
+    for (size_t slot = 0; slot < 2; slot++) {
+        if (state->event_fd[slot] >= 0) {
+            close(state->event_fd[slot]);
+            state->event_fd[slot] = -1;
+        }
+        if (state->stats_fd[slot] >= 0) {
+            close(state->stats_fd[slot]);
+            state->stats_fd[slot] = -1;
+        }
+    }
     for (size_t index = 0; index < 6; index++) {
         if (state->links[index] != NULL) {
             bpf_link__destroy(state->links[index]);
@@ -167,13 +179,28 @@ static int lookup_inner_maps(struct loader_state *state)
         return -ENOENT;
 
     for (slot = 0; slot < 2; slot++) {
-        int error = bpf_map_lookup_elem(state->events_outer_fd, &slot, &fd);
-        if (error != 0)
-            return error;
+        /* An ARRAY_OF_MAPS lookup returns the inner map *ID*, not a file
+           descriptor. Using the u32 id as an fd made every drain fail with
+           EBADF, which the P4 privileged acceptance (T-007) caught here.
+           Translate the id into an owned fd. */
+        __u32 inner_id = 0;
+        if (bpf_map_lookup_elem(state->events_outer_fd, &slot, &inner_id) != 0)
+            return -errno;
+        if (inner_id == 0)
+            return -ENOENT;
+        fd = bpf_map_get_fd_by_id(inner_id);
+        if (fd < 0)
+            return -errno;
         state->event_fd[slot] = fd;
-        error = bpf_map_lookup_elem(state->stats_outer_fd, &slot, &fd);
-        if (error != 0)
-            return error;
+
+        inner_id = 0;
+        if (bpf_map_lookup_elem(state->stats_outer_fd, &slot, &inner_id) != 0)
+            return -errno;
+        if (inner_id == 0)
+            return -ENOENT;
+        fd = bpf_map_get_fd_by_id(inner_id);
+        if (fd < 0)
+            return -errno;
         state->stats_fd[slot] = fd;
     }
     return 0;
@@ -312,6 +339,10 @@ static int append_record(struct record_vector *records,
     record->cgroup_id = key->cgroup_id;
     record->major = major((dev_t)key->device);
     record->minor = minor((dev_t)key->device);
+    { FILE *dbg = fopen("/tmp/appdbg.log", "a");
+      if (dbg) { fprintf(dbg, "device=%llu major=%u minor=%u sizeof_dev_t=%zu\n",
+                         (unsigned long long)key->device, record->major, record->minor, sizeof(dev_t));
+                 fclose(dbg); } }
     record->inode = key->inode;
     record->generation = key->i_generation;
     record->reads = value->reads;
