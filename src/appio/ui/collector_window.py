@@ -4,8 +4,8 @@ Ownership of privilege is deliberate and narrow. Exactly one checkable control -
 ``System services (root)`` in Settings -- can change machine-wide collection, and
 it only ever *requests* a change through a consent dialog and
 ``/usr/bin/pkexec /usr/bin/appio-setup <verb>``. Every other affordance in this
-window (the status banner, the unavailable Files entry) navigates to that one
-control and changes no state at all.
+window (the status banner, the ``Files`` entry) selects a page, issues one
+read-only query, or focuses that one control; none of them changes any state.
 
 The switch renders the *probe*, never the last click: clicking restores the
 probed position immediately, and the displayed state is recomputed from
@@ -63,6 +63,8 @@ from ..ipc_security import read_peer, require_root_server
 from ..live import LiveCollector, SystemClock
 from ..setup_boundary import CommandResult
 from ..setup_client import SetupClient, SetupReply
+from .files_view import STATE_UNAVAILABLE as FILES_STATE_UNAVAILABLE
+from .files_view import FilesView
 
 __all__ = [
     "ACTIVATION_INACTIVE",
@@ -486,22 +488,23 @@ class CollectorWindow(QMainWindow):
 
         self.files_page = QWidget()
         files_layout = QVBoxLayout(self.files_page)
-        self.files_message = QLabel(
-            f"In this version {FILES_UNAVAILABLE}. appio does not record which files were "
-            "read or written, and system services does not provide that data either; it "
-            "only measures device and per-application counters. The Files view arrives with "
-            "the per-file collector, not with this switch."
-        )
+        # The real Files surface. It consumes only the Files query contract and
+        # never selects, elevates, or writes anything.
+        self.files_view = FilesView(self.history)
+        self.files_view.setObjectName("files_view")
+        self.files_message = QLabel(FILES_UNAVAILABLE)
         self.files_message.setObjectName("files_message")
         self.files_message.setWordWrap(True)
+        self.files_message.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.files_message.setVisible(False)
         self.files_open_settings = QPushButton("Open settings")
         self.files_open_settings.setObjectName("files_open_settings")
         self.files_open_settings.setToolTip(
             "Opens Settings at the System services switch. Changes no state."
         )
+        files_layout.addWidget(self.files_view, 1)
         files_layout.addWidget(self.files_message)
         files_layout.addWidget(self.files_open_settings)
-        files_layout.addStretch(1)
         self.stack.addWidget(self.files_page)
         self.stack.setCurrentWidget(self.history_page)
         outer.addWidget(self.stack, 1)
@@ -515,6 +518,8 @@ class CollectorWindow(QMainWindow):
         self.banner_open_settings.clicked.connect(self._open_settings_default)
         self.files_open_settings.clicked.connect(self._open_settings_default)
         self.files_nav.clicked.connect(self.open_files_unavailable)
+        self.files_view.state_changed.connect(self._render_files_message)
+        self._render_files_message()
 
     def _open_settings_default(self) -> None:
         # QPushButton.clicked carries a checked flag; the deep link takes no argument.
@@ -537,9 +542,68 @@ class CollectorWindow(QMainWindow):
         self.settings.focus_row(focus)
 
     def open_files_unavailable(self) -> None:
-        """Show the unavailable Files entry. Never invokes or changes state."""
+        """Compatibility navigation slot: select the Files page and query it.
+
+        The name is retained because the P3 banner already pointed at it. It now
+        shows the real Files surface and issues one contract query for the
+        current window; it invokes no helper and changes no collector state.
+        """
 
         self.stack.setCurrentWidget(self.files_page)
+        self._sync_files(request=True)
+
+    # -- the Files page ---------------------------------------------------
+
+    def _history_ready(self, window: Window | None) -> bool:
+        """The router's readiness gate, with a raised read treated as not ready."""
+
+        if window is None:
+            return False
+        try:
+            return bool(self.history.ready(window))
+        except Exception:
+            return False
+
+    def _files_status_text(self) -> str | None:
+        """The explicit page-level message beside the table, or ``None``."""
+
+        window = self._prepared
+        if window is None:
+            return "waiting for the first sample"
+        if not self._history_ready(window):
+            # A degraded file source is already a final fact while the process
+            # history is still loading: it is never rendered as a table.
+            status = self.history.file_source_status()
+            if not getattr(status, "available", False):
+                reason = getattr(status, "reason", None)
+                detail = getattr(status, "diagnostic", None) or "the file source is unavailable"
+                prefix = f"{reason}: " if reason else ""
+                return f"{FILES_UNAVAILABLE}: {prefix}{detail}"
+            return f"loading history ({self.history.view_state})"
+        if self.files_view.state == FILES_STATE_UNAVAILABLE:
+            return f"{FILES_UNAVAILABLE}: {self.files_view.unavailable_text()}"
+        return None
+
+    def _render_files_message(self, *_args) -> None:
+        try:
+            text = self._files_status_text()
+        except Exception as error:  # a state signal must never kill the window
+            text = f"appio: {error}"
+        self.files_message.setText(text or "")
+        self.files_message.setVisible(text is not None)
+
+    def _sync_files(self, *, request: bool) -> None:
+        """Point the Files surface at the prepared window, or hide it honestly."""
+
+        window = self._prepared
+        ready = self._history_ready(window)
+        if ready:
+            # The same exact Window the Overview renders, never a widened one.
+            self.files_view.set_window(window)
+            if request:
+                self.files_view.request_refresh()
+        self.files_view.setVisible(ready)
+        self._render_files_message()
 
     def refresh(self) -> None:
         """Probe (unprivileged), reconcile ownership, then render only proven data."""
@@ -623,10 +687,12 @@ class CollectorWindow(QMainWindow):
     def _render_history(self) -> None:
         window = self._current_window()
         if window is None:
+            self._prepared = None
             self._hide_view()
             self.history_state.setText("waiting for the first sample")
             self.history_state.setVisible(True)
             self._poll_timer.stop()
+            self._sync_files(request=False)
             return
         self._prepared = window
         self.history.prepare(window)
@@ -662,6 +728,7 @@ class CollectorWindow(QMainWindow):
         self.history_state.setText("")
         self.history_state.setVisible(False)
         self._view.setVisible(True)
+        self._sync_files(request=False)
         self._poll_timer.stop()
 
     def _ensure_view(self, window: Window) -> "AppIoWindow":
