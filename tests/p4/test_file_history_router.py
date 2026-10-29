@@ -9,6 +9,14 @@ import threading
 
 import pytest
 
+# Pin PyQt6 before pytest-qt builds its qapp fixture (see tests/test_ui.py).
+from pytestqt.qt_compat import qt_api
+
+if qt_api.pytest_qt_api != "pyqt6":
+    qt_api.set_qt_api("pyqt6")
+
+from PyQt6.QtCore import Qt
+
 from appio.bpf_fileio import BpfFileSource, VectorLoader
 from appio.contracts import FILE_HOUR_NS as H, Window, WindowUnavailableError
 from appio.file_runtime import FileRuntime
@@ -19,6 +27,7 @@ from appio.iodclient import AppRegistry, ClientState, RemoteError
 from appio.ipc_models import Capabilities, QueryRequest, validate_request
 from appio.query import QueryService
 from appio.store import AppIoStore
+from appio.ui.files_view import FilesView
 from tests.p3.test_iodclient import Harness, snapshot_frame
 from tests.p4.test_file_runtime import APP, ZERO, Frames, event
 
@@ -183,6 +192,27 @@ def test_mixed_or_excluded_ownership_never_merges_database_local_paths(retained,
     finally:
         router.close()
         other.db.close()
+
+
+def test_retained_local_file_history_is_queried_without_answering_daemon(retained, qtbot):
+    router = local_router(retained)
+    view = FilesView(router)
+    qtbot.addWidget(view)
+    try:
+        view.set_window(WINDOW)
+        qtbot.waitUntil(lambda: view.state != "loading", timeout=10_000)
+        assert view.state == "ready", (
+            f"screen_state={view.state}; request_count={len(view.requests)}"
+        )
+        assert len(view.requests) == 1
+        rendered = [
+            view.model.data(view.model.index(row, 0), Qt.ItemDataRole.DisplayRole)
+            for row in range(view.model.rowCount())
+        ]
+        assert "alpha" in rendered
+    finally:
+        view.close()
+        router.close()
 
 
 class Remote:
