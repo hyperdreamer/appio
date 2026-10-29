@@ -139,6 +139,65 @@ def test_loader_uses_quiescence_and_clear_before_drain_ack(loader_source: str) -
 
 
 @pytest.fixture(scope="module")
+def native_producer_probe(tmp_path_factory):
+    """Compile actual producer helpers; replace only kernel map/CO-RE access."""
+    compiler = shutil.which("cc")
+    assert compiler is not None, "native producer probe requires cc"
+    out = tmp_path_factory.mktemp("native-producer-probe")
+    source = BPF_SOURCE.read_text(encoding="utf-8")
+    # Preserve all map declarations and helper bodies verbatim. The hook wrappers
+    # require BPF register calling conventions and are checked by the BPF build.
+    helpers = source[:source.index('SEC("fexit/vfs_read")')]
+    helpers = "\n".join(line for line in helpers.splitlines()
+                        if not line.startswith("#include <bpf/"))
+    (out / "fileio_host_helpers.h").write_text(helpers, encoding="utf-8")
+    binary = out / "producer"
+    built = subprocess.run(
+        [compiler, "-O2", "-std=gnu11", "-Wall", "-Wextra", "-Werror",
+         "-I", str(out), "-I", str(BPF_DIR),
+         str(Path(__file__).with_name("fileio_producer_host.c")), "-o", str(binary)],
+        capture_output=True, text=True, check=False, timeout=30,
+    )
+    assert built.returncode == 0, built.stdout + built.stderr
+
+    def run(scenario, slot=0, cgroup=42):
+        result = subprocess.run([str(binary), scenario, str(slot), str(cgroup)],
+                                capture_output=True, text=True, check=False, timeout=5)
+        assert result.returncode == 0, result.stdout + result.stderr
+        return json.loads(result.stdout)
+
+    return run
+
+
+@pytest.mark.parametrize("scenario", ["race-event", "race-stats"])
+@pytest.mark.parametrize("slot,cgroup", [(0, 42), (1, 0)])
+def test_native_producer_first_touch_preserves_both_cpus(
+    native_producer_probe, scenario, slot, cgroup,
+) -> None:
+    # Breaks on BPF_ANY at either first-touch site, including the reserved key.
+    result = native_producer_probe(scenario, slot, cgroup)
+    assert (result["bytes_r"], result["reads"], result["hook_hits"],
+            result["overflow_files"], result["overflow_bytes_r"]) == (100, 2, 2, 0, 0)
+    assert result["stats_present"] == result["event_present"] == 1
+    assert result["cgroup_id"] == cgroup
+    assert result["in_flight"] == 0
+
+
+def test_native_producer_stats_race_preserves_skip_deltas(native_producer_probe) -> None:
+    result = native_producer_probe("race-skip")
+    assert (result["skipped_nonfile"], result["skipped_unsupported"]) == (1, 1)
+
+
+def test_native_producer_genuine_insert_failures(native_producer_probe) -> None:
+    full = native_producer_probe("event-full")
+    assert (full["event_present"], full["overflow_files"], full["overflow_bytes_r"],
+            full["hook_hits"], full["in_flight"]) == (0, 1, 30, 1, 0)
+    no_stats = native_producer_probe("stats-full")
+    assert (no_stats["stats_present"], no_stats["event_present"], no_stats["bytes_r"],
+            no_stats["in_flight"]) == (0, 1, 30, 0)
+
+
+@pytest.fixture(scope="module")
 def native_loader_probe(tmp_path_factory):
     """Run production C against fake maps; never open/load a BPF object."""
     compiler = shutil.which("cc")
