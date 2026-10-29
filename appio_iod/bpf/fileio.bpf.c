@@ -198,6 +198,7 @@ static __always_inline int fileio_account(struct file *file, ssize_t ret,
 
     struct fileio_key key = {};
     key.cgroup_id = cgroup_id;
+    /* CO-RE relocates bd_dev by name; retain its raw kernel dev_t encoding. */
     key.device = (__u64)BPF_CORE_READ(bdev, bd_dev);
     key.inode = (__u64)BPF_CORE_READ(inode, i_ino);
     key.i_generation = BPF_CORE_READ(inode, i_generation);

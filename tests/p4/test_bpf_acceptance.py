@@ -113,8 +113,9 @@ EXPECTED OBSERVABLES FOR A CONFIRMED RUN
 * ``reads``/``writes`` equal the number of positive operations per direction.
 * A second, nonpositive-only workload pass (read at EOF returns 0; ``read`` on a
   directory fd returns ``-EISDIR``) adds no record and no bytes, and the following
-  drain of the retired slot is empty -- so a failed operation is never counted and
-  the old slot was really cleared rather than replayed.
+  drain contains no record for the workload file. Each completed drain is followed
+  by a count of both event and stats inner maps in both slots; its retired maps
+  must have zero keys. The active slot can contain unrelated cgroup traffic.
 * ``drains[0].drained_slot != drains[1].drained_slot`` with ``complete == 1``.
 * ``skipped``/``overflow`` counters are reported per cgroup; with an isolated
   cgroup they must be zero, without one they may include unrelated session
@@ -1355,6 +1356,109 @@ def _drain_slot(frame: bytes) -> int | None:
         return None
 
 
+class _MapInfo(ctypes.Structure):
+    # The stable prefix of Linux struct bpf_map_info; the kernel copies info_len.
+    _fields_ = [
+        ("type", ctypes.c_uint32), ("id", ctypes.c_uint32),
+        ("key_size", ctypes.c_uint32), ("value_size", ctypes.c_uint32),
+        ("max_entries", ctypes.c_uint32), ("map_flags", ctypes.c_uint32),
+        ("name", ctypes.c_char * 16),
+    ]
+
+
+def _post_drain_slot_counts(pid: int, *, fdinfo_root=None, libbpf=None):
+    """Inspect this loader's real inner maps, only from the opt-in run path.
+
+    Counts in the active slot are observational: other cgroups keep writing.
+    The retired slot must be empty after the completed drain acknowledgement.
+    Tests inject both fdinfo and libbpf; they never access /proc or live maps.
+    """
+    if libbpf is None:
+        libbpf = ctypes.CDLL("libbpf.so.1", use_errno=True)
+        for name, args in {
+            "bpf_map_get_fd_by_id": [ctypes.c_uint32],
+            "bpf_obj_get_info_by_fd": [ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p],
+            "bpf_map_lookup_elem": [ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p],
+            "bpf_map_get_next_key": [ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p],
+        }.items():
+            function = getattr(libbpf, name)
+            function.argtypes = args
+            function.restype = ctypes.c_int
+    if fdinfo_root is None:
+        fdinfo_root = Path(f"/proc/{pid}/fdinfo")
+
+    def checked(result, operation):
+        if result < 0:
+            raise AcceptanceError(f"map count {operation}: errno={ctypes.get_errno()}")
+        return result
+
+    def info(fd):
+        value = _MapInfo()
+        size = ctypes.c_uint32(ctypes.sizeof(value))
+        checked(libbpf.bpf_obj_get_info_by_fd(fd, ctypes.byref(value), ctypes.byref(size)),
+                "get info")
+        return value
+
+    def count(fd, metadata):
+        current = None
+        total = 0
+        while True:
+            following = ctypes.create_string_buffer(metadata.key_size)
+            ctypes.set_errno(0)
+            result = libbpf.bpf_map_get_next_key(fd, current, following)
+            if result < 0 and ctypes.get_errno() == errno.ENOENT:
+                return total
+            checked(result, "get next key")
+            total += 1
+            if total > metadata.max_entries:
+                raise AcceptanceError("map count exceeded map capacity during iteration")
+            current = following
+
+    names = {"fileio_slots": "events", "fileio_stats_slots"[:15]: "stats"}
+    slots = [{}, {}]
+    seen = set()
+    found = set()
+    for fdinfo in Path(fdinfo_root).iterdir():
+        match = re.search(r"^map_id:\s*(\d+)$", fdinfo.read_text(), re.MULTILINE)
+        if match is None:
+            continue
+        map_id = int(match[1])
+        if map_id in seen:
+            continue
+        seen.add(map_id)
+        outer_fd = checked(libbpf.bpf_map_get_fd_by_id(map_id), "open outer")
+        try:
+            metadata = info(outer_fd)
+            name = metadata.name.decode("ascii")
+            # Inner stats names share the same 15-byte prefix as their outer.
+            if name not in names or metadata.type != 12:  # ARRAY_OF_MAPS
+                continue
+            if metadata.max_entries != 2:
+                raise AcceptanceError(f"unexpected outer map layout for {name}")
+            label = names[name]
+            if label in found:
+                raise AcceptanceError(f"ambiguous loader map {name}")
+            found.add(label)
+            for slot in range(2):
+                key = ctypes.c_uint32(slot)
+                inner_id = ctypes.c_uint32()
+                checked(libbpf.bpf_map_lookup_elem(outer_fd, ctypes.byref(key),
+                                                  ctypes.byref(inner_id)), "lookup inner id")
+                # Outer lookup returns an ID, never a process fd.
+                inner_fd = checked(libbpf.bpf_map_get_fd_by_id(inner_id.value), "open inner")
+                try:
+                    inner_info = info(inner_fd)
+                    slots[slot][label] = count(inner_fd, inner_info)
+                    slots[slot][f"{label}_map_id"] = inner_id.value
+                finally:
+                    os.close(inner_fd)
+        finally:
+            os.close(outer_fd)
+    if found != {"events", "stats"}:
+        raise AcceptanceError(f"could not find both loader outer maps: {sorted(found)}")
+    return slots
+
+
 class _RecordingLoader:
     """A ``LoaderProtocol`` that keeps every raw frame and delegates to the real one.
 
@@ -1662,6 +1766,7 @@ def run_acceptance(
                             "events": [_event_dict(event) for event in first.events],
                             "stats": [_stats_dict(stats) for stats in first.stats],
                             "diagnostic": first.diagnostic,
+                            "post_drain_slots": _post_drain_slot_counts(process.pid),
                         }
                     )
 
@@ -1681,6 +1786,7 @@ def run_acceptance(
                             "events": [_event_dict(event) for event in second.events],
                             "stats": [_stats_dict(stats) for stats in second.stats],
                             "diagnostic": second.diagnostic,
+                            "post_drain_slots": _post_drain_slot_counts(process.pid),
                         }
                     )
                     after = read_io_stat(cgroup)
@@ -1760,12 +1866,18 @@ def _evaluate_drains(report, check, dev: str, inode: int, generation: int | None
         not second_matching,
         f"{len(second_matching)} records after the nonpositive pass",
     )
-    if report["workload"].get("cgroup_isolated"):
-        check(
-            "retired_slot_cleared",
-            second["events"] == [],
-            f"{len(second['events'])} records remained in the retired slot",
-        )
+    retired_counts = []
+    for drained in (first, second):
+        slot = drained["drained_slot"]
+        snapshots = drained.get("post_drain_slots", [])
+        counts = snapshots[slot] if slot in (0, 1) and len(snapshots) == 2 else {}
+        retired_counts.append(counts)
+    check(
+        "retired_slot_cleared",
+        all(counts.get("events") == 0 and counts.get("stats") == 0
+            for counts in retired_counts),
+        f"post-drain retired event/stats counts: {retired_counts}",
+    )
     if len(matching) != 1:
         return
     record = matching[0]
@@ -2446,7 +2558,8 @@ def test_unavailable_file_source_keeps_process_and_device_stream_answering(
         daemon.selector.close()
 
 
-def test_drain_evaluation_rejects_identity_byte_slot_and_ownership_regressions() -> None:
+@pytest.fixture
+def drain_evaluation():
     """Falsifiers for the drain assertions that only run on a privileged host.
 
     A lost ``i_generation``, a count that includes a failed operation, a slot that
@@ -2465,7 +2578,13 @@ def test_drain_evaluation_rejects_identity_byte_slot_and_ownership_regressions()
         "bytes_w": 76,
     }
 
-    def evaluate(first, second, *, isolated=True, slots=(0, 1), complete=(1, 1)):
+    def evaluate(first, second, *, isolated=True, slots=(0, 1), complete=(1, 1),
+                 retired_events=(0, 0), retired_stats=(0, 0)):
+        post_drain = []
+        for index, slot in enumerate(slots):
+            counts = [{"events": 0, "stats": 0}, {"events": 0, "stats": 0}]
+            counts[slot] = {"events": retired_events[index], "stats": retired_stats[index]}
+            post_drain.append(counts)
         report = {
             "workload": {
                 "expected": {"reads": 2, "writes": 2, "bytes_r": 76, "bytes_w": 76},
@@ -2481,12 +2600,14 @@ def test_drain_evaluation_rejects_identity_byte_slot_and_ownership_regressions()
                     "complete": complete[0],
                     "drained_slot": slots[0],
                     "events": first,
+                    "post_drain_slots": post_drain[0],
                     "stats": [],
                 },
                 {
                     "complete": complete[1],
                     "drained_slot": slots[1],
                     "events": second,
+                    "post_drain_slots": post_drain[1],
                     "stats": [],
                 },
             ],
@@ -2501,6 +2622,11 @@ def test_drain_evaluation_rejects_identity_byte_slot_and_ownership_regressions()
         _evaluate_drains(report, check, "259:6", 42, 99)
         return failures
 
+    return good, evaluate
+
+
+def test_drain_evaluation_rejects_identity_byte_slot_and_ownership_regressions(drain_evaluation) -> None:
+    good, evaluate = drain_evaluation
     assert evaluate([dict(good)], []) == []
     assert "file_generation" in evaluate([dict(good, generation=1)], [])
     assert "file_inode" not in evaluate([dict(good)], [])  # guarded by the record match
@@ -2509,11 +2635,79 @@ def test_drain_evaluation_rejects_identity_byte_slot_and_ownership_regressions()
     assert "file_name_matches" in evaluate([dict(good, basename="other.bin")], [])
     assert "file_cgroup_attribution" in evaluate([dict(good, cgroup_id=8)], [])
     assert "nonpositive_adds_no_record" in evaluate([dict(good)], [dict(good)])
-    assert "retired_slot_cleared" in evaluate([dict(good)], [dict(good)])
-    assert "retired_slot_cleared" not in evaluate([dict(good)], [dict(good)], isolated=False)
+    assert "retired_slot_cleared" not in evaluate([dict(good)], [dict(good)])
+    assert "retired_slot_cleared" in evaluate([dict(good)], [], isolated=False, retired_events=(0, 55))
     assert "file_record_present" in evaluate([], [])
     assert "drain_slot_rotated" in evaluate([dict(good)], [], slots=(1, 1))
     assert "drain_complete" in evaluate([dict(good)], [], complete=(1, 0))
+
+
+def test_post_drain_counts_follow_inner_ids_and_count_each_slot(tmp_path, monkeypatch) -> None:
+    # The two stats inner names collide with the outer's kernel-truncated name.
+    layout = {
+        11: (b"fileio_slots", 12, 4, 2, None),
+        12: (b"fileio_stats_sl", 12, 4, 2, None),
+        21: (b"fileio_slot_0", 1, 32, 262144, 0),
+        22: (b"fileio_slot_1", 1, 32, 262144, 7),
+        31: (b"fileio_stats_sl", 1, 8, 65536, 0),
+        32: (b"fileio_stats_sl", 1, 8, 65536, 1),
+    }
+    for index, map_id in enumerate((31, 11, 12, 32, 11)):
+        (tmp_path / str(index)).write_text(f"map_id:\t{map_id}\n")
+    (tmp_path / "socket").write_text("ino:\t123\n")
+    opened, closed = [], []
+    monkeypatch.setattr(os, "close", closed.append)
+
+    class FakeMaps:
+        def bpf_map_get_fd_by_id(self, map_id):
+            assert map_id in layout
+            fd = map_id + 1000  # Deliberately distinct from the kernel map ID.
+            opened.append(fd)
+            return fd
+
+        def bpf_obj_get_info_by_fd(self, fd, value, size):
+            name, kind, key_size, capacity, _ = layout[fd - 1000]
+            value = ctypes.cast(value, ctypes.POINTER(_MapInfo)).contents
+            value.name, value.type, value.key_size, value.max_entries = name, kind, key_size, capacity
+            assert ctypes.cast(size, ctypes.POINTER(ctypes.c_uint32)).contents.value == 40
+            return 0
+
+        def bpf_map_lookup_elem(self, fd, key, value):
+            assert fd in (1011, 1012)
+            slot = ctypes.cast(key, ctypes.POINTER(ctypes.c_uint32)).contents.value
+            ctypes.cast(value, ctypes.POINTER(ctypes.c_uint32)).contents.value = (
+                (21, 22) if fd == 1011 else (31, 32)
+            )[slot]
+            return 0
+
+        def bpf_map_get_next_key(self, fd, current, following):
+            _, _, key_size, _, count = layout[fd - 1000]
+            assert count is not None
+            index = 0 if current is None else int.from_bytes(ctypes.string_at(current, key_size), "little") + 1
+            if index == count:
+                ctypes.set_errno(errno.ENOENT)
+                return -errno.ENOENT
+            ctypes.memmove(following, index.to_bytes(key_size, "little"), key_size)
+            return 0
+
+    counts = _post_drain_slot_counts(123, fdinfo_root=tmp_path, libbpf=FakeMaps())
+    assert counts == [
+        {"events": 0, "events_map_id": 21, "stats": 0, "stats_map_id": 31},
+        {"events": 7, "events_map_id": 22, "stats": 1, "stats_map_id": 32},
+    ]
+    assert sorted(opened) == sorted(closed)
+
+
+def test_drain_evaluation_allows_background_records_in_the_other_slot(drain_evaluation) -> None:
+    good, evaluate = drain_evaluation
+    background = dict(good, cgroup_id=999, inode=9999, basename="unrelated.log")
+    assert evaluate([dict(good)], [background]) == []
+
+
+def test_drain_evaluation_requires_the_retired_inner_maps_to_be_empty(drain_evaluation) -> None:
+    good, evaluate = drain_evaluation
+    assert "retired_slot_cleared" in evaluate([dict(good)], [], retired_events=(55, 0))
+    assert "retired_slot_cleared" in evaluate([dict(good)], [], retired_stats=(0, 1))
 
 
 def test_counter_evaluation_rejects_a_dead_cgroup_row_and_hidden_overflow() -> None:
@@ -2603,8 +2797,9 @@ def test_opt_in_privileged_acceptance_confirms_the_real_object_and_workload() ->
     assert first["complete"] == 1 and second["complete"] == 1
     assert first["drained_slot"] != second["drained_slot"]
     assert report["workload"]["second_pass_records"] == []
-    if report["workload"]["cgroup_isolated"]:
-        assert second["events"] == []
+    for drained in (first, second):
+        retired = drained["post_drain_slots"][drained["drained_slot"]]
+        assert retired["events"] == 0 and retired["stats"] == 0
     record = report["workload"]["record"]
     expected = report["workload"]["expected"]
     assert record["dev"] == report["workload"]["expected_dev"]
