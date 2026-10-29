@@ -181,7 +181,11 @@ static int lookup_inner_maps(struct loader_state *state)
 
 static int load_object(struct loader_state *state, const char *path)
 {
-    struct bpf_object_open_opts options = {};
+    /* LIBBPF_OPTS sets .sz. A zeroed struct leaves sz = 0 and libbpf >= 1.0
+       rejects it with EINVAL ("bpf_object_open_opts size (0) is too small"),
+       which made the loader unable to open the object at all. Found by the P4
+       privileged acceptance harness (T-007) on this host. */
+    LIBBPF_OPTS(bpf_object_open_opts, options);
     int error;
 
     unload_object(state);
