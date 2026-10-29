@@ -347,11 +347,12 @@ def test_remote_error_preserves_explicit_reason_without_returning_zeroes(retaine
         remote.close()
 
 
-def test_remote_missing_capability_has_diagnostic_and_never_sends_files_query(retained, tmp_path):
+@pytest.mark.parametrize("file_io", [False, True], ids=["no-file-io", "no-bpf-loaded"])
+def test_remote_missing_capability_has_diagnostic_and_never_sends_files_query(retained, tmp_path, file_io):
     remote = Remote(tmp_path, retained)
     try:
         remote.h.send(snapshot_frame(2, boot_id="boot-A", epoch=1, caps=dict(
-            proc_all=True, dev_stat=True, file_io=False, bpf_loaded=False)))
+            proc_all=True, dev_stat=True, file_io=file_io, bpf_loaded=False)))
         remote.h.client.pump()
         future = remote.router.request_file_view(id_for(remote.router), WINDOW, "bytes_total", "desc", None)
         with pytest.raises(WindowUnavailableError) as caught:
