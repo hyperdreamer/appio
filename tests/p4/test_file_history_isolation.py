@@ -8,7 +8,7 @@ from appio.history_router import HistoryRouter
 from appio.iodclient import AppRegistry
 from appio.query import QueryService
 from tests.p3.test_handover import APP, BOOT, NS, group, initialized, outgoing, record, tick
-from tests.p4.test_file_history_router import Client, retained
+from tests.p4.test_file_history_router import Client, WINDOW, retained
 
 
 def _measured_store(path):
@@ -93,6 +93,80 @@ def test_boot_lookup_failure_does_not_hide_another_sources_file_receipt(
     finally:
         router.close()
         store.connection.close()
+
+
+@pytest.mark.parametrize("previous_success", [False, True], ids=["first-prepare", "reprepare"])
+def test_R02_connection_closed_before_prepare_marks_files_unavailable(retained, previous_success):
+    # The error must happen before submission, not while consuming a worker.
+    # Repreparing also pins that a previous available status cannot survive.
+    router = HistoryRouter(QueryService(retained.db), Client(), AppRegistry())
+    try:
+        if previous_success:
+            router.prepare(WINDOW)
+            router._local_future.result(timeout=10)
+            assert router.ready(WINDOW)
+            assert router.file_source_status().available
+        retained.db.close()
+        with pytest.raises(sqlite3.ProgrammingError, match="Cannot operate on a closed database"):
+            router.prepare(WINDOW)
+        status = router.file_source_status()
+        assert not status.available
+        assert status.reason == "file_source_unavailable"
+    finally:
+        router.close()
+
+
+@pytest.mark.parametrize("failure_stage", ["precheck", "submit"])
+def test_prepare_failure_clears_previous_availability_and_preserves_exception(
+        retained, monkeypatch, failure_stage):
+    router = HistoryRouter(QueryService(retained.db), Client(), AppRegistry())
+    error = RuntimeError("preparation rejected")
+
+    def rejected(*args, **kwargs):
+        raise error
+
+    try:
+        router.prepare(WINDOW)
+        router._local_future.result(timeout=10)
+        assert router.ready(WINDOW)
+        assert router.file_source_status().available
+        if failure_stage == "precheck":
+            monkeypatch.setattr(router.local, "_precheck", rejected)
+        else:
+            monkeypatch.setattr(router._executor, "submit", rejected)
+        with pytest.raises(RuntimeError) as caught:
+            router.prepare(WINDOW)
+        assert caught.value is error
+        status = router.file_source_status()
+        assert not status.available
+        assert status.reason == "file_source_unavailable"
+    finally:
+        router.close()
+
+
+def test_prepare_advertises_file_availability_only_after_submission(retained, monkeypatch):
+    router = HistoryRouter(QueryService(retained.db), Client(), AppRegistry())
+    submit = router._executor.submit
+
+    def checked_submit(*args, **kwargs):
+        status = router.file_source_status()
+        assert not status.available
+        assert status.reason == "file_source_unavailable"
+        return submit(*args, **kwargs)
+
+    monkeypatch.setattr(router._executor, "submit", checked_submit)
+    try:
+        # Repeat after real retained file history has proved availability.
+        for _ in range(2):
+            router.prepare(WINDOW)
+            status = router.file_source_status()
+            assert status.available
+            assert status.reason is None
+            router._local_future.result(timeout=10)
+            assert router.ready(WINDOW)
+            assert router.file_source_status().available
+    finally:
+        router.close()
 
 
 @pytest.mark.parametrize("close_registered", [False, True], ids=["open", "closed"])
