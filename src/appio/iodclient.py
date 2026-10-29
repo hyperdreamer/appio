@@ -62,7 +62,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .contracts import Window, WindowUnavailableError
+from .contracts import FileCoverage, FileTable, Window, WindowUnavailableError
 from .identity import validate_app_key
 from .iod_history import from_wire
 from .ipc_models import (
@@ -262,6 +262,7 @@ class ClientState:
     capabilities: Capabilities | None = None
     pending_activation: bool | None = None
     last_error: str | None = None
+    file_diagnostic: str | None = None
 
 
 class AppRegistry:
@@ -1114,6 +1115,11 @@ class IodClient:
             self._duplicates += 1
             return
         self._capabilities = message["capabilities"]
+        # Snapshot has passed both protocol validation and cursor acceptance.
+        # Never copy an arbitrary object or a stale frame into administrator UI.
+        source = message["coverage"].get("file_source")
+        detail = source.get("diagnostic") if isinstance(source, dict) else None
+        self._file_diagnostic = (detail if len(detail) <= 512 else detail[:511] + "…") if isinstance(detail, str) else None
         self._last_snapshot_ts = message["ts_mono_ns"]
 
     def _apply_gap(self, message: Mapping[str, Any]) -> None:
@@ -1185,6 +1191,10 @@ class IodClient:
             "snapshot": snapshot,
             "next_cursor": meta.get("next_cursor") if isinstance(meta, Mapping) else None,
         }
+        if isinstance(result, (FileTable, FileCoverage)):
+            # Presentation IDs are private to this decoder, not the router's
+            # registry. Preserve the validated external identity for binding.
+            value["app_key"] = self._apps.key_for(result.app_id)
         self._cache_put(pending.key, value, size)
         _settle(pending.future, value=dict(value))
 
@@ -1321,6 +1331,7 @@ class IodClient:
             capabilities=self._capabilities,
             pending_activation=self._pending_activation,
             last_error=self._last_error,
+            file_diagnostic=getattr(self, "_file_diagnostic", None) if verified else None,
         )
         if state != self._state:
             self._state = state

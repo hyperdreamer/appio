@@ -28,6 +28,8 @@ import time
 
 from .cgroups import friendly_device_name, parse_diskstats
 from .contracts import WindowUnavailableError
+from .file_runtime import FileAvailability, FileRuntime
+from .bpf_fileio import FileSourceError
 from .iod_history import HistoryRpc, to_wire
 from .ipc_models import Capabilities, StreamCursor, validate_request, validate_server_message
 from .ipc_protocol import HEADER, FrameDecoder, ProtocolError, encode_frame
@@ -229,7 +231,7 @@ class _Snapshot:
 class Daemon:
     def __init__(self, paths: DaemonPaths = DaemonPaths(), *, clock=None, peer_reader=read_peer,
                  group_lookup=_groups, filesystem=None, selector=None, query_worker=None,
-                 sample_ns=SAMPLE_NS, flush_ns=MAX_FLUSH_NS):
+                 sample_ns=SAMPLE_NS, flush_ns=MAX_FLUSH_NS, file_source_factory=None):
         if type(sample_ns) is not int or sample_ns <= 0:
             raise ValueError("sample_ns must be a positive integer")
         if type(flush_ns) is not int or flush_ns <= sample_ns:
@@ -245,6 +247,9 @@ class Daemon:
         self.clients = {}
         self.refusals = RefusalLog()
         self.collector = None
+        self.file_runtime = None
+        self._file_source_factory = file_source_factory
+        self._file_diagnostic = None
         self.committed_cursor = None
         self.last_error = None
         self._lock_fd = None
@@ -328,6 +333,8 @@ class Daemon:
         self.selector.register(listener, selectors.EVENT_READ, None)
 
     def _new_collector(self):
+        if self.file_runtime is not None:
+            self.file_runtime.close()
         if self.collector is not None:
             self.collector.close()
         self.collector = LiveCollector(self.paths.proc_root, self.paths.cgroup_root, self.paths.database,
@@ -338,6 +345,8 @@ class Daemon:
         connection.execute("PRAGMA synchronous=FULL")
         self._sidecars()
         self._pruner = QuotaPruner(connection, self.paths.database)
+        self.file_runtime = FileRuntime(connection, source_factory=self._file_source_factory)
+        self.file_runtime.start()
 
     def start(self):
         if self._running:
@@ -635,13 +644,16 @@ class Daemon:
         devs = [{"app_key": item.app_key, **asdict(item.delta),
                  "name": friendly_device_name(item.delta.dev, names)} for item in frame.device_deltas]
         summary = asdict(result.coverage)
+        files = (self.file_runtime.availability if self.file_runtime is not None else
+                 FileAvailability(False, False, "file_source_unavailable"))
+        summary["file_source"] = asdict(files)
         summary["apps"] = {item.app_key: asdict(item) for item in frame.coverage}
         if self._storage_error is not None:
             summary["storage_error"] = self._storage_error
         return {"protocol": 1, "type": "snapshot", "boot_id": frame.boot_id,
                 "iod_epoch": frame.epoch, "seq": frame.seq, "ts_mono_ns": frame.observed_mono_ns,
                 "ts_wall": (frame.observed_mono_ns + frame.clock_offset_ns) / NS, "source": "iod",
-                "capabilities": asdict(Capabilities(True, result.coverage.device_state == "available", False, False)),
+                "capabilities": asdict(Capabilities(True, result.coverage.device_state == "available", files.available, files.bpf_loaded)),
                 "procs": procs, "devs": devs, "files": [], "coverage": to_wire(summary, app_keys={})}
 
     def _publish(self):
@@ -709,14 +721,23 @@ class Daemon:
             self._recover = True
             _LOG.warning("collection_failed")
             return
+        collection_elapsed = self.clock()[0] - started
         self._recover = False
         self.last_error = self._storage_error
         if self.last_error is None:
             self._announced_error = None
+        # F consumes the same committed endpoint, in its own short transaction.
+        # It cannot change the T/D error, replay, cadence, or recovery state.
+        try:
+            self.file_runtime.consume(self.collector.last_frame, self.collector.file_context)
+        except FileSourceError:
+            if self._file_diagnostic != self.file_runtime.diagnostic:
+                _LOG.warning("file_source_unavailable diagnostic=%s", self.file_runtime.diagnostic)
+        self._file_diagnostic = self.file_runtime.diagnostic
         self._publish()
         if previous_mono is None or self._committed_mono > previous_mono:
             self._next_recovery = 0
-        if self.clock()[0] - started > self._flush_ns:
+        if collection_elapsed > self._flush_ns:
             self._failure("collection_overdue")
             self._recover = True
             _LOG.warning("collection_overdue")
@@ -833,6 +854,8 @@ class Daemon:
             except FileNotFoundError:
                 pass
             self._socket_identity = None
+        if self.file_runtime is not None:
+            self.file_runtime.close()
         if self.collector is not None:
             self.collector.close()
         if self._lock_fd is not None:
