@@ -18,7 +18,7 @@ even when excluding uncertain whole deltas has reduced every counter to zero.
 from __future__ import annotations
 
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, InvalidStateError, ThreadPoolExecutor
 from dataclasses import dataclass, replace
 import json
 from pathlib import Path
@@ -26,11 +26,12 @@ import sqlite3
 from types import SimpleNamespace
 
 from .contracts import (
-    AppTotal, DiskShare, Series, Window, SQLITE_INT_MAX,
-    validate_enum, validate_sqlite_integer,
+    AppTotal, Direction, DiskShare, FileCoverage, FileSort, FileTable, Series, Window,
+    WindowUnavailableError, SQLITE_INT_MAX, validate_enum, validate_search, validate_sqlite_integer,
 )
 from .durable import decode_handover
-from .iodclient import AppRegistry, GapNotice, IodClient
+from .file_runtime import FileAvailability
+from .iodclient import AppRegistry, GapNotice, IodClient, IodClientError, RequestRejected
 from .ipc_models import QueryRequest
 from .ownership import ownership_exclusions, subtract_intervals
 from .query import QueryService, _model_coverage, _reduce_coverage
@@ -89,10 +90,19 @@ def _coverage(rows, *, gaps=0, overlaps=0, unavailable=False):
                            unavailable_reason=reason)
 
 
+@dataclass(frozen=True)
+class FileViewResult:
+    table: FileTable
+    coverage: FileCoverage
+
+
 class HistoryRouter:
     def __init__(self, local: QueryService, client: IodClient, registry: AppRegistry):
         self.local, self.client, self.registry = local, client, registry
         self._sources = {"local": (local, "gui")}
+        # Capture identity only when a source is registered, never in a Files
+        # request on the UI thread. Worker connections stay read-only.
+        self._source_paths = {"local": local.connection.execute("PRAGMA database_list").fetchone()[2]}
         self.segments: tuple[HistorySegment, ...] = ()
         self.boundaries: tuple[tuple[str, int, str, str], ...] = ()
         self.view_state = "unavailable"
@@ -118,9 +128,202 @@ class HistoryRouter:
         self._cached_parts = {}
         self._remote_snapshot = None
         self._closed = False
+        self._file_jobs = set()
+        self._file_workers = set()
+        self._file_status = FileAvailability(False, False, "file_source_unavailable")
+
+    def _cancel_file_requests(self):
+        for future in tuple(self._file_jobs):
+            self._settle_file(future, self._generation, error=WindowUnavailableError(
+                "file_source_unavailable", "File history generation retired."))
+
+    def _settle_file(self, future, generation, value=None, error=None):
+        if future.done():
+            return
+        if generation != self._generation or self._closed:
+            error = WindowUnavailableError("file_source_unavailable", "File history generation retired.")
+        try:
+            if error is not None:
+                if not isinstance(error, (WindowUnavailableError, IodClientError)):
+                    error = WindowUnavailableError("file_source_unavailable", "File history could not be read.")
+                self._file_status = FileAvailability(False, False,
+                    "not_retained" if getattr(error, "reason", None) == "not_retained" else "file_source_unavailable")
+                future.set_exception(error)
+            else:
+                self._file_status = FileAvailability(True, False)
+                future.set_result(value)
+        except InvalidStateError:
+            pass  # Caller cancellation racing worker completion is not a UI fault.
+
+    def file_source_status(self) -> FileAvailability:
+        state = self.client.state
+        if state is not None and state.verified and state.answering:
+            caps = state.capabilities
+            ready = bool(caps is not None and caps.file_io and caps.bpf_loaded)
+            return FileAvailability(ready, ready, None if ready else "file_source_unavailable",
+                                    getattr(state, "file_diagnostic", None))
+        return self._file_status
+
+    @staticmethod
+    def _check_file_result(table, coverage):
+        if table.window != coverage.window or table.coverage.tier != coverage.coverage.tier:
+            raise WindowUnavailableError("file_source_unavailable", "Mixed file scope or retention tiers.")
+        for evidence in (table.coverage, coverage.coverage):
+            if evidence.unavailable_reason:
+                raise WindowUnavailableError(evidence.unavailable_reason, "File history is not available for this window.")
+        if table.coverage != coverage.coverage or table.unknown_owner_overflow != coverage.unknown_owner_overflow:
+            raise WindowUnavailableError("file_source_unavailable", "File coverage does not match the table snapshot.")
+        return FileViewResult(table, coverage)
+
+    @staticmethod
+    def _read_local_files(paths, window, key, app_id, sort, direction, search):
+        """Read one ownership-proved store on the bounded executor, never sum IDs.
+
+        Process retraction cannot retract top-100 hourly F candidates. Reject any
+        mixed or excluded window instead of using _materialize's unfiltered F
+        tables, or making raw-process retention a prerequisite for F retention.
+        """
+        sources, worker = [], None
+        try:
+            for name, path, owner in paths:
+                source = sqlite3.connect(Path(path).as_uri() + "?mode=ro", uri=True, timeout=0.2)
+                copy = sqlite3.connect(":memory:")
+                try:
+                    source.backup(copy)
+                finally:
+                    source.close()
+                sources.append((name, QueryService(copy), owner))
+            worker = HistoryRouter(sources[0][1], SimpleNamespace(state=None), AppRegistry())
+            worker._sources = {name: (service, owner) for name, service, owner in sources}
+            worker._window = window
+            worker._plan(window)
+            names = {s.collector_id for s in worker.segments if s.proven}
+            if (len(names) != 1 or not worker.segments or any(not s.proven for s in worker.segments)
+                    or worker._chronology_unproved):
+                raise WindowUnavailableError("file_source_unavailable", "File ownership cannot be represented by one store.")
+            service = worker._sources[names.pop()][0]
+            row = service.connection.execute("SELECT app_id FROM app WHERE key=?", (key,)).fetchone()
+            if row is None:
+                raise WindowUnavailableError("file_source_unavailable", "No authoritative file app receipt.")
+            with service._snapshot():
+                table = service.file_table(row[0], window, sort, direction, search)
+                coverage = service.file_coverage(row[0], window)
+            return HistoryRouter._check_file_result(replace(table, app_id=app_id), replace(coverage, app_id=app_id))
+        finally:
+            if worker is not None:
+                worker.close()
+            for _, service, _ in sources:
+                service.connection.close()
+
+    def request_file_view(self, app_id: int, window: Window, sort: FileSort,
+                          direction: Direction, search: str | None) -> Future[FileViewResult]:
+        # A22 must win even over a bad app/sort, just as on the RPC surface.
+        self.local._precheck(window)
+        validate_enum(sort, ("bytes_total", "bytes_r", "bytes_w", "reads", "writes", "basename", "dev", "last_seen"), "sort")
+        validate_enum(direction, ("asc", "desc"), "direction")
+        validate_search(search)
+        future, generation = Future(), self._generation
+        if len(self._file_jobs) >= 8 or len(self._file_workers) >= 8:
+            future.set_exception(RequestRejected("query_busy", "File history queue is full."))
+            return future
+        self._file_jobs.add(future)
+        future.add_done_callback(self._file_jobs.discard)
+        try:
+            self._require(window)
+            key = self.registry.key_for(app_id)
+            if self._remote is not None:
+                self._request_remote_files(future, generation, app_id, key, window, sort, direction, search)
+            else:
+                paths = []
+                for name, (service, owner) in self._sources.items():
+                    path = self._source_paths[name]
+                    if not path or service.connection.in_transaction:
+                        raise WindowUnavailableError("file_source_unavailable", "File history needs a committed store.")
+                    paths.append((name, path, owner))
+                def read():
+                    if not future.done():
+                        return self._read_local_files(paths, window, key, app_id, sort, direction, search)
+                job = self._executor.submit(read)
+                # Cancellation retires a UI response, not a running worker.
+                # Keep its admission slot until the executor really retires it.
+                self._file_workers.add(job)
+                job.add_done_callback(self._file_workers.discard)
+                def completed(job):
+                    try:
+                        self._settle_file(future, generation, value=job.result())
+                    except Exception as error:
+                        self._settle_file(future, generation, error=error)
+                job.add_done_callback(completed)
+        except Exception as error:
+            self._settle_file(future, generation, error=error)
+        return future
+
+    def _request_remote_files(self, out, generation, app_id, key, window, sort, direction, search):
+        snapshot = self._remote_snapshot
+        state = self.client.state
+        if not self.file_source_status().available or snapshot is None:
+            raise WindowUnavailableError("file_source_unavailable", "Daemon file source unavailable.")
+        cursor, connection = state.cursor, getattr(self.client, "generation", None)
+        pages, tokens = [], set()
+        request = QueryRequest("files", window, key, sort=sort, direction=direction, search=search)
+
+        def active():
+            now = self.client.state
+            if (out.done() or generation != self._generation or self._closed or now is None
+                    or not now.verified or not now.answering or now.cursor != cursor
+                    or getattr(self.client, "generation", None) != connection):
+                raise WindowUnavailableError("file_source_unavailable", "Stale file history response.")
+
+        def decoded(job, kind):
+            active()
+            response = job.result()
+            if (response.get("snapshot") != snapshot or response.get("kind") != kind
+                    or response.get("app_key") != key):
+                raise WindowUnavailableError("file_source_unavailable", "Remote file scope or snapshot changed.")
+            return response
+
+        def covered(job):
+            try:
+                response = decoded(job, "coverage")
+                coverage = response["result"]
+                if not isinstance(coverage, FileCoverage) or response.get("next_cursor") is not None:
+                    raise WindowUnavailableError("file_source_unavailable", "Invalid remote file coverage.")
+                table = replace(pages[0], rows=tuple(row for page in pages for row in page.rows), app_id=app_id)
+                value = self._check_file_result(table, replace(coverage, app_id=app_id))
+                self._settle_file(out, generation, value=value)
+            except Exception as error:
+                self._settle_file(out, generation, error=error)
+
+        def received(job):
+            try:
+                response = decoded(job, "files")
+                table = response["result"]
+                if (not isinstance(table, FileTable) or table.window != window or
+                        (table.sort, table.direction, table.search) != (sort, direction, search)):
+                    raise WindowUnavailableError("file_source_unavailable", "Remote file scope changed.")
+                if pages and replace(table, rows=pages[0].rows) != pages[0]:
+                    raise WindowUnavailableError("file_source_unavailable", "Remote file page metadata changed.")
+                pages.append(table)
+                if sum(len(page.rows) for page in pages) > 50_000 or len(pages) > 128:
+                    raise RequestRejected("query_too_large", "File history exceeds the bounded view budget.")
+                token = response.get("next_cursor")
+                if token is not None:
+                    if not isinstance(token, str) or not token or token in tokens or not table.rows:
+                        raise WindowUnavailableError("file_source_unavailable", "Invalid file continuation.")
+                    tokens.add(token)
+                    # Opaque server HMAC, forwarded unchanged. Never decode,
+                    # recompute, skip a page, or fabricate a local continuation.
+                    self.client.query(replace(request, cursor=token)).add_done_callback(received)
+                else:
+                    self.client.query(QueryRequest("coverage", window, key, coverage_kind="file")).add_done_callback(covered)
+            except Exception as error:
+                self._settle_file(out, generation, error=error)
+        self.client.query(request).add_done_callback(received)
 
     def invalidate(self) -> None:
         self._generation += 1
+        self._cancel_file_requests()
+        self._file_status = FileAvailability(False, False, "file_source_unavailable")
         self._local_generation = -1
         if self._local_future is not None:
             self._local_future.cancel()
@@ -132,6 +335,7 @@ class HistoryRouter:
             raise ValueError("an imported collector requires its own identity")
         validate_enum(owner, ("gui", "iod"), "owner")
         self._sources[collector_id] = (service, owner)
+        self._source_paths[collector_id] = service.connection.execute("PRAGMA database_list").fetchone()[2]
         self.invalidate()
 
     def record_transport_gap(self, notice: GapNotice) -> None:
@@ -428,6 +632,8 @@ class HistoryRouter:
         if self._closed:
             raise RuntimeError("history router is closed")
         self._generation += 1
+        self._cancel_file_requests()
+        self._file_status = FileAvailability(False, False, "file_source_unavailable")
         self._window, self._ready = window, False
         self.segments, self.boundaries = (), ()
         self._gap_ranges, self._overlap_ranges = [], []
