@@ -11,7 +11,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/sysmacros.h>
 #include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
@@ -337,12 +336,11 @@ static int append_record(struct record_vector *records,
     struct fileio_file_record *record = &records->items[records->count++];
     memset(record, 0, sizeof(*record));
     record->cgroup_id = key->cgroup_id;
-    record->major = major((dev_t)key->device);
-    record->minor = minor((dev_t)key->device);
-    { FILE *dbg = fopen("/tmp/appdbg.log", "a");
-      if (dbg) { fprintf(dbg, "device=%llu major=%u minor=%u sizeof_dev_t=%zu\n",
-                         (unsigned long long)key->device, record->major, record->minor, sizeof(dev_t));
-                 fclose(dbg); } }
+    /* bd_dev is Linux's internal dev_t (12 major bits, 20 minor bits).
+     * It is not libc's differently encoded st_dev. Keep the raw BPF key intact.
+     */
+    record->major = (__u32)(key->device >> 20);
+    record->minor = (__u32)(key->device & ((1U << 20) - 1));
     record->inode = key->inode;
     record->generation = key->i_generation;
     record->reads = value->reads;
