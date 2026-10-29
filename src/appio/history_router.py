@@ -640,12 +640,13 @@ class HistoryRouter:
                 service.connection.close()
 
     def prepare(self, window: Window) -> None:
+        # Preparation may fail before a future exists to report unavailability.
+        self._file_status = FileAvailability(False, False, "file_source_unavailable")
         self.local._precheck(window)
         if self._closed:
             raise RuntimeError("history router is closed")
         self._generation += 1
         self._cancel_file_requests()
-        self._file_status = FileAvailability(True, False)
         self._window, self._ready = window, False
         self.segments, self.boundaries = (), ()
         self._gap_ranges, self._overlap_ranges = [], []
@@ -670,6 +671,7 @@ class HistoryRouter:
         if state is not None and state.verified and state.answering:
             self._queue.append(QueryRequest("ranking", window))
             self._dispatch()
+        self._file_status = FileAvailability(True, False)
 
     def _consume_local(self):
         if self._local_generation is None:
