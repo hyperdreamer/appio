@@ -616,13 +616,17 @@ class HistoryRouter:
                     except (ValueError, RuntimeError) as error:
                         # An A22-disabled series is not a zero-filled timeline.
                         details[(kind, row.app_key)] = error
-            file_available = any(
-                service.connection.execute(
-                    "SELECT 1 FROM boot WHERE file_finalized_through_mono_ns > 0 LIMIT 1"
-                ).fetchone()
-                is not None
-                for _, service, _ in sources
-            )
+            file_available = False
+            for _, service, _ in sources:
+                try:
+                    if service.connection.execute(
+                            "SELECT 1 FROM boot WHERE file_finalized_through_mono_ns > 0 LIMIT 1"
+                    ).fetchone() is not None:
+                        file_available = True
+                except Exception:
+                    # Optional file metadata must not suppress process history
+                    # or prevent another source from proving file availability.
+                    continue
             return {"ranking": worker._ranking, "parts": details, "segments": worker.segments,
                 "boundaries": worker.boundaries, "gaps": worker._gap_ranges,
                 "overlaps": worker._overlap_ranges, "local_history": worker._has_local_history,
@@ -674,7 +678,11 @@ class HistoryRouter:
             return False
         if self._local_future is None or not self._local_future.done():
             return False
-        data = self._local_future.result()
+        try:
+            data = self._local_future.result()
+        except Exception:
+            self._file_status = FileAvailability(False, False, "file_source_unavailable")
+            raise
         self.segments, self.boundaries = data["segments"], data["boundaries"]
         self._gap_ranges, self._overlap_ranges = data["gaps"], data["overlaps"]
         self._has_local_history = data["local_history"]
