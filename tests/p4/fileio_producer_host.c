@@ -11,6 +11,8 @@ static void *host_lookup(const void *map, const void *key);
 static long host_update(const void *map, const void *key, const void *value, __u64 flags);
 static __u64 host_cgroup(void);
 static long host_read(void *dst, __u32 size, const void *src);
+static __u64 host_atomic_add(__u64 *counter, __u64 delta);
+static __u64 host_atomic_sub(__u64 *counter, __u64 delta);
 
 #define __uint(name, value) int (*name)[value]
 #define __type(name, value) value *name
@@ -22,6 +24,8 @@ static long host_read(void *dst, __u32 size, const void *src);
 #define bpf_map_update_elem host_update
 #define bpf_get_current_cgroup_id host_cgroup
 #define bpf_probe_read_kernel host_read
+#define __sync_fetch_and_add host_atomic_add
+#define __sync_fetch_and_sub host_atomic_sub
 /* glibc and the kernel spell loff_t differently; no helper uses this typedef. */
 #define loff_t fileio_host_loff_t
 #include "fileio_host_helpers.h"
@@ -123,6 +127,22 @@ static long host_update(const void *map, const void *key, const void *value, __u
 
 static __u64 host_cgroup(void) { return cgroup_id; }
 
+/* The scheduler switches callers only at map update boundaries. Each arithmetic
+ * operation here is one indivisible host step with the builtin's return value. */
+static __u64 host_atomic_add(__u64 *counter, __u64 delta)
+{
+    __u64 previous = *counter;
+    *counter += delta;
+    return previous;
+}
+
+static __u64 host_atomic_sub(__u64 *counter, __u64 delta)
+{
+    __u64 previous = *counter;
+    *counter -= delta;
+    return previous;
+}
+
 static long host_read(void *dst, __u32 size, const void *src)
 {
     memcpy(dst, src, size);
@@ -135,25 +155,41 @@ int main(int argc, char **argv)
     if (argc >= 3) active_slot = (__u32)strtoul(argv[2], NULL, 10);
     if (active_slot > 1) return 2;
     if (argc == 4) cgroup_id = strtoull(argv[3], NULL, 10);
+    int sequence = 0;
+    ssize_t returned_bytes = 30;
     if (strcmp(argv[1], "race-event") == 0) race_event = 1;
     else if (strcmp(argv[1], "race-stats") == 0) race_stats = 1;
     else if (strcmp(argv[1], "race-skip") == 0) race_stats = race_skip = 1;
     else if (strcmp(argv[1], "event-full") == 0) event_error = -E2BIG;
     else if (strcmp(argv[1], "stats-full") == 0) stats_error = -E2BIG;
-    else return 2;
+    else if (strcmp(argv[1], "event-disappears") == 0) event_error = -EEXIST;
+    else if (strcmp(argv[1], "stats-disappears") == 0) stats_error = -EEXIST;
+    else if (strcmp(argv[1], "read-wide") == 0) returned_bytes = 4294967313L;
+    else if (strcmp(argv[1], "read-sequence") == 0) sequence = 1;
+    else if (strcmp(argv[1], "overflow-sequence") == 0) {
+        sequence = 1;
+        event_error = -E2BIG;
+    } else return 2;
 
-    if (race_skip) fileio_mark_skip(cgroup_id, 0);
-    else fileio_account(&file, 30, direction, FILEIO_HOOK_VFS_READ);
+    if (sequence) {
+        fileio_account(&file, 70, FILEIO_READ, FILEIO_HOOK_VFS_READ);
+        fileio_account(&file, 30, FILEIO_READ, FILEIO_HOOK_VFS_READ);
+        fileio_account(&file, 11, FILEIO_WRITE, FILEIO_HOOK_VFS_WRITE);
+        fileio_account(&file, 0, FILEIO_READ, FILEIO_HOOK_VFS_READ);
+        fileio_account(&file, -EIO, FILEIO_READ, FILEIO_HOOK_VFS_READ);
+    } else if (race_skip) fileio_mark_skip(cgroup_id, 0);
+    else fileio_account(&file, returned_bytes, direction, FILEIO_HOOK_VFS_READ);
     const struct fileio_value *event = &events[active_slot];
     const struct fileio_cgroup_stats_value *stat = &stats[active_slot];
     printf("{\"bytes_r\":%llu,\"bytes_w\":%llu,\"reads\":%llu,\"writes\":%llu,"
-           "\"hook_hits\":%llu,\"overflow_files\":%llu,\"overflow_bytes_r\":%llu,"
+           "\"hook_hits\":%llu,\"hook_hits_w\":%llu,\"overflow_files\":%llu,\"overflow_bytes_r\":%llu,"
            "\"overflow_bytes_w\":%llu,\"skipped_nonfile\":%llu,"
            "\"skipped_unsupported\":%llu,\"in_flight\":%llu,"
            "\"event_present\":%d,\"stats_present\":%d,\"cgroup_id\":%llu}\n",
            (unsigned long long)event->bytes_r, (unsigned long long)event->bytes_w,
            (unsigned long long)event->reads, (unsigned long long)event->writes,
            (unsigned long long)stat->hook_hits[FILEIO_HOOK_VFS_READ],
+           (unsigned long long)stat->hook_hits[FILEIO_HOOK_VFS_WRITE],
            (unsigned long long)stat->overflow_files, (unsigned long long)stat->overflow_bytes_r,
            (unsigned long long)stat->overflow_bytes_w, (unsigned long long)stat->skipped_nonfile,
            (unsigned long long)stat->skipped_unsupported, (unsigned long long)in_flight,
