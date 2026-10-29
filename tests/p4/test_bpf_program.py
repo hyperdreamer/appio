@@ -103,17 +103,13 @@ def test_bpf_program_has_two_hash_slots_behind_array_of_maps(bpf_source: str) ->
     assert re.search(r"fileio_slots|event_slots|hash_slots", bpf_source)
 
 
-def test_bpf_program_counts_failed_updates_as_per_cgroup_overflow(bpf_source: str) -> None:
-    update = re.search(
-        r"if\s*\(\s*(?:update_rc|update_result|rc)\s*!=\s*0\s*\)\s*\{(?P<body>.*?)\}",
-        bpf_source,
-        re.DOTALL,
-    )
-    assert update is not None
-    body = update.group("body")
-    assert "overflow_files" in body
-    assert "overflow_bytes" in body
-    assert "fileio_cgroup_stats" in bpf_source
+def test_bpf_program_counts_failed_updates_as_per_cgroup_overflow(native_producer_probe) -> None:
+    # Map capacity failures must preserve the actual positive return counts.
+    result = native_producer_probe("overflow-sequence")
+    assert (result["overflow_files"], result["overflow_bytes_r"],
+            result["overflow_bytes_w"]) == (3, 100, 11)
+    assert result["event_present"] == 0
+    assert (result["hook_hits"], result["hook_hits_w"], result["in_flight"]) == (2, 1, 0)
 
 
 def test_readv_and_writev_bodies_do_not_call_iter_hooks(bpf_source: str) -> None:
@@ -132,167 +128,124 @@ def test_loader_declares_protocol_and_six_hook_abi(loader_source: str) -> None:
     assert "fileio_protocol.h" in loader_source
 
 
-def test_loader_uses_quiescence_and_clear_before_drain_ack(loader_source: str) -> None:
-    for token in ("in_flight", "quiesc", "clear", "DRAIN", "complete"):
-        assert token.lower() in loader_source.lower()
-    assert re.search(r"acknowledge|response", loader_source, re.IGNORECASE)
+def test_loader_uses_quiescence_and_clear_before_drain_ack(native_loader_probe) -> None:
+    # F=flip, B=busy lookup, S=sleep, Q=zero in-flight, E/T=first
+    # event/stats clear, A=ack. Removing the production wait gives FETA.
+    for result in native_loader_probe():
+        assert result["order"] == "FBSBSQETA"
+        assert result["cleared_while_busy"] == 0
+        assert (result["wait_reads"], result["sleep_calls"]) == (3, 2)
+        assert (result["status"], result["error"], result["complete"]) == (0, 0, 1)
+
+
+@pytest.mark.parametrize("scenario,expected", [
+    ("read-sequence", (100, 2, 11, 1, 2, 1)),
+    ("read-wide", (4294967313, 1, 0, 0, 1, 0)),
+])
+def test_native_producer_successful_read_byte_arithmetic(
+    native_producer_probe, scenario, expected,
+) -> None:
+    # First insert and existing-entry accumulation use successful returned bytes;
+    # zero/negative returns do not contribute, and 64-bit returns are not truncated.
+    result = native_producer_probe(scenario)
+    assert (result["bytes_r"], result["reads"], result["bytes_w"], result["writes"],
+            result["hook_hits"], result["hook_hits_w"]) == expected
+    assert (result["overflow_files"], result["in_flight"]) == (0, 0)
+
+
+@pytest.mark.parametrize("mode,error,order", [
+    ("timeout", -110, "FBA"),
+    ("lookup-error", -5, "FXA"),
+])
+def test_native_loader_failed_quiescence_preserves_retired_maps(
+    native_loader_probe, mode, error, order,
+) -> None:
+    result, = native_loader_probe(mode=mode)
+    assert result["order"] == order
+    assert (result["status"], result["error"], result["complete"]) == (1, error, 0)
+    assert result["event_counts"] == [55, 7]
+    assert result["stats_counts"] == [1, 1]
+    assert (result["events"], result["stats"], result["wait_reads"]) == (0, 0, 1)
+
+
+@pytest.fixture(scope="module")
+def native_producer_probe(tmp_path_factory):
+    """Compile production helpers against deterministic map and atomic stubs."""
+    compiler = shutil.which("cc")
+    assert compiler is not None, "native producer probe requires cc"
+    out = tmp_path_factory.mktemp("native-producer-probe")
+    source = BPF_SOURCE.read_text(encoding="utf-8")
+    # Preserve all map declarations and helper bodies verbatim. The hook wrappers
+    # require BPF register calling conventions and are checked by the BPF build.
+    helpers = source[:source.index('SEC("fexit/vfs_read")')]
+    helpers = "\n".join(line for line in helpers.splitlines()
+                        if not line.startswith("#include <bpf/"))
+    (out / "fileio_host_helpers.h").write_text(helpers, encoding="utf-8")
+    binary = out / "producer"
+    built = subprocess.run(
+        [compiler, "-O2", "-std=gnu11", "-Wall", "-Wextra", "-Werror",
+         "-I", str(out), "-I", str(BPF_DIR),
+         str(Path(__file__).with_name("fileio_producer_host.c")), "-o", str(binary)],
+        capture_output=True, text=True, check=False, timeout=30,
+    )
+    assert built.returncode == 0, built.stdout + built.stderr
+
+    def run(scenario, slot=0, cgroup=42):
+        result = subprocess.run([str(binary), scenario, str(slot), str(cgroup)],
+                                capture_output=True, text=True, check=False, timeout=5)
+        assert result.returncode == 0, result.stdout + result.stderr
+        return json.loads(result.stdout)
+
+    return run
+
+
+@pytest.mark.parametrize("scenario", ["race-event", "race-stats"])
+@pytest.mark.parametrize("slot,cgroup", [(0, 42), (1, 0)])
+def test_native_producer_first_touch_preserves_both_cpus(
+    native_producer_probe, scenario, slot, cgroup,
+) -> None:
+    # Breaks on BPF_ANY at either first-touch site, including the reserved key.
+    result = native_producer_probe(scenario, slot, cgroup)
+    assert (result["bytes_r"], result["reads"], result["hook_hits"],
+            result["overflow_files"], result["overflow_bytes_r"]) == (100, 2, 2, 0, 0)
+    assert result["stats_present"] == result["event_present"] == 1
+    assert result["cgroup_id"] == cgroup
+    assert result["in_flight"] == 0
+
+
+def test_native_producer_stats_race_preserves_skip_deltas(native_producer_probe) -> None:
+    result = native_producer_probe("race-skip")
+    assert (result["skipped_nonfile"], result["skipped_unsupported"]) == (1, 1)
+
+
+def test_native_producer_genuine_insert_failures(native_producer_probe) -> None:
+    for scenario in ("event-full", "event-disappears"):
+        full = native_producer_probe(scenario)
+        assert (full["event_present"], full["overflow_files"], full["overflow_bytes_r"],
+                full["hook_hits"], full["in_flight"]) == (0, 1, 30, 1, 0)
+    for scenario in ("stats-full", "stats-disappears"):
+        no_stats = native_producer_probe(scenario)
+        assert (no_stats["stats_present"], no_stats["event_present"], no_stats["bytes_r"],
+                no_stats["in_flight"]) == (0, 1, 30, 0)
 
 
 @pytest.fixture(scope="module")
 def native_loader_probe(tmp_path_factory):
     """Run production C against fake maps; never open/load a BPF object."""
     compiler = shutil.which("cc")
-    if compiler is None:
-        pytest.skip("native loader probe requires cc and libbpf development files")
+    assert compiler is not None, "native loader probe requires cc and libbpf development files"
     out = tmp_path_factory.mktemp("native-loader-probe")
-    source = out / "probe.c"
-    source.write_text(
-        r'''
-#define _POSIX_C_SOURCE 200809L
-#include <bpf/bpf.h>
-#include <bpf/libbpf.h>
-#include <errno.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <unistd.h>
-static int fake_next(int fd, const void *key, void *next);
-static int fake_lookup(int fd, const void *key, void *value);
-static int fake_delete(int fd, const void *key);
-static int fake_update(int fd, const void *key, const void *value, __u64 flags);
-static ssize_t fake_write(int fd, const void *data, size_t size);
-static __attribute__((unused)) FILE *fake_fopen(const char *path, const char *mode);
-#define fopen fake_fopen
-#define bpf_map_get_next_key fake_next
-#define bpf_map_lookup_elem fake_lookup
-#define bpf_map_delete_elem fake_delete
-#define bpf_map_update_elem fake_update
-#define write fake_write
-#define main fileio_loader_main
-#include "fileio_loader.c"
-#undef main
-#undef write
-#undef fopen
-
-/* Suppress the baseline's temporary device debug file during the probe. */
-static FILE *fake_fopen(const char *path, const char *mode)
-{
-    (void)path; (void)mode;
-    return NULL;
-}
-
-static unsigned int active_slot;
-static __u64 raw_device = 0x10300005;
-/* event slots 0/1 at fd 20/21; stats slots 0/1 at fd 22/23. */
-static unsigned char live[4][55];
-static unsigned char output[32768];
-static size_t output_size;
-
-static int absent(void) { errno = ENOENT; return -ENOENT; }
-static int index_for(int fd) { if (fd < 20 || fd > 23) abort(); return fd - 20; }
-static __attribute__((noinline)) unsigned int key_index(int fd, const void *key)
-{
-    return fd < 22 ? (unsigned int)((const struct fileio_key *)key)->inode - 1
-                   : (unsigned int)*(const __u64 *)key - 1;
-}
-static int fake_next(int fd, const void *key, void *next)
-{
-    int map = index_for(fd);
-    unsigned int start = key ? key_index(fd, key) + 1 : 0;
-    for (unsigned int i = start; i < 55; i++) {
-        if (!live[map][i]) continue;
-        if (fd < 22) {
-            struct fileio_key event = { .cgroup_id = 42, .device = raw_device,
-                                       .inode = i + 1, .i_generation = 7 };
-            memcpy(next, &event, sizeof(event));
-        } else {
-            __u64 cgroup = i + 1;
-            memcpy(next, &cgroup, sizeof(cgroup));
-        }
-        return 0;
-    }
-    return absent();
-}
-static int fake_lookup(int fd, const void *key, void *value)
-{
-    if (fd == 10) { memcpy(value, &active_slot, sizeof(active_slot)); return 0; }
-    if (fd == 11) { memset(value, 0, sizeof(__u64)); return 0; }
-    unsigned int i = key_index(fd, key);
-    if (i >= 55 || !live[index_for(fd)][i]) return absent();
-    if (fd < 22) {
-        struct fileio_value event = { .reads = 1, .bytes_r = 17,
-                                     .name_len = 3, .name = "log" };
-        memcpy(value, &event, sizeof(event));
-    } else {
-        struct fileio_cgroup_stats stats = {0};
-        memcpy(value, &stats, sizeof(stats));
-    }
-    return 0;
-}
-static int fake_delete(int fd, const void *key)
-{
-    unsigned int i = key_index(fd, key);
-    if (i >= 55 || !live[index_for(fd)][i]) return absent();
-    live[index_for(fd)][i] = 0;
-    return 0;
-}
-static int fake_update(int fd, const void *key, const void *value, __u64 flags)
-{
-    if (fd != 10 || *(__u32 *)key != 0 || flags != BPF_ANY) abort();
-    memcpy(&active_slot, value, sizeof(active_slot));
-    return 0;
-}
-static ssize_t fake_write(int fd, const void *data, size_t size)
-{
-    if (fd != STDOUT_FILENO || output_size + size > sizeof(output)) abort();
-    memcpy(output + output_size, data, size);
-    output_size += size;
-    return (ssize_t)size;
-}
-static unsigned int count(int map)
-{
-    unsigned int result = 0;
-    for (unsigned int i = 0; i < 55; i++) result += live[map][i] != 0;
-    return result;
-}
-int main(int argc, char **argv)
-{
-    if (argc == 2) raw_device = strtoull(argv[1], NULL, 0);
-    struct loader_state state = { .active_slot_fd = 10, .in_flight_fd = 11,
-        .event_fd = {20, 21}, .stats_fd = {22, 23}, .hook_mask = 63, .ready = true };
-    struct fileio_flip_request request = { .epoch = 1, .seq = 1 };
-    memset(live[0], 1, 55);
-    memset(live[1], 1, 7);
-    live[2][0] = live[3][0] = 1;
-    for (int pass = 0; pass < 3; pass++) {
-        output_size = 0;
-        if (drain(&state, &request) != 0) return 1;
-        struct fileio_drain_response response;
-        memcpy(&response, output, sizeof(response));
-        struct fileio_file_record event = {0};
-        if (response.event_count)
-            memcpy(&event, output + sizeof(response), sizeof(event));
-        printf("{\"slot\":%u,\"events\":%u,\"stats\":%u,\"status\":%u,"
-               "\"active\":%u,\"event_counts\":[%u,%u],\"stats_counts\":[%u,%u],"
-               "\"device\":[%u,%u]}\n", response.drained_slot,
-               response.event_count, response.stats_count, response.status, active_slot,
-               count(0), count(1), count(2), count(3), event.major, event.minor);
-        request.seq++;
-    }
-    return 0;
-}
-''',
-        encoding="utf-8",
-    )
+    source = Path(__file__).with_name("fileio_loader_host.c")
     binary = out / "probe"
     built = subprocess.run(
         [compiler, "-O2", "-std=c11", "-Wall", "-Wextra", "-Werror",
          "-I", str(BPF_DIR), str(source), "-o", str(binary), "-lbpf", "-lelf", "-lz"],
-        capture_output=True, text=True, check=False,
+        capture_output=True, text=True, check=False, timeout=30,
     )
     assert built.returncode == 0, built.stdout + built.stderr
-    def run(kernel_dev=0x10300005):
-        result = subprocess.run([str(binary), hex(kernel_dev)], capture_output=True,
+
+    def run(kernel_dev=0x10300005, mode="success"):
+        result = subprocess.run([str(binary), hex(kernel_dev), mode], capture_output=True,
                                 text=True, check=False, timeout=5)
         assert result.returncode == 0, result.stderr
         return [json.loads(line) for line in result.stdout.splitlines()]
@@ -315,10 +268,11 @@ def test_native_loader_clears_both_retired_inner_maps(native_loader_probe) -> No
     # Characterization control: this already passes at the lane's baseline.
     # Removing clear_map or selecting the new slot must make it fail.
     first, second, revisit = native_loader_probe()
-    assert first == {
+    expected_first = {
         "slot": 0, "events": 55, "stats": 1, "status": 0, "active": 1,
         "event_counts": [0, 7], "stats_counts": [0, 1], "device": first["device"],
     }
+    assert {key: first[key] for key in expected_first} == expected_first
     assert second["slot"] == 1 and second["events"] == 7 and second["stats"] == 1
     assert second["event_counts"] == [0, 0] and second["stats_counts"] == [0, 0]
     assert revisit["slot"] == 0 and revisit["events"] == 0 and revisit["stats"] == 0

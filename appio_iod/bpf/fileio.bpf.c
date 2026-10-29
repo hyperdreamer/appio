@@ -1,4 +1,5 @@
 #include <linux/bpf.h>
+#include <linux/errno.h>
 #include <linux/stat.h>
 #include <linux/types.h>
 
@@ -127,8 +128,10 @@ static __always_inline struct fileio_cgroup_stats_value *fileio_stats_for(__u64 
 
     struct fileio_cgroup_stats_value initial = {};
     initial.cgroup_id = cgroup_id;
-    if (bpf_map_update_elem(stats_map, &cgroup_id, &initial, BPF_ANY) != 0)
+    long update_rc = bpf_map_update_elem(stats_map, &cgroup_id, &initial, BPF_NOEXIST);
+    if (update_rc != 0 && update_rc != -EEXIST)
         return NULL;
+    /* A competing CPU may have installed and already incremented the winner. */
     return bpf_map_lookup_elem(stats_map, &cgroup_id);
 }
 
@@ -226,22 +229,29 @@ static __always_inline int fileio_account(struct file *file, ssize_t ret,
         goto out;
 
     struct fileio_value *current = bpf_map_lookup_elem(event_map, &key);
+    long update_rc = 0;
+    if (current == NULL) {
+        update_rc = bpf_map_update_elem(event_map, &key, &value, BPF_NOEXIST);
+        if (update_rc == -EEXIST) {
+            current = bpf_map_lookup_elem(event_map, &key);
+            if (current != NULL)
+                update_rc = 0;
+        }
+    }
     if (current != NULL) {
         __sync_fetch_and_add(&current->reads, value.reads);
         __sync_fetch_and_add(&current->writes, value.writes);
         __sync_fetch_and_add(&current->bytes_r, value.bytes_r);
         __sync_fetch_and_add(&current->bytes_w, value.bytes_w);
-    } else {
-        long update_rc = bpf_map_update_elem(event_map, &key, &value, BPF_ANY);
-        if (update_rc != 0) {
-            struct fileio_cgroup_stats_value *overflow_stats = fileio_stats_for(cgroup_id);
-            if (overflow_stats != NULL) {
-                __sync_fetch_and_add(&overflow_stats->overflow_files, 1);
-                if (direction == FILEIO_WRITE)
-                    __sync_fetch_and_add(&overflow_stats->overflow_bytes_w, (__u64)ret);
-                else
-                    __sync_fetch_and_add(&overflow_stats->overflow_bytes_r, (__u64)ret);
-            }
+    }
+    if (update_rc != 0) {
+        struct fileio_cgroup_stats_value *overflow_stats = fileio_stats_for(cgroup_id);
+        if (overflow_stats != NULL) {
+            __sync_fetch_and_add(&overflow_stats->overflow_files, 1);
+            if (direction == FILEIO_WRITE)
+                __sync_fetch_and_add(&overflow_stats->overflow_bytes_w, (__u64)ret);
+            else
+                __sync_fetch_and_add(&overflow_stats->overflow_bytes_r, (__u64)ret);
         }
     }
 
