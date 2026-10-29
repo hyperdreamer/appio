@@ -25,12 +25,27 @@ from PyQt6.QtWidgets import (
     QMenu,
     QSystemTrayIcon,
     QTabWidget,
+    QTableView,
     QTableWidget,
 )
 
 from appio.collector_owner import ServiceFacts
-from appio.contracts import RAW_BUCKET_NS, Window
+from appio.contracts import (
+    RAW_BUCKET_NS,
+    AppTotal,
+    Coverage,
+    DiskShare,
+    FileCoverage,
+    FileRow,
+    FileTable,
+    HookHits,
+    UnknownOwnerOverflow,
+    Window,
+    WindowUnavailableError,
+)
+from appio.file_runtime import FileAvailability
 from appio.history_export import ExportResult
+from appio.history_router import FileViewResult
 from appio.setup_boundary import CommandResult
 from appio.setup_client import SetupReply
 from appio.ui import collector_window as cw
@@ -79,6 +94,11 @@ class FakeHistory:
         self.ranking_calls: list[Window] = []
         self._ready = ready
         self.rows: list[object] = []
+        # Files query surface: absent by default so a page that is not asked
+        # for a view cannot silently acquire one.
+        self.file_status = FileAvailability(False, False, "file_source_unavailable", None)
+        self.file_result: FileViewResult | None = None
+        self.file_requests: list[tuple] = []
 
     def prepare(self, window: Window) -> None:
         self.actions.append(("prepare", window))
@@ -99,8 +119,29 @@ class FakeHistory:
         self.ranking_calls.append(window)
         return list(self.rows)
 
-    def disk_share(self, app_id: int, window: Window):
-        raise AssertionError("these tests render an empty ranking")
+    def file_source_status(self) -> FileAvailability:
+        return self.file_status
+
+    def request_file_view(self, app_id: int, window: Window, sort: str,
+                          direction: str, search: str | None) -> Future:
+        self.file_requests.append((app_id, window, sort, direction, search))
+        done: Future = Future()
+        if self.file_result is None:
+            done.set_exception(
+                WindowUnavailableError("file_source_unavailable", "no file source")
+            )
+        else:
+            done.set_result(self.file_result)
+        return done
+
+    def disk_share(self, app_id: int, window: Window) -> DiskShare:
+        row = next(row for row in self.rows if row.app_id == app_id)
+        # No device attribution in this fake: None is rendered as unavailable.
+        return DiskShare(
+            app_id, window, row.read_bytes, row.write_bytes, row.total_bytes,
+            (), None, None, None, None, None, None,
+            file_coverage(device_state="not_delegated"),
+        )
 
 
 class FakeCoordinator:
@@ -162,6 +203,61 @@ def ok(verb: str, body: dict | None = None) -> SetupReply:
                               "error": None, **(body or {})})
 
 
+def file_coverage(**overrides: object) -> Coverage:
+    values: dict[str, object] = {
+        "tier": "raw",
+        "complete": True,
+        "unavailable_reason": None,
+        "inaccessible_pids": 0,
+        "resets": 0,
+        "reap_corrections": 0,
+        "reap_unapplied": (0, 0, 0, 0),
+        "reap_unobserved": (0, 0, 0, 0),
+        "partial_intervals": 0,
+        "gap_intervals": 0,
+        "overlap_uncertain_intervals": 0,
+        "spans_suspend_intervals": 0,
+        "spans_suspend": False,
+        "reap_incomplete": False,
+        "counter_overflow": False,
+        "device_state": "available",
+        "counted_omitted_files": 0,
+        "counted_omitted_bytes_r": 0,
+        "counted_omitted_bytes_w": 0,
+        "uncounted_overflow_files": 0,
+        "uncounted_overflow_bytes_r": 0,
+        "uncounted_overflow_bytes_w": 0,
+        "skipped_nonfile": 0,
+        "skipped_unsupported_fs": 0,
+        "weak_identity_rows": 0,
+        "hook_hits": HookHits(1, 1, 0, 0, 0, 0),
+    }
+    values.update(overrides)
+    return Coverage(**values)  # type: ignore[arg-type]
+
+
+def file_view_result(window: Window | None = None) -> FileViewResult:
+    """One synthetic retained row, shaped exactly like the query contract."""
+
+    window = window or Window(kind="since_boot", boot_id=BOOT, end_mono_ns=END)
+    inner = file_coverage()
+    row = FileRow(1, "report.txt", "resolved", False, "259:0", 42, 7, 3, 2, 100, 50,
+                  150, BOOT, END - RAW_BUCKET_NS)
+    overflow = UnknownOwnerOverflow(window, "overflow_owner_unknown", 0, 0, 0, inner)
+    table = FileTable(1, window, (row,), "bytes_total", "desc", None, overflow, inner)
+    coverage = FileCoverage(
+        1, window, 0, 0, 0, 0, 0, 0, 0, 0, 0, inner.hook_hits, 100, 50, overflow, inner
+    )
+    return FileViewResult(table, coverage)
+
+
+def app_total(app_id: int = 1) -> AppTotal:
+    """One ranking row, so the Files app selector has an app to select."""
+
+    return AppTotal(1, "unit:alpha.service", "alpha", 150, 150, 300, 150, 150,
+                    None, None, None, file_coverage())
+
+
 def build(qtbot, *, facts=OFF, ready=False, setup=None, events=None):
     events = events if events is not None else []
     coordinator = FakeCoordinator(events)
@@ -204,11 +300,102 @@ def test_banner_and_files_deep_links_focus_settings_without_changing_state(qtbot
 
     window.open_files_unavailable()
     assert window.files_page.isVisible()
-    assert FILES_UNAVAILABLE in window.files_message.text()
+    assert window.stack.currentWidget() is window.files_page
+    # No window has been prepared yet, so the page says so instead of showing a
+    # zero table; the deep link is still the only action offered.
+    assert window.files_message.isVisible()
+    assert "waiting for the first sample" in window.files_message.text()
+    assert window.files_view.isVisible() is False
+    assert history.file_requests == []
     click(window.files_open_settings)
     assert window.settings.focused_row == "system_services"
     assert window.settings.isVisible()
     assert_no_state_change(coordinator, history, setup)
+
+
+def test_opening_files_shows_the_real_table_and_changes_only_query_state(qtbot):
+    window, coordinator, history, setup = build(qtbot, ready=True)
+    history.rows = [app_total()]
+    history.file_status = FileAvailability(True, True)
+    history.file_result = file_view_result()
+    window.refresh()
+    qtbot.waitUntil(lambda: window.history_visible is True, timeout=2000)
+    # The page is prepared by the same exact Window the Overview renders.
+    assert history.file_requests[-1][1] == history.prepared
+    assert window.files_view.isVisibleTo(window.files_page)
+    assert window.files_view.model.rowCount() == 1
+    before_actions = list(coordinator.actions)
+    before_calls = list(setup.calls)
+    issued = len(history.file_requests)
+
+    window.open_files_unavailable()
+    assert window.stack.currentWidget() is window.files_page
+    assert window.files_view.isVisible() and window.files_view.table.isVisible()
+    assert window.files_message.isVisible() is False
+    assert len(history.file_requests) == issued + 1
+    assert coordinator.actions == before_actions
+    assert setup.calls == before_calls
+    assert window.settings.switch.isChecked() is False
+
+
+def test_a_degraded_file_source_is_reported_while_history_is_still_loading(qtbot):
+    window, coordinator, history, setup = build(qtbot, ready=False)
+    history.file_status = FileAvailability(
+        False, False, "file_source_unavailable", "bpf load failed: EPERM"
+    )
+    window.refresh()
+    assert window.history_visible is False
+    before_actions = list(coordinator.actions)
+    before_calls = list(setup.calls)
+
+    window.open_files_unavailable()
+    assert window.stack.currentWidget() is window.files_page
+    assert window.files_message.isVisible()
+    assert FILES_UNAVAILABLE in window.files_message.text()
+    assert "bpf load failed: EPERM" in window.files_message.text()
+    assert window.files_view.isVisible() is False
+    assert history.file_requests == []
+    assert coordinator.actions == before_actions
+    assert setup.calls == before_calls
+
+
+def test_files_page_keeps_an_explicit_unavailable_message_and_settings_link(qtbot):
+    window, coordinator, history, setup = build(qtbot, ready=True)
+    history.file_status = FileAvailability(
+        False, False, "file_source_unavailable", "bpf load failed: EPERM"
+    )
+    window.refresh()
+    qtbot.waitUntil(lambda: window.history_visible is True, timeout=2000)
+    before_actions = list(coordinator.actions)
+    before_calls = list(setup.calls)
+
+    window.open_files_unavailable()
+    assert window.stack.currentWidget() is window.files_page
+    assert history.file_requests == [], "an unavailable source is never queried"
+    assert window.files_view.state == "unavailable"
+    assert window.files_view.model.rowCount() == 0
+    assert window.files_message.isVisible()
+    assert FILES_UNAVAILABLE in window.files_message.text()
+    assert "bpf load failed: EPERM" in window.files_message.text()
+    assert coordinator.actions == before_actions
+    assert setup.calls == before_calls
+    click(window.files_open_settings)
+    assert window.settings.focused_row == "system_services"
+    assert coordinator.actions == before_actions and setup.calls == before_calls
+
+
+def test_the_files_surface_never_appears_inside_the_overview_window(qtbot):
+    window, coordinator, history, setup = build(qtbot, ready=True)
+    window.refresh()
+    qtbot.waitUntil(lambda: window.history_visible is True, timeout=2000)
+    assert window.view is not None
+    assert window.view.findChildren(QTableView) == []
+    assert window.stack.currentWidget() is window.history_page
+    # The Files surface lives on its own page, never inside the Overview's page
+    # or the P1/P2 AppIoWindow the acceptance guard inspects.
+    assert not window.view.isAncestorOf(window.files_view)
+    assert not window.history_page.isAncestorOf(window.files_view)
+    assert window.files_view.parent() is window.files_page
 
 
 def test_open_settings_rejects_an_unknown_focus_row(qtbot):
@@ -633,7 +820,10 @@ def test_history_is_prepared_before_rendering_and_stale_detail_is_hidden(qtbot):
 
     history.become_ready()
     qtbot.waitUntil(lambda: window.history_visible is True, timeout=2000)
-    assert history.ranking_calls == [history.prepared]
+    # Two read-only consumers rank the same prepared window: the Files app
+    # selector and the Overview list. Neither widens the scope.
+    assert history.ranking_calls
+    assert set(history.ranking_calls) == {history.prepared}
 
 
 def test_no_boot_row_yet_waits_instead_of_querying_an_empty_scope(qtbot):
