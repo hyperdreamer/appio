@@ -130,7 +130,7 @@ class HistoryRouter:
         self._closed = False
         self._file_jobs = set()
         self._file_workers = set()
-        self._file_status = FileAvailability(False, False, "file_source_unavailable")
+        self._file_status = FileAvailability(True, False)
 
     def _cancel_file_requests(self):
         for future in tuple(self._file_jobs):
@@ -323,7 +323,7 @@ class HistoryRouter:
     def invalidate(self) -> None:
         self._generation += 1
         self._cancel_file_requests()
-        self._file_status = FileAvailability(False, False, "file_source_unavailable")
+        self._file_status = FileAvailability(True, False)
         self._local_generation = -1
         if self._local_future is not None:
             self._local_future.cancel()
@@ -616,11 +616,19 @@ class HistoryRouter:
                     except (ValueError, RuntimeError) as error:
                         # An A22-disabled series is not a zero-filled timeline.
                         details[(kind, row.app_key)] = error
+            file_available = any(
+                service.connection.execute(
+                    "SELECT 1 FROM boot WHERE file_finalized_through_mono_ns > 0 LIMIT 1"
+                ).fetchone()
+                is not None
+                for _, service, _ in sources
+            )
             return {"ranking": worker._ranking, "parts": details, "segments": worker.segments,
                 "boundaries": worker.boundaries, "gaps": worker._gap_ranges,
                 "overlaps": worker._overlap_ranges, "local_history": worker._has_local_history,
                 "not_retained": worker._not_retained,
-                "chronology_unproved": worker._chronology_unproved}
+                "chronology_unproved": worker._chronology_unproved,
+                "file_available": file_available}
         finally:
             if worker is not None:
                 worker.close()
@@ -633,7 +641,7 @@ class HistoryRouter:
             raise RuntimeError("history router is closed")
         self._generation += 1
         self._cancel_file_requests()
-        self._file_status = FileAvailability(False, False, "file_source_unavailable")
+        self._file_status = FileAvailability(True, False)
         self._window, self._ready = window, False
         self.segments, self.boundaries = (), ()
         self._gap_ranges, self._overlap_ranges = [], []
@@ -672,6 +680,10 @@ class HistoryRouter:
         self._has_local_history = data["local_history"]
         self._not_retained = self._not_retained or data["not_retained"]
         self._chronology_unproved = data["chronology_unproved"]
+        self._file_status = FileAvailability(
+            bool(data["file_available"]), False,
+            None if data["file_available"] else "file_source_unavailable",
+        )
         self._ranking = [replace(row, app_id=self.registry.id_for(row.app_key)) for row in data["ranking"]]
         self._cached_parts = data["parts"]
         self._local_generation = None
