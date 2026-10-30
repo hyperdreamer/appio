@@ -107,7 +107,10 @@ called the label defect is in fact required behaviour, already implemented and a
 - `display_state` deliberately lets the activation probe override `decide_owner` whenever
   `facts.enabled is not False`, so `on, needs activation`, `off` for an enabled-but-inactive
   service, and `unavailable` for unknown facts all remain reachable;
-- `coordinator.reconcile` keeps using `decide_owner`, so display and ownership are **not** split;
+- reconciliation ownership stays unsplit — `coordinator.reconcile` keeps using `decide_owner` —
+  while `display_state` may legitimately show a different state today (owner `on, answering`
+  beside display `delegation present, accounting inactive`, as
+  `test_an_explicit_recheck_invokes_status_and_shows_the_probe_verdict` asserts);
 - `test_current_link_status_requires_verification_and_preserves_activation` and
   `test_pending_activation_stays_visible_across_a_restart` pin the activation behaviour.
 
