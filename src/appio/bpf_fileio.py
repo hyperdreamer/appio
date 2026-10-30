@@ -704,7 +704,9 @@ class StreamLoader:
         chunks: list[bytes] = []
         remaining = size
         while remaining > 0:
-            chunk = self._reader.read(remaining)
+            # Avoid repeatedly allocating space for the whole remaining map.
+            # Pipe reads may be shorter, but never request record-sized chunks.
+            chunk = self._reader.read(min(remaining, 256 << 10))
             if not chunk:
                 raise LoaderFrameError(
                     f"the loader command stream ended {size - remaining} bytes into a "
