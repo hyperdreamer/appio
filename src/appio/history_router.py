@@ -179,11 +179,12 @@ class HistoryRouter:
     def _read_local_files(paths, window, key, app_id, sort, direction, search):
         """Read one ownership-proved store on the bounded executor, never sum IDs.
 
-        Process retraction cannot retract top-100 hourly F candidates. Reject any
-        mixed or excluded window instead of using _materialize's unfiltered F
-        tables, or making raw-process retention a prerequisite for F retention.
+        Process retraction cannot retract top-100 hourly F candidates. Prove
+        ownership over each query's reported served interval, retaining its
+        original window and coverage disclosure. Never use _materialize's
+        unfiltered F tables or make process retention a prerequisite for F.
         """
-        sources, worker = [], None
+        sources = []
         try:
             for name, path, owner in paths:
                 source = sqlite3.connect(Path(path).as_uri() + "?mode=ro", uri=True, timeout=0.2)
@@ -193,25 +194,43 @@ class HistoryRouter:
                 finally:
                     source.close()
                 sources.append((name, QueryService(copy), owner))
-            worker = HistoryRouter(sources[0][1], SimpleNamespace(state=None), AppRegistry())
-            worker._sources = {name: (service, owner) for name, service, owner in sources}
-            worker._window = window
-            worker._plan(window)
-            names = {s.collector_id for s in worker.segments if s.proven}
-            if (len(names) != 1 or not worker.segments or any(not s.proven for s in worker.segments)
-                    or worker._chronology_unproved):
+            results = []
+            unavailable = WindowUnavailableError("file_source_unavailable", "No authoritative file app receipt.")
+            for name, service, _ in sources:
+                row = service.connection.execute("SELECT app_id FROM app WHERE key=?", (key,)).fetchone()
+                if row is None:
+                    continue
+                try:
+                    with service._snapshot():
+                        table = service.file_table(row[0], window, sort, direction, search)
+                        coverage = service.file_coverage(row[0], window)
+                    result = HistoryRouter._check_file_result(
+                        replace(table, app_id=app_id), replace(coverage, app_id=app_id))
+                except WindowUnavailableError as error:
+                    unavailable = error
+                    continue
+                worker = HistoryRouter(service, SimpleNamespace(state=None), AppRegistry())
+                try:
+                    worker._sources = {source: (query, owner) for source, query, owner in sources}
+                    served = result.coverage.unknown_owner_overflow.window
+                    worker._window = served
+                    worker._plan(served)
+                    names = {s.collector_id for s in worker.segments if s.proven}
+                    if (len(names) != 1 or not worker.segments
+                            or any(not s.proven for s in worker.segments) or worker._chronology_unproved):
+                        raise WindowUnavailableError("file_source_unavailable",
+                            "File ownership cannot be represented by one store.")
+                    if names != {name}:
+                        continue  # A discarded mirror cannot supply the rows.
+                    results.append(result)
+                finally:
+                    worker.close()
+            if not results:
+                raise unavailable
+            if len(results) != 1:
                 raise WindowUnavailableError("file_source_unavailable", "File ownership cannot be represented by one store.")
-            service = worker._sources[names.pop()][0]
-            row = service.connection.execute("SELECT app_id FROM app WHERE key=?", (key,)).fetchone()
-            if row is None:
-                raise WindowUnavailableError("file_source_unavailable", "No authoritative file app receipt.")
-            with service._snapshot():
-                table = service.file_table(row[0], window, sort, direction, search)
-                coverage = service.file_coverage(row[0], window)
-            return HistoryRouter._check_file_result(replace(table, app_id=app_id), replace(coverage, app_id=app_id))
+            return results[0]
         finally:
-            if worker is not None:
-                worker.close()
             for _, service, _ in sources:
                 service.connection.close()
 
