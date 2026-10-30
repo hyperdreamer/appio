@@ -76,22 +76,41 @@ def pending(frames, boot="boot-A", hour=0):
     return None if row is None else decode_file_hour_state(row[0], boot, hour)
 
 
-def test_file_store_rejects_caller_transaction_without_savepoint_or_mutation():
+def test_file_store_joins_enclosing_frame_and_rolls_back_with_it():
     from appio.file_store import _atomic
 
     db = sqlite3.connect(":memory:")
     db.execute("CREATE TABLE marker(value INTEGER)")
-    db.execute("BEGIN")
-    db.execute("INSERT INTO marker VALUES(1)")
     try:
-        with pytest.raises(ValueError, match="F persistence requires its own transaction"):
-            with _atomic(db):
-                db.execute("INSERT INTO marker VALUES(2)")
+        db.execute("BEGIN")
+        db.execute("INSERT INTO marker VALUES(1)")
+        with _atomic(db):
+            db.execute("INSERT INTO marker VALUES(2)")
         assert db.in_transaction
-        assert db.execute("SELECT value FROM marker ORDER BY value").fetchall() == [(1,)]
+        assert db.execute("SELECT value FROM marker ORDER BY value").fetchall() == [(1,), (2,)]
+        db.rollback()
+        assert db.execute("SELECT value FROM marker ORDER BY value").fetchall() == []
+    finally:
+        if db.in_transaction:
+            db.rollback()
+        db.close()
+
+
+def test_file_runtime_rejects_foreign_transaction_at_persist_boundary_with_diagnostic(frames):
+    rt, loader = runtime(frames)
+    db = frames.db
+    db.execute("CREATE TEMP TABLE t_d_marker(value INTEGER)")
+    db.execute("BEGIN")
+    db.execute("INSERT INTO t_d_marker VALUES(1)")
+    try:
+        with pytest.raises(FileSourceError, match="F requires a committed T/D frame, not a caller transaction"):
+            rt._persist({})
+        assert db.in_transaction
+        assert db.execute("SELECT value FROM t_d_marker").fetchall() == [(1,)]
+        assert rt.diagnostic == "F requires a committed T/D frame, not a caller transaction"
+        assert loader.close_requests == 1
     finally:
         db.rollback()
-        db.close()
 
 
 def test_f_transaction_survives_later_caller_rollback_and_own_failure():

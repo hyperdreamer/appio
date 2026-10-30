@@ -203,7 +203,9 @@ class FileRuntime:
 
     def _persist(self, hours, finalize=()):
         if self.connection.in_transaction:
-            raise ValueError("F requires a committed T/D frame, not a caller transaction")
+            failure = ValueError("F requires a committed T/D frame, not a caller transaction")
+            self._disable(failure)
+            raise FileSourceError(None, None, str(failure)) from failure
         # A separate F transaction must not inherit the T/D writer's 5s lock
         # wait. Apply one wall deadline to all statements, restore connection
         # policy on every exit, and keep the rollback outside the progress hook.
