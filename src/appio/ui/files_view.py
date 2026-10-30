@@ -705,15 +705,16 @@ class FilesView(QWidget):
         coverage = result.coverage
         inner = coverage.coverage
         covered = coverage.unknown_owner_overflow.window
-        partial_start = (
-            covered.start_mono_ns
+        partial_interval = (
+            (covered.start_mono_ns, covered.end_mono_ns)
             if covered != coverage.window and covered.kind == "range"
             and covered.boot_id == coverage.window.boot_id
             else None
         )
         scope_prefix = (
-            f"covered portion only (T0={elapsed_text(partial_start)} after boot): "
-            if partial_start is not None else ""
+            f"served interval only (T0={elapsed_text(partial_interval[0])} through "
+            f"T1={elapsed_text(partial_interval[1])} after boot): "
+            if partial_interval is not None else ""
         )
         if inner.complete:
             self.footer_state.setText(
@@ -721,9 +722,10 @@ class FilesView(QWidget):
             )
         else:
             disclosure = (
-                f"; covered portion only; collection started at "
-                f"T0={elapsed_text(partial_start)} after boot"
-                if partial_start is not None else ""
+                f"; served interval only (T0={elapsed_text(partial_interval[0])} through "
+                f"T1={elapsed_text(partial_interval[1])} after boot); "
+                f"collection has gaps in the requested window"
+                if partial_interval is not None else ""
             )
             self.footer_state.setText(
                 f"coverage: incomplete; tier: {inner.tier}; window: {window.kind}; "
@@ -787,8 +789,9 @@ class FilesView(QWidget):
         if (covered != coverage.window and covered.kind == "range"
                 and covered.boot_id == coverage.window.boot_id):
             prefix = (
-                f"observed (counted, covered portion only; "
-                f"T0={elapsed_text(covered.start_mono_ns)} after boot): "
+                f"observed (counted, served interval only ("
+                f"T0={elapsed_text(covered.start_mono_ns)} through "
+                f"T1={elapsed_text(covered.end_mono_ns)} after boot)): "
                 f"{format_bytes(coverage.observed_bytes_r)} read, "
                 f"{format_bytes(coverage.observed_bytes_w)} written"
             )
