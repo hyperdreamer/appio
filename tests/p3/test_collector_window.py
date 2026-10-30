@@ -272,6 +272,57 @@ def build(qtbot, *, facts=OFF, ready=False, setup=None, events=None):
     return window, coordinator, history, setup
 
 
+def test_verified_status_round_trip_clears_silent_header_while_window_open(qtbot):
+    from test_iodclient import Harness
+
+    window, coordinator, history, setup = build(qtbot, facts=SILENT)
+    harness = Harness()
+    history.client = harness.client
+    window._pump = harness.client.pump
+    window._timer.setInterval(10)
+    try:
+        window.refresh()
+        assert window.state_text == COLLECTOR_STATE_SILENT
+        harness.one_request("status")
+        # A real, correlated, validated response on the GUI's own connection.
+        # The separate one-shot service probe remains silent throughout.
+        harness.status()
+        qtbot.waitUntil(lambda: window.state_text == COLLECTOR_STATE_ON_ANSWERING,
+                        timeout=1000)
+        assert window.banner_status.text() == COLLECTOR_STATE_ON_ANSWERING
+        assert window.settings.status_label.text() == COLLECTOR_STATE_ON_ANSWERING
+        assert coordinator.reconciles[-1].daemon_verified
+        assert coordinator.reconciles[-1].answering
+        assert setup.calls == []
+        # Disconnect clears current verification; a retained cursor/status must
+        # not keep the successful label latched forever.
+        harness.eof()
+        qtbot.waitUntil(lambda: window.state_text == COLLECTOR_STATE_SILENT,
+                        timeout=1000)
+    finally:
+        window._timer.stop()
+        harness.client.close()
+        for server in harness.servers:
+            server.close()
+
+
+@pytest.mark.parametrize("verified,answering,pending,expected", [
+    (False, True, False, COLLECTOR_STATE_SILENT),
+    (True, False, False, COLLECTOR_STATE_SILENT),
+    (True, True, True, COLLECTOR_STATE_NEEDS_ACTIVATION),
+])
+def test_current_link_status_requires_verification_and_preserves_activation(
+    qtbot, verified, answering, pending, expected,
+):
+    window, _, history, _ = build(qtbot, facts=SILENT)
+    history.client = SimpleNamespace(state=SimpleNamespace(
+        verified=verified, answering=answering, pending_activation=pending, cursor=None,
+    ))
+    window.refresh()
+    assert window.state_text == expected
+    window._timer.stop()
+
+
 def click(control: QAbstractButton) -> None:
     control.click()
 
