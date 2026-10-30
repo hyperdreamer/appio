@@ -212,7 +212,6 @@ class FileRuntime:
         self.connection.execute(f"PRAGMA busy_timeout={min(busy, 10)}")
         self.connection.set_progress_handler(lambda: int(time.monotonic() >= deadline), 1000)
         try:
-            self.connection.execute("BEGIN IMMEDIATE")
             for key, acc in hours.items():
                 self.store.apply_pending(acc.finalize())
                 if time.monotonic() >= deadline:
@@ -221,7 +220,6 @@ class FileRuntime:
                 self.store.finalize_hour(hours[key].finalize())
                 if time.monotonic() >= deadline:
                     raise TimeoutError("file persistence deadline expired")
-            self.connection.execute("COMMIT")
         except BaseException:
             self.connection.set_progress_handler(None, 0)
             if self.connection.in_transaction:

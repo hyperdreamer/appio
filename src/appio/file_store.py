@@ -29,17 +29,20 @@ FILE_COLUMNS = tuple(name for name in FILE_COUNTERS if name not in ("gap_interva
 
 @contextmanager
 def _atomic(connection: sqlite3.Connection):
-    """Own the transaction, or join a frame without publishing its caller's work."""
-    nested = connection.in_transaction
-    connection.execute("SAVEPOINT appio_file_hour" if nested else "BEGIN IMMEDIATE")
+    """Run one F operation in its own transaction.
+
+    F shares the SQLite connection with T/D but never shares a transaction.
+    A caller-owned transaction is an unsafe boundary: accepting it would let
+    F writes commit, roll back, or hold locks with unrelated T/D work.
+    """
+    if connection.in_transaction:
+        raise ValueError("F persistence requires its own transaction")
     try:
+        connection.execute("BEGIN IMMEDIATE")
         yield
-        connection.execute("RELEASE appio_file_hour" if nested else "COMMIT")
+        connection.execute("COMMIT")
     except BaseException:
-        if nested:
-            connection.execute("ROLLBACK TO appio_file_hour")
-            connection.execute("RELEASE appio_file_hour")
-        elif connection.in_transaction:
+        if connection.in_transaction:
             connection.execute("ROLLBACK")
         raise
 

@@ -76,6 +76,46 @@ def pending(frames, boot="boot-A", hour=0):
     return None if row is None else decode_file_hour_state(row[0], boot, hour)
 
 
+def test_file_store_rejects_caller_transaction_without_savepoint_or_mutation():
+    from appio.file_store import _atomic
+
+    db = sqlite3.connect(":memory:")
+    db.execute("CREATE TABLE marker(value INTEGER)")
+    db.execute("BEGIN")
+    db.execute("INSERT INTO marker VALUES(1)")
+    try:
+        with pytest.raises(ValueError, match="F persistence requires its own transaction"):
+            with _atomic(db):
+                db.execute("INSERT INTO marker VALUES(2)")
+        assert db.in_transaction
+        assert db.execute("SELECT value FROM marker ORDER BY value").fetchall() == [(1,)]
+    finally:
+        db.rollback()
+        db.close()
+
+
+def test_f_transaction_survives_later_caller_rollback_and_own_failure():
+    from appio.file_store import _atomic
+
+    db = sqlite3.connect(":memory:")
+    db.execute("CREATE TABLE marker(value INTEGER)")
+    try:
+        with _atomic(db):
+            db.execute("INSERT INTO marker VALUES(2)")
+        db.execute("BEGIN")
+        db.execute("INSERT INTO marker VALUES(3)")
+        db.rollback()
+        assert db.execute("SELECT value FROM marker").fetchall() == [(2,)]
+        with pytest.raises(RuntimeError, match="F write failed"):
+            with _atomic(db):
+                db.execute("INSERT INTO marker VALUES(4)")
+                raise RuntimeError("F write failed")
+        assert db.execute("SELECT value FROM marker").fetchall() == [(2,)]
+        assert not db.in_transaction
+    finally:
+        db.close()
+
+
 def test_receipt_zero_app_and_unknown_owner_persist_without_touching_T_D(frames):
     rt, loader = runtime(frames)
     loader.queue(0, events=[event(), event(cgroup=99, amount=31)])
