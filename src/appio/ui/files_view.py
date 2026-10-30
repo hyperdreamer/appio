@@ -690,22 +690,38 @@ class FilesView(QWidget):
     def _render_coverage(self, result: FileViewResult, window: Window) -> None:
         coverage = result.coverage
         inner = coverage.coverage
+        covered = coverage.unknown_owner_overflow.window
+        partial_start = (
+            covered.start_mono_ns
+            if covered != coverage.window and covered.kind == "range"
+            and covered.boot_id == coverage.window.boot_id
+            else None
+        )
+        scope_prefix = (
+            f"covered portion only (T0={elapsed_text(partial_start)} after boot): "
+            if partial_start is not None else ""
+        )
         if inner.complete:
             self.footer_state.setText(
                 f"coverage: complete; tier: {inner.tier}; window: {window.kind}"
             )
         else:
+            disclosure = (
+                f"; covered portion only; collection started at "
+                f"T0={elapsed_text(partial_start)} after boot"
+                if partial_start is not None else ""
+            )
             self.footer_state.setText(
                 f"coverage: incomplete; tier: {inner.tier}; window: {window.kind}; "
                 f"gaps: {inner.gap_intervals}; "
                 f"overlaps: {inner.overlap_uncertain_intervals}; "
-                f"reason: {inner.unavailable_reason or 'unspecified'}"
+                f"reason: {inner.unavailable_reason or 'unspecified'}{disclosure}"
             )
         self.footer_observed.setText(
             self._observed_text(coverage, result.table)
         )
         self.footer_counted.setText(
-            "counted omissions (top-100/quota): "
+            f"{scope_prefix}counted omissions (top-100/quota): "
             f"{coverage.counted_omitted_files} files, "
             f"{format_bytes(coverage.counted_omitted_bytes_r)} read, "
             f"{format_bytes(coverage.counted_omitted_bytes_w)} written"
@@ -714,32 +730,32 @@ class FilesView(QWidget):
         # measured and dropped by a deterministic top-N, the other was lost when
         # a map insert failed and cannot be measured at all.
         self.footer_uncounted.setText(
-            "uncounted overflow (BPF map full, not measured): "
+            f"{scope_prefix}uncounted overflow (BPF map full, not measured): "
             f"{coverage.uncounted_overflow_files} files, "
             f"{format_bytes(coverage.uncounted_overflow_bytes_r)} read, "
             f"{format_bytes(coverage.uncounted_overflow_bytes_w)} written"
         )
         overflow = coverage.unknown_owner_overflow
         self.footer_unknown_owner.setText(
-            "unknown owner overflow (unassigned, never added to an app): "
+            f"{scope_prefix}unknown owner overflow (unassigned, never added to an app): "
             f"{overflow.overflow_files} files, "
             f"{format_bytes(overflow.overflow_bytes_r)} read, "
             f"{format_bytes(overflow.overflow_bytes_w)} written"
         )
         self.footer_skipped.setText(
-            "skipped objects (excluded, never counted as file I/O): "
+            f"{scope_prefix}skipped objects (excluded, never counted as file I/O): "
             f"{coverage.skipped_nonfile} non-file, "
             f"{coverage.skipped_unsupported_fs} unsupported filesystem"
         )
         self.footer_weak.setText(
-            "weak identity rows (dev+inode only, no filesystem UUID): "
+            f"{scope_prefix}weak identity rows (dev+inode only, no filesystem UUID): "
             f"{coverage.weak_identity_rows}"
         )
-        self.footer_hooks.setText(hooks_text(coverage.hook_hits))
+        self.footer_hooks.setText(scope_prefix + hooks_text(coverage.hook_hits))
 
     @staticmethod
     def _observed_text(coverage, table) -> str:
-        """Observed bytes are whole-window; the row count is what is displayed.
+        """Observed bytes use the coverage scope; row count is displayed.
 
         A search filter narrows the table but not ``observed_bytes_*``, so the
         two facts are labelled separately rather than implying that the shown
@@ -753,6 +769,15 @@ class FilesView(QWidget):
             f"{format_bytes(coverage.observed_bytes_r)} read, "
             f"{format_bytes(coverage.observed_bytes_w)} written"
         )
+        covered = coverage.unknown_owner_overflow.window
+        if (covered != coverage.window and covered.kind == "range"
+                and covered.boot_id == coverage.window.boot_id):
+            prefix = (
+                f"observed (counted, covered portion only; "
+                f"T0={elapsed_text(covered.start_mono_ns)} after boot): "
+                f"{format_bytes(coverage.observed_bytes_r)} read, "
+                f"{format_bytes(coverage.observed_bytes_w)} written"
+            )
         if table.search:
             return f"{prefix}; table filtered to {count} {noun} matching {table.search!r}"
         return f"{prefix}; {count} retained file {noun}"

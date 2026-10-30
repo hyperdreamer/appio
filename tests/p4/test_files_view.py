@@ -340,6 +340,26 @@ def test_headers_are_the_seven_ratified_columns_in_order(qtbot):
     assert view.findChildren(QTableWidget) == []
 
 
+def test_partial_file_window_discloses_the_covered_start_for_all_aggregates(qtbot):
+    start = 3_600_000_000_000
+    covered = Window("range", BOOT, start_mono_ns=start, end_mono_ns=END)
+    partial = coverage(complete=False)
+    overflow = UnknownOwnerOverflow(
+        covered, "overflow_owner_unknown", 0, 0, 0, partial
+    )
+    result = file_view(
+        (file_row(),), cov=partial, unknown_owner_overflow=overflow
+    )
+    view = build(qtbot, FakeRouter(result=result, ranking_rows=APPS))
+    view.set_window(WINDOW)
+
+    assert view.state == "incomplete"
+    assert texts(view)[0][0] == "report.txt"
+    assert "collection started at T0=1h 0m 0s after boot" in view.footer_state.text()
+    assert "T0=1h 0m 0s after boot" in footer_text(view)
+    assert "covered portion only" in footer_text(view)
+
+
 # --------------------------------------------------------------------------- #
 # Sorting: every column, through the contract, including last_seen
 # --------------------------------------------------------------------------- #

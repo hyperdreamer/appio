@@ -559,6 +559,102 @@ def test_missing_finalized_file_hour_returns_empty_unavailable_window(file_db):
     assert unknown.coverage.unavailable_reason == "not_retained"
 
 
+def test_since_boot_file_window_serves_covered_suffix_and_names_its_boundary(file_db, monkeypatch):
+    # Falsifier: return a false complete boot total or discard all rows because
+    # file collection began after boot.
+    service = QueryService(file_db)
+    start = 2 * FILE_HOUR_NS
+    end = 4 * FILE_HOUR_NS
+    for hour in (start, start + FILE_HOUR_NS):
+        accumulator = HourlyAccumulator("boot-A", hour)
+        accumulator.add_observation(
+            R, FILE_APP,
+            observation(1, bytes_r=17, last_seen_mono_ns=hour + 100_000_000_000),
+            ZERO,
+        )
+        FileHourStore(file_db).finalize_hour(accumulator.finalize())
+    file_db.commit()
+    monkeypatch.setattr(service, "_available_cutoff", lambda _boot_id: end)
+
+    requested = Window("since_boot", "boot-A", end_mono_ns=end)
+    table = service.file_table(1, requested, "bytes_total", "desc", None)
+
+    assert sum(row.bytes_r for row in table.rows) == 34
+    assert len(table.rows) == 1
+    assert table.coverage.complete is False
+    assert table.coverage.unavailable_reason is None
+    assert table.unknown_owner_overflow.window == Window(
+        "range", "boot-A", start_mono_ns=start, end_mono_ns=end
+    )
+    observed = service.file_coverage(1, requested)
+    assert (observed.observed_bytes_r, observed.observed_bytes_w) == (34, 0)
+    assert observed.coverage.complete is False
+    assert observed.window == requested
+
+    last_24h = Window("range", "boot-A", start_mono_ns=FILE_HOUR_NS, end_mono_ns=end)
+    range_table = service.file_table(1, last_24h, "bytes_total", "desc", None)
+    assert sum(row.bytes_r for row in range_table.rows) == 34
+    assert range_table.coverage.complete is False
+    assert range_table.unknown_owner_overflow.window == Window(
+        "range", "boot-A", start_mono_ns=start, end_mono_ns=end
+    )
+
+
+def test_complete_since_boot_file_window_keeps_its_requested_scope(file_db, monkeypatch):
+    service = QueryService(file_db)
+    end = 2 * FILE_HOUR_NS
+    for hour in (0, FILE_HOUR_NS):
+        accumulator = HourlyAccumulator("boot-A", hour)
+        accumulator.add_observation(
+            R, FILE_APP,
+            observation(1, bytes_r=17, last_seen_mono_ns=hour + 100_000_000_000),
+            ZERO,
+        )
+        FileHourStore(file_db).finalize_hour(accumulator.finalize())
+    file_db.commit()
+    monkeypatch.setattr(service, "_available_cutoff", lambda _boot_id: end)
+
+    requested = Window("since_boot", "boot-A", end_mono_ns=end)
+    table = service.file_table(1, requested, "bytes_total", "desc", None)
+
+    assert sum(row.bytes_r for row in table.rows) == 34
+    assert table.coverage.complete is True
+    assert table.unknown_owner_overflow.window == requested
+
+
+def test_no_coverage_since_boot_file_window_remains_unavailable(file_db, monkeypatch):
+    service = QueryService(file_db)
+    end = 2 * FILE_HOUR_NS
+    monkeypatch.setattr(service, "_available_cutoff", lambda _boot_id: end)
+    requested = Window("since_boot", "boot-A", end_mono_ns=end)
+
+    result = service.file_table(1, requested, "bytes_total", "desc", None)
+
+    assert result.rows == ()
+    assert result.coverage.unavailable_reason in {
+        "file_source_unavailable",
+        "not_retained",
+    }
+
+
+def test_missing_interior_file_hour_is_not_reported_as_collection_start(file_db):
+    for hour in (0, 2 * FILE_HOUR_NS):
+        accumulator = HourlyAccumulator("boot-A", hour)
+        accumulator.add_observation(
+            R, FILE_APP,
+            observation(1, bytes_r=17, last_seen_mono_ns=hour + 100_000_000_000),
+            ZERO,
+        )
+        FileHourStore(file_db).finalize_hour(accumulator.finalize())
+    file_db.commit()
+    window = Window("range", "boot-A", 0, 3 * FILE_HOUR_NS)
+
+    result = QueryService(file_db).file_table(1, window, "bytes_total", "desc", None)
+
+    assert result.rows == ()
+    assert result.coverage.unavailable_reason == "not_retained"
+
+
 def test_full_boot_file_totals_survive_hourly_row_pruning(file_db):
     # Falsifier: a full-boot request loses exact file totals after hourly retention pruning.
     acc = HourlyAccumulator("boot-A", 0)
