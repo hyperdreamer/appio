@@ -27,6 +27,10 @@ from .files import (
 from .sampler import AggregatedFrame
 
 DIAGNOSTIC_CAP = 512
+ATTACH_BUDGET_S = 5.0
+DRAIN_BUDGET_S = 1.0
+CLOSE_BUDGET_S = 0.1
+SHUTDOWN_WAIT_S = 0.1
 _LOG = logging.getLogger(__name__)
 _F_ERRORS = (FileSourceError, OSError, sqlite3.Error, ValueError, CounterOverflowError)
 
@@ -97,9 +101,9 @@ class _Pipe:
 class _ProcessLoader:
     """Absolute, installed helper only. No shell, builds, or unbounded pipe I/O.
 
-    The daemon supplies ownership and privilege; StreamLoader supplies the ABI.
-    HELLO/drain have a 250ms wall deadline. CLOSE/kill/reap fit within the existing
-    shutdown budget (100ms command + at most 100ms kill wait), including failure.
+    HELLO gets a bounded attach budget sized above the measured 268--320ms
+    startup samples. FLIP_DRAIN gets its own 1s quiescence budget, above the
+    measured 474ms drain sample. CLOSE and the final reap remain tight.
     """
     def __init__(self, executable="/usr/lib/appio/fileio_loader", obj="/usr/lib/appio/fileio.bpf.o"):
         if not Path(executable).is_absolute() or not Path(obj).is_absolute():
@@ -121,10 +125,10 @@ class _ProcessLoader:
             raise
 
     def hello(self):
-        return self._command(self.stream.hello)
+        return self._command(self.stream.hello, timeout=ATTACH_BUDGET_S)
 
     def flip_drain(self, epoch, seq):
-        return self._command(self.stream.flip_drain, epoch, seq)
+        return self._command(self.stream.flip_drain, epoch, seq, timeout=DRAIN_BUDGET_S)
 
     def _reap(self):
         if self._reap_attempted:
@@ -135,14 +139,14 @@ class _ProcessLoader:
         self.process.stdin.close()
         self.process.stdout.close()
         try:
-            self.process.wait(timeout=0.1)
+            self.process.wait(timeout=SHUTDOWN_WAIT_S)
         except subprocess.TimeoutExpired:
             # Killed but not yet reapable: never wait unboundedly on the owner loop.
             _LOG.warning("file_loader_reap_pending")
 
     def close(self):
         try:
-            return self._command(self.stream.close, timeout=0.1)
+            return self._command(self.stream.close, timeout=CLOSE_BUDGET_S)
         finally:
             self._reap()
 
