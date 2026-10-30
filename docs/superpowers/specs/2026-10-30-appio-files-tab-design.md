@@ -1,6 +1,6 @@
 # appio Files tab — honest window and honest label
 
-Status: revision 6 — addresses design reviews 1-3. The label clause is now a
+Status: revision 7 (approved by design review 6) — addresses design reviews 1-3. The label clause is now a
 preservation pin, not a repair: review 3 showed the behaviour I called a defect is
 required by tests and produced by unchanged code.
 Date: 2026-10-30
@@ -109,7 +109,8 @@ called the label defect is in fact required behaviour, already implemented and a
   service, and `unavailable` for unknown facts all remain reachable;
 - reconciliation ownership stays unsplit — `coordinator.reconcile` keeps using `decide_owner` —
   while `display_state` may legitimately show a different state today (owner `on, answering`
-  beside display `delegation present, accounting inactive`, as
+  beside display `delegation present, accounting inactive`; with `pending_activation=True` the
+  owner state there is `on, needs activation`), as
   `test_an_explicit_recheck_invokes_status_and_shows_the_probe_verdict` asserts);
 - `test_current_link_status_requires_verification_and_preserves_activation` and
   `test_pending_activation_stays_visible_across_a_restart` pin the activation behaviour.
