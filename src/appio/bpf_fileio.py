@@ -1062,7 +1062,7 @@ class BpfFileSource:
             error = FileSourceError(
                 -failure.errno if failure.errno else None,
                 None,
-                f"the FLIP_DRAIN command could not be written: {failure}",
+                f"the FLIP_DRAIN operation failed: {failure}",
             )
             self._fail(error)
             raise error from None

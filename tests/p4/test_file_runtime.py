@@ -76,6 +76,65 @@ def pending(frames, boot="boot-A", hour=0):
     return None if row is None else decode_file_hour_state(row[0], boot, hour)
 
 
+def test_file_store_joins_enclosing_frame_and_rolls_back_with_it():
+    from appio.file_store import _atomic
+
+    db = sqlite3.connect(":memory:")
+    db.execute("CREATE TABLE marker(value INTEGER)")
+    try:
+        db.execute("BEGIN")
+        db.execute("INSERT INTO marker VALUES(1)")
+        with _atomic(db):
+            db.execute("INSERT INTO marker VALUES(2)")
+        assert db.in_transaction
+        assert db.execute("SELECT value FROM marker ORDER BY value").fetchall() == [(1,), (2,)]
+        db.rollback()
+        assert db.execute("SELECT value FROM marker ORDER BY value").fetchall() == []
+    finally:
+        if db.in_transaction:
+            db.rollback()
+        db.close()
+
+
+def test_file_runtime_rejects_foreign_transaction_at_persist_boundary_with_diagnostic(frames):
+    rt, loader = runtime(frames)
+    db = frames.db
+    db.execute("CREATE TEMP TABLE t_d_marker(value INTEGER)")
+    db.execute("BEGIN")
+    db.execute("INSERT INTO t_d_marker VALUES(1)")
+    try:
+        with pytest.raises(FileSourceError, match="F requires a committed T/D frame, not a caller transaction"):
+            rt._persist({})
+        assert db.in_transaction
+        assert db.execute("SELECT value FROM t_d_marker").fetchall() == [(1,)]
+        assert rt.diagnostic == "F requires a committed T/D frame, not a caller transaction"
+        assert loader.close_requests == 1
+    finally:
+        db.rollback()
+
+
+def test_f_transaction_survives_later_caller_rollback_and_own_failure():
+    from appio.file_store import _atomic
+
+    db = sqlite3.connect(":memory:")
+    db.execute("CREATE TABLE marker(value INTEGER)")
+    try:
+        with _atomic(db):
+            db.execute("INSERT INTO marker VALUES(2)")
+        db.execute("BEGIN")
+        db.execute("INSERT INTO marker VALUES(3)")
+        db.rollback()
+        assert db.execute("SELECT value FROM marker").fetchall() == [(2,)]
+        with pytest.raises(RuntimeError, match="F write failed"):
+            with _atomic(db):
+                db.execute("INSERT INTO marker VALUES(4)")
+                raise RuntimeError("F write failed")
+        assert db.execute("SELECT value FROM marker").fetchall() == [(2,)]
+        assert not db.in_transaction
+    finally:
+        db.close()
+
+
 def test_receipt_zero_app_and_unknown_owner_persist_without_touching_T_D(frames):
     rt, loader = runtime(frames)
     loader.queue(0, events=[event(), event(cgroup=99, amount=31)])
@@ -240,7 +299,12 @@ def test_installed_helper_stalls_are_bounded_and_reaped_without_root_or_live_BPF
     import sys
     import time
     from appio.bpf_fileio import HOOK_MASK_ALL, HELLO_RESPONSE, ABI_VERSION
-    from appio.file_runtime import _ProcessLoader
+    from appio.file_runtime import (
+        ATTACH_BUDGET_S,
+        CLOSE_BUDGET_S,
+        DRAIN_BUDGET_S,
+        _ProcessLoader,
+    )
 
     helper = tmp_path / "fake-fileio"
     obj = tmp_path / "fake-object"
@@ -264,7 +328,12 @@ def test_installed_helper_stalls_are_bounded_and_reaped_without_root_or_live_BPF
                 loader.flip_drain(1, 1)
             else:
                 loader.close()
-        assert time.monotonic() - at < 1.0
+        budget = {
+            "hello": ATTACH_BUDGET_S,
+            "drain": DRAIN_BUDGET_S,
+            "close": CLOSE_BUDGET_S,
+        }[mode]
+        assert time.monotonic() - at < budget + 1.0
         assert loader.process.poll() is not None
     finally:
         try:
@@ -277,6 +346,175 @@ def test_installed_helper_stalls_are_bounded_and_reaped_without_root_or_live_BPF
             loader.process.wait(timeout=1)
             loader.process.stdin.close()
             loader.process.stdout.close()
+
+
+def test_slow_attach_response_after_600ms_succeeds(tmp_path):
+    import sys
+    from appio.bpf_fileio import ABI_VERSION, HOOK_MASK_ALL, HELLO_RESPONSE
+    from appio.file_runtime import _ProcessLoader
+
+    helper = tmp_path / "slow-attach-fileio"
+    obj = tmp_path / "fake-object"
+    obj.touch()
+    response = HELLO_RESPONSE.pack(ABI_VERSION, 0, HOOK_MASK_ALL, 4096, 0, 0)
+    helper.write_text(
+        f"#!{sys.executable}\nimport os,time\n"
+        "os.read(0,8)\n"
+        "time.sleep(0.6)\n"
+        f"os.write(1,{response!r})\n"
+        "time.sleep(60)\n"
+    )
+    helper.chmod(0o700)
+    loader = _ProcessLoader(str(helper), str(obj))
+    try:
+        assert loader.hello() == response
+    finally:
+        loader._reap()
+        if loader.process.poll() is None:
+            loader.process.kill()
+        loader.process.wait(timeout=1)
+        loader.process.stdin.close()
+        loader.process.stdout.close()
+
+
+def test_slow_drain_response_after_600ms_succeeds(tmp_path):
+    import sys
+    from appio.bpf_fileio import (
+        ABI_VERSION,
+        DRAIN_RESPONSE,
+        HOOK_MASK_ALL,
+        HELLO_RESPONSE,
+    )
+    from appio.file_runtime import _ProcessLoader
+
+    helper = tmp_path / "slow-drain-fileio"
+    obj = tmp_path / "fake-object"
+    obj.touch()
+    hello = HELLO_RESPONSE.pack(ABI_VERSION, 0, HOOK_MASK_ALL, 4096, 0, 0)
+    drain = DRAIN_RESPONSE.pack(ABI_VERSION, 0, HOOK_MASK_ALL, 4096, 0, 0, 1, 1, 0, 0, 1, 0)
+    helper.write_text(
+        f"#!{sys.executable}\nimport os,time\n"
+        "os.read(0,8)\n"
+        f"os.write(1,{hello!r})\n"
+        "os.read(0,24)\n"
+        "time.sleep(0.6)\n"
+        f"os.write(1,{drain!r})\n"
+        "time.sleep(60)\n"
+    )
+    helper.chmod(0o700)
+    loader = _ProcessLoader(str(helper), str(obj))
+    try:
+        loader.hello()
+        assert loader.flip_drain(1, 1) == drain
+    finally:
+        loader._reap()
+        if loader.process.poll() is None:
+            loader.process.kill()
+        loader.process.wait(timeout=1)
+        loader.process.stdin.close()
+        loader.process.stdout.close()
+
+
+def test_stalled_drain_waits_to_and_then_aborts_at_drain_budget(tmp_path):
+    import sys
+    import time
+    from appio.bpf_fileio import HOOK_MASK_ALL, HELLO_RESPONSE
+    from appio.file_runtime import DRAIN_BUDGET_S, _ProcessLoader
+
+    helper = tmp_path / "stalled-drain-fileio"
+    obj = tmp_path / "fake-object"
+    obj.touch()
+    hello = HELLO_RESPONSE.pack(1, 0, HOOK_MASK_ALL, 4096, 0, 0)
+    helper.write_text(
+        f"#!{sys.executable}\nimport os,time\n"
+        "os.read(0,8)\n"
+        f"os.write(1,{hello!r})\n"
+        "os.read(0,24)\n"
+        "time.sleep(60)\n"
+    )
+    helper.chmod(0o700)
+    loader = _ProcessLoader(str(helper), str(obj))
+    try:
+        loader.hello()
+        started = time.monotonic()
+        with pytest.raises(OSError):
+            loader.flip_drain(1, 1)
+        elapsed = time.monotonic() - started
+        assert DRAIN_BUDGET_S - 0.5 < elapsed < DRAIN_BUDGET_S + 1.0, elapsed
+        assert loader.process.poll() is not None
+    finally:
+        loader._reap()
+        if loader.process.poll() is None:
+            loader.process.kill()
+        loader.process.wait(timeout=1)
+        loader.process.stdin.close()
+        loader.process.stdout.close()
+
+
+def test_stalled_attach_is_bounded_by_attach_budget(tmp_path):
+    import sys
+    import time
+    from appio.file_runtime import ATTACH_BUDGET_S, _ProcessLoader
+
+    helper = tmp_path / "stalled-attach-fileio"
+    obj = tmp_path / "fake-object"
+    obj.touch()
+    helper.write_text(
+        f"#!{sys.executable}\nimport os,time\n"
+        "os.read(0,8)\n"
+        "time.sleep(60)\n"
+    )
+    helper.chmod(0o700)
+    loader = _ProcessLoader(str(helper), str(obj))
+    try:
+        started = time.monotonic()
+        with pytest.raises(OSError):
+            loader.hello()
+        elapsed = time.monotonic() - started
+        assert ATTACH_BUDGET_S - 0.5 < elapsed < ATTACH_BUDGET_S + 1.0, elapsed
+        assert loader.process.poll() is not None
+    finally:
+        loader._reap()
+        if loader.process.poll() is None:
+            loader.process.kill()
+        loader.process.wait(timeout=1)
+        loader.process.stdin.close()
+        loader.process.stdout.close()
+
+
+def test_close_remains_tight_when_the_peer_never_acknowledges(tmp_path):
+    import sys
+    import time
+    from appio.bpf_fileio import HOOK_MASK_ALL, HELLO_RESPONSE
+    from appio.file_runtime import CLOSE_BUDGET_S, _ProcessLoader
+
+    helper = tmp_path / "stalled-close-fileio"
+    obj = tmp_path / "fake-object"
+    obj.touch()
+    hello = HELLO_RESPONSE.pack(1, 0, HOOK_MASK_ALL, 4096, 0, 0)
+    helper.write_text(
+        f"#!{sys.executable}\nimport os,time\n"
+        "os.read(0,8)\n"
+        f"os.write(1,{hello!r})\n"
+        "os.read(0,8)\n"
+        "time.sleep(60)\n"
+    )
+    helper.chmod(0o700)
+    loader = _ProcessLoader(str(helper), str(obj))
+    try:
+        loader.hello()
+        started = time.monotonic()
+        with pytest.raises(OSError):
+            loader.close()
+        assert time.monotonic() - started < CLOSE_BUDGET_S + 0.5
+        assert loader.process.poll() is not None
+    finally:
+        loader._reap()
+        if loader.process.poll() is None:
+            loader.process.kill()
+        loader.process.wait(timeout=1)
+        loader.process.stdin.close()
+        loader.process.stdout.close()
 
 
 @pytest.mark.parametrize("relative", ["helper", "object"])
