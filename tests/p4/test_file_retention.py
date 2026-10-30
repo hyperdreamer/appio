@@ -91,7 +91,7 @@ def test_file_quota_wall_collision_uses_full_file_hour_key(db, tmp_path):
     assert db.execute("SELECT ts_mono_ns FROM file_sample").fetchall() == [(FILE_HOUR_NS,)]
 
 
-def test_missing_file_hour_total_blocks_expiry_before_any_file_unit_is_deleted(db):
+def test_missing_file_hour_total_keeps_that_unit_and_allows_ready_unknown_owner(db):
     _finalize_file_hour(db, 0, 5)
     db.execute("DELETE FROM app_boot_file_total")
     db.commit()
@@ -100,7 +100,8 @@ def test_missing_file_hour_total_blocks_expiry_before_any_file_unit_is_deleted(d
 
     assert not result.complete
     assert result.reason == "missing_materialization"
-    assert result.deleted == ()
+    assert [u.kind for u in result.deleted] == ["file_unknown"]
+    assert [(u.kind, u.primary_key) for u in result.skipped] == [("file", ("boot-A", 1, 0))]
     assert db.execute("SELECT count(*) FROM file_sample").fetchone() == (1,)
     assert db.execute("SELECT count(*) FROM file_coverage").fetchone() == (1,)
-    assert db.execute("SELECT count(*) FROM file_overflow_unknown").fetchone() == (1,)
+    assert db.execute("SELECT count(*) FROM file_overflow_unknown").fetchone() == (0,)

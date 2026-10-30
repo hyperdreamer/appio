@@ -1,16 +1,18 @@
 """Mapped-wall retention, indivisible deletion units, and a physical hard quota.
 
 Rollups/totals are prerequisites, never rebuilt with additive UPSERTs by pruning.
-Missing clock evidence or materialization stops a pass without guessing. Results
+Missing clock evidence stops a pass without guessing. Unmaterialized units are
+reported and skipped so independent ready units can still be deleted. Results
 account separately for measured rows, counted omissions and failed insert attempts.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from heapq import nsmallest
 from pathlib import Path
 import sqlite3
 
-from appio.contracts import FILE_HOUR_NS, validate_sqlite_integer
+from appio.contracts import FILE_HOUR_NS, SQLITE_INT_MAX, validate_sqlite_integer
 from appio.durable import canonical_json, decode_file_hour_state
 from appio.file_store import _decode_coverage
 from appio.files import checked_sum
@@ -18,6 +20,7 @@ from appio.ownership import ownership_settled
 
 DAY_NS = 86_400_000_000_000
 DEFAULT_QUOTA_BYTES = 1_500_000_000
+DEFAULT_BATCH_SIZE = 256
 RETENTION_NS = {"core": DAY_NS, "gap": DAY_NS, "file": 14 * DAY_NS,
                 "file_unknown": 14 * DAY_NS, 60: 30 * DAY_NS, 3600: 365 * DAY_NS}
 
@@ -61,12 +64,20 @@ class DroppedUnit:
 
 
 @dataclass(frozen=True)
+class SkippedUnit:
+    kind: str
+    primary_key: tuple
+    reason: str = "missing_materialization"
+
+
+@dataclass(frozen=True)
 class PruneResult:
     deleted: tuple[DroppedUnit, ...]
     complete: bool
     sampling_paused: bool
     physical_bytes: int
     reason: str | None = None
+    skipped: tuple[SkippedUnit, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -99,8 +110,13 @@ class _Unit:
 
 class QuotaPruner:
     def __init__(self, connection: sqlite3.Connection, database_paths,
-                 quota_bytes: int = DEFAULT_QUOTA_BYTES):
+                 quota_bytes: int = DEFAULT_QUOTA_BYTES, *,
+                 batch_size: int = DEFAULT_BATCH_SIZE):
         validate_sqlite_integer(quota_bytes, "quota_bytes")
+        validate_sqlite_integer(batch_size, "batch_size")
+        if batch_size == 0:
+            raise ValueError("batch_size must be positive")
+        self.batch_size = batch_size
         self.connection = connection
         # The connected database is always included even if callers omit its name.
         connected = [row[2] for row in connection.execute("PRAGMA database_list") if row[1] == "main" and row[2]]
@@ -109,6 +125,10 @@ class QuotaPruner:
         self.sampling_paused = False
         self.coverage_complete = True
         self.last_reason: str | None = None
+        self._expiry_after = None
+        self._quota_after = None
+        self._gap_scans = {}
+        self._gc_after = 0
 
     def _require_idle(self):
         if self.connection.in_transaction:
@@ -118,30 +138,183 @@ class QuotaPruner:
         row = self.connection.execute("SELECT wall_offset_ns FROM clock_map WHERE boot_id=? AND segment_start_mono_ns<=? ORDER BY segment_start_mono_ns DESC LIMIT 1", (boot, mono)).fetchone()
         return None if row is None else mono + row[0]
 
-    def _candidates(self) -> list[_Unit] | None:
-        units = []
-        for row in self.connection.execute("SELECT boot_id,source,epoch,seq,app_id,ts_mono_ns FROM sample_coverage"):
-            boot, source, epoch, seq, app, mono = row
-            units.append(_Unit("core", (boot, source, epoch, seq, app), boot, mono, source, epoch, seq, app))
-        for row in self.connection.execute("SELECT boot_id,app_id,ts_mono_ns,source,epoch,seq FROM file_coverage"):
-            boot, app, mono, source, epoch, seq = row
-            units.append(_Unit("file", (boot, app, mono), boot, mono, source, epoch, seq, app))
-        for row in self.connection.execute("SELECT boot_id,ts_mono_ns,source,epoch,seq FROM file_overflow_unknown"):
-            boot, mono, source, epoch, seq = row
-            units.append(_Unit("file_unknown", (boot, mono), boot, mono, source, epoch, seq))
-        for row in self.connection.execute("SELECT gap_id,boot_id,to_mono_ns,source,epoch,seq FROM gap"):
-            gap, boot, mono, source, epoch, seq = row
-            units.append(_Unit("gap", (gap,), boot, mono, source, epoch, seq, gap_id=gap))
-        for row in self.connection.execute("SELECT boot_id,app_id,bucket_secs,bucket_start_mono_ns FROM rollup_app"):
-            boot, app, secs, mono = row
-            units.append(_Unit("rollup", (boot, app, secs, mono), boot, mono, app_id=app, bucket_secs=secs))
-        mapped = []
-        for unit in units:
-            wall = self._map(unit.boot, unit.mono)
-            if wall is None:
-                return None
-            mapped.append(replace(unit, wall=wall))
-        return sorted(mapped, key=lambda unit: unit.key)
+    def _clock_ranges(self):
+        """Small metadata, not observation history. Offsets may step backwards."""
+        ranges = {}
+        for (boot,) in self.connection.execute("SELECT boot_id FROM boot ORDER BY boot_id"):
+            segments = self.connection.execute(
+                "SELECT segment_start_mono_ns,wall_offset_ns FROM clock_map "
+                "WHERE boot_id=? ORDER BY segment_start_mono_ns", (boot,),
+            ).fetchall()
+            ranges[boot] = [(start, segments[i + 1][0] - 1 if i + 1 < len(segments)
+                             else SQLITE_INT_MAX, offset)
+                            for i, (start, offset) in enumerate(segments)]
+        return ranges
+
+    def _unmapped(self, ranges, apps):
+        # Preserve the global missing-clock fail-closed contract using index
+        # existence probes, including retained units. Gaps are checked in their
+        # bounded interval scan below: their index leads with *start*, not end.
+        for boot, segments in ranges.items():
+            first = segments[0][0] if segments else SQLITE_INT_MAX + 1
+            if first == 0:
+                continue
+            ceiling = min(first - 1, SQLITE_INT_MAX)
+            for app in apps:
+                for table, index, time, extra in (
+                    ("sample_coverage", "sample_coverage_app_time_idx", "ts_mono_ns", ""),
+                    ("file_coverage", "file_coverage_app_time_idx", "ts_mono_ns", ""),
+                    ("rollup_app", "rollup_app_time_idx", "bucket_start_mono_ns", " AND bucket_secs=?"),
+                ):
+                    for suffix in ((60,), (3600,)) if extra else ((),):
+                        if self.connection.execute(
+                            f"SELECT 1 FROM {table} INDEXED BY {index} WHERE app_id=? AND boot_id=?"
+                            f"{extra} AND {time}<=? LIMIT 1", (app, boot, *suffix, ceiling),
+                        ).fetchone():
+                            return True
+            if self.connection.execute(
+                "SELECT 1 FROM file_overflow_unknown WHERE boot_id=? AND ts_mono_ns<=? LIMIT 1",
+                (boot, ceiling),
+            ).fetchone():
+                return True
+        return False
+
+    def _gap_candidates(self, ranges, now_wall, after):
+        """Bounded keyset scan where the existing gap index cannot order by end.
+
+        from < to is a conservative indexed eligibility bound. Keep only the
+        oldest batch (+ one lookahead), and publish it once the interval scan is
+        complete. Until then no unit is deleted: guessing the earliest end could
+        violate A13. Large gap histories advance over several ticks, never one
+        unbounded SQL sort. No observation-sized cache or schema change.
+        """
+        mode = now_wall is None
+        scan = self._gap_scans.get(mode)
+        if scan is None or scan["after"] != after:
+            bounds = {}
+            for boot, segments in ranges.items():
+                bounds[boot] = max((min(end, now_wall - RETENTION_NS["gap"] - offset - 1)
+                                    if now_wall is not None else end
+                                    for _, end, offset in segments), default=SQLITE_INT_MAX)
+                # An unmapped endpoint must be found even outside retention.
+                if segments:
+                    bounds[boot] = max(bounds[boot], segments[0][0] - 1)
+            scan = {"after": after, "wall": now_wall, "bounds": bounds,
+                    "cursors": {}, "done": set(), "units": []}
+            self._gap_scans[mode] = scan
+        self._selection_wall = (min(now_wall, scan["wall"])
+                                if now_wall is not None else None)
+        for boot, ceiling in scan["bounds"].items():
+            if boot in scan["done"]:
+                continue
+            params = [boot, max(-1, min(SQLITE_INT_MAX, ceiling))]
+            seek = ""
+            if boot in scan["cursors"]:
+                seek = " AND (from_mono_ns,to_mono_ns,source,epoch,gap_id)>(?,?,?,?,?)"
+                params.extend(scan["cursors"][boot])
+            rows = self.connection.execute(
+                "SELECT from_mono_ns,to_mono_ns,source,epoch,gap_id,seq FROM gap "
+                "INDEXED BY gap_time_idx WHERE boot_id=? AND from_mono_ns<=?" + seek +
+                " ORDER BY from_mono_ns,to_mono_ns,source,epoch,gap_id LIMIT ?",
+                (*params, self.batch_size + 1),
+            ).fetchall()
+            for beginning, mono, source, epoch, gap_id, seq in rows[:self.batch_size]:
+                wall = self._map(boot, mono)
+                if wall is None:
+                    self._gap_scans.pop(mode, None)
+                    return None
+                unit = _Unit("gap", (gap_id,), boot, mono, source, epoch, seq,
+                             gap_id=gap_id, wall=wall)
+                if ((after is None or unit.key > after) and
+                    (self._selection_wall is None or wall < self._selection_wall - RETENTION_NS["gap"])):
+                    scan["units"].append(unit)
+            scan["units"] = nsmallest(self.batch_size + 1, scan["units"], key=lambda u: u.key)
+            if len(rows) > self.batch_size:
+                scan["cursors"][boot] = rows[self.batch_size - 1][:5]
+            else:
+                scan["done"].add(boot)
+        self._scan_pending = len(scan["done"]) != len(scan["bounds"])
+        if self._scan_pending:
+            return []
+        self._gap_scans.pop(mode, None)
+        return [u for u in scan["units"] if self._selection_wall is None or
+                u.wall < self._selection_wall - RETENTION_NS["gap"]]
+
+    def _candidates(self, now_wall=None, after=None) -> list[_Unit] | None:
+        """Merge bounded index ranges, already restricted to each retention tier.
+
+        Cost depends on batch size and app/boot/clock metadata, not the number of
+        retained samples. LIMIT is applied in each covering index before rows
+        become Python objects; the final merge retains the complete A13 key.
+        """
+        self._scan_pending = False
+        self._candidate_more = False
+        ranges = self._clock_ranges()
+        apps = [row[0] for row in self.connection.execute("SELECT app_id FROM app ORDER BY app_id")]
+        if self._unmapped(ranges, apps):
+            return None
+        units = self._gap_candidates(ranges, now_wall, after)
+        if units is None or self._scan_pending:
+            return units
+        now_wall = self._selection_wall
+        for boot, segments in ranges.items():
+            for start, end, offset in segments:
+                for kind, secs, table, index, time, order in (
+                    ("core", 0, "sample_coverage", "sample_coverage_app_time_idx", "ts_mono_ns", "ts_mono_ns,source,epoch,seq"),
+                    ("file", 0, "file_coverage", "file_coverage_app_time_idx", "ts_mono_ns", "ts_mono_ns"),
+                    ("file_unknown", 0, "file_overflow_unknown", None, "ts_mono_ns", "ts_mono_ns"),
+                    ("rollup", 60, "rollup_app", "rollup_app_time_idx", "bucket_start_mono_ns", "bucket_start_mono_ns"),
+                    ("rollup", 3600, "rollup_app", "rollup_app_time_idx", "bucket_start_mono_ns", "bucket_start_mono_ns"),
+                ):
+                    tier = {0: 0, 60: 1, 3600: 2}[secs]
+                    if after is not None and tier < after[0]:
+                        continue
+                    low, high = start, end
+                    if now_wall is not None:
+                        high = min(high, now_wall - RETENTION_NS[secs or kind] - offset - 1)
+                    same_tier = after is not None and tier == after[0]
+                    if same_tier:
+                        low = max(low, after[1] - offset)
+                    if low > high:
+                        continue
+                    for app in (apps if kind != "file_unknown" else (0,)):
+                        params = [boot, low, high]
+                        condition = f"boot_id=? AND {time}>=? AND {time}<=?"
+                        if kind != "file_unknown":
+                            condition += " AND app_id=?"
+                            params.append(app)
+                        if secs:
+                            condition += " AND bucket_secs=?"
+                            params.append(secs)
+                        if kind == "core" and same_tier:
+                            # Seek past tied ticks in the index itself, rather
+                            # than rereading an arbitrarily large equal-time prefix.
+                            pivot = after[1] - offset
+                            if boot.encode() == after[2] and pivot >= start:
+                                op = ">=" if app > after[6] else ">"
+                                condition = ("boot_id=? AND app_id=? AND ts_mono_ns<=? AND "
+                                             f"(ts_mono_ns,source,epoch,seq){op}(?,?,?,?)")
+                                params = [boot, app, high, pivot, after[3].decode(), after[4], after[5]]
+                            elif boot.encode() < after[2] and pivot >= start:
+                                condition += " AND ts_mono_ns>?"
+                                params.append(pivot)
+                        columns = (f"{time},source,epoch,seq" if not secs else f"{time},'',0,0")
+                        indexed = f" INDEXED BY {index}" if index else ""
+                        rows = self.connection.execute(
+                            f"SELECT {columns} FROM {table}{indexed} WHERE {condition} "
+                            f"ORDER BY {order} LIMIT ?", (*params, self.batch_size + 2),
+                        )
+                        for mono, source, epoch, seq in rows:
+                            pk = ((boot, source, epoch, seq, app) if kind == "core" else
+                                  (boot, app, mono) if kind == "file" else
+                                  (boot, mono) if kind == "file_unknown" else (boot, app, secs, mono))
+                            unit = _Unit(kind, pk, boot, mono, source, epoch, seq, app,
+                                         bucket_secs=secs, wall=mono + offset)
+                            if after is None or unit.key > after:
+                                units.append(unit)
+                        units = nsmallest(self.batch_size + 1, units, key=lambda u: u.key)
+        self._candidate_more = len(units) > self.batch_size
+        return units[:self.batch_size]
 
     @staticmethod
     def _dominates(total, contribution) -> bool:
@@ -342,8 +515,21 @@ class QuotaPruner:
         return row is not None and row[0] == 0
 
     def _garbage_collect_paths(self):
-        protected = set()
-        for boot, hour, text in self.connection.execute("SELECT boot_id,ts_mono_ns,state_json FROM file_hour_state"):
+        # Path references have no inverse path_id index in the frozen schema.
+        # Defer optional GC when proving reachability would scan a large file
+        # history. Retaining an orphan is safe; deleting a referenced identity
+        # is not. Small histories still collect orphans incrementally.
+        limit = self.batch_size + 1
+        pending = self.connection.execute(
+            "SELECT boot_id,ts_mono_ns,state_json FROM file_hour_state LIMIT ?", (limit,),
+        ).fetchall()
+        references = [self.connection.execute(
+            f"SELECT path_id FROM {table} LIMIT ?", (limit,),
+        ).fetchall() for table in ("file_sample", "app_boot_file_total")]
+        if any(len(rows) == limit for rows in (pending, *references)):
+            return
+        protected = {row[0] for rows in references for row in rows}
+        for boot, hour, text in pending:
             state = decode_file_hour_state(text, boot, hour)
             for app in state.apps:
                 for entry in app.files:
@@ -351,11 +537,15 @@ class QuotaPruner:
                         row = self.connection.execute("SELECT path_id FROM path WHERE fs_uuid=? AND dev=? AND inode=? AND generation=? AND basename=? AND identity_weak=?", (entry.fs_uuid, entry.dev, entry.inode, entry.generation, name, entry.identity_weak)).fetchone()
                         if row:
                             protected.add(row[0])
-        protected.update(row[0] for row in self.connection.execute("SELECT path_id FROM file_sample UNION SELECT path_id FROM app_boot_file_total"))
-        orphan_ids = [row[0] for row in self.connection.execute("SELECT path_id FROM path") if row[0] not in protected]
-        for path_id in sorted(orphan_ids):
-            self.connection.execute("DELETE FROM path_alias WHERE path_id=?", (path_id,))
-            self.connection.execute("DELETE FROM path WHERE path_id=?", (path_id,))
+        paths = self.connection.execute(
+            "SELECT path_id FROM path WHERE path_id>? ORDER BY path_id LIMIT ?",
+            (self._gc_after, self.batch_size),
+        ).fetchall()
+        for (path_id,) in paths:
+            if path_id not in protected:
+                self.connection.execute("DELETE FROM path_alias WHERE path_id=?", (path_id,))
+                self.connection.execute("DELETE FROM path WHERE path_id=?", (path_id,))
+        self._gc_after = paths[-1][0] if len(paths) == self.batch_size else 0
 
     def _delete(self, unit: _Unit) -> DroppedUnit:
         c, pk = self.connection, unit.primary_key
@@ -387,17 +577,16 @@ class QuotaPruner:
             stats = replace(stats, retained_rows=1, bytes_r=values[0], bytes_w=values[1])
             c.execute("DELETE FROM rollup_dev WHERE boot_id=? AND app_id=? AND bucket_secs=? AND bucket_start_mono_ns=?", (boot, app, secs, start))
             c.execute("DELETE FROM rollup_app WHERE boot_id=? AND app_id=? AND bucket_secs=? AND bucket_start_mono_ns=?", pk)
-        self._garbage_collect_paths()
         return stats
 
-    def _result(self, deleted, reason=None, *, paused=None):
+    def _result(self, deleted, reason=None, *, paused=None, skipped=()):
         if reason:
             self.coverage_complete = False
         self.last_reason = reason
         if paused is not None:
             self.sampling_paused = paused
         return PruneResult(tuple(deleted), reason is None, self.sampling_paused,
-                           physical_store_bytes(self.database_paths), reason)
+                           physical_store_bytes(self.database_paths), reason, tuple(skipped))
 
     def _commit_delete(self, unit):
         self.connection.execute("BEGIN IMMEDIATE")
@@ -419,60 +608,83 @@ class QuotaPruner:
         if not isinstance(now_boot_id, str) or not now_boot_id:
             raise ValueError("now_boot_id must be nonempty")
         now_wall = self._map(now_boot_id, now_mono_ns)
-        units = self._candidates()
-        if now_wall is None or units is None:
+        if now_wall is None:
             return self._result([], "missing_clock_mapping")
-        eligible = [u for u in units if u.wall < now_wall - RETENTION_NS[u.bucket_secs if u.kind == "rollup" else u.kind]]
-        # Inspect all prerequisites before deleting even the first eligible row.
-        if any(not self._materialized(u) for u in eligible):
-            return self._result([], "missing_materialization")
-        deleted = []
-        for unit in eligible:
+        units = self._candidates(now_wall, self._expiry_after)
+        if units is None:
+            return self._result([], "missing_clock_mapping")
+        if self._scan_pending:
+            return self._result([], "batch_limit")
+        deleted, skipped = [], []
+        for unit in units:
             stats = self._commit_delete(unit)
             if stats is None:
-                return self._result(deleted, "missing_materialization")
+                skipped.append(SkippedUnit(unit.kind, unit.primary_key))
+                continue
             deleted.append(stats)
             if not self._checkpoint():
-                return self._result(deleted, "checkpoint_busy", paused=True)
-        if not eligible:
-            self.connection.execute("BEGIN IMMEDIATE")
-            try:
-                self._garbage_collect_paths()
-                self.connection.execute("COMMIT")
-            except BaseException:
-                self.connection.execute("ROLLBACK")
-                raise
-            if not self._checkpoint():
-                return self._result(deleted, "checkpoint_busy", paused=True)
-        return self._result(deleted)
+                return self._result(deleted, "checkpoint_busy", paused=True, skipped=skipped)
+        # Advancing past skipped units prevents a permanently bad oldest batch
+        # from starving later ready units. Wrap after a sweep so repaired units
+        # are retried, and late/imported observations are eventually revisited.
+        self._expiry_after = units[-1].key if units and self._candidate_more else None
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            self._garbage_collect_paths()
+            self.connection.execute("COMMIT")
+        except BaseException:
+            self.connection.execute("ROLLBACK")
+            raise
+        if not self._checkpoint():
+            return self._result(deleted, "checkpoint_busy", paused=True, skipped=skipped)
+        reason = "missing_materialization" if skipped else "batch_limit" if self._candidate_more else None
+        return self._result(deleted, reason, skipped=skipped)
 
     def shrink_if_needed(self) -> PruneResult:
         self._require_idle()
         validate_sqlite_integer(self.quota_bytes, "quota_bytes")
-        deleted = []
+        deleted, skipped = [], []
         if not self._checkpoint():
             return self._result(deleted, "checkpoint_busy", paused=True)
-        while physical_store_bytes(self.database_paths) > self.quota_bytes:
+        if physical_store_bytes(self.database_paths) > self.quota_bytes:
             if self.connection.execute("PRAGMA freelist_count").fetchone()[0] > 0:
                 self.connection.execute("VACUUM")
                 if not self._checkpoint():
                     return self._result(deleted, "checkpoint_busy", paused=True)
-                if physical_store_bytes(self.database_paths) <= self.quota_bytes:
-                    break
-            units = self._candidates()
-            if units is None:
-                return self._result(deleted, "missing_clock_mapping", paused=True)
-            if not units:
-                return self._result(deleted, "quota_exhausted", paused=True)
-            unit = units[0]
-            stats = self._commit_delete(unit)
-            if stats is None:
-                return self._result(deleted, "missing_materialization", paused=True)
-            deleted.append(stats)
-            if not self._checkpoint():
-                return self._result(deleted, "checkpoint_busy", paused=True)
+            if physical_store_bytes(self.database_paths) > self.quota_bytes:
+                units = self._candidates(after=self._quota_after)
+                if units is None:
+                    return self._result(deleted, "missing_clock_mapping", paused=True)
+                if self._scan_pending:
+                    return self._result(deleted, "batch_limit", paused=True)
+                for unit in units:
+                    self._quota_after = unit.key
+                    stats = self._commit_delete(unit)
+                    if stats is None:
+                        skipped.append(SkippedUnit(unit.kind, unit.primary_key))
+                        continue
+                    deleted.append(stats)
+                    if not self._checkpoint():
+                        return self._result(deleted, "checkpoint_busy", paused=True, skipped=skipped)
+                    if physical_store_bytes(self.database_paths) <= self.quota_bytes:
+                        break
+                else:
+                    if not self._candidate_more:
+                        self._quota_after = None
+                if deleted and physical_store_bytes(self.database_paths) > self.quota_bytes:
+                    # Compact once per batch, never once per deleted unit.
+                    if self.connection.execute("PRAGMA freelist_count").fetchone()[0] > 0:
+                        self.connection.execute("VACUUM")
+                        if not self._checkpoint():
+                            return self._result(deleted, "checkpoint_busy", paused=True, skipped=skipped)
+                if physical_store_bytes(self.database_paths) > self.quota_bytes:
+                    reason = ("missing_materialization" if skipped else
+                              "batch_limit" if self._candidate_more else "quota_exhausted")
+                    return self._result(deleted, reason, paused=True, skipped=skipped)
         # Resume is based only on a new physical measurement after checkpoint.
         size = physical_store_bytes(self.database_paths)
         if size > self.quota_bytes:
-            return self._result(deleted, "quota_exhausted", paused=True)
-        return self._result(deleted, paused=False)
+            return self._result(deleted, "quota_exhausted", paused=True, skipped=skipped)
+        self._quota_after = None
+        return self._result(deleted, "missing_materialization" if skipped else None,
+                            paused=False, skipped=skipped)
