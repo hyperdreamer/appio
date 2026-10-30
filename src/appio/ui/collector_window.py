@@ -12,8 +12,9 @@ probed position immediately, and the displayed state is recomputed from
 ``SetupClient.refresh()`` after every operation. The four honest service states
 (``off``, ``on, answering``, ``enabled, not answering``, ``on, needs activation``)
 come from :func:`appio.collector_owner.decide_owner`; a helper's accounting
-verdict may refine the activation dimension but never overrides the GUI's own
-observation that the daemon is silent.
+verdict may refine the activation dimension. A verified answer on the GUI's
+current history connection is also a socket observation and supersedes a silent
+one-shot probe.
 
 The P2 :class:`~appio.ui.main_window.AppIoWindow` is embedded unchanged and is
 only rendered after :meth:`HistoryRouter.ready` is true for the exact window that
@@ -23,6 +24,7 @@ was prepared; until then its numeric detail is hidden and a loading text is show
 from __future__ import annotations
 
 from concurrent.futures import Future
+from dataclasses import replace
 import os
 from pathlib import Path
 import subprocess
@@ -614,6 +616,15 @@ class CollectorWindow(QMainWindow):
             if self._pump is not None:
                 self._pump()
             facts = self.setup.refresh()
+            # Both probes belong to this GUI. A successful status round-trip on
+            # the current history connection is stronger evidence than a silent
+            # one-shot probe. IodClient clears verification on loss/reconnect,
+            # so a retained cursor cannot latch the answering label.
+            client = getattr(self.history, "client", None)
+            state = getattr(client, "state", None)
+            if state is not None and state.verified and state.answering:
+                facts = replace(facts, daemon_verified=True, answering=True,
+                                pending_activation=state.pending_activation)
             self._facts = facts
             if not self._busy:
                 self.coordinator.reconcile(facts)
