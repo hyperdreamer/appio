@@ -1,8 +1,8 @@
 """Owner-loop F collection, independent of the committed T/D transaction.
 
-No second writer, timers, host identity lookup, or sampling loop lives here.
-F drains only committed iod endpoints. Its transactions finish (or roll back)
-before returning to the daemon; a broken F source is sticky until recovery.
+No second writer or independent sampling loop lives here. F drains only committed
+iod endpoints. Its transactions finish (or roll back) before returning to the
+daemon; a broken source retries at bounded owner-loop deadlines.
 """
 from __future__ import annotations
 
@@ -28,12 +28,14 @@ from .sampler import AggregatedFrame
 
 DIAGNOSTIC_CAP = 512
 ATTACH_BUDGET_S = 5.0
-#: Wall budget for one FLIP_DRAIN. The loader itself waits up to 500 ms for
-#: in-flight hook updates before it scans and clears the retired slot, so this
-#: must exceed that wait plus the scan by a wide margin. Measured on this host:
-#: 263 ms, 474 ms, and one drain past 1 s under load. A 250 ms budget made every
-#: drain fail; a 1 s budget still raced the loader's own 500 ms bound.
+#: Maximum silence while awaiting a drain response. Every received byte renews
+#: this window, including partial headers; command writes do not count.
 DRAIN_BUDGET_S = 2.0
+#: One generous hard cap still bounds peers that trickle bytes forever.
+DRAIN_MAX_DURATION_S = 60.0
+#: Five fresh-source attempts per outage. Only a committed drain resets this
+#: budget; a successful HELLO followed by another failed drain does not.
+REATTACH_BACKOFF_S = (1.0, 2.0, 4.0, 8.0, 16.0)
 #: Wall budget for one F persistence transaction. F runs after T/D commits, so this
 #: bounds how long the *next* sample can be delayed; it is not a statement latency.
 #: A 250 ms budget here aborted on the real host: startup recovery of pending state
@@ -78,25 +80,34 @@ def _persistence_failure(failure: BaseException) -> BaseException:
 
 
 class _Pipe:
-    """Nonblocking binary pipe with one *command* deadline, not per-read retries."""
+    """Nonblocking pipe bounded by the command cap and response idle deadline."""
     def __init__(self, stream, owner, writing=False):
         self.fd, self.owner, self.writing = stream.fileno(), owner, writing
         os.set_blocking(self.fd, False)
 
     def _wait(self):
-        left = self.owner.deadline - time.monotonic()
+        deadline = self.owner.deadline
+        idle = self.owner.idle_deadline
+        no_progress = idle is not None and idle < deadline
+        if no_progress:
+            deadline = idle
+        detail = "no progress deadline" if no_progress else "absolute deadline"
+        left = deadline - time.monotonic()
         if left <= 0:
-            raise TimeoutError("file loader command deadline expired")
+            raise TimeoutError(f"file loader {detail} expired")
         ready = select.select([] if self.writing else [self.fd],
                               [self.fd] if self.writing else [], [], left)
         if not (ready[0] or ready[1]):
-            raise TimeoutError("file loader command deadline expired")
+            raise TimeoutError(f"file loader {detail} expired")
 
     def read(self, size):
         while True:
             self._wait()
             try:
-                return os.read(self.fd, size)
+                data = os.read(self.fd, size)
+                if data and self.owner.idle_timeout is not None:
+                    self.owner.idle_deadline = time.monotonic() + self.owner.idle_timeout
+                return data
             except BlockingIOError:
                 continue
 
@@ -119,9 +130,8 @@ class _Pipe:
 class _ProcessLoader:
     """Absolute, installed helper only. No shell, builds, or unbounded pipe I/O.
 
-    HELLO gets a bounded attach budget sized above the measured 268--320ms
-    startup samples. FLIP_DRAIN gets its own 1s quiescence budget, above the
-    measured 474ms drain sample. CLOSE and the final reap remain tight.
+    HELLO keeps its attach budget. FLIP_DRAIN renews a two-second idle window on
+    response bytes, within a sixty-second cap. CLOSE and final reap stay tight.
     """
     def __init__(self, executable="/usr/lib/appio/fileio_loader", obj="/usr/lib/appio/fileio.bpf.o"):
         if not Path(executable).is_absolute() or not Path(obj).is_absolute():
@@ -131,11 +141,16 @@ class _ProcessLoader:
         self.process = subprocess.Popen([executable, obj], stdin=subprocess.PIPE,
                                         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=0)
         self.deadline = 0.0
+        self.idle_deadline = None
+        self.idle_timeout = None
         self._reap_attempted = False
         self.stream = StreamLoader(_Pipe(self.process.stdout, self), _Pipe(self.process.stdin, self, True))
 
-    def _command(self, method, *args, timeout=0.25):
-        self.deadline = time.monotonic() + timeout
+    def _command(self, method, *args, timeout=0.25, idle_timeout=None):
+        now = time.monotonic()
+        self.deadline = now + timeout
+        self.idle_timeout = idle_timeout
+        self.idle_deadline = None if idle_timeout is None else now + idle_timeout
         try:
             return method(*args)
         except OSError:
@@ -146,7 +161,8 @@ class _ProcessLoader:
         return self._command(self.stream.hello, timeout=ATTACH_BUDGET_S)
 
     def flip_drain(self, epoch, seq):
-        return self._command(self.stream.flip_drain, epoch, seq, timeout=DRAIN_BUDGET_S)
+        return self._command(self.stream.flip_drain, epoch, seq,
+                             timeout=DRAIN_MAX_DURATION_S, idle_timeout=DRAIN_BUDGET_S)
 
     def _reap(self):
         if self._reap_attempted:
@@ -176,8 +192,9 @@ def default_file_source():
 
 
 class FileRuntime:
-    def __init__(self, connection: sqlite3.Connection, *, source_factory=None, identity_resolver=None):
+    def __init__(self, connection: sqlite3.Connection, *, source_factory=None, identity_resolver=None, clock=None):
         self.connection = connection
+        self._clock = time.monotonic if clock is None else clock
         self.source_factory = default_file_source if source_factory is None else source_factory
         # No path reconstruction or unsafe dev_t-to-UUID inference. A deployment
         # may inject a proved UUID resolver; absence is explicitly weak identity.
@@ -189,6 +206,10 @@ class FileRuntime:
         self._last = {}
         self._boot = None
         self._closed = False
+        self._started = False
+        self._retry_attempts = 0
+        self._retry_at = None
+        self._recovering = False
         self._availability = FileAvailability(False, False, "file_source_unavailable")
 
     @property
@@ -208,6 +229,17 @@ class FileRuntime:
                 source.close()
             except _F_ERRORS:
                 pass  # Keep the original failure, not a secondary CLOSE error.
+        self._recovering = True
+        if (not self._closed and self._retry_at is None
+                and self._retry_attempts < len(REATTACH_BACKOFF_S)):
+            self._retry_at = self._clock() + REATTACH_BACKOFF_S[self._retry_attempts]
+
+    def _retry_if_due(self):
+        if (not self._closed and self._source is None and self._retry_at is not None
+                and self._clock() >= self._retry_at):
+            self._retry_at = None
+            self._retry_attempts += 1
+            self._attach()
 
     @staticmethod
     def _incomplete(acc):
@@ -267,9 +299,12 @@ class FileRuntime:
         self._availability = FileAvailability(True, True)
 
     def start(self):
-        if self._source is not None:
+        if self._source is not None or (self._started and not self._closed):
             return self.availability
         self._closed = False
+        self._started = True
+        self._retry_attempts = 0
+        self._retry_at = None
         try:
             # Crash/recovery tails cannot silently become complete hours. Path
             # endpoints already persisted by apply_pending survive this restore.
@@ -371,6 +406,7 @@ class FileRuntime:
                 self._source.close()
                 self._source = None
                 self._attach()
+            self._retry_if_due()
             if self._closed or not self.availability.available:
                 raise FileSourceError(None, None, self.diagnostic or "file source unavailable")
             self._source_boot = frame.boot_id
@@ -378,8 +414,15 @@ class FileRuntime:
             drain = self._source.drain(receipt)
             if drain.receipt != receipt:
                 raise ValueError("file drain rewrote its source/epoch/seq")
+            if self._recovering:
+                # Fresh maps cannot measure accesses lost between failure and
+                # re-attach, even if recovery starts in a different hour.
+                drain = replace(drain, complete=False)
             contribution = attribute_file_drain(drain, context, self.identity_resolver)
             self._advance(frame, context, contribution)
+            self._recovering = False
+            self._retry_attempts = 0
+            self._retry_at = None
             return True
         except _F_ERRORS as failure:
             self._disable(failure)
@@ -396,6 +439,7 @@ class FileRuntime:
         if self._closed:
             return
         self._closed = True
+        self._retry_at = None
         try:
             if self._hours:
                 self._persist({key: self._incomplete(acc) for key, acc in self._hours.items()})

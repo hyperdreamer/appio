@@ -619,3 +619,230 @@ def test_drain_budget_keeps_headroom_over_the_loaders_own_quiescence_bound():
         f"drain budget {DRAIN_BUDGET_S}s must exceed the loader's "
         f"{LOADER_QUIESCENCE_BOUND_S}s quiescence wait"
     )
+
+
+@pytest.fixture
+def synthetic_stream_peer(tmp_path):
+    """Real pipes and a synthetic protocol peer; never invokes BPF."""
+    import sys
+    from appio.bpf_fileio import ABI_VERSION, DRAIN_RESPONSE, FILE_RECORD, HELLO_RESPONSE, HOOK_MASK_ALL, MAX_MAP_ENTRIES
+    from appio.file_runtime import _ProcessLoader
+
+    live = []
+    hello = HELLO_RESPONSE.pack(ABI_VERSION, 0, HOOK_MASK_ALL, MAX_MAP_ENTRIES, 0, 0)
+    count = 4096
+    header = DRAIN_RESPONSE.pack(ABI_VERSION, 0, HOOK_MASK_ALL, MAX_MAP_ENTRIES, 0, 0, 1, 1, count, 0, 1, 0)
+    body = bytes(FILE_RECORD.size * count)
+
+    def make(mode):
+        helper = tmp_path / f"stream-peer-{len(live)}"
+        obj = tmp_path / "synthetic-object"
+        obj.touch()
+        helper.write_text(
+            f"#!{sys.executable}\nimport os,time\n"
+            "def read_exact(n):\n"
+            "    while n:\n"
+            "        part=os.read(0,n)\n"
+            "        if not part: raise SystemExit\n"
+            "        n-=len(part)\n"
+            "def emit(data):\n"
+            "    while data: data=data[os.write(1,data):]\n"
+            "read_exact(8)\n"
+            f"emit({hello!r})\n"
+            "read_exact(24)\n"
+            f"mode={mode!r}\nheader={header!r}\nbody=bytes({len(body)})\n"
+            "if mode == 'steady':\n"
+            "    emit(header)\n"
+            "    for start in range(0,len(body),65536):\n"
+            "        time.sleep(0.4)\n"
+            "        emit(body[start:start+65536])\n"
+            "elif mode == 'mid':\n"
+            "    emit(header)\n"
+            "    time.sleep(0.7)\n"
+            "    emit(body[:65536])\n"
+            "elif mode == 'trickle':\n"
+            "    for value in header:\n"
+            "        time.sleep(0.05)\n"
+            "        emit(bytes([value]))\n"
+            "time.sleep(60)\n"
+        )
+        helper.chmod(0o700)
+        loader = _ProcessLoader(str(helper), str(obj))
+        live.append(loader)
+        loader.hello()
+        return loader, header + body
+
+    yield make
+    for loader in live:
+        loader._reap()
+        if loader.process.poll() is None:
+            loader.process.kill()
+        loader.process.wait(timeout=1)
+        loader.process.stdin.close()
+        loader.process.stdout.close()
+
+
+def test_large_slow_drain_resets_idle_deadline_on_each_chunk(synthetic_stream_peer):
+    import time
+
+    loader, expected = synthetic_stream_peer("steady")
+    started = time.monotonic()
+    assert loader.flip_drain(1, 1) == expected
+    assert time.monotonic() - started > 2.0  # Healthy transfer outlives the old total budget.
+
+
+@pytest.mark.parametrize("mode, minimum", [("silent", 1.8), ("mid", 2.5)])
+def test_silent_drain_aborts_from_last_received_byte_and_reaps(synthetic_stream_peer, mode, minimum):
+    import time
+
+    loader, _ = synthetic_stream_peer(mode)
+    started = time.monotonic()
+    with pytest.raises(TimeoutError, match="no progress"):
+        loader.flip_drain(1, 1)
+    assert minimum <= time.monotonic() - started < minimum + 1.5
+    assert loader.process.poll() is not None
+
+
+def test_trickling_drain_still_hits_absolute_cap_and_is_reaped(synthetic_stream_peer, monkeypatch):
+    import time
+    import appio.file_runtime as module
+
+    # Accelerate both clocks; there is still a byte every 50ms, within 300ms idle.
+    monkeypatch.setattr(module, "DRAIN_BUDGET_S", 0.3)
+    monkeypatch.setattr(module, "DRAIN_MAX_DURATION_S", 0.9, raising=False)
+    loader, _ = synthetic_stream_peer("trickle")
+    started = time.monotonic()
+    with pytest.raises(TimeoutError, match="absolute"):
+        loader.flip_drain(1, 1)
+    assert 0.8 <= time.monotonic() - started < 1.9
+    assert loader.process.poll() is not None
+
+
+def test_large_frame_body_is_read_in_bounded_large_chunks():
+    import io
+    from appio.bpf_fileio import DRAIN_RESPONSE, FILE_RECORD, HOOK_MASK_ALL, MAX_MAP_ENTRIES, StreamLoader
+
+    header = DRAIN_RESPONSE.pack(1, 0, HOOK_MASK_ALL, MAX_MAP_ENTRIES, 0, 0, 1, 1, 4096, 0, 1, 0)
+    response = header + bytes(FILE_RECORD.size * 4096)
+
+    class ObservedReader(io.BytesIO):
+        def __init__(self, data):
+            super().__init__(data)
+            self.requests = []
+
+        def read(self, size):
+            self.requests.append(size)
+            return super().read(size)
+
+    reader = ObservedReader(response)
+    assert StreamLoader(reader, io.BytesIO()).flip_drain(1, 1) == response
+    assert max(reader.requests) == 256 << 10
+    assert len(reader.requests) < 16
+
+
+def test_reattach_uses_backoff_stops_on_success_and_preserves_gap(frames, monkeypatch):
+    broken = VectorLoader()
+    broken.clear_failure = -5
+    refused = VectorLoader(hello_status=1, hello_error=-5)
+    healthy = VectorLoader()
+    healthy.queue(0, events=[event(amount=77)])
+    candidates, calls, now = iter([broken, refused, healthy]), [], [0.0]
+
+    def factory():
+        calls.append(now[0])
+        return BpfFileSource(next(candidates))
+
+    rt = FileRuntime(frames.db, source_factory=factory)
+    monkeypatch.setattr(rt, "_clock", lambda: now[0], raising=False)
+    assert rt.start().available
+    with pytest.raises(FileSourceError):
+        rt.consume(*frames.tick(0))
+    assert not rt.availability.available and not rt.availability.bpf_loaded
+    assert broken.close_requests == 1
+    assert pending(frames).apps[0].coverage.complete == 0
+    for at in (0.5, 0.999):
+        now[0] = at
+        with pytest.raises(FileSourceError):
+            rt.consume(*frames.tick(int(at * 10**9)))
+        assert calls == [0.0]
+    now[0] = 1.0
+    with pytest.raises(FileSourceError):
+        rt.consume(*frames.tick(10**9))
+    assert calls == [0.0, 1.0]
+    assert refused.close_requests == 1
+    now[0] = 2.999
+    with pytest.raises(FileSourceError):
+        rt.consume(*frames.tick(2999 * 10**6))
+    assert calls == [0.0, 1.0]
+    now[0] = 3.0
+    assert rt.consume(*frames.tick(3 * 10**9))
+    assert rt.availability.available and rt.availability.bpf_loaded
+    assert rt.diagnostic is None
+    assert pending(frames).apps[0].files[0].bytes_r == 77
+    assert pending(frames).apps[0].coverage.complete == 0
+    now[0] = 100.0
+    assert rt.consume(*frames.tick(100 * 10**9))
+    assert calls == [0.0, 1.0, 3.0]
+    rt.close()
+    now[0] = 1000.0
+    with pytest.raises(FileSourceError):
+        rt.consume(*frames.tick(1000 * 10**9))
+    assert calls == [0.0, 1.0, 3.0]
+
+
+def test_reattach_attempts_are_finite_even_if_hello_succeeds_but_drain_fails(frames, monkeypatch):
+    now, calls, loaders = [0.0], [], []
+
+    def factory():
+        calls.append(now[0])
+        loader = VectorLoader()
+        loader.clear_failure = -5
+        loaders.append(loader)
+        return BpfFileSource(loader)
+
+    rt = FileRuntime(frames.db, source_factory=factory)
+    monkeypatch.setattr(rt, "_clock", lambda: now[0], raising=False)
+    assert rt.start().available
+    with pytest.raises(FileSourceError):
+        rt.consume(*frames.tick(0))
+    # Five retries per outage, then stop; HELLO alone must not reset the budget.
+    for due in (1.0, 3.0, 7.0, 15.0, 31.0):
+        now[0] = due - 0.01
+        before = len(calls)
+        with pytest.raises(FileSourceError):
+            rt.consume(*frames.tick(int(now[0] * 10**9)))
+        assert len(calls) == before
+        now[0] = due
+        with pytest.raises(FileSourceError):
+            rt.consume(*frames.tick(int(due * 10**9)))
+        assert len(calls) == before + 1
+    now[0] = 100000.0
+    with pytest.raises(FileSourceError):
+        rt.consume(*frames.tick(int(now[0] * 10**9)))
+    assert calls == [0.0, 1.0, 3.0, 7.0, 15.0, 31.0]
+    assert all(loader.close_requests == 1 for loader in loaders)
+    assert not rt.availability.available and not rt.availability.bpf_loaded
+    assert pending(frames, hour=27 * H).apps[0].coverage.complete == 0
+    assert not frames.db.in_transaction
+
+
+def test_initial_attach_failure_recovers_into_new_hour_as_incomplete(frames, monkeypatch):
+    sources = iter([VectorLoader(hello_status=1, hello_error=-5), VectorLoader()])
+    now, calls = [0.0], []
+
+    def factory():
+        calls.append(now[0])
+        return BpfFileSource(next(sources))
+
+    rt = FileRuntime(frames.db, source_factory=factory)
+    monkeypatch.setattr(rt, "_clock", lambda: now[0], raising=False)
+    assert not rt.start().available
+    now[0] = 1.0
+    assert rt.consume(*frames.tick(H))
+    assert calls == [0.0, 1.0]
+    assert rt.availability.available
+    state = pending(frames, hour=H)
+    assert state.apps[0].files == ()
+    assert state.apps[0].coverage.complete == 0
+    assert state.apps[0].coverage.gap_intervals >= 1
+    assert state.unknown_owner.coverage.complete == 0
