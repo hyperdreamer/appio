@@ -559,3 +559,63 @@ def test_F_writer_lock_wait_is_bounded_restores_busy_timeout_and_next_T_D_tick_c
         other.close()
     frames.tick(10**10, amount=200)
     assert frames.db.execute("SELECT sum(read_bytes) FROM app_boot_total").fetchone() == (200,)
+
+
+def test_persistence_budget_allows_a_healthy_commit_slower_than_the_old_quarter_second(frames):
+    """Falsifier: a 250 ms persistence budget, which aborted F on the real host.
+
+    Startup recovery of pending state exceeded 250 ms there; SQLite's progress
+    handler fired and the source was disabled. A slow-but-healthy commit must
+    still publish.
+    """
+    import time
+    from appio.files import HourlyAccumulator
+
+    rt, _ = runtime(frames)
+
+    class SlowStore:
+        def __init__(self, delay):
+            self.delay = delay
+            self.calls = 0
+
+        def apply_pending(self, state):
+            self.calls += 1
+            time.sleep(self.delay)
+
+        def finalize_hour(self, state):
+            self.calls += 1
+            time.sleep(self.delay)
+
+    slow = SlowStore(0.40)  # longer than 0.25 s, far below any real bound
+    rt.store = slow
+    rt._persist({("boot-A", 0): HourlyAccumulator("boot-A", 0)})
+    assert slow.calls == 1
+
+
+def test_persistence_deadline_is_named_instead_of_surfacing_as_interrupted():
+    """SQLite reports a progress-handler abort as OperationalError('interrupted')."""
+    import sqlite3
+    from appio.file_runtime import _persistence_failure
+
+    translated = _persistence_failure(sqlite3.OperationalError("interrupted"))
+    assert isinstance(translated, TimeoutError)
+    assert "file persistence deadline expired" in str(translated)
+
+    original = ValueError("something else")
+    assert _persistence_failure(original) is original
+
+
+def test_drain_budget_keeps_headroom_over_the_loaders_own_quiescence_bound():
+    """Falsifier: lowering the drain budget back toward the loader's 500 ms wait.
+
+    fileio_loader.c waits up to 500 ms for in-flight hook updates before it scans
+    and clears the retired slot. A client budget at or near that value races the
+    loader and turns a healthy drain into a timeout, which disables the source.
+    """
+    from appio.file_runtime import DRAIN_BUDGET_S
+
+    LOADER_QUIESCENCE_BOUND_S = 0.5  # fileio_loader.c wait_for_quiescence()
+    assert DRAIN_BUDGET_S > LOADER_QUIESCENCE_BOUND_S, (
+        f"drain budget {DRAIN_BUDGET_S}s must exceed the loader's "
+        f"{LOADER_QUIESCENCE_BOUND_S}s quiescence wait"
+    )

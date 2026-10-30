@@ -28,7 +28,18 @@ from .sampler import AggregatedFrame
 
 DIAGNOSTIC_CAP = 512
 ATTACH_BUDGET_S = 5.0
-DRAIN_BUDGET_S = 1.0
+#: Wall budget for one FLIP_DRAIN. The loader itself waits up to 500 ms for
+#: in-flight hook updates before it scans and clears the retired slot, so this
+#: must exceed that wait plus the scan by a wide margin. Measured on this host:
+#: 263 ms, 474 ms, and one drain past 1 s under load. A 250 ms budget made every
+#: drain fail; a 1 s budget still raced the loader's own 500 ms bound.
+DRAIN_BUDGET_S = 2.0
+#: Wall budget for one F persistence transaction. F runs after T/D commits, so this
+#: bounds how long the *next* sample can be delayed; it is not a statement latency.
+#: A 250 ms budget here aborted on the real host: startup recovery of pending state
+#: exceeded it, SQLite's progress handler fired, and the failure surfaced as an
+#: opaque ``OperationalError: interrupted`` that disabled the whole file source.
+PERSIST_BUDGET_S = 2.5
 CLOSE_BUDGET_S = 0.1
 SHUTDOWN_WAIT_S = 0.1
 _LOG = logging.getLogger(__name__)
@@ -57,6 +68,13 @@ class FileAvailability:
         if self.reason not in (None, "file_source_unavailable", "not_retained"):
             raise ValueError("invalid file source reason")
         object.__setattr__(self, "diagnostic", bounded_diagnostic(self.diagnostic))
+
+
+def _persistence_failure(failure: BaseException) -> BaseException:
+    """Name a deadline that SQLite can only report as an opaque ``interrupted``."""
+    if isinstance(failure, sqlite3.OperationalError) and "interrupted" in str(failure).lower():
+        return TimeoutError("file persistence deadline expired")
+    return failure
 
 
 class _Pipe:
@@ -210,8 +228,9 @@ class FileRuntime:
         # wait. Apply one wall deadline to all statements, restore connection
         # policy on every exit, and keep the rollback outside the progress hook.
         busy = self.connection.execute("PRAGMA busy_timeout").fetchone()[0]
-        deadline = time.monotonic() + 0.25
-        self.connection.execute(f"PRAGMA busy_timeout={min(busy, 10)}")
+        storage = min(busy, 10)
+        deadline = time.monotonic() + PERSIST_BUDGET_S
+        self.connection.execute(f"PRAGMA busy_timeout={storage}")
         self.connection.set_progress_handler(lambda: int(time.monotonic() >= deadline), 1000)
         try:
             for key, acc in hours.items():
@@ -222,12 +241,15 @@ class FileRuntime:
                 self.store.finalize_hour(hours[key].finalize())
                 if time.monotonic() >= deadline:
                     raise TimeoutError("file persistence deadline expired")
-        except BaseException:
+        except BaseException as failure:
             self.connection.set_progress_handler(None, 0)
             if self.connection.in_transaction:
                 self.connection.execute("ROLLBACK")
             # In particular, do NOT emit FileHourStore.record_overflow here:
             # generic iod diagnostics would poison the next T/D receipt.
+            translated = _persistence_failure(failure)
+            if translated is not failure:
+                raise translated from failure
             raise
         finally:
             self.connection.set_progress_handler(None, 0)
