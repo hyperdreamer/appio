@@ -1,6 +1,6 @@
 # appio Files tab — honest window and honest label
 
-Status: revision 4 — addresses design reviews 1-3. The label clause is now a
+Status: revision 5 — addresses design reviews 1-3. The label clause is now a
 preservation pin, not a repair: review 3 showed the behaviour I called a defect is
 required by tests and produced by unchanged code.
 Date: 2026-10-30
@@ -62,14 +62,20 @@ redesign, no collection-cadence change, no new user-facing copy.
 | # | Predicate (first match wins) | Disclosure |
 | --- | --- | --- |
 | 1 | no servable interval, or any refusal fires | `unavailable`, with the reason |
-| 2 | a search filter is active and rows > 0 | `rows` — bounds, gaps, and the filter in effect |
+| 2 | rows > 0 | `rows` — bounds, gaps, and the filter in effect when one is present |
 | 3 | a search filter is active and rows = 0 | `no_matches` — bounds, gaps, and the filter in effect |
-| 4 | no filter, rows = 0, coverage complete | `empty_proven` — bounds; "no applications observed in this window" |
+| 4 | no filter, rows = 0, coverage complete | `empty_proven` — bounds; "no retained file activity for this application in this window" |
 | 5 | no filter, rows = 0, coverage incomplete | `empty_partial` — bounds; "no retained file activity in the served interval"; coverage incomplete with both counts |
 
 Ordering is what makes the table exclusive: a filtered zero-row result matches rule 3 and can
 never also match 5, because 5 requires the absence of a filter. Revision 3 listed these as
 unordered predicates and consequently let one result satisfy two of them.
+
+`empty_proven` deliberately speaks about **this application's file result**, not about whether
+applications were observed. `HourlyAccumulator` supports a monitored app with no supported file
+observations, so complete coverage with zero rows is a statement about that app's retained file
+activity while other apps may have been busy. The phrase "no applications observed" belongs only
+to the separate empty-application-selector case, which this spec does not change.
 
 `no_matches` claims only what is knowable: **no retained file matches this filter**. It does not
 claim that a retained file population existed and was filtered away — `file_coverage` reports
@@ -110,10 +116,18 @@ reconciliation. It adds only these pins, on the two transitions the existing tes
 (`test_verified_status_round_trip_clears_silent_header_while_window_open` starts from a silent
 probe and stops at EOF):
 
-| Case | Expected |
-| --- | --- |
-| EOF on the live connection while the one-shot probe still answers | still reads answering, because the probe witnesses a healthy daemon |
-| reconnection on the same open window after such an EOF | returns to answering without a restart |
+| Case | Sequence | Expected |
+| --- | --- | --- |
+| probe-only truth | verified connection → EOF on the live connection, probe answered on the next three refreshes | answering throughout, because the probe witnesses a healthy daemon |
+| recovery | connected → EOF **and** probe silent on one refresh (label becomes `enabled, not answering`) → probe answers again | returns to answering on the following refresh, with no restart |
+
+The recovery row is what makes the pins falsifiable: without it, freezing the refresh or retaining
+stale answering facts produces an identical trace, since the label would read answering at every
+stage. The sequence must therefore include a refresh where the label observably changes, and the
+assertion must cover the transition back, not only the steady state.
+
+Additionally the test asserts the *connection* becomes verified after reconnection, not merely that
+the label reads answering, so a probe-only recovery cannot masquerade as a stream recovery.
 
 If the implementer can exhibit a concrete state where the current precedence misreports the
 daemon, that observation becomes its own finding and its own change; absent such an observation,
