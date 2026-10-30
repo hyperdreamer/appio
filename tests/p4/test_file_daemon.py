@@ -5,9 +5,12 @@ retry every 2s or bypass storage backoff, miss a closed hour, or leak a loader.
 """
 from dataclasses import asdict
 import errno
+import logging
 from pathlib import Path
 import shutil
 from types import SimpleNamespace
+
+import appio.iod as iod
 
 import pytest
 
@@ -122,6 +125,30 @@ def test_drain_failure_does_not_stall_T_D_publish_or_clear_replay(make_daemon):
     assert h.daemon.last_error is None and not h.daemon._recover
 
 
+
+
+def test_F_failure_does_not_change_T_D_cadence_or_last_error(make_daemon):
+    h = make_daemon()
+    h.loader.clear_failure = -errno.EIO
+    first = h.daemon.committed_cursor
+
+    step(h)
+    failed = snapshot(h.daemon)
+    assert failed["seq"] == first.seq + 1
+    assert total(h.daemon) == 1200
+    assert h.daemon.last_error is None
+
+    h.clock.advance(9)
+    h.daemon.step()
+    assert snapshot(h.daemon)["seq"] == failed["seq"]
+    write_io(h.proc, 300)
+    h.clock.advance(1)
+    h.daemon.step()
+    assert snapshot(h.daemon)["seq"] == failed["seq"] + 1
+    assert total(h.daemon) == 2400
+    assert h.daemon.last_error is None
+
+
 def test_file_sqlite_failure_leaves_shared_connection_ready_for_next_T_D_commit(make_daemon):
     h = make_daemon()
     db = h.daemon.collector.store.connection
@@ -197,6 +224,30 @@ def test_stop_closes_source_without_promoting_partial_hour(make_daemon):
     d.collector.close = close
     assert h.loader.close_requests == 1
     assert captured and '"complete":0' in captured[0][0]
+
+
+
+
+def test_main_logs_daemon_failure_with_traceback(monkeypatch, caplog):
+    class FailingDaemon:
+        last_error = None
+        selector = SimpleNamespace(close=lambda: None)
+
+        def start(self):
+            raise RuntimeError("synthetic daemon failure")
+
+        def stop(self):
+            return None
+
+    monkeypatch.setattr(iod.os, "geteuid", lambda: 0)
+    monkeypatch.setattr(iod, "Daemon", FailingDaemon)
+    with caplog.at_level(logging.ERROR, logger="appio.iod"):
+        assert iod.main([]) == 1
+
+    failure = next(record for record in caplog.records if record.getMessage() == "daemon_failed")
+    assert failure.exc_info is not None
+    assert failure.exc_info[0] is RuntimeError
+    assert "synthetic daemon failure" in caplog.text
 
 
 def test_client_diagnostic_bound_clear_and_stale_snapshot_isolation():

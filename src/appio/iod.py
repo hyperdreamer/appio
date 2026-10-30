@@ -893,7 +893,7 @@ def main(argv=None):
         while not stopping:
             daemon.step()
     except (OSError, ValueError, RuntimeError, sqlite3.Error, KeyError):
-        _LOG.error("daemon_failed")
+        _LOG.error("daemon_failed", exc_info=True)
         result = 1
     finally:
         try:

@@ -334,6 +334,22 @@ def test_drain_returns_old_slot_records_once_across_a_flip() -> None:
     assert len({event.inode for event in first.events + second.events}) == 2
 
 
+
+
+def test_drain_names_the_operation_and_real_oserror_for_read_timeout() -> None:
+    """Falsifier: classify a read timeout as a FLIP_DRAIN write failure."""
+    loader = VectorLoader()
+    source = started(loader)
+
+    def read_timeout(_epoch: int, _seq: int) -> bytes:
+        raise TimeoutError("read timed out")
+
+    loader.flip_drain = read_timeout  # type: ignore[method-assign]
+    with pytest.raises(FileSourceError) as caught:
+        source.drain(Receipt("iod", 1, 1))
+    assert caught.value.detail == "the FLIP_DRAIN operation failed: read timed out"
+
+
 def test_drain_returns_every_record_in_a_slot_exactly_once() -> None:
     """Falsifier: dropping the trailing record of a slot, or re-reporting a
     slot that was already enumerated and cleared."""
