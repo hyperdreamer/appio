@@ -340,6 +340,51 @@ def test_headers_are_the_seven_ratified_columns_in_order(qtbot):
     assert view.findChildren(QTableWidget) == []
 
 
+def test_partial_file_window_discloses_the_covered_start_for_all_aggregates(qtbot):
+    start = 3_600_000_000_000
+    covered = Window("range", BOOT, start_mono_ns=start, end_mono_ns=END)
+    partial = coverage(complete=False)
+    overflow = UnknownOwnerOverflow(
+        covered, "overflow_owner_unknown", 0, 0, 0, partial
+    )
+    result = file_view(
+        (file_row(),), cov=partial, unknown_owner_overflow=overflow
+    )
+    view = build(qtbot, FakeRouter(result=result, ranking_rows=APPS))
+    view.set_window(WINDOW)
+
+    assert view.state == "incomplete"
+    assert texts(view)[0][0] == "report.txt"
+    assert "collection started at T0=1h 0m 0s after boot" in view.footer_state.text()
+    assert "T0=1h 0m 0s after boot" in footer_text(view)
+    assert "covered portion only" in footer_text(view)
+
+
+def test_file_selector_uses_retained_file_apps_when_process_ranking_is_empty(qtbot):
+    router = FakeRouter()
+    app_key = "unit:retained-only.service"
+
+    class LocalFiles:
+        def file_applications(self, window):
+            assert window == WINDOW
+            return ((app_key, "retained-only", 512),)
+
+    class Registry:
+        def id_for(self, key):
+            assert key == app_key
+            return 41
+
+    router.local = LocalFiles()
+    router.registry = Registry()
+    view = build(qtbot, router)
+    view.set_window(WINDOW)
+
+    assert view.app_selector.count() == 1
+    assert view.app_selector.itemText(0) == "retained-only  512 B"
+    assert view.app_selector.itemData(0) == 41
+    assert router.requests[0][0] == 41
+
+
 # --------------------------------------------------------------------------- #
 # Sorting: every column, through the contract, including last_seen
 # --------------------------------------------------------------------------- #
