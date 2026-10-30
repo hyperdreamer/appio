@@ -1012,6 +1012,12 @@ class BpfFileSource:
 
     # -- lifecycle -----------------------------------------------------------
 
+    def set_stop_event(self, event) -> None:
+        """Bind cooperative transport cancellation on the loader's owner thread."""
+        setter = getattr(self._loader, "set_stop_event", None)
+        if setter is not None:
+            setter(event)
+
     def start(self) -> FileAvailability:
         """Attach through the loader and report what F may advertise.
 

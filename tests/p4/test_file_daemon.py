@@ -8,6 +8,7 @@ import errno
 import logging
 from pathlib import Path
 import shutil
+import time
 from types import SimpleNamespace
 
 import appio.iod as iod
@@ -56,12 +57,28 @@ def make_daemon(tmp_path):
                         query_worker=DeferredWorker(), file_source_factory=factory or (lambda: BpfFileSource(loader)))
         made.append(daemon)
         daemon.start()
+        wait_for_F(daemon)
         return SimpleNamespace(daemon=daemon, clock=clock, loader=loader, proc=proc)
 
     yield make
     for daemon in made:
         daemon.stop()
         daemon.selector.close()
+
+
+def wait_for_F(d):
+    # Tests may await persistence; the production owner must never do so.
+    frame = d.collector.last_frame
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        worker, runtime = d.file_runtime, d.file_runtime._runtime
+        if runtime is not None and worker.availability is runtime.availability:
+            if runtime._last.get(frame.boot_id) == (frame.epoch, frame.seq):
+                return
+            if worker.diagnostic and "F failure" in worker.diagnostic:
+                return
+        time.sleep(0.001)
+    pytest.fail("worker did not complete the committed F endpoint")
 
 
 def snapshot(d):
@@ -72,6 +89,7 @@ def step(h, seconds=10, amount=200):
     write_io(h.proc, amount)
     h.clock.advance(seconds)
     h.daemon.step()
+    wait_for_F(h.daemon)
 
 
 def total(d):
@@ -119,9 +137,11 @@ def test_drain_failure_does_not_stall_T_D_publish_or_clear_replay(make_daemon):
     failed = snapshot(h.daemon)
     assert failed["seq"] == 1 and total(h.daemon) == 1200
     assert h.daemon.last_error is None and len(h.daemon._ring) == 2
-    assert not failed["capabilities"]["file_io"] and "errno -5" in failed["coverage"]["file_source"]["diagnostic"]
+    assert not h.daemon.file_runtime.availability.available
     step(h, amount=300)
     assert snapshot(h.daemon)["seq"] == 2 and total(h.daemon) == 2400
+    assert not snapshot(h.daemon)["capabilities"]["file_io"]
+    assert "errno -5" in snapshot(h.daemon)["coverage"]["file_source"]["diagnostic"]
     assert h.daemon.last_error is None and not h.daemon._recover
 
 
@@ -149,15 +169,16 @@ def test_F_failure_does_not_change_T_D_cadence_or_last_error(make_daemon):
     assert h.daemon.last_error is None
 
 
-def test_file_sqlite_failure_leaves_shared_connection_ready_for_next_T_D_commit(make_daemon):
+def test_file_sqlite_failure_leaves_T_D_connection_ready_for_next_commit(make_daemon):
     h = make_daemon()
     db = h.daemon.collector.store.connection
-    db.execute("CREATE TEMP TRIGGER fail_F BEFORE INSERT ON file_hour_state BEGIN SELECT RAISE(FAIL,'F failure'); END")
+    db.execute("CREATE TRIGGER fail_F BEFORE INSERT ON file_hour_state BEGIN SELECT RAISE(FAIL,'F failure'); END")
     db.commit()
     step(h)
     assert not db.in_transaction and h.daemon.last_error is None
-    assert not snapshot(h.daemon)["capabilities"]["file_io"]
+    assert not h.daemon.file_runtime.availability.available
     step(h, amount=300)
+    assert not snapshot(h.daemon)["capabilities"]["file_io"]
     assert total(h.daemon) == 2400 and snapshot(h.daemon)["seq"] == 2
 
 
@@ -177,7 +198,7 @@ def test_closed_hour_finalized_through_real_daemon_path(make_daemon):
     assert db.execute("SELECT file_finalized_through_mono_ns FROM boot").fetchone() == (H,)
 
 
-def test_T_D_recovery_replaces_source_but_capabilities_wait_for_committed_snapshot(make_daemon):
+def test_T_D_recovery_keeps_F_worker_and_capabilities_wait_for_committed_snapshot(make_daemon):
     loaders = [VectorLoader(hook_mask=1), VectorLoader()]
     calls = []
 
@@ -187,9 +208,17 @@ def test_T_D_recovery_replaces_source_but_capabilities_wait_for_committed_snapsh
 
     h = make_daemon(factory=factory)
     assert not snapshot(h.daemon)["capabilities"]["file_io"]
-    h.daemon._recover = True  # same collector-recovery path, no F polling loop
+    worker = h.daemon.file_runtime
+    h.daemon._recover = True
+    step(h)
+    assert h.daemon.file_runtime is worker and calls == [0]
+    # T/D recovery cannot reset F's bounded retry budget. Only the worker's
+    # next committed endpoint after the retry deadline permits a fresh attach.
+    time.sleep(max(0, worker._runtime._retry_at - time.monotonic()) + 0.02)
     step(h)
     assert calls == [0, 1]
+    # Async attachment is advertised by the next committed snapshot.
+    step(h)
     assert snapshot(h.daemon)["capabilities"]["file_io"]
     assert snapshot(h.daemon)["coverage"]["file_source"]["diagnostic"] is None
     assert h.daemon.last_error is None
