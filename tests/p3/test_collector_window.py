@@ -1,9 +1,9 @@
 """Offscreen proof that one switch owns privilege and everything else navigates.
 
-Every test injects a fake setup client, a fake coordinator and a fake history
-router. The assertions are about *mechanism*: which probe text is displayed,
-which argv is elevated, which coordinator transition runs, and — for every deep
-link — that none of them ran at all.
+Most tests inject setup, coordinator and history fakes. The liveness regression
+also runs the real coordinator, router and client against a temporary Unix-socket
+daemon. The assertions cover probe text, elevated argv, ownership transitions,
+and navigation that leaves collection and privilege state alone.
 """
 
 from __future__ import annotations
@@ -877,6 +877,39 @@ def test_history_is_prepared_before_rendering_and_stale_detail_is_hidden(qtbot):
     assert set(history.ranking_calls) == {history.prepared}
 
 
+@pytest.mark.parametrize("change", ["time", "boot", "owner", "invalidated", "ready", "local"])
+def test_pending_history_yields_to_new_scope_ownership_or_invalidation(qtbot, change):
+    window, coordinator, history, setup = build(qtbot, facts=OFF if change == "local" else ON)
+    window._timer.stop()
+    window._poll_timer.stop()
+    window.refresh()
+    original_window = history.prepared
+    if change == "time":
+        window._clock_ns = lambda: END + RAW_BUCKET_NS // 2
+    elif change == "boot":
+        history.local.connection.boot_id = "next-boot"
+    elif change == "owner":
+        setup.facts = OFF
+    elif change == "invalidated":
+        history.view_state = "unavailable"
+    elif change == "ready":
+        history.become_ready()
+
+    window.refresh()
+    assert len(history.actions) == 2
+    assert coordinator.ticks == 2
+    if change == "time":
+        assert history.prepared.end_mono_ns == END + RAW_BUCKET_NS
+    elif change == "boot":
+        assert history.prepared.boot_id == "next-boot"
+    else:
+        assert history.prepared == original_window
+        assert len(coordinator.reconciles) == 2
+    if change == "owner":
+        assert coordinator.reconciles[-1] == OFF
+        assert window.state_text == COLLECTOR_STATE_OFF
+
+
 def test_no_boot_row_yet_waits_instead_of_querying_an_empty_scope(qtbot):
     window, coordinator, history, setup = build(qtbot)
     history.local = SimpleNamespace(connection=FakeConnection(None))
@@ -978,6 +1011,245 @@ def test_real_history_router_gates_rendering_until_ready(qtbot, tmp_path):
     finally:
         history.close()
         store.connection.close()
+
+
+def test_window_keeps_in_flight_history_for_the_same_scope(qtbot, tmp_path, monkeypatch):
+    """A responsive daemon must populate an open window without a manual refresh."""
+    from collections import deque
+    import socket
+    import sqlite3
+    import time
+
+    from appio.history_router import HistoryRouter
+    from appio.iod_history import HistoryRpc
+    from appio.iodclient import AppRegistry, IodClient
+    from appio.ipc_models import StreamCursor, validate_request
+    from appio.ipc_protocol import FrameDecoder, encode_frame
+    from appio.ipc_security import Peer
+    from appio.query import QueryService
+    from appio.store import AppIoStore
+    from test_history_router import source
+    from test_iodclient import snapshot_frame, status_frame
+
+    trace = deque(maxlen=64)
+    local = AppIoStore(tmp_path / "gui.db")
+    local.start_boot(BOOT, 1, 0, 1000.0, "gui")
+    local.connection.commit()
+    daemon_store, _ = source(
+        tmp_path / "daemon.db", owner="iod", boot=BOOT, start=100, end=110,
+    )
+    daemon_store.connection.close()
+    errors = deque(maxlen=8)
+    socket_path = tmp_path / "iod.sock"
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(str(socket_path))
+    listener.listen(1)
+    listener.settimeout(0.1)
+    stopping = threading.Event()
+
+    def fake_daemon():
+        peer = None
+        connection = None
+        try:
+            connection = sqlite3.connect(tmp_path / "daemon.db")
+            rpc = HistoryRpc(connection)
+            while not stopping.is_set():
+                try:
+                    peer, _ = listener.accept()
+                    trace.append(("daemon-accepted",))
+                    break
+                except socket.timeout:
+                    continue
+            if peer is None:
+                return
+            peer.settimeout(0.05)
+            decoder = FrameDecoder()
+            while not stopping.is_set():
+                try:
+                    data = peer.recv(65536)
+                except socket.timeout:
+                    continue
+                if not data:
+                    break
+                for message in decoder.feed(data):
+                    trace.append(("daemon-recv", message["type"]))
+                    if message["type"] == "status":
+                        reply = status_frame(
+                            cursor=StreamCursor(BOOT, 1, 0),
+                            request_id=message["request_id"],
+                        )
+                    elif message["type"] == "subscribe":
+                        reply = snapshot_frame(1, boot_id=BOOT, epoch=1, ts=120_000_000_000)
+                    elif message["type"] == "query":
+                        trace.append(("daemon-query", message["query"]["kind"], time.monotonic_ns()))
+                        request = validate_request(message)
+                        reply = rpc.execute(request.query, request_id=request.request_id)
+                    else:  # pragma: no cover - the production client sends no other requests
+                        raise AssertionError(f"unexpected client message: {message['type']}")
+                    peer.sendall(encode_frame(reply))
+        except Exception as error:
+            if not stopping.is_set():
+                errors.append(("daemon-error", repr(error)))
+        finally:
+            if peer is not None:
+                peer.close()
+            if connection is not None:
+                connection.close()
+
+    server = threading.Thread(target=fake_daemon, name="fake-iod", daemon=True)
+    server.start()
+
+    history_ref = []
+    client = IodClient(
+        socket_path,
+        peer_reader=lambda _sock: Peer(pid=4321, uid=0, gid=0),
+        path_verifier=lambda _path: None,
+        on_gap=lambda notice: history_ref[0].record_transport_gap(notice),
+        on_change=lambda: None,
+    )
+    history = HistoryRouter(QueryService(local), client, AppRegistry())
+    read_local = history._read_local
+
+    def slow_local_snapshot(*args):
+        # Model a loaded history worker; the daemon itself answers immediately.
+        stopping.wait(0.18)
+        return read_local(*args)
+
+    monkeypatch.setattr(history, "_read_local", slow_local_snapshot)
+    history_ref.append(history)
+    coordinator = cw.CollectorCoordinator(
+        local_factory=lambda: pytest.fail("a daemon-owned window must not collect locally"),
+        client=client, history=history, lease=cw.GuiLease(tmp_path / "gui.lock"),
+        clock=lambda: (120_000_000_000 - 1, 1_700_000_000_000_000_000),
+    )
+    setup = FakeSetup(SILENT)
+    now = 120_000_000_000 - 1
+    window = CollectorWindow(
+        coordinator, history, setup,
+        clock_ns=lambda: now,
+        pump=client.pump,
+        refresh_interval_ms=50,
+    )
+    qtbot.addWidget(window)
+    qtbot.addWidget(window.settings)
+
+    original_prepare = history.prepare
+    original_ready = history.ready
+    original_query = client.query
+    original_pump = client.pump
+    original_probe = setup.refresh
+    original_show_error = window._show_error
+    observed = {
+        "pumps": 0, "probes": 0, "prepares": 0, "settled_local": 0, "ranking_settled": 0,
+    }
+
+    def instrumented_error(message):
+        errors.append(("window-error", message))
+        original_show_error(message)
+
+    def instrumented_pump():
+        observed["pumps"] += 1
+        trace.append(("pump", time.monotonic_ns()))
+        original_pump()
+        trace.append(("client", client.state.verified, client.state.answering,
+                      client.state.last_error, client.state.cursor))
+
+    def instrumented_probe():
+        observed["probes"] += 1
+        facts = original_probe()
+        trace.append(("status", client.state.verified, client.state.answering,
+                      client.state.last_error, client.state.cursor))
+        return facts
+
+    def instrumented_prepare(scope):
+        observed["prepares"] += 1
+        trace.append(("prepare", history._generation + 1, scope))
+        original_prepare(scope)
+        future = history._local_future
+        if future is not None:
+            generation = history._generation
+
+            def local_settled(done):
+                observed["settled_local"] += 1
+                trace.append(("local-future", generation, done.cancelled(),
+                              done.exception() if not done.cancelled() else None))
+
+            future.add_done_callback(local_settled)
+
+    def instrumented_ready(scope):
+        try:
+            ready = original_ready(scope)
+        except Exception as error:
+            trace.append(("ready-error", type(error).__name__, str(error)))
+            raise
+        pending = history._pending
+        trace.append(("ready", history._generation, ready,
+                      None if pending is None else pending[1].kind,
+                      None if pending is None else pending[2].done(), history.view_state))
+        return ready
+
+    def instrumented_query(request):
+        future = original_query(request)
+
+        def settled(done):
+            try:
+                done.result()
+            except Exception as error:
+                trace.append(("query-failed", request.kind, type(error).__name__, str(error)))
+            else:
+                if request.kind == "ranking":
+                    observed["ranking_settled"] += 1
+                trace.append(("query-settled", request.kind))
+
+        future.add_done_callback(settled)
+        return future
+
+    client.pump = instrumented_pump
+    setup.refresh = instrumented_probe
+    history.prepare = instrumented_prepare
+    history.ready = instrumented_ready
+    client.query = instrumented_query
+    window._pump = instrumented_pump
+    window._show_error = instrumented_error
+    wake = cw._wake_object()
+    wake.woke.connect(window.refresh)
+    client._on_change = wake.woke.emit
+    window.show()
+
+    def populated():
+        return (
+            window.history_visible
+            and client.state.verified
+            and client.state.answering
+            and window._view is not None
+            and window._view._list.count() == 1
+            and history._remote is not None
+            and bool(history._remote)
+        )
+
+    try:
+        try:
+            qtbot.waitUntil(populated, timeout=1800)
+        except Exception as error:
+            pytest.fail(
+                f"history did not populate without an external refresh: {error}; "
+                f"observed={observed}; state={window.state_text}; errors={list(errors)}; "
+                f"trace={list(trace)}"
+            )
+        assert window.state_text == COLLECTOR_STATE_ON_ANSWERING
+        assert observed["pumps"] > 1 and observed["probes"] > 1
+        assert observed["ranking_settled"] > 0
+        assert [(row.app_key, row.total_bytes) for row in history.ranking(
+            window._prepared, "total_bytes",
+        )] == [("exe:/usr/bin/shared", 40)]
+        assert not errors, list(errors)
+    finally:
+        stopping.set()
+        window.shutdown()
+        listener.close()
+        server.join(timeout=1)
+        local.connection.close()
+        assert not server.is_alive()
 
 
 def test_consent_text_is_verb_specific_and_never_mentions_a_path():

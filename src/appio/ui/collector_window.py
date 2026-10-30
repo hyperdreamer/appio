@@ -625,13 +625,23 @@ class CollectorWindow(QMainWindow):
             if state is not None and state.verified and state.answering:
                 facts = replace(facts, daemon_verified=True, answering=True,
                                 pending_activation=state.pending_activation)
+            # Reconciliation invalidates the router. With unchanged daemon
+            # ownership, let an in-flight read finish across refresh ticks;
+            # replacing it each tick can discard every completed generation.
+            keep_pending = (
+                facts == self._facts
+                and facts.daemon_verified and facts.answering
+                and self._prepared is not None
+                and self.history.view_state == "loading"
+            )
             self._facts = facts
             if not self._busy:
-                self.coordinator.reconcile(facts)
+                if not keep_pending:
+                    self.coordinator.reconcile(facts)
                 self.coordinator.tick_local()
             self._render(facts)
             if not self._busy:
-                self._render_history()
+                self._render_history(keep_pending=keep_pending)
         except Exception as error:  # a timer callback must never kill the window
             self._show_error(f"appio: {error}")
 
@@ -695,7 +705,7 @@ class CollectorWindow(QMainWindow):
         end = (now // RAW_BUCKET_NS + 1) * RAW_BUCKET_NS
         return Window(kind="since_boot", boot_id=boot_id, end_mono_ns=end)
 
-    def _render_history(self) -> None:
+    def _render_history(self, *, keep_pending: bool = False) -> None:
         window = self._current_window()
         if window is None:
             self._prepared = None
@@ -705,8 +715,9 @@ class CollectorWindow(QMainWindow):
             self._poll_timer.stop()
             self._sync_files(request=False)
             return
-        self._prepared = window
-        self.history.prepare(window)
+        if not keep_pending or self._prepared != window:
+            self._prepared = window
+            self.history.prepare(window)
         if self.history.ready(window):
             self._show_ready(window)
             return
