@@ -28,7 +28,7 @@ import time
 
 from .cgroups import friendly_device_name, parse_diskstats
 from .contracts import WindowUnavailableError
-from .file_runtime import FileAvailability, FileWorker
+from .file_runtime import FileAvailability, FileRuntime
 from .bpf_fileio import FileSourceError
 from .iod_history import HistoryRpc, to_wire
 from .ipc_models import Capabilities, StreamCursor, validate_request, validate_server_message
@@ -333,8 +333,8 @@ class Daemon:
         self.selector.register(listener, selectors.EVENT_READ, None)
 
     def _new_collector(self):
-        # T/D recovery must not join a busy F worker on the IPC owner loop.
-        # F owns a different connection and follows committed epoch receipts.
+        if self.file_runtime is not None:
+            self.file_runtime.close()
         if self.collector is not None:
             self.collector.close()
         self.collector = LiveCollector(self.paths.proc_root, self.paths.cgroup_root, self.paths.database,
@@ -345,9 +345,8 @@ class Daemon:
         connection.execute("PRAGMA synchronous=FULL")
         self._sidecars()
         self._pruner = QuotaPruner(connection, self.paths.database)
-        if self.file_runtime is None:
-            self.file_runtime = FileWorker(self.paths.database, source_factory=self._file_source_factory)
-            self.file_runtime.start()
+        self.file_runtime = FileRuntime(connection, source_factory=self._file_source_factory)
+        self.file_runtime.start()
 
     def start(self):
         if self._running:
@@ -741,14 +740,13 @@ class Daemon:
         self.last_error = self._storage_error
         if self.last_error is None:
             self._announced_error = None
-        # tick() returns only after record_tick's outer COMMIT. Mint the
-        # checked endpoint here; no loader calls or F persistence on this loop.
-        # The worker consumes this certificate even if T/D has since advanced.
+        # F consumes the same committed endpoint, in its own short transaction.
+        # It cannot change the T/D error, replay, cadence, or recovery state.
         try:
-            self.file_runtime.submit_committed(
-                self.collector.store.connection, self.collector.last_frame, self.collector.file_context)
-        except (FileSourceError, sqlite3.Error, ValueError):
-            _LOG.warning("file_frame_handoff_failed")
+            self.file_runtime.consume(self.collector.last_frame, self.collector.file_context)
+        except FileSourceError:
+            if self._file_diagnostic != self.file_runtime.diagnostic:
+                _LOG.warning("file_source_unavailable diagnostic=%s", self.file_runtime.diagnostic)
         self._file_diagnostic = self.file_runtime.diagnostic
         self._publish()
         if previous_mono is None or self._committed_mono > previous_mono:
@@ -872,7 +870,6 @@ class Daemon:
             self._socket_identity = None
         if self.file_runtime is not None:
             self.file_runtime.close()
-            self.file_runtime = None
         if self.collector is not None:
             self.collector.close()
         if self._lock_fd is not None:

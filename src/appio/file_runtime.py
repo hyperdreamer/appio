@@ -1,7 +1,8 @@
-"""Committed-endpoint F collection on a dedicated, bounded worker.
+"""Owner-loop F collection, independent of the committed T/D transaction.
 
-The owner hands off only commit-checked frames. The worker owns the loader,
-SQLite connection, retry state and persistence; it has no sampling timer.
+No second writer or independent sampling loop lives here. F drains only committed
+iod endpoints. Its transactions finish (or roll back) before returning to the
+daemon; a broken source retries at bounded owner-loop deadlines.
 """
 from __future__ import annotations
 
@@ -13,7 +14,6 @@ from pathlib import Path
 import select
 import sqlite3
 import subprocess
-import threading
 import time
 
 from .bpf_fileio import BpfFileSource, FileSourceError, StreamLoader
@@ -36,16 +36,14 @@ DRAIN_MAX_DURATION_S = 60.0
 #: Five fresh-source attempts per outage. Only a committed drain resets this
 #: budget; a successful HELLO followed by another failed drain does not.
 REATTACH_BACKOFF_S = (1.0, 2.0, 4.0, 8.0, 16.0)
-#: Wall budget for F persistence on its own connection. It is not an owner-loop
-#: or statement latency budget.
+#: Wall budget for one F persistence transaction. F runs after T/D commits, so this
+#: bounds how long the *next* sample can be delayed; it is not a statement latency.
 #: A 250 ms budget here aborted on the real host: startup recovery of pending state
 #: exceeded it, SQLite's progress handler fired, and the failure surfaced as an
 #: opaque ``OperationalError: interrupted`` that disabled the whole file source.
 PERSIST_BUDGET_S = 2.5
 CLOSE_BUDGET_S = 0.1
 SHUTDOWN_WAIT_S = 0.1
-WORKER_STOP_BUDGET_S = 0.6
-CANCEL_POLL_S = 0.02
 _LOG = logging.getLogger(__name__)
 _F_ERRORS = (FileSourceError, OSError, sqlite3.Error, ValueError, CounterOverflowError)
 
@@ -88,8 +86,6 @@ class _Pipe:
         os.set_blocking(self.fd, False)
 
     def _wait(self):
-        if self.owner.stop_event is not None and self.owner.stop_event.is_set():
-            raise InterruptedError("file worker stopping")
         deadline = self.owner.deadline
         idle = self.owner.idle_deadline
         no_progress = idle is not None and idle < deadline
@@ -100,17 +96,13 @@ class _Pipe:
         if left <= 0:
             raise TimeoutError(f"file loader {detail} expired")
         ready = select.select([] if self.writing else [self.fd],
-                              [self.fd] if self.writing else [], [], min(left, CANCEL_POLL_S))
+                              [self.fd] if self.writing else [], [], left)
         if not (ready[0] or ready[1]):
-            # Poll cancellation even when the peer is silent. The caller loops
-            # back here without renewing either response deadline.
-            return False
-        return True
+            raise TimeoutError(f"file loader {detail} expired")
 
     def read(self, size):
         while True:
-            if not self._wait():
-                continue
+            self._wait()
             try:
                 data = os.read(self.fd, size)
                 if data and self.owner.idle_timeout is not None:
@@ -122,8 +114,7 @@ class _Pipe:
     def write(self, data):
         view = memoryview(data)
         while view:
-            if not self._wait():
-                continue
+            self._wait()
             try:
                 sent = os.write(self.fd, view)
                 if sent == 0:
@@ -149,15 +140,11 @@ class _ProcessLoader:
             raise FileSourceError(None, None, "installed fileio loader/object unavailable")
         self.process = subprocess.Popen([executable, obj], stdin=subprocess.PIPE,
                                         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=0)
-        self.stop_event = None
         self.deadline = 0.0
         self.idle_deadline = None
         self.idle_timeout = None
         self._reap_attempted = False
         self.stream = StreamLoader(_Pipe(self.process.stdout, self), _Pipe(self.process.stdin, self, True))
-
-    def set_stop_event(self, event):
-        self.stop_event = event
 
     def _command(self, method, *args, timeout=0.25, idle_timeout=None):
         now = time.monotonic()
@@ -205,10 +192,8 @@ def default_file_source():
 
 
 class FileRuntime:
-    def __init__(self, connection: sqlite3.Connection, *, source_factory=None, identity_resolver=None, clock=None,
-                 stop_event=None):
+    def __init__(self, connection: sqlite3.Connection, *, source_factory=None, identity_resolver=None, clock=None):
         self.connection = connection
-        self._stop_event = stop_event
         self._clock = time.monotonic if clock is None else clock
         self.source_factory = default_file_source if source_factory is None else source_factory
         # No path reconstruction or unsafe dev_t-to-UUID inference. A deployment
@@ -278,9 +263,7 @@ class FileRuntime:
         storage = min(busy, 10)
         deadline = time.monotonic() + PERSIST_BUDGET_S
         self.connection.execute(f"PRAGMA busy_timeout={storage}")
-        self.connection.set_progress_handler(
-            lambda: int(time.monotonic() >= deadline or
-                        (self._stop_event is not None and self._stop_event.is_set())), 1000)
+        self.connection.set_progress_handler(lambda: int(time.monotonic() >= deadline), 1000)
         try:
             for key, acc in hours.items():
                 self.store.apply_pending(acc.finalize())
@@ -309,8 +292,6 @@ class FileRuntime:
 
     def _attach(self):
         self._source = self.source_factory()
-        if self._stop_event is not None:
-            self._source.set_stop_event(self._stop_event)
         self._source_boot = None
         status = self._source.start()
         if not (status.file_io and status.bpf_loaded):
@@ -347,7 +328,7 @@ class FileRuntime:
             self._disable(failure)
         return self.availability
 
-    def _validate(self, frame, context, committed=None):
+    def _validate(self, frame, context):
         if not isinstance(frame, AggregatedFrame) or not isinstance(context, FileFrameContext):
             raise ValueError("F requires a committed frame and its immutable context")
         if frame.source != "iod" or (frame.boot_id, frame.epoch, frame.seq, frame.observed_mono_ns) != (
@@ -357,20 +338,17 @@ class FileRuntime:
             return False
         if self.connection.in_transaction:
             raise ValueError("T/D frame is not committed")
-        if committed is None:
-            frontier = self.connection.execute(
-                "SELECT boot_id,epoch,seq,checkpoint_mono_ns FROM sampler_checkpoint WHERE source='iod'").fetchone()
-            if frontier != (frame.boot_id, frame.epoch, frame.seq, frame.observed_mono_ns):
-                raise ValueError("F may only drain the committed iod frontier")
-        elif not isinstance(committed, _CommittedFrame) or (committed.frame is not frame or committed.context is not context):
-            raise ValueError("F handoff lacks its committed endpoint")
+        committed = self.connection.execute(
+            "SELECT boot_id,epoch,seq,checkpoint_mono_ns FROM sampler_checkpoint WHERE source='iod'").fetchone()
+        if committed != (frame.boot_id, frame.epoch, frame.seq, frame.observed_mono_ns):
+            raise ValueError("F may only drain the committed iod frontier")
         if self._boot is not None and self._boot != frame.boot_id:
             orders = dict(self.connection.execute("SELECT boot_id,boot_order FROM boot"))
             if orders[frame.boot_id] <= orders[self._boot]:
                 raise ValueError("F boot chronology must advance before draining")
         return True
 
-    def _advance(self, frame, context, contribution=None, *, gap_intervals=1):
+    def _advance(self, frame, context, contribution=None):
         boot, at = frame.boot_id, frame.observed_mono_ns
         hour = at // FILE_HOUR_NS * FILE_HOUR_NS
         key = (boot, hour)
@@ -388,8 +366,8 @@ class FileRuntime:
         if contribution is None:
             keys = set(context.app_keys) | {app.app_key for app in acc.state().apps}
             for app in sorted(keys):
-                acc.add_observation(receipt, app, None, replace(ZERO_COVERAGE, complete=False, gap_intervals=gap_intervals))
-            acc.add_unknown_owner(receipt, replace(ZERO_UNKNOWN, complete=False, gap_intervals=gap_intervals))
+                acc.add_observation(receipt, app, None, replace(ZERO_COVERAGE, complete=False, gap_intervals=1))
+            acc.add_unknown_owner(receipt, replace(ZERO_UNKNOWN, complete=False, gap_intervals=1))
         else:
             partial = previous is None and not any(k[0] == boot for k in self._hours) and at % FILE_HOUR_NS
             for app, rows, coverage in contribution.apps:
@@ -411,15 +389,10 @@ class FileRuntime:
         self._boot = boot
         self._last[boot] = (frame.epoch, frame.seq)
 
-    def record_gap(self, committed, count=1):
-        if self._validate(committed.frame, committed.context, committed):
-            self._advance(committed.frame, committed.context, gap_intervals=count)
-            self._recovering = True
-
-    def consume(self, frame: AggregatedFrame, context: FileFrameContext, *, committed=None):
+    def consume(self, frame: AggregatedFrame, context: FileFrameContext):
         validated = False
         try:
-            if not self._validate(frame, context, committed):
+            if not self._validate(frame, context):
                 return False
             validated = True
             hour = frame.observed_mono_ns // FILE_HOUR_NS * FILE_HOUR_NS
@@ -458,7 +431,7 @@ class FileRuntime:
                     self._advance(frame, context)
                 except _F_ERRORS:
                     # Even failure to persist F gap evidence cannot leave the
-                    # F writer in a transaction or claim measured zero.
+                    # shared writer in a transaction or claim measured zero.
                     _LOG.warning("file_gap_persistence_failed")
             raise FileSourceError(getattr(failure, "errno", None), None, self.diagnostic or "file source unavailable") from failure
 
@@ -479,147 +452,3 @@ class FileRuntime:
             except _F_ERRORS as failure:
                 self._disable(failure)
         self._availability = FileAvailability(False, False, "file_source_unavailable", self.diagnostic)
-
-
-@dataclass(frozen=True)
-class _CommittedFrame:
-    """Certificate minted on the T/D connection, after its outer COMMIT.
-
-    A worker may lag behind sampler_checkpoint. Checking that moving frontier
-    on its own connection would incorrectly reject an already committed frame.
-    """
-    frame: AggregatedFrame
-    context: FileFrameContext
-
-    @classmethod
-    def capture(cls, connection, frame, context):
-        if connection.in_transaction:
-            raise ValueError("F submission requires T/D COMMIT")
-        frontier = connection.execute(
-            "SELECT boot_id,epoch,seq,checkpoint_mono_ns FROM sampler_checkpoint WHERE source='iod'").fetchone()
-        if frontier != (frame.boot_id, frame.epoch, frame.seq, frame.observed_mono_ns):
-            raise ValueError("F submission is not the committed T/D frontier")
-        return cls(frame, context)
-
-
-@dataclass(frozen=True)
-class _SkippedFrames:
-    # Two endpoints plus a count, never a growing list of frames/contexts.
-    first: _CommittedFrame
-    last: _CommittedFrame
-    count: int
-
-
-class FileWorker:
-    """One active frame, one replaceable pending frame, bounded gap metadata.
-
-    Only this thread constructs/uses/closes the loader and SQLite connection.
-    The condition protects pointer swaps only: no I/O or callbacks under it.
-    Stop cancels silent/trickling pipes and SQLite VM work, then joins; the
-    production transport must obey cancellation (injected peers must too).
-    """
-    def __init__(self, database, *, source_factory=None, identity_resolver=None):
-        self.database = database
-        self.source_factory = default_file_source if source_factory is None else source_factory
-        self.identity_resolver = identity_resolver
-        self._condition = threading.Condition()
-        self._stop = threading.Event()
-        self._accepting = True
-        self._pending = None
-        self._skipped = None
-        self._runtime = None
-        self._availability = FileAvailability(False, False, "file_source_unavailable")
-        self._thread = threading.Thread(target=self._run, name="appio-file-worker")
-
-    @property
-    def availability(self):
-        return self._availability
-
-    @property
-    def diagnostic(self):
-        return self._availability.diagnostic
-
-    def start(self):
-        self._thread.start()
-
-    def submit_committed(self, connection, frame, context):
-        if not self._accepting:
-            return False
-        committed = _CommittedFrame.capture(connection, frame, context)
-        with self._condition:
-            if not self._accepting:
-                return False
-            if self._pending is not None:
-                old = self._pending
-                prior = self._skipped
-                self._skipped = _SkippedFrames(
-                    old if prior is None else prior.first, old,
-                    1 if prior is None else prior.count + 1)
-            self._pending = committed
-            self._condition.notify()
-        return True
-
-    def _run(self):
-        connection = None
-        try:
-            connection = sqlite3.connect(str(self.database), timeout=0.01)
-            connection.execute("PRAGMA journal_mode=WAL")
-            connection.execute("PRAGMA busy_timeout=10")
-            runtime = self._runtime = FileRuntime(
-                connection, source_factory=self.source_factory,
-                identity_resolver=self.identity_resolver, stop_event=self._stop)
-            # Attachment belongs to this worker too, not Daemon.start().
-            runtime.start()
-            self._availability = runtime.availability
-            while True:
-                with self._condition:
-                    while self._pending is None and not self._stop.is_set():
-                        self._condition.wait()
-                    if self._stop.is_set():
-                        break
-                    item, skipped = self._pending, self._skipped
-                    self._pending = self._skipped = None
-                try:
-                    if skipped is not None:
-                        runtime.record_gap(skipped.first,
-                                           skipped.count if skipped.last is skipped.first else skipped.count - 1)
-                        if skipped.last is not skipped.first:
-                            runtime.record_gap(skipped.last)
-                    runtime.consume(item.frame, item.context, committed=item)
-                except _F_ERRORS as failure:
-                    runtime._disable(failure)
-                    _LOG.warning("file_source_unavailable diagnostic=%s", runtime.diagnostic)
-                self._availability = runtime.availability
-        except _F_ERRORS as failure:
-            self._availability = FileAvailability(False, False, "file_source_unavailable", str(failure))
-            _LOG.warning("file_worker_unavailable diagnostic=%s", self.diagnostic)
-        finally:
-            with self._condition:
-                self._accepting = False
-                abandoned, skipped = self._pending, self._skipped
-                self._pending = self._skipped = None
-            try:
-                if self._runtime is not None:
-                    # Never drain on shutdown. Persist the abandoned endpoint
-                    # as unavailable coverage, including coalesced intervals.
-                    try:
-                        if abandoned is not None:
-                            self._runtime.record_gap(abandoned, 1 + (0 if skipped is None else skipped.count))
-                    except _F_ERRORS as failure:
-                        self._runtime._disable(failure)
-                        _LOG.warning("file_gap_persistence_failed")
-                    self._runtime.close()
-            finally:
-                if connection is not None:
-                    connection.close()
-                self._availability = FileAvailability(False, False, "file_source_unavailable", self.diagnostic)
-
-    def close(self):
-        with self._condition:
-            self._accepting = False
-            self._stop.set()
-            self._condition.notify()
-        if self._thread.ident is not None:
-            self._thread.join(WORKER_STOP_BUDGET_S)
-            if self._thread.is_alive():
-                raise RuntimeError("file worker exceeded its shutdown budget")
