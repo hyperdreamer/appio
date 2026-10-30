@@ -223,7 +223,8 @@ def test_gap_without_persisted_tier_coverage_is_never_erased(db):
     assert not result.complete
     assert result.reason == "missing_materialization"
     assert db.execute("SELECT count(*) FROM gap").fetchone()[0] == 1
-    assert db.execute("SELECT count(*) FROM sample_coverage").fetchone()[0] == 1
+    assert db.execute("SELECT count(*) FROM sample_coverage").fetchone()[0] == 0
+    assert [(u.kind, u.primary_key) for u in result.skipped] == [("gap", (1,))]
 
 
 def test_gap_with_persisted_tier_coverage_expires_without_losing_its_effects(db):
@@ -305,7 +306,15 @@ def test_b2_lagging_collector_cannot_prune_bytes_before_late_overlap_is_resolved
         pruned = QuotaPruner(db, []).expire(BOOT, 2 * DAY)
         assert not pruned.complete
         assert pruned.reason == "missing_materialization"
-        assert pruned.deleted == ()
+        # Settled zero-byte baselines may prune independently. The unmaterialized
+        # nonzero tick and every other durable row must survive byte-for-byte.
+        removed = {u.primary_key for u in pruned.deleted}
+        assert removed == {(BOOT, "gui", 1, 0, 1), (BOOT, "iod", 1, 0, 1)}
+        assert [(u.primary_key, u.reason) for u in pruned.skipped] == [
+            ((BOOT, "gui", 1, 1, 1), "missing_materialization")
+        ]
+        for table in ("sample", "sample_dev", "sample_coverage"):
+            before[table] = [row for row in before[table] if row[:5] not in removed]
         assert snapshot(db) == before
         record(store, iod, tick(1, 2 * DAY + 20 * NS, [process(counters=(10, 0, 10, 0))], source="iod"))
         assert db.execute("SELECT read_bytes FROM app_boot_total").fetchone()[0] == 0
@@ -384,7 +393,9 @@ def test_long_gap_requires_coverage_in_every_overlapped_bucket(db):
     db.commit()
     result = QuotaPruner(db, []).expire("boot-A", 2 * DAY)
     assert result.reason == "missing_materialization"
-    assert result.deleted == ()
+    assert [u.kind for u in result.deleted] == ["core"]
+    assert [(u.kind, u.primary_key) for u in result.skipped] == [("gap", (1,))]
+    assert db.execute("SELECT count(*) FROM gap").fetchone() == (1,)
     assert db.execute("SELECT count(*) FROM gap").fetchone()[0] == 1
 
 
