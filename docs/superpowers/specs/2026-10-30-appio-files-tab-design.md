@@ -53,28 +53,64 @@ redesign, no collection-cadence change, no new user-facing copy.
 
 > The window must not misreport the daemon, and must not misreport its data.
 
-**Rendering outcomes.** Exactly three, each with a defined predicate:
+**Rendering outcomes.** Four, each with a predicate that is exhaustive because the
+zero-row partial case is its own outcome:
 
 | Outcome | Predicate | Disclosure |
 | --- | --- | --- |
-| `rows` | a served interval exists and holds ≥1 row | bounds T0/T1, gaps inside the served interval, gaps inside the requested window |
-| `empty_proven` | served interval equals the requested window **and** coverage is `complete` | bounds; "no applications observed in this window" — a proven empty, never a fallback for an unknown |
+| `rows` | a served interval exists and holds ≥1 row | bounds T0/T1, gaps inside the served interval (where provable), gaps inside the requested window |
+| `empty_proven` | served interval equals the requested window, coverage is `complete`, **zero rows, and no active search filter** | bounds; "no applications observed in this window" |
+| `no_matches` | zero rows while a search filter is active | bounds; "no retained files match <filter>" — proven absence of matches, never a claim that the app had no activity |
+| `empty_partial` | a served interval exists, coverage is incomplete, **zero rows** | bounds; "no retained file activity in the served interval"; coverage incomplete with both counts |
 | `unavailable` | no servable interval, or any refusal fires | reason |
 
-`empty_proven` is reachable **only** through complete coverage. The present path that can
-reach `ready` with zero rows and no result is retired: unknown must never render as empty.
-Disclosure is uniform — a complete window states its bounds too, so the reader never has to
-infer whether bounds were omitted because the window was complete or because they were lost.
+The zero-row partial case is not hypothetical: `HourlyAccumulator` supports monitored apps
+with no supported file observations (`files.py:309`), producing coverage with rows=0,
+`complete=False`, no refusal, and a served interval equal to the request. That result matched
+none of revision 2's three predicates; `empty_partial` is its terminal outcome and is pinned
+independently of missing-coverage.
 
-**Label rule.** "answering" describes the daemon and has two independent witnesses: the live
-client's verified stream, and the one-shot status probe.
+**Per-route disclosure.** The Files tab is fed either by the local store or by the daemon over
+the history route. The served-gap count needs the gap rows, and the remote consumer receives
+only `FileTable` + `FileCoverage` — two different gap layouts encode identically. Therefore the
+design states what each route can prove, rather than assuming both can prove the same thing:
 
-- either witness positive → `on, answering`;
-- both negative → `enabled, not answering`;
-- the live verified state, when present, supplies `pending_activation`;
-- a disconnected GUI against a healthy daemon still reads `on, answering`; the table
-  reports the GUI's own state separately, and the two are never conflated;
-- the label is recomputed on every refresh, so no value latches.
+| Route | Bounds | Gaps inside served interval | Gaps inside requested window |
+| --- | --- | --- | --- |
+| local store | yes | yes — `file_serve_facts` computes it from the gap rows | yes — existing scalar |
+| daemon / remote | yes | **no** — stated as unavailable for that route | yes — existing scalar |
+
+No wire change is made to enable the remote column. The disclosure names the scope it can
+prove and says plainly when a scope is unavailable on that route, which is consistent with the
+rest of this product: no number is invented and none is silently omitted.
+
+**Label rule — witness merging, then existing precedence.** "answering" describes the daemon
+and has two independent witnesses: the live client's verified stream and the one-shot status
+probe. Witness merging and display state are separate steps, and the existing owner logic keeps
+authority over the final label:
+
+1. **Merge witnesses** into one `answering` fact: positive if either witness is positive,
+   negative only when both are. The live verified state, when present, supplies
+   `pending_activation`; a disconnected GUI against a healthy daemon therefore still yields a
+   positive `answering` fact.
+2. **Derive display state from the existing precedence**, unchanged: `off` for an absent or
+   inactive service; `on, needs activation` when a verified answering daemon has a pending
+   activation; `on, answering` otherwise when the fact is positive; `enabled, not answering`
+   only when the fact is negative. `unavailable` remains reachable for unknown facts.
+3. **The merged facts reach `coordinator.reconcile` unchanged**, so collector ownership keeps
+   its current behaviour; the label change may not alter ownership.
+
+The label is recomputed on every refresh so no value latches.
+
+**This clause is preservation unless a failing case is demonstrated.** A controlled replay of
+`CollectorWindow.refresh` on unchanged code yields all four health transitions already (live
+positive/silent probe → answering; EOF with a healthy probe → answering; both negative → not
+answering; reconnection → answering), and
+`test_verified_status_round_trip_clears_silent_header_while_window_open` already covers live
+promotion and EOF. Revision 2 misdescribed required behaviour as the defect. The implementer
+must therefore either exhibit a concrete failing observation (a state the current precedence
+produces that misreports the daemon) or treat this clause as a preservation pin, and the design
+summary must say which. No repair is claimed without an observed failure.
 
 ## Component changes
 
