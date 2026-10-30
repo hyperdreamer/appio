@@ -1,6 +1,8 @@
 # appio Files tab — honest window and honest label
 
-Status: revision 2 — addresses design review 1 (4 blockers, 4 majors, 1 minor)
+Status: revision 4 — addresses design reviews 1-3. The label clause is now a
+preservation pin, not a repair: review 3 showed the behaviour I called a defect is
+required by tests and produced by unchanged code.
 Date: 2026-10-30
 Supersedes: revision 1 of this document. Builds on the merged P4 work at `2874841`.
 
@@ -26,11 +28,12 @@ ownership is unambiguous, no overlap uncertainty falls inside the served interva
 unproved segment is fully covered by known non-overlap gaps, and those segments are
 hour-aligned.
 
-**Why the label misreports.** The header read `enabled, not answering` while the table was
-populated. Review established that the refresh **already** promotes a verified, answering
-live connection over a silent one-shot probe. The actual asymmetry is the other direction:
-an unverified or disconnected live client does **not** clear facts supplied by a successful
-probe, and the disconnect case was never resolved.
+**About the label.** The header was observed reading `enabled, not answering` while the table
+was populated. Two reviews then established that the refresh already promotes a verified,
+answering live connection over a silent probe, that the activation probe override is deliberate,
+and that unchanged code produces every health transition the earlier drafts called missing. The
+label is therefore treated here as **behaviour to preserve**, with two uncovered transitions
+pinned. A repair would need a concrete failing observation, and none has been exhibited.
 
 **Why naming matters.** The served interval is carried in
 `coverage.unknown_owner_overflow.window`. That field does mean "the interval served", but
@@ -40,7 +43,8 @@ its name says otherwise, and that confusion cost hours during diagnosis.
 
 1. For a requested window, the Files tab renders the rows of the interval it served, and
    discloses that interval and the gaps inside it.
-2. The header reports daemon health truthfully in **both** directions.
+2. The header's existing truthful behaviour is preserved and its two uncovered transitions are
+   pinned; no precedence or ownership change is made.
 3. The served interval is exposed under an honest name without changing the wire contract.
 4. No honesty rule weakens.
 
@@ -53,22 +57,28 @@ redesign, no collection-cadence change, no new user-facing copy.
 
 > The window must not misreport the daemon, and must not misreport its data.
 
-**Rendering outcomes.** Four, each with a predicate that is exhaustive because the
-zero-row partial case is its own outcome:
+**Rendering outcomes.** Five, evaluated **in order**, so exactly one applies to any result:
 
-| Outcome | Predicate | Disclosure |
+| # | Predicate (first match wins) | Disclosure |
 | --- | --- | --- |
-| `rows` | a served interval exists and holds ≥1 row | bounds T0/T1, gaps inside the served interval (where provable), gaps inside the requested window |
-| `empty_proven` | served interval equals the requested window, coverage is `complete`, **zero rows, and no active search filter** | bounds; "no applications observed in this window" |
-| `no_matches` | zero rows while a search filter is active | bounds; "no retained files match <filter>" — proven absence of matches, never a claim that the app had no activity |
-| `empty_partial` | a served interval exists, coverage is incomplete, **zero rows** | bounds; "no retained file activity in the served interval"; coverage incomplete with both counts |
-| `unavailable` | no servable interval, or any refusal fires | reason |
+| 1 | no servable interval, or any refusal fires | `unavailable`, with the reason |
+| 2 | a search filter is active and rows > 0 | `rows` — bounds, gaps, and the filter in effect |
+| 3 | a search filter is active and rows = 0 | `no_matches` — bounds, gaps, and the filter in effect |
+| 4 | no filter, rows = 0, coverage complete | `empty_proven` — bounds; "no applications observed in this window" |
+| 5 | no filter, rows = 0, coverage incomplete | `empty_partial` — bounds; "no retained file activity in the served interval"; coverage incomplete with both counts |
 
-The zero-row partial case is not hypothetical: `HourlyAccumulator` supports monitored apps
-with no supported file observations (`files.py:309`), producing coverage with rows=0,
-`complete=False`, no refusal, and a served interval equal to the request. That result matched
-none of revision 2's three predicates; `empty_partial` is its terminal outcome and is pinned
-independently of missing-coverage.
+Ordering is what makes the table exclusive: a filtered zero-row result matches rule 3 and can
+never also match 5, because 5 requires the absence of a filter. Revision 3 listed these as
+unordered predicates and consequently let one result satisfy two of them.
+
+`no_matches` claims only what is knowable: **no retained file matches this filter**. It does not
+claim that a retained file population existed and was filtered away — `file_coverage` reports
+aggregate bytes, not an unfiltered retained-row count, so that stronger claim is not available.
+The observed byte totals are shown separately, exactly as `_observed_text` already does.
+
+The zero-row partial case is not hypothetical: `HourlyAccumulator` supports monitored apps with
+no supported file observations (`files.py:309`), producing coverage with rows=0, `complete=False`,
+no refusal, and a served interval equal to the request. `empty_partial` is its terminal outcome.
 
 **Per-route disclosure.** The Files tab is fed either by the local store or by the daemon over
 the history route. The served-gap count needs the gap rows, and the remote consumer receives
@@ -84,33 +94,31 @@ No wire change is made to enable the remote column. The disclosure names the sco
 prove and says plainly when a scope is unavailable on that route, which is consistent with the
 rest of this product: no number is invented and none is silently omitted.
 
-**Label rule — witness merging, then existing precedence.** "answering" describes the daemon
-and has two independent witnesses: the live client's verified stream and the one-shot status
-probe. Witness merging and display state are separate steps, and the existing owner logic keeps
-authority over the final label:
+**Label clause — preservation, not repair.** Review 3 established that what revision 1 and 2
+called the label defect is in fact required behaviour, already implemented and already tested:
 
-1. **Merge witnesses** into one `answering` fact: positive if either witness is positive,
-   negative only when both are. The live verified state, when present, supplies
-   `pending_activation`; a disconnected GUI against a healthy daemon therefore still yields a
-   positive `answering` fact.
-2. **Derive display state from the existing precedence**, unchanged: `off` for an absent or
-   inactive service; `on, needs activation` when a verified answering daemon has a pending
-   activation; `on, answering` otherwise when the fact is positive; `enabled, not answering`
-   only when the fact is negative. `unavailable` remains reachable for unknown facts.
-3. **The merged facts reach `coordinator.reconcile` unchanged**, so collector ownership keeps
-   its current behaviour; the label change may not alter ownership.
+- `CollectorWindow.refresh` promotes a verified, answering live connection over a silent probe;
+- `display_state` deliberately lets the activation probe override `decide_owner` whenever
+  `facts.enabled is not False`, so `on, needs activation`, `off` for an enabled-but-inactive
+  service, and `unavailable` for unknown facts all remain reachable;
+- `coordinator.reconcile` keeps using `decide_owner`, so display and ownership are **not** split;
+- `test_current_link_status_requires_verification_and_preserves_activation` and
+  `test_pending_activation_stays_visible_across_a_restart` pin the activation behaviour.
 
-The label is recomputed on every refresh so no value latches.
+This design therefore **does not change** witness handling, display precedence, or ownership
+reconciliation. It adds only these pins, on the two transitions the existing tests do not cover
+(`test_verified_status_round_trip_clears_silent_header_while_window_open` starts from a silent
+probe and stops at EOF):
 
-**This clause is preservation unless a failing case is demonstrated.** A controlled replay of
-`CollectorWindow.refresh` on unchanged code yields all four health transitions already (live
-positive/silent probe → answering; EOF with a healthy probe → answering; both negative → not
-answering; reconnection → answering), and
-`test_verified_status_round_trip_clears_silent_header_while_window_open` already covers live
-promotion and EOF. Revision 2 misdescribed required behaviour as the defect. The implementer
-must therefore either exhibit a concrete failing observation (a state the current precedence
-produces that misreports the daemon) or treat this clause as a preservation pin, and the design
-summary must say which. No repair is claimed without an observed failure.
+| Case | Expected |
+| --- | --- |
+| EOF on the live connection while the one-shot probe still answers | still reads answering, because the probe witnesses a healthy daemon |
+| reconnection on the same open window after such an EOF | returns to answering without a restart |
+
+If the implementer can exhibit a concrete state where the current precedence misreports the
+daemon, that observation becomes its own finding and its own change; absent such an observation,
+this clause is a preservation pin and the delivery summary must say so. No repair is claimed
+without an observed failure.
 
 ## Component changes
 
@@ -121,7 +129,8 @@ summary must say which. No repair is claimed without an observed failure.
 | `QueryService.file_applications`, `file_table` | select using served bounds | unchanged behaviour, conversion noted |
 | `_largest_contiguous_file_interval` | compute the interval | unchanged |
 | `HistoryRouter` | provenance | reads `served_interval`; keeps every refusal; keeps `_gap_ranges` scoped to the requested window for process coverage |
-| `FilesView` | render | three outcomes above; disclosure reads `FileServeFacts` |
+| `HistoryRouter.FileViewResult` | carry the facts to the view | **local dataclass** gains `served_gap_count: int \| None`, where `None` means "not provable on this route"; it is never transported |
+| `FilesView` | render | the five ordered outcomes above; disclosure reads `FileServeFacts` plus `FileViewResult.served_gap_count` |
 | `CollectorWindow` | status | two-witness rule; bounded refresh |
 
 **Two mechanisms, deliberately.** `served_interval` is derivable from fields already on
@@ -201,11 +210,13 @@ Two conditions are non-negotiable before adoption:
    not acceptable evidence.
 4. **Router refusals**, each pinned independently so one predicate cannot satisfy several.
 5. **Wire contract**: encoded field set and exact-match decode of `FileCoverage` unchanged.
-6. **View outcomes**: `rows`, `empty_proven`, `unavailable`, each by its own predicate;
-   disclosure states bounds and both counts with named scopes.
-7. **Label**: verified stream + silent probe → answering; EOF on the stream while the probe
-   still answers → answering; both negative → not answering; reconnection on the same open
-   window restores answering. Mutations separately freeze the refresh and retain stale facts.
+6. **View outcomes**: all five, each reached by its own predicate in the stated order,
+   including a filtered zero-row result that must match rule 3 and not rule 5; disclosure
+   states bounds, both counts with named scopes, and `served_gap_count=None` on the remote
+   route.
+7. **Label (preservation)**: the two uncovered transitions above — EOF with a healthy probe,
+   and reconnection on the same window — plus the existing activation tests staying green.
+   Mutations freeze the refresh and retain stale facts to prove the pins bite.
 8. **Real-database acceptance**: offscreen render against a snapshot shows rows with bounds
    and both counts; the label reads answering while the stream is verified.
 
