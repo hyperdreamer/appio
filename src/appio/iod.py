@@ -419,10 +419,18 @@ class Daemon:
             sock.close()
             return False
 
-    def _close_client(self, client, reason=None):
+    def _close_client(self, client, reason=None, *, operation=None, error=None):
         if reason is not None:
             self.refusals.record(reason, client.peer)
-            _LOG.warning("client_refused reason=%s uid=%d", reason[:128], client.peer.uid)
+            if isinstance(error, OSError):
+                # Keep syscall evidence, never peer data or exception text. A
+                # peer timeout/reset is not evidence of a decode refusal.
+                _LOG.warning(
+                    "client_refused reason=%s uid=%d operation=%s errno=%s",
+                    reason[:128], client.peer.uid, operation, error.errno,
+                )
+            else:
+                _LOG.warning("client_refused reason=%s uid=%d", reason[:128], client.peer.uid)
         self.clients.pop(client.sock.fileno(), None)
         try:
             self.selector.unregister(client.sock)
@@ -592,7 +600,10 @@ class Daemon:
         except BlockingIOError:
             pass
         except (OSError, ProtocolError) as error:
-            self._close_client(client, getattr(error, "reason", "transport_error"))
+            self._close_client(
+                client, getattr(error, "reason", "transport_error"),
+                operation="recv", error=error,
+            )
 
     def _send(self, client):
         budget = IO_BUDGET
@@ -623,7 +634,10 @@ class Daemon:
         except BlockingIOError:
             pass
         except (OSError, SlowClientError) as error:
-            self._close_client(client, getattr(error, "reason", "transport_error"))
+            self._close_client(
+                client, getattr(error, "reason", "transport_error"),
+                operation="send", error=error,
+            )
         self._interest(client)
 
     def _snapshot(self, frame, result):

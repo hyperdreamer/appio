@@ -544,6 +544,95 @@ def test_sigterm_equivalent_main_flushes_on_owner_thread_and_restores_handlers(r
     assert not r.paths.socket.exists()
 
 
+def test_real_IodClient_handshakes_and_subscribes_over_bound_unix_socket(runtime, caplog):
+    """Catch a daemon/client integration fault invisible to scripted peers.
+
+    The connector, listener, accept loop, framing and both protocol consumers are
+    real. Only host credentials/metadata and collection inputs use rootless seams.
+    """
+    from appio.bpf_fileio import BpfFileSource, VectorLoader
+    from appio.iodclient import IodClient
+    from appio.ipc_security import read_peer, verify_runtime_paths
+
+    r = runtime
+    # Use actual kernel client credentials; only root metadata/server identity
+    # need injection to run a privileged daemon contract as an ordinary user.
+    r.daemon.peer_reader = read_peer
+    r.daemon.group_lookup = lambda uid: frozenset({987}) if uid == os.getuid() else frozenset()
+    r.daemon._file_source_factory = lambda: BpfFileSource(VectorLoader())
+    r.daemon.start()
+    checked = []
+
+    def verify(path):
+        verify_runtime_paths(path, metadata=r.fs.lstat, appio_gid=987)
+        checked.append(path)
+
+    gaps, changes = [], []
+    client = IodClient(
+        r.paths.socket, on_gap=gaps.append, on_change=lambda: changes.append(client.state),
+        clock_ns=lambda: r.clock.ns, path_verifier=verify,
+        peer_reader=lambda sock: Peer(os.getpid(), 0, 987),
+    )
+    try:
+        client.connect()
+        for _ in range(12):
+            r.daemon.step()
+            client.pump()
+        evidence = f"daemon_refusals={r.daemon.refusals.records!r}; client_state={client.state!r}; logs={caplog.text}"
+        print(evidence)
+        assert checked == [r.paths.socket], evidence
+        assert client.state.verified and client.state.answering, evidence
+        assert client.state.cursor == r.daemon.committed_cursor, evidence
+        assert client.state.capabilities is not None, evidence
+        assert client.state.capabilities.proc_all, evidence
+        assert len(r.daemon.clients) == 1, evidence
+        assert next(iter(r.daemon.clients.values())).subscribed, evidence
+        assert not r.daemon.refusals.records and not gaps, evidence
+        assert changes
+    finally:
+        client.close()
+
+
+@pytest.mark.parametrize("operation, error_number", [("send", 32), ("recv", 104)])
+def test_real_socket_transport_refusal_names_operation_and_errno(runtime, caplog, operation, error_number):
+    """A client timeout/reset can produce the symptom without a wire mismatch."""
+    from appio.bpf_fileio import BpfFileSource, VectorLoader
+    from appio.iodclient import IodClient, NO_ANSWER_NS
+    from appio.ipc_security import read_peer, verify_runtime_paths
+
+    r = runtime
+    r.daemon.peer_reader = read_peer
+    r.daemon.group_lookup = lambda uid: frozenset({987}) if uid == os.getuid() else frozenset()
+    r.daemon._file_source_factory = lambda: BpfFileSource(VectorLoader())
+    r.daemon.start()
+    client = IodClient(
+        r.paths.socket, on_gap=lambda gap: None, on_change=lambda: None,
+        clock_ns=lambda: r.clock.ns,
+        path_verifier=lambda path: verify_runtime_paths(path, metadata=r.fs.lstat, appio_gid=987),
+        peer_reader=lambda sock: Peer(os.getpid(), 0, 987),
+    )
+    try:
+        client.connect()  # Real connector writes the framed status request.
+        if operation == "send":
+            # Reproduce a deadline while the owner loop has not serviced IPC.
+            r.clock.ns += NO_ANSWER_NS
+            client.pump()
+            assert not client.state.verified and not client.state.answering
+            assert client.state.last_error == "daemon_not_answering"
+        else:
+            # Closing with an unread status response resets this real socket.
+            pump(r)
+            client.close()
+        pump(r)
+        evidence = f"daemon_refusals={r.daemon.refusals.records!r}; client_state={client.state!r}; logs={caplog.text}"
+        print(evidence)
+        assert r.daemon.refusals.records[-1].reason == "transport_error", evidence
+        assert f"reason=transport_error uid={os.getuid()} operation={operation} errno={error_number}" in caplog.text, evidence
+        assert all(len(record.message) < 256 for record in caplog.records)
+    finally:
+        client.close()
+
+
 def test_accept_loop_and_refusal_logs_never_include_raw_payload(runtime, caplog):
     r = runtime
     r.daemon.start()
