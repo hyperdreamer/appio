@@ -1,6 +1,6 @@
 # appio Files tab — honest window and honest label
 
-Status: revision 5 — addresses design reviews 1-3. The label clause is now a
+Status: revision 6 — addresses design reviews 1-3. The label clause is now a
 preservation pin, not a repair: review 3 showed the behaviour I called a defect is
 required by tests and produced by unchanged code.
 Date: 2026-10-30
@@ -116,10 +116,17 @@ reconciliation. It adds only these pins, on the two transitions the existing tes
 (`test_verified_status_round_trip_clears_silent_header_while_window_open` starts from a silent
 probe and stops at EOF):
 
+**Which probe.** "Probe" below means the **unprivileged status-socket observation**
+(`production_probe` / `SetupClient.refresh()`), which is what can produce
+`daemon_verified=True, answering=True` (`collector_window.py:1006-1058`,
+`setup_client.py:116-172`). It is **not** the root activation probe: `_apply_body` deliberately
+discards that probe's answering claim (`collector_window.py:869-880`), so a pin written against it
+could never observe the expected answer.
+
 | Case | Sequence | Expected |
 | --- | --- | --- |
-| probe-only truth | verified connection → EOF on the live connection, probe answered on the next three refreshes | answering throughout, because the probe witnesses a healthy daemon |
-| recovery | connected → EOF **and** probe silent on one refresh (label becomes `enabled, not answering`) → probe answers again | returns to answering on the following refresh, with no restart |
+| probe-only truth | verified connection → EOF on the live connection, status probe answered on the next three refreshes | answering throughout, because the status probe witnesses a healthy daemon |
+| recovery | connected → EOF **and** status probe silent on one refresh (label becomes `enabled, not answering`) → status probe answers again | returns to answering on the following refresh, with no restart |
 
 The recovery row is what makes the pins falsifiable: without it, freezing the refresh or retaining
 stale answering facts produces an identical trace, since the label would read answering at every
