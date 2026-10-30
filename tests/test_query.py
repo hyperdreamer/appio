@@ -655,6 +655,20 @@ def test_missing_interior_file_hour_is_not_reported_as_collection_start(file_db)
     assert result.coverage.unavailable_reason == "not_retained"
 
 
+def test_file_applications_come_from_retained_rows_without_process_ranking(file_db):
+    accumulator = HourlyAccumulator("boot-A", 0)
+    accumulator.add_observation(
+        R, FILE_APP, observation(1, bytes_r=17, last_seen_mono_ns=100_000_000_000), ZERO
+    )
+    FileHourStore(file_db).finalize_hour(accumulator.finalize())
+    file_db.commit()
+    service = QueryService(file_db)
+    window = Window("range", "boot-A", 0, FILE_HOUR_NS)
+
+    assert service.ranking(window, "total_bytes") == []
+    assert service.file_applications(window) == ((FILE_APP, "Demo", 17),)
+
+
 def test_full_boot_file_totals_survive_hourly_row_pruning(file_db):
     # Falsifier: a full-boot request loses exact file totals after hourly retention pruning.
     acc = HourlyAccumulator("boot-A", 0)

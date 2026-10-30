@@ -654,15 +654,29 @@ class FilesView(QWidget):
             self._set_unavailable(getattr(error, "reason", None),
                                   str(error) or type(error).__name__)
             return
+        choices = [(row.name, row.total_bytes, row.app_id) for row in rows]
+        if not rows:
+            local = getattr(self._history, "local", None)
+            registry = getattr(self._history, "registry", None)
+            if local is not None and registry is not None:
+                try:
+                    choices = [
+                        (name, total_bytes, registry.id_for(key))
+                        for key, name, total_bytes in local.file_applications(self._window)
+                    ]
+                except Exception as error:
+                    self._set_unavailable(getattr(error, "reason", None),
+                                          str(error) or type(error).__name__)
+                    return
         self.app_selector.blockSignals(True)
         try:
             self.app_selector.clear()
-            for row in rows:
+            for name, total_bytes, app_id in choices:
                 self.app_selector.addItem(
-                    f"{row.name}  {format_bytes(row.total_bytes)}", row.app_id
+                    f"{name}  {format_bytes(total_bytes)}", app_id
                 )
-            if self._app_id is None and rows:
-                self._app_id = rows[0].app_id
+            if self._app_id is None and choices:
+                self._app_id = choices[0][2]
             index = -1
             if self._app_id is not None:
                 index = self.app_selector.findData(self._app_id)

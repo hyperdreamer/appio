@@ -918,6 +918,48 @@ class QueryService:
         tier: Tier = "raw" if scope == "hourly" else "totals_only"
         return tier, scope, boot_id, start, end
 
+    def file_applications(self, window: Window) -> tuple[tuple[str, str, int], ...]:
+        """Return apps with retained file observations in the requested window."""
+
+        self._precheck(window)
+        with self._snapshot():
+            _, scope, boot_id, start, end = self._file_query_context(window)
+            if scope == "lifetime":
+                rows = self.connection.execute(
+                    "SELECT a.key,a.name,t.bytes_r,t.bytes_w "
+                    "FROM app_boot_file_total t JOIN app a USING(app_id) "
+                    "ORDER BY a.key"
+                ).fetchall()
+            elif scope == "boot":
+                rows = self.connection.execute(
+                    "SELECT a.key,a.name,t.bytes_r,t.bytes_w "
+                    "FROM app_boot_file_total t JOIN app a USING(app_id) "
+                    "WHERE t.boot_id=? ORDER BY a.key",
+                    (boot_id,),
+                ).fetchall()
+            else:
+                unknown = self._unknown_owner(window, scope, boot_id, start, end)
+                query_start = max(start, unknown.window.start_mono_ns) \
+                    if unknown.window != window and unknown.window.kind == "range" else start
+                first = _ceil_bucket(query_start, FILE_HOUR_NS)
+                last = (end // FILE_HOUR_NS) * FILE_HOUR_NS
+                if first >= last:
+                    return ()
+                rows = self.connection.execute(
+                    "SELECT a.key,a.name,f.bytes_r,f.bytes_w "
+                    "FROM file_sample f JOIN app a USING(app_id) "
+                    "WHERE f.boot_id=? AND f.ts_mono_ns>=? AND f.ts_mono_ns<? "
+                    "ORDER BY a.key",
+                    (boot_id, first, last),
+                ).fetchall()
+            totals = {}
+            for key, name, bytes_r, bytes_w in rows:
+                aggregate = totals.setdefault(key, [name, 0])
+                aggregate[1] += bytes_r + bytes_w
+            return tuple(
+                (key, name, total) for key, (name, total) in sorted(totals.items())
+            )
+
     def file_table(self, app_id: int, window: Window, sort: FileSort, direction: Direction, search: str | None) -> FileTable:
         self._precheck(window)
         sort = validate_enum(sort, _FILE_SORTS, "sort")
