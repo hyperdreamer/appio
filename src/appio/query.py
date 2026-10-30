@@ -217,27 +217,29 @@ def _ceil_bucket(value: int, width: int) -> int:
     return ((value + width - 1) // width) * width
 
 
-def _missing_file_prefix_start(
-    start: int, end: int, watermark: int, present_hours: set[int],
-    collection_start: int | None,
-) -> int | None:
+def _largest_contiguous_file_interval(
+    start: int, end: int, watermark: int, present_hours,
+) -> tuple[int, int] | None:
     first = _ceil_bucket(start, FILE_HOUR_NS)
-    last = (end // FILE_HOUR_NS) * FILE_HOUR_NS
-    retained_end = max(first, min(last, watermark))
-    expected = (retained_end - first) // FILE_HOUR_NS
-    present = sorted(hour for hour in present_hours if first <= hour < retained_end)
-    if len(present) >= expected or not present or present[0] <= first:
+    last = min((end // FILE_HOUR_NS) * FILE_HOUR_NS, watermark)
+    if first >= last:
         return None
-    covered_start = present[0]
-    if collection_start is None or collection_start <= first or covered_start != collection_start:
+
+    hours = iter(hour for hour in present_hours if first <= hour < last)
+    first_present = next(hours, None)
+    if first_present is None:
         return None
-    suffix_hours = (retained_end - covered_start) // FILE_HOUR_NS
-    if len(present) == suffix_hours and all(
-        hour == covered_start + index * FILE_HOUR_NS
-        for index, hour in enumerate(present)
-    ):
-        return covered_start
-    return None
+
+    best_start = run_start = first_present
+    best_end = run_end = run_start + FILE_HOUR_NS
+    for hour in hours:
+        if hour == run_end:
+            run_end += FILE_HOUR_NS
+        else:
+            run_start, run_end = hour, hour + FILE_HOUR_NS
+        if (run_end - run_start, run_end) >= (best_end - best_start, best_end):
+            best_start, best_end = run_start, run_end
+    return best_start, best_end
 
 
 def _unavailable_reason(*reasons: str | None) -> str | None:
@@ -700,12 +702,16 @@ class QueryService:
         boot_id = window.boot_id
         exact_boot = window.kind == "since_boot" and cutoff is not None and window.end_mono_ns == cutoff
         if exact_boot:
-            first_file_hour = self.connection.execute(
-                "SELECT MIN(ts_mono_ns) FROM file_overflow_unknown WHERE boot_id=?", (boot_id,)
-            ).fetchone()[0]
-            if first_file_hour is not None and first_file_hour > 0:
-                return "hourly", boot_id, 0, window.end_mono_ns
-            return "boot", boot_id, 0, window.end_mono_ns
+            has_hourly = any(
+                self.connection.execute(sql, (boot_id, window.end_mono_ns)).fetchone() is not None
+                for sql in (
+                    "SELECT 1 FROM file_coverage WHERE boot_id=? AND ts_mono_ns<? LIMIT 1",
+                    "SELECT 1 FROM file_overflow_unknown WHERE boot_id=? AND ts_mono_ns<? LIMIT 1",
+                )
+            )
+            if not has_hourly:
+                return "boot", boot_id, 0, window.end_mono_ns
+            return "hourly", boot_id, 0, window.end_mono_ns
         _, start, end = _bounds(window)
         return "hourly", boot_id, start, end
 
@@ -729,6 +735,7 @@ class QueryService:
         return reduced
 
     def _unknown_owner(self, window: Window, scope: str, boot_id: str | None, start: int | None, end: int | None) -> UnknownOwnerOverflow:
+        served_interval = None
         if scope == "lifetime":
             rows = self.connection.execute(
                 "SELECT b.boot_order,u.boot_id,NULL,u.overflow_files,u.overflow_bytes_r,u.overflow_bytes_w,u.coverage_json "
@@ -741,11 +748,31 @@ class QueryService:
             ).fetchall()
         else:
             first, last = _ceil_bucket(start, FILE_HOUR_NS), (end // FILE_HOUR_NS) * FILE_HOUR_NS
-            rows = [] if first >= last else self.connection.execute(
-                "SELECT b.boot_order,u.boot_id,u.ts_mono_ns,u.overflow_files,u.overflow_bytes_r,u.overflow_bytes_w,u.coverage_json "
-                "FROM file_overflow_unknown u JOIN boot b USING(boot_id) WHERE u.boot_id=? AND u.ts_mono_ns>=? AND u.ts_mono_ns<? ORDER BY u.ts_mono_ns",
-                (boot_id, first, last),
-            ).fetchall()
+            watermark_row = self.connection.execute(
+                "SELECT file_finalized_through_mono_ns FROM boot WHERE boot_id=?", (boot_id,)
+            ).fetchone()
+            if watermark_row is None:
+                rows = []
+            else:
+                calendar_end = min(last, watermark_row[0])
+                calendar = self.connection.execute(
+                    "SELECT ts_mono_ns FROM file_overflow_unknown "
+                    "WHERE boot_id=? AND ts_mono_ns>=? AND ts_mono_ns<? ORDER BY ts_mono_ns",
+                    (boot_id, first, calendar_end),
+                ) if first < calendar_end else ()
+                served_interval = _largest_contiguous_file_interval(
+                    start, end, watermark_row[0], (row[0] for row in calendar)
+                )
+                if served_interval is None:
+                    rows = []
+                else:
+                    served_start, served_end = served_interval
+                    rows = self.connection.execute(
+                        "SELECT b.boot_order,u.boot_id,u.ts_mono_ns,u.overflow_files,u.overflow_bytes_r,u.overflow_bytes_w,u.coverage_json "
+                        "FROM file_overflow_unknown u JOIN boot b USING(boot_id) "
+                        "WHERE u.boot_id=? AND u.ts_mono_ns>=? AND u.ts_mono_ns<? ORDER BY u.ts_mono_ns",
+                        (boot_id, served_start, served_end),
+                    ).fetchall()
         reduced = _empty_coverage() | {"device_states": [], "spans_suspend": False}
         files = rb = wb = 0
         for _, _, _, count, read_bytes, write_bytes, cov in rows:
@@ -754,8 +781,11 @@ class QueryService:
             wb += write_bytes
             _reduce_coverage(reduced, cov)
         present_hours = {row[2] for row in rows} if scope == "hourly" else set()
+        availability_start, availability_end = (
+            served_interval if served_interval is not None else (start, end)
+        )
         base_complete, reason = self._file_availability(
-            scope, boot_id, start, end, present_hours, bool(rows)
+            scope, boot_id, availability_start, availability_end, present_hours, bool(rows)
         )
         if scope == "lifetime":
             required_boots = {row[0] for row in self.connection.execute(
@@ -767,27 +797,15 @@ class QueryService:
         base_complete = base_complete and overlays_complete
         if reason == "not_retained":
             files = rb = wb = 0
+        if served_interval is not None and served_interval != (start, end):
+            base_complete = False
         tier: Tier = "raw" if scope == "hourly" else "totals_only"
         coverage = _model_coverage(reduced, tier, base_complete=base_complete, unavailable_reason=reason)
         covered_window = window
-        if scope == "hourly" and reason is None:
-            first = _ceil_bucket(start, FILE_HOUR_NS)
-            last = (end // FILE_HOUR_NS) * FILE_HOUR_NS
-            watermark = self.connection.execute(
-                "SELECT file_finalized_through_mono_ns FROM boot WHERE boot_id=?", (boot_id,)
-            ).fetchone()[0]
-            retained_end = max(first, min(last, watermark))
-            prefix_start = _missing_file_prefix_start(
-                start, end, watermark, present_hours,
-                self.connection.execute(
-                    "SELECT MIN(ts_mono_ns) FROM file_overflow_unknown WHERE boot_id=?",
-                    (boot_id,),
-                ).fetchone()[0],
+        if served_interval is not None and served_interval != (start, end):
+            covered_window = Window(
+                "range", boot_id, start_mono_ns=served_interval[0], end_mono_ns=served_interval[1]
             )
-            if prefix_start is not None:
-                covered_window = Window(
-                    "range", boot_id, start_mono_ns=prefix_start, end_mono_ns=retained_end
-                )
         return UnknownOwnerOverflow(covered_window, "overflow_owner_unknown", files, rb, wb, coverage)
 
     def _file_rows(self, app_id: int, scope: str, boot_id: str | None, start: int | None, end: int | None) -> list[dict]:
@@ -855,8 +873,7 @@ class QueryService:
         )
 
     def _file_availability(self, scope: str, boot_id: str | None, start: int | None,
-                           end: int | None, present_hours: set[int], has_rows: bool,
-                           *, allow_missing_prefix: bool = True):
+                           end: int | None, present_hours: set[int], has_rows: bool):
         if scope == "lifetime":
             pending = self._pending_lifetime_file_tail()
             reason = "file_source_unavailable" if pending or not has_rows else None
@@ -876,23 +893,13 @@ class QueryService:
         retained_end = max(first, min(last, watermark))
         expected_finalized = (retained_end - first) // FILE_HOUR_NS
         present_finalized = sum(first <= hour < retained_end for hour in present_hours)
-        collection_start = self.connection.execute(
-            "SELECT MIN(ts_mono_ns) FROM file_overflow_unknown WHERE boot_id=?", (boot_id,)
-        ).fetchone()[0]
-        missing_prefix = (
-            _missing_file_prefix_start(
-                start, end, watermark, present_hours, collection_start
-            )
-            if allow_missing_prefix and present_finalized < expected_finalized else None
-        )
         if present_finalized < expected_finalized:
-            if missing_prefix is None:
-                return False, "not_retained"
+            return False, "not_retained"
         if pending or not has_rows:
             reason = "unsupported_window" if not pending and first >= last else "file_source_unavailable"
             return False, reason
         clipped = bool(start % FILE_HOUR_NS or end % FILE_HOUR_NS)
-        return not clipped and missing_prefix is None, None
+        return not clipped, None
 
     def _file_app_coverage(self, app_id: int, window: Window, scope: str, boot_id: str | None, start: int | None, end: int | None):
         rows = self._file_coverage_rows(scope, boot_id, start, end, app_id)
@@ -900,7 +907,6 @@ class QueryService:
         base, reason = self._file_availability(
             scope, boot_id, start, end,
             {row[0] for row in rows} if scope == "hourly" else set(), bool(rows),
-            allow_missing_prefix=False,
         )
         if scope == "lifetime":
             required_boots = {row[0] for row in self.connection.execute(
@@ -908,7 +914,10 @@ class QueryService:
             )}
             if not required_boots.issubset({row[0] for row in rows}):
                 base, reason = False, "file_source_unavailable"
-        overlays_complete = self._file_overlays(reduced, scope, boot_id, start, end, app_id)
+        _, overlay_start, overlay_end = _bounds(window)
+        overlays_complete = self._file_overlays(
+            reduced, scope, boot_id, overlay_start, overlay_end, app_id
+        )
         return reduced, base and overlays_complete, reason
 
     def _file_query_context(self, window: Window):
@@ -939,10 +948,12 @@ class QueryService:
                 ).fetchall()
             else:
                 unknown = self._unknown_owner(window, scope, boot_id, start, end)
-                query_start = max(start, unknown.window.start_mono_ns) \
-                    if unknown.window != window and unknown.window.kind == "range" else start
+                query_start, query_end = start, end
+                if unknown.window != window and unknown.window.kind == "range":
+                    query_start = unknown.window.start_mono_ns
+                    query_end = unknown.window.end_mono_ns
                 first = _ceil_bucket(query_start, FILE_HOUR_NS)
-                last = (end // FILE_HOUR_NS) * FILE_HOUR_NS
+                last = (query_end // FILE_HOUR_NS) * FILE_HOUR_NS
                 if first >= last:
                     return ()
                 rows = self.connection.execute(
@@ -972,10 +983,12 @@ class QueryService:
                 raise ValueError("app_id must be positive")
             self._require_app(app_id)
             unknown = self._unknown_owner(window, scope, boot_id, start, end)
-            query_start = max(start, unknown.window.start_mono_ns) \
-                if scope == "hourly" and unknown.window != window and unknown.window.kind == "range" else start
+            query_start, query_end = start, end
+            if scope == "hourly" and unknown.window != window and unknown.window.kind == "range":
+                query_start = unknown.window.start_mono_ns
+                query_end = unknown.window.end_mono_ns
             reduced, base, reason = self._file_app_coverage(
-                app_id, window, scope, boot_id, query_start, end
+                app_id, window, scope, boot_id, query_start, query_end
             )
             coverage_reason = _unavailable_reason(reason, unknown.coverage.unavailable_reason)
             base = base and unknown.coverage.complete
@@ -985,7 +998,7 @@ class QueryService:
                 unknown_owner_files=(unknown.overflow_files or unknown.overflow_bytes_r or unknown.overflow_bytes_w),
             )
             raw_rows = (
-                self._file_rows(app_id, scope, boot_id, query_start, end)
+                self._file_rows(app_id, scope, boot_id, query_start, query_end)
                 if reason != "not_retained" and reduced["device_states"] else []
             )
             normalized_search = unicodedata.normalize("NFC", search).casefold() if search else None
@@ -1022,10 +1035,12 @@ class QueryService:
                 raise ValueError("app_id must be positive")
             self._require_app(app_id)
             unknown = self._unknown_owner(window, scope, boot_id, start, end)
-            query_start = max(start, unknown.window.start_mono_ns) \
-                if scope == "hourly" and unknown.window != window and unknown.window.kind == "range" else start
+            query_start, query_end = start, end
+            if scope == "hourly" and unknown.window != window and unknown.window.kind == "range":
+                query_start = unknown.window.start_mono_ns
+                query_end = unknown.window.end_mono_ns
             reduced, base, reason = self._file_app_coverage(
-                app_id, window, scope, boot_id, query_start, end
+                app_id, window, scope, boot_id, query_start, query_end
             )
             coverage_reason = _unavailable_reason(reason, unknown.coverage.unavailable_reason)
             coverage = _model_coverage(
@@ -1034,7 +1049,7 @@ class QueryService:
                 unknown_owner_files=(unknown.overflow_files or unknown.overflow_bytes_r or unknown.overflow_bytes_w),
             )
             rows = (
-                self._file_rows(app_id, scope, boot_id, query_start, end)
+                self._file_rows(app_id, scope, boot_id, query_start, query_end)
                 if reason != "not_retained" and reduced["device_states"] else []
             )
             file_values = reduced["file"]

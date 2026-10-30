@@ -19,7 +19,7 @@ import time
 from .bpf_fileio import BpfFileSource, FileSourceError, StreamLoader
 from .contracts import CounterOverflowError, FILE_HOUR_NS
 from .durable import Receipt, decode_file_hour_state
-from .file_store import FileHourStore
+from .file_store import FileHourStore, PendingStateRegressionError
 from .files import (
     FileFrameContext, FileIdentityResolver, HourlyAccumulator, ZERO_COVERAGE,
     ZERO_UNKNOWN, attribute_file_drain, checked_sum,
@@ -251,7 +251,7 @@ class FileRuntime:
             apps=tuple(replace(app, coverage=gap(app.coverage)) for app in state.apps),
             unknown_owner=replace(state.unknown_owner, coverage=gap(state.unknown_owner.coverage))))
 
-    def _persist(self, hours, finalize=()):
+    def _persist(self, hours, finalize=(), *, restoring=False):
         if self.connection.in_transaction:
             failure = ValueError("F requires a committed T/D frame, not a caller transaction")
             self._disable(failure)
@@ -264,9 +264,21 @@ class FileRuntime:
         deadline = time.monotonic() + PERSIST_BUDGET_S
         self.connection.execute(f"PRAGMA busy_timeout={storage}")
         self.connection.set_progress_handler(lambda: int(time.monotonic() >= deadline), 1000)
+        quarantined = set()
         try:
             for key, acc in hours.items():
-                self.store.apply_pending(acc.finalize())
+                try:
+                    self.store.apply_pending(acc.finalize())
+                except PendingStateRegressionError as failure:
+                    if not restoring:
+                        raise
+                    # Only a checkpoint loaded at startup may be quarantined.
+                    # A live regression still escapes to the normal fault path.
+                    self.store.quarantine_pending(*key)
+                    quarantined.add(key)
+                    _LOG.warning(bounded_diagnostic(
+                        f"file_pending_hour_quarantined hour_start_mono_ns={key[1]} "
+                        f"boot_id={key[0]} diagnostic={failure}"))
                 if time.monotonic() >= deadline:
                     raise TimeoutError("file persistence deadline expired")
             for key in finalize:
@@ -286,7 +298,8 @@ class FileRuntime:
         finally:
             self.connection.set_progress_handler(None, 0)
             self.connection.execute(f"PRAGMA busy_timeout={busy}")
-        self._hours.update(hours)
+        self._hours.update((key, acc) for key, acc in hours.items()
+                           if key not in quarantined)
         for key in finalize:
             self._hours.pop(key, None)
 
@@ -322,7 +335,7 @@ class FileRuntime:
                                            max((r.epoch, r.seq) for r in receipts))
                 self._boot = boot
             if restored:
-                self._persist(restored)
+                self._persist(restored, restoring=True)
             self._attach()
         except _F_ERRORS as failure:
             self._disable(failure)

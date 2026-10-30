@@ -826,6 +826,172 @@ def test_reattach_attempts_are_finite_even_if_hello_succeeds_but_drain_fails(fra
     assert not frames.db.in_transaction
 
 
+@pytest.fixture
+def legacy_pending_hours(frames, monkeypatch, request):
+    """Canonical legacy rows plus an incompatible restore fold; real SQL/guard.
+
+    The current accumulator round-trips canonical state losslessly. Model the
+    compatibility fault by reducing one legacy counter at the restore boundary,
+    rather than stubbing the guard or making SQLite raise a synthetic error.
+    """
+    from appio.contracts import FileObservation
+    from appio.files import HourlyAccumulator, ZERO_COVERAGE
+    from appio.file_store import FileHourStore
+
+    poison_hour = getattr(request, "param", H)
+    # Register apps and advance the committed process frontier independently.
+    frames.tick(0)
+    store = FileHourStore(frames.db)
+    for index, amount in enumerate((11, 999, 23)):
+        acc = HourlyAccumulator("boot-A", index * H)
+        cov = replace(ZERO_COVERAGE,
+                      skipped_nonfile=9 if index * H == poison_hour else 2)
+        receipt = Receipt("iod", frames.epoch, index)
+        acc.add_observation(receipt, APP, None, cov)
+        # Retained observations exercise finalization, totals and path endpoints.
+        row = FileObservation(APP, "fs-uuid", "8:0", 70 + index, 3,
+                              f"hour-{index}", "resolved", False,
+                              1, 0, amount, 0, index * H + 1)
+        acc.add_observation(receipt, APP, row, cov)
+        store.apply_pending(acc.finalize())
+    frames.tick(H)
+    frames.tick(2 * H)
+    before = dict(frames.db.execute(
+        "SELECT ts_mono_ns,state_json FROM file_hour_state ORDER BY ts_mono_ns"))
+    original = FileRuntime._incomplete
+
+    def incompatible_fold(acc):
+        restored = original(acc)
+        state = restored.state()
+        if state.hour_start_mono_ns == poison_hour:
+            state = replace(state, apps=tuple(replace(app, coverage=replace(
+                app.coverage, skipped_nonfile=1))
+                if app.coverage.skipped_nonfile == 9 else app for app in state.apps))
+            return HourlyAccumulator.from_state(state)
+        return restored
+
+    monkeypatch.setattr(FileRuntime, "_incomplete", staticmethod(incompatible_fold))
+    return before
+
+
+def test_poisoned_pending_hour_starts_and_serves_new_data(frames, legacy_pending_hours):
+    # Falsifier: propagate a restored regression and disable the entire source.
+    rt, loader = runtime(frames)
+    for index, amount in ((3, 31), (4, 37)):
+        loader.queue((index - 3) % 2, events=[event(amount=amount)])
+        assert rt.consume(*frames.tick(index * H))
+        assert rt.availability.available and rt.diagnostic is None
+    assert frames.db.execute(
+        "SELECT ts_mono_ns,bytes_r FROM file_sample ORDER BY ts_mono_ns"
+    ).fetchall() == [(0, 11), (2 * H, 23), (3 * H, 31)]
+    assert pending(frames, hour=4 * H).apps[0].files[0].bytes_r == 37
+    assert loader.close_requests == 0
+    assert not frames.db.in_transaction
+
+
+def test_poisoned_pending_hour_alone_is_dropped_with_one_bounded_gap_diagnostic(
+        frames, legacy_pending_hours, caplog):
+    # Falsifiers: delete all pending rows, omit/widen the gap, or log every cycle.
+    with caplog.at_level("WARNING", logger="appio.file_runtime"):
+        rt, loader = runtime(frames)
+        assert pending(frames, hour=H) is None
+        assert [row[0] for row in frames.db.execute(
+            "SELECT ts_mono_ns FROM file_hour_state ORDER BY ts_mono_ns"
+        )] == [0, 2 * H]
+        gaps = frames.db.execute(
+            "SELECT boot_id,source,epoch,seq,from_mono_ns,to_mono_ns,reason FROM gap"
+        ).fetchall()
+        assert gaps == [("boot-A", "iod", 1, 1, H, 2 * H, "collector_gap")]
+        for at in (3 * H, 3 * H + 1, 4 * H):
+            assert rt.consume(*frames.tick(at))
+        rt.close()
+        other, _ = runtime(frames)
+        assert frames.db.execute(
+            "SELECT boot_id,source,epoch,seq,from_mono_ns,to_mono_ns,reason FROM gap"
+        ).fetchall() == gaps
+        other.close()
+    diagnostics = [record.getMessage() for record in caplog.records
+                   if "quarantin" in record.getMessage()]
+    assert len(diagnostics) == 1
+    assert str(H) in diagnostics[0]
+    assert "pending state must not regress counters" in diagnostics[0]
+    assert len(diagnostics[0]) <= 512
+    assert not frames.db.in_transaction
+
+
+def test_healthy_pending_hours_beside_poison_restore_and_finalize_unchanged(
+        frames, legacy_pending_hours):
+    # Falsifier: quarantine the healthy neighbors or change their observations.
+    rt, _ = runtime(frames)
+    for hour, amount in ((0, 11), (2 * H, 23)):
+        before = decode_file_hour_state(legacy_pending_hours[hour], "boot-A", hour)
+        restored = pending(frames, hour=hour)
+        assert restored.apps[0].files == before.apps[0].files
+        assert restored.apps[0].last_receipt == before.apps[0].last_receipt
+        assert restored.apps[0].coverage.skipped_nonfile == 2
+        assert restored.apps[0].coverage.gap_intervals == 1
+        assert restored.apps[0].coverage.complete == 0
+    # Restored receipt seq=2 must not suppress the next legitimate frame.
+    assert rt.consume(*frames.tick(3 * H))
+    assert frames.db.execute(
+        "SELECT ts_mono_ns,reads,bytes_r FROM file_sample ORDER BY ts_mono_ns"
+    ).fetchall() == [(0, 1, 11), (2 * H, 1, 23)]
+    assert frames.db.execute(
+        "SELECT ts_mono_ns,skipped_nonfile FROM file_coverage ORDER BY ts_mono_ns"
+    ).fetchall() == [(0, 2), (2 * H, 2)]
+    assert frames.db.execute(
+        "SELECT sum(bytes_r) FROM app_boot_file_total"
+    ).fetchone() == (34,)
+    assert frames.db.execute(
+        "SELECT file_finalized_through_mono_ns FROM boot"
+    ).fetchone() == (3 * H,)
+    assert frames.db.execute(
+        "SELECT basename,first_mono_ns,last_mono_ns FROM path ORDER BY basename"
+    ).fetchall() == [("hour-0", 1, 1), ("hour-1", H + 1, H + 1),
+                    ("hour-2", 2 * H + 1, 2 * H + 1)]
+
+
+@pytest.mark.parametrize("legacy_pending_hours", [2 * H], indirect=True)
+def test_poisoned_current_hour_can_collect_again_without_reusing_lost_counters(
+        frames, legacy_pending_hours):
+    # Falsifier: quarantine advances the watermark or strands the new same-hour data.
+    rt, loader = runtime(frames)
+    for slot, at, amount in ((0, 2 * H + 1, 7), (1, 2 * H + 2, 13)):
+        loader.queue(slot, events=[event(amount=amount)])
+        assert rt.consume(*frames.tick(at))
+    assert pending(frames, hour=2 * H).apps[0].files[0].bytes_r == 20
+    assert rt.consume(*frames.tick(3 * H))
+    assert frames.db.execute(
+        "SELECT ts_mono_ns,bytes_r FROM file_sample ORDER BY ts_mono_ns"
+    ).fetchall() == [(0, 11), (H, 999), (2 * H, 20)]
+    assert frames.db.execute(
+        "SELECT from_mono_ns,to_mono_ns FROM gap"
+    ).fetchall() == [(2 * H, 3 * H)]
+    app_id = frames.db.execute("SELECT app_id FROM app WHERE key=?", (APP,)).fetchone()[0]
+    result = QueryService(frames.db).file_table(
+        app_id, Window("range", "boot-A", 2 * H, 3 * H), "bytes_total", "desc", None)
+    assert result.rows[0].bytes_r == 20
+    assert not result.coverage.complete and result.coverage.gap_intervals == 1
+
+
+def test_live_runtime_counter_regression_raises_without_quarantine(frames):
+    # Falsifier: extend the restore exception handler to ordinary live persistence.
+    from appio.files import HourlyAccumulator
+
+    rt, loader = runtime(frames)
+    loader.queue(0, events=[event(amount=10)])
+    rt.consume(*frames.tick(0))
+    before = pending(frames)
+    app, zero = before.apps
+    corrupt = replace(before, apps=(replace(app, files=(replace(
+        app.files[0], bytes_r=9),)), zero))
+    with pytest.raises(ValueError, match="pending state must not regress counters"):
+        rt._persist({("boot-A", 0): HourlyAccumulator.from_state(corrupt)})
+    assert pending(frames) == before
+    assert frames.db.execute("SELECT * FROM gap").fetchall() == []
+    assert not frames.db.in_transaction
+
+
 def test_initial_attach_failure_recovers_into_new_hour_as_incomplete(frames, monkeypatch):
     sources = iter([VectorLoader(hello_status=1, hello_error=-5), VectorLoader()])
     now, calls = [0.0], []

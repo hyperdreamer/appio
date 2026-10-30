@@ -255,6 +255,54 @@ def test_pending_cumulative_state_cannot_regress_or_lose_a_candidate(db):
     assert db.execute("SELECT SUM(bytes_r) FROM file_sample").fetchone()[0] == 30
 
 
+@pytest.mark.parametrize("operation", ["apply_pending", "finalize_hour"])
+@pytest.mark.parametrize("counter", ["bytes_r", "skipped_nonfile"])
+def test_live_pending_counter_regression_still_raises(db, operation, counter):
+    # Falsifier: remove the guard, or allow quarantine on ordinary live writes.
+    store = FileHourStore(db)
+    original = HourlyAccumulator("boot-A", 0)
+    original.add_observation(R, APP, observation(bytes_r=10),
+                             replace(ZERO, skipped_nonfile=4))
+    store.apply_pending(original.finalize())
+    regressed = HourlyAccumulator("boot-A", 0)
+    regressed.add_observation(R, APP,
+        observation(bytes_r=9 if counter == "bytes_r" else 10),
+        replace(ZERO, skipped_nonfile=3 if counter == "skipped_nonfile" else 4))
+    tables = ("file_hour_state", "file_sample", "file_coverage", "gap", "boot")
+    before = {table: db.execute(f"SELECT * FROM {table}").fetchall() for table in tables}
+    with pytest.raises(ValueError, match="pending state must not regress counters"):
+        getattr(store, operation)(regressed.finalize())
+    assert {table: db.execute(f"SELECT * FROM {table}").fetchall()
+            for table in tables} == before
+    assert not db.in_transaction
+
+
+def test_quarantine_pending_gap_and_state_deletion_are_atomic(db):
+    # Falsifier: persist the gap separately so a failed delete can duplicate loss.
+    import sqlite3
+
+    store = FileHourStore(db)
+    acc = HourlyAccumulator("boot-A", 0)
+    acc.add_observation(R, APP, observation(bytes_r=17), ZERO)
+    store.apply_pending(acc.finalize())
+    before = db.execute("SELECT * FROM file_hour_state").fetchall()
+    db.execute("CREATE TEMP TRIGGER fail_quarantine BEFORE DELETE ON main.file_hour_state "
+               "BEGIN SELECT RAISE(ABORT,'quarantine delete fault'); END")
+    db.commit()
+    with pytest.raises(sqlite3.IntegrityError, match="quarantine delete fault"):
+        store.quarantine_pending("boot-A", 0)
+    assert db.execute("SELECT * FROM file_hour_state").fetchall() == before
+    assert db.execute("SELECT * FROM gap").fetchall() == []
+    assert db.execute("SELECT file_finalized_through_mono_ns FROM boot").fetchone() == (0,)
+    assert not db.in_transaction
+    db.execute("DROP TRIGGER fail_quarantine")
+    db.commit()
+    store.quarantine_pending("boot-A", 0)
+    assert db.execute("SELECT * FROM file_hour_state").fetchall() == []
+    assert db.execute("SELECT from_mono_ns,to_mono_ns FROM gap").fetchall() == [(0, FILE_HOUR_NS)]
+    assert not db.in_transaction
+
+
 def test_public_snapshot_with_pending_receipts_consumes_base_observation_type(db):
     # Falsifier: private dataclass subclass equality rejects the public transport interface.
     from appio.contracts import HourlyFileSnapshot

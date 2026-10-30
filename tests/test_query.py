@@ -537,26 +537,36 @@ def test_pending_file_hour_is_incomplete_but_keeps_finalized_hour_observations(f
     assert result.coverage.complete is False
 
 
-def test_missing_finalized_file_hour_returns_empty_unavailable_window(file_db):
-    # Falsifier: partial finalized rows are returned as though they reconstruct the full requested window.
+def test_missing_finalized_file_hour_serves_the_covered_prefix_as_partial(file_db):
+    # Falsifier: one missing finalized hour suppresses an adjacent covered interval.
     acc = HourlyAccumulator("boot-A", 0)
     acc.add_observation(R, FILE_APP, observation(1, basename="kept", bytes_r=7), ZERO)
     FileHourStore(file_db).finalize_hour(acc.finalize())
     file_db.execute("UPDATE boot SET file_finalized_through_mono_ns=? WHERE boot_id='boot-A'", (2 * FILE_HOUR_NS,))
-    file_db.commit()
-    result = QueryService(file_db).file_table(
-        1, Window("range", "boot-A", 0, 2 * FILE_HOUR_NS), "bytes_total", "desc", None
+    file_db.execute(
+        "INSERT INTO gap VALUES(1,'boot-A','gui',1,0,?,?,'collector_gap')",
+        (FILE_HOUR_NS, 2 * FILE_HOUR_NS),
     )
-    assert result.rows == ()
+    file_db.commit()
+    requested = Window("range", "boot-A", 0, 2 * FILE_HOUR_NS)
+
+    service = QueryService(file_db)
+    result = service.file_table(1, requested, "bytes_total", "desc", None)
+
+    assert [row.basename for row in result.rows] == ["kept"]
     assert result.coverage.complete is False
-    assert result.coverage.unavailable_reason == "not_retained"
-    values = QueryService(file_db).file_coverage(1, Window("range", "boot-A", 0, 2 * FILE_HOUR_NS))
+    assert result.coverage.unavailable_reason is None
+    assert result.coverage.gap_intervals >= 1
+    assert result.unknown_owner_overflow.window == Window(
+        "range", "boot-A", start_mono_ns=0, end_mono_ns=FILE_HOUR_NS
+    )
+    values = service.file_coverage(1, requested)
+    assert (values.observed_bytes_r, values.observed_bytes_w) == (7, 0)
     assert values.coverage.complete is False
-    assert values.coverage.unavailable_reason == "not_retained"
-    assert (values.observed_bytes_r, values.observed_bytes_w) == (0, 0)
-    unknown = QueryService(file_db).unknown_owner_file_coverage(Window("range", "boot-A", 0, 2 * FILE_HOUR_NS))
+    assert values.coverage.unavailable_reason is None
+    unknown = service.unknown_owner_file_coverage(requested)
     assert unknown.coverage.complete is False
-    assert unknown.coverage.unavailable_reason == "not_retained"
+    assert unknown.coverage.unavailable_reason is None
 
 
 def test_since_boot_file_window_serves_covered_suffix_and_names_its_boundary(file_db, monkeypatch):
@@ -637,22 +647,73 @@ def test_no_coverage_since_boot_file_window_remains_unavailable(file_db, monkeyp
     }
 
 
-def test_missing_interior_file_hour_is_not_reported_as_collection_start(file_db):
-    for hour in (0, 2 * FILE_HOUR_NS):
+def test_interior_file_gaps_serve_the_largest_interval_and_name_both_bounds(file_db, monkeypatch):
+    # Falsifier: suffix-only recovery discards a longer covered run between gaps.
+    hours = (0, 2 * FILE_HOUR_NS, 3 * FILE_HOUR_NS, 5 * FILE_HOUR_NS)
+    for index, hour in enumerate(hours):
         accumulator = HourlyAccumulator("boot-A", hour)
         accumulator.add_observation(
             R, FILE_APP,
-            observation(1, bytes_r=17, last_seen_mono_ns=hour + 100_000_000_000),
+            observation(index + 1, basename=f"hour-{hour // FILE_HOUR_NS}", bytes_r=(index + 1) * 10,
+                        last_seen_mono_ns=hour + 100_000_000_000),
             ZERO,
         )
         FileHourStore(file_db).finalize_hour(accumulator.finalize())
+    file_db.execute(
+        "INSERT INTO gap VALUES(1,'boot-A','gui',1,0,?,?,'collector_gap')",
+        (FILE_HOUR_NS, 2 * FILE_HOUR_NS),
+    )
+    file_db.execute(
+        "INSERT INTO gap VALUES(2,'boot-A','gui',1,1,?,?,'collector_gap')",
+        (4 * FILE_HOUR_NS, 5 * FILE_HOUR_NS),
+    )
     file_db.commit()
-    window = Window("range", "boot-A", 0, 3 * FILE_HOUR_NS)
+    requested = Window("since_boot", "boot-A", end_mono_ns=6 * FILE_HOUR_NS)
+    service = QueryService(file_db)
+    monkeypatch.setattr(service, "_available_cutoff", lambda _boot_id: 6 * FILE_HOUR_NS)
 
-    result = QueryService(file_db).file_table(1, window, "bytes_total", "desc", None)
+    result = service.file_table(1, requested, "bytes_total", "desc", None)
 
-    assert result.rows == ()
-    assert result.coverage.unavailable_reason == "not_retained"
+    assert {row.basename for row in result.rows} == {"hour-2", "hour-3"}
+    assert sum(row.bytes_r for row in result.rows) == 50
+    assert result.coverage.complete is False
+    assert result.coverage.unavailable_reason is None
+    assert result.coverage.gap_intervals >= 2
+    served = Window("range", "boot-A", start_mono_ns=2 * FILE_HOUR_NS,
+                    end_mono_ns=4 * FILE_HOUR_NS)
+    assert result.unknown_owner_overflow.window == served
+    values = service.file_coverage(1, requested)
+    assert (values.observed_bytes_r, values.observed_bytes_w) == (50, 0)
+    assert values.unknown_owner_overflow.window == served
+    assert values.coverage.complete is False
+    assert values.coverage.gap_intervals >= 2
+
+
+def test_largest_file_interval_breaks_equal_length_ties_toward_latest(file_db):
+    # Falsifier: equal-length covered runs have an unstable selection.
+    for index, hour in enumerate((0, 2 * FILE_HOUR_NS)):
+        accumulator = HourlyAccumulator("boot-A", hour)
+        accumulator.add_observation(
+            R, FILE_APP,
+            observation(index + 1, basename=f"hour-{index}", bytes_r=10 + index,
+                        last_seen_mono_ns=hour + 100_000_000_000),
+            ZERO,
+        )
+        FileHourStore(file_db).finalize_hour(accumulator.finalize())
+    file_db.execute(
+        "INSERT INTO gap VALUES(1,'boot-A','gui',1,0,?,?,'collector_gap')",
+        (FILE_HOUR_NS, 2 * FILE_HOUR_NS),
+    )
+    file_db.commit()
+    requested = Window("range", "boot-A", 0, 3 * FILE_HOUR_NS)
+
+    result = QueryService(file_db).file_table(1, requested, "bytes_total", "desc", None)
+
+    assert [row.basename for row in result.rows] == ["hour-1"]
+    assert result.unknown_owner_overflow.window == Window(
+        "range", "boot-A", start_mono_ns=2 * FILE_HOUR_NS, end_mono_ns=3 * FILE_HOUR_NS
+    )
+    assert result.coverage.complete is False
 
 
 def test_file_applications_come_from_retained_rows_without_process_ranking(file_db):

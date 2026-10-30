@@ -340,10 +340,10 @@ def test_headers_are_the_seven_ratified_columns_in_order(qtbot):
     assert view.findChildren(QTableWidget) == []
 
 
-def test_partial_file_window_discloses_the_covered_start_for_all_aggregates(qtbot):
+def test_partial_file_window_names_the_served_interval_and_discloses_gaps(qtbot):
     start = 3_600_000_000_000
     covered = Window("range", BOOT, start_mono_ns=start, end_mono_ns=END)
-    partial = coverage(complete=False)
+    partial = coverage(complete=False, gap_intervals=2)
     overflow = UnknownOwnerOverflow(
         covered, "overflow_owner_unknown", 0, 0, 0, partial
     )
@@ -355,9 +355,13 @@ def test_partial_file_window_discloses_the_covered_start_for_all_aggregates(qtbo
 
     assert view.state == "incomplete"
     assert texts(view)[0][0] == "report.txt"
-    assert "collection started at T0=1h 0m 0s after boot" in view.footer_state.text()
-    assert "T0=1h 0m 0s after boot" in footer_text(view)
-    assert "covered portion only" in footer_text(view)
+    assert "served interval only" in view.footer_state.text()
+    assert "T0=1h 0m 0s through T1=2h 0m 0s after boot" in view.footer_state.text()
+    assert "collection has gaps in the requested window" in view.footer_state.text()
+    assert footer_text(view).count("served interval only") == 8
+    assert "T0=1h 0m 0s through T1=2h 0m 0s after boot" in footer_text(view)
+    assert "collection has gaps in the requested window" in footer_text(view)
+    assert "covered portion only" not in footer_text(view)
 
 
 def test_file_selector_uses_retained_file_apps_when_process_ranking_is_empty(qtbot):

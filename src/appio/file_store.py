@@ -104,6 +104,10 @@ def _merge_coverage_json(old_text: str | None, incoming: dict) -> str:
     return canonical_json(merge(old, incoming, "coverage"))
 
 
+class PendingStateRegressionError(ValueError):
+    """A cumulative write would discard already committed pending evidence."""
+
+
 class FileHourStore:
     def __init__(self, connection: sqlite3.Connection):
         self.connection = connection
@@ -123,23 +127,23 @@ class FileHourStore:
         """A cumulative checkpoint can extend committed evidence, never replace it."""
         def nondecreasing(old, new, counters):
             if any(getattr(new, name) < getattr(old, name) for name in counters):
-                raise ValueError("pending state must not regress counters")
+                raise PendingStateRegressionError("pending state must not regress counters")
 
         def receipt(old, new):
             if old is not None and (new is None or
                     (old.source == new.source and (new.epoch, new.seq) < (old.epoch, old.seq))):
-                raise ValueError("pending state must not regress receipts")
+                raise PendingStateRegressionError("pending state must not regress receipts")
 
         def coverage(old, new):
             nondecreasing(old, new, FILE_COUNTERS)
             nondecreasing(old.hook_hits, new.hook_hits, HOOKS)
             if old.complete < new.complete:
-                raise ValueError("pending state must not regress incompleteness evidence")
+                raise PendingStateRegressionError("pending state must not regress incompleteness evidence")
 
         apps = {app.app_key: app for app in incoming.apps}
         for old in previous.apps:
             if old.app_key not in apps:
-                raise ValueError("pending state must not regress app candidates")
+                raise PendingStateRegressionError("pending state must not regress app candidates")
             new = apps[old.app_key]
             receipt(old.last_receipt, new.last_receipt)
             coverage(old.coverage, new.coverage)
@@ -147,14 +151,14 @@ class FileHourStore:
             for entry in old.files:
                 candidate = entries.get(entry.identity)
                 if candidate is None or not {entry.basename, *entry.aliases} <= {candidate.basename, *candidate.aliases}:
-                    raise ValueError("pending state must not regress file candidates or names")
+                    raise PendingStateRegressionError("pending state must not regress file candidates or names")
                 nondecreasing(entry, candidate, ("reads", "writes", "bytes_r", "bytes_w", "last_seen_mono_ns"))
         old, new = previous.unknown_owner, incoming.unknown_owner
         receipt(old.last_receipt, new.last_receipt)
         nondecreasing(old, new, ("overflow_files", "overflow_bytes_r", "overflow_bytes_w"))
         nondecreasing(old.coverage, new.coverage, ("gap_intervals", "overlap_uncertain_intervals"))
         if old.coverage.complete < new.coverage.complete:
-            raise ValueError("pending state must not regress unknown-owner evidence")
+            raise PendingStateRegressionError("pending state must not regress unknown-owner evidence")
 
     def _snapshot(self, snapshot: HourlyFileSnapshot) -> tuple[FileHourState, tuple[CapturedName, ...], int]:
         if not isinstance(snapshot, HourlyFileSnapshot):
@@ -270,6 +274,31 @@ class FileHourStore:
             self._paths(state, names)
             self.connection.execute("INSERT INTO file_hour_state VALUES(?,?,?) ON CONFLICT(boot_id,ts_mono_ns) DO UPDATE SET state_json=excluded.state_json", (state.boot_id, state.hour_start_mono_ns, canonical_json(state)))
         return True
+
+    def quarantine_pending(self, boot_id: str, hour: int) -> None:
+        """Atomically trade one incompatible restored checkpoint for its gap.
+
+        This is recovery of durable state, not permission for live cumulative
+        writes to regress. Keep receipts for provenance, but retain none of the
+        unmergeable counters and do not advance the finalization watermark.
+        """
+        with _atomic(self.connection):
+            state = self._existing(boot_id, hour)
+            if state is None:
+                raise ValueError("quarantine requires an existing pending hour")
+            receipts = [app.last_receipt for app in state.apps]
+            if state.unknown_owner.last_receipt is not None:
+                receipts.append(state.unknown_owner.last_receipt)
+            receipt = max(receipts, key=lambda r: (r.epoch, r.seq, r.source))
+            end = checked_sum(hour, FILE_HOUR_NS, field="quarantined_hour_end")
+            self.connection.execute(
+                "INSERT INTO gap(boot_id,source,epoch,seq,from_mono_ns,to_mono_ns,reason) "
+                "VALUES(?,?,?,?,?,?,?)",
+                (boot_id, receipt.source, receipt.epoch, receipt.seq,
+                 hour, end, "collector_gap"))
+            self.connection.execute(
+                "DELETE FROM file_hour_state WHERE boot_id=? AND ts_mono_ns=?",
+                (boot_id, hour))
 
     def finalize_hour(self, snapshot: HourlyFileSnapshot) -> bool:
         """Finalize once; atomic totals/coverage/state removal/watermark update."""

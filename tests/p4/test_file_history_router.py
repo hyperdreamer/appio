@@ -314,7 +314,8 @@ def test_remote_scope_snapshot_stale_cursor_and_invalidate_fail_closed(retained,
             if fault == "coverage_app" and reply.get("kind") == "coverage":
                 reply["payload"]["value"]["app_key"] = ZERO
             if fault == "mixed_tier" and reply.get("kind") == "coverage":
-                reply["payload"]["value"]["coverage"]["tier"] = "raw"
+                coverage = reply["payload"]["value"]["coverage"]
+                coverage["tier"] = "totals_only" if coverage["tier"] == "raw" else "raw"
         for _ in range(15):
             remote.respond(corrupt)
             if future.done():
