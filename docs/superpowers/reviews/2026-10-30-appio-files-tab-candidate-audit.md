@@ -48,3 +48,46 @@ Validation record:
 - `git show --stat dd8b042` reported commit `dd8b042c31ff4189a0710bf9baeda0e880fcf77b`, subject `fix(router): serve hourly file windows across disclosed gaps`, and three changed files: `src/appio/history_router.py` (38 lines changed), `src/appio/ui/files_view.py` (34 lines changed), and `tests/p4/test_file_history_router.py` (121 insertions); total 183 insertions and 10 deletions.
 - Targeted baseline command from the plan: 7 passed in 1.19s.
 - Candidate-only tests from an unmodified archive: 4 passed in 1.35s.
+
+## T-005 Re-Audit Addendum: Requested-Window Process Gap Isolation
+
+The base implementation preserves the exact requested-window assignment in
+`src/appio/history_router.py:511`:
+
+```python
+self._gap_ranges = [(s.boot_id, s.start_ns, s.end_ns) for s in scoped if not s.proven]
+```
+
+The file is byte-identical to lane base `67493e28c3512174362ab7a8b5bb0ead20b98249`
+(SHA-256 `a18f94f9b9a51ed782c7ab00e2e2025673f0679bd6e6e4bc834c0a2d7177a46a`).
+The earlier unscoped append at `:488` is superseded by this requested-scope
+assignment. `_read_local` returns `_gap_ranges` at `:650`, `_consume_local`
+installs those returned gaps at `:708`, and `_combine_coverage` counts their
+merged ranges for process coverage at `:735`. Initialization and request reset
+remain at `:118` and `:671`. The candidate archive lacks the final assignment;
+this re-audit confirms the repair target is already correct on the lane base,
+so no production source change was needed.
+
+The new `tests/p4/test_files_tab_process_scope.py` contains both required
+controls. The final validation command passed: `2 passed in 0.49s`. Isolated probe
+controls and restored runs each passed both tests:
+
+- `M_requested_gap_scope_deleted` removed only the scoped assignment. Both
+  tests failed at their `_gap_ranges` assertions: the first included the
+  outside-request `[0h,1h)` range; the second also observed that range instead
+  of an empty set. See `evidence/T-005/mutants/M_requested_gap_scope_deleted/`.
+- `M_process_uses_S` substituted `S` for `R2` at the process-planner call
+  boundary in the disposable test copy. The first assertion observed no
+  `[4h,5h)` range (`[]` instead of the expected range). This is a caller-scope
+  substitution probe; the tracked production test and source were restored
+  byte-identically. See `evidence/T-005/mutants/M_process_uses_S/`.
+- `M_served_counts_requested_gap` changed only the disposable query copy to
+  populate `gaps_in_served_interval` from the requested-window scalar. The
+  first test failed at the served-count assertion (`1 != 0`). See
+  `evidence/T-005/mutants/M_served_counts_requested_gap/`.
+
+Each probe recorded its unmutated control, mutation diff, module origin,
+mutant failure, restored run, and restored SHA-256. The relevant imports came
+from each disposable tree. This closes the requested-process-scope finding
+only; the `repair` verdict remains in force and candidate adoption remains
+pending Tasks 6-9 and independent acceptance Task 24.
