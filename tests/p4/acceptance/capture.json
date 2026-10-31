@@ -1,0 +1,52 @@
+{
+  "apps_with_file_rows": 38,
+  "boot_id": "c753ab5f-87a1-4285-9c4e-d749ce9ac758",
+  "capture_method": "sqlite3 .backup of the live daemon store (consistent, single transaction)",
+  "captured_at": "2026-10-31T12:21:49.430564+00:00",
+  "delivered_main_commit": "2874841f344d004fb4cee7382f9c73693d31c0aa",
+  "file_finalized_through_mono_ns": 216000000000000,
+  "gaps_in_finalized_window": 760,
+  "provenance_notes": [
+    "captured by the PM with root because the lane tasks may not use root",
+    "expectations below are derived from the raw rows, independently of QueryService",
+    "the store predates the current integration branch, so acceptance must treat missing or refactored columns as findings, not as licence to regenerate the capture"
+  ],
+  "row_counts": {
+    "app_boot_file_coverage": 175,
+    "app_boot_file_total": 2942,
+    "boot": 1,
+    "file_coverage": 1112,
+    "file_sample": 6163,
+    "gap": 1009,
+    "sample": 1332567
+  },
+  "snapshot": {
+    "bytes": 1497067520,
+    "path": "/tmp/appio-files-tab-capture/iod.sqlite",
+    "sha256": "5eea10690422e3eba12e3376044c953dfcfe1ae3657bf13e34cb42d5bfe891e6"
+  },
+  "source": {
+    "owner": "root:appio",
+    "path": "/var/lib/appio/iod.db"
+  },
+  "top_apps_by_bytes": [
+    {
+      "app_id": 47,
+      "bytes_r": 320570088639,
+      "bytes_w": 2079040300,
+      "rows": 665
+    },
+    {
+      "app_id": 96,
+      "bytes_r": 21351018166,
+      "bytes_w": 17170448,
+      "rows": 689
+    },
+    {
+      "app_id": 99,
+      "bytes_r": 7662142567,
+      "bytes_w": 0,
+      "rows": 800
+    }
+  ]
+}
