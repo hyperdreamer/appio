@@ -94,6 +94,7 @@ def _coverage(rows, *, gaps=0, overlaps=0, unavailable=False):
 class FileViewResult:
     table: FileTable
     coverage: FileCoverage
+    served_gap_count: int | None
 
 
 class HistoryRouter:
@@ -166,7 +167,9 @@ class HistoryRouter:
         return self._file_status
 
     @staticmethod
-    def _check_file_result(table, coverage):
+    def _check_file_result(table, coverage, served_gap_count: int | None = None):
+        if table.app_id != coverage.app_id:
+            raise WindowUnavailableError("file_source_unavailable", "File coverage does not match the table snapshot.")
         if table.window != coverage.window or table.coverage.tier != coverage.coverage.tier:
             raise WindowUnavailableError("file_source_unavailable", "Mixed file scope or retention tiers.")
         for evidence in (table.coverage, coverage.coverage):
@@ -174,7 +177,10 @@ class HistoryRouter:
                 raise WindowUnavailableError(evidence.unavailable_reason, "File history is not available for this window.")
         if table.coverage != coverage.coverage or table.unknown_owner_overflow != coverage.unknown_owner_overflow:
             raise WindowUnavailableError("file_source_unavailable", "File coverage does not match the table snapshot.")
-        return FileViewResult(table, coverage)
+        if coverage.served_interval is None:
+            raise WindowUnavailableError(
+                "file_source_unavailable", "File ownership cannot be represented by one store.")
+        return FileViewResult(table, coverage, served_gap_count)
 
     @staticmethod
     def _check_file_provenance(worker, served: Window, supplying_name: str) -> bool:
@@ -247,15 +253,24 @@ class HistoryRouter:
             unavailable = WindowUnavailableError("file_source_unavailable", "No authoritative file app receipt.")
             provenance_error = None
             for name, service, _ in sources:
-                row = service.connection.execute("SELECT app_id FROM app WHERE key=?", (key,)).fetchone()
-                if row is None:
-                    continue
                 try:
                     with service._snapshot():
-                        table = service.file_table(row[0], window, sort, direction, search)
-                        coverage = service.file_coverage(row[0], window)
-                    result = HistoryRouter._check_file_result(
-                        replace(table, app_id=app_id), replace(coverage, app_id=app_id))
+                        row = service.connection.execute("SELECT app_id FROM app WHERE key=?", (key,)).fetchone()
+                        if row is None:
+                            continue
+                        local_app_id = row[0]
+                        table = service.file_table(local_app_id, window, sort, direction, search)
+                        coverage = service.file_coverage(local_app_id, window)
+                        facts = service.file_serve_facts(local_app_id, window)
+                        if (table.app_id != local_app_id or coverage.app_id != local_app_id
+                                or table.window != window or coverage.window != window
+                                or facts.served_interval != coverage.served_interval
+                                or facts.gaps_in_requested_window != coverage.coverage.gap_intervals):
+                            raise WindowUnavailableError(
+                                "file_source_unavailable", "File coverage does not match the table snapshot.")
+                        result = HistoryRouter._check_file_result(
+                            replace(table, app_id=app_id), replace(coverage, app_id=app_id),
+                            facts.gaps_in_served_interval)
                 except WindowUnavailableError as error:
                     unavailable = error
                     continue
@@ -362,7 +377,7 @@ class HistoryRouter:
                 if not isinstance(coverage, FileCoverage) or response.get("next_cursor") is not None:
                     raise WindowUnavailableError("file_source_unavailable", "Invalid remote file coverage.")
                 table = replace(pages[0], rows=tuple(row for page in pages for row in page.rows), app_id=app_id)
-                value = self._check_file_result(table, replace(coverage, app_id=app_id))
+                value = self._check_file_result(table, replace(coverage, app_id=app_id), None)
                 self._settle_file(out, generation, value=value)
             except Exception as error:
                 self._settle_file(out, generation, error=error)

@@ -248,7 +248,7 @@ def file_view_result(window: Window | None = None) -> FileViewResult:
     coverage = FileCoverage(
         1, window, 0, 0, 0, 0, 0, 0, 0, 0, 0, inner.hook_hits, 100, 50, overflow, inner
     )
-    return FileViewResult(table, coverage)
+    return FileViewResult(table, coverage, None)
 
 
 def app_total(app_id: int = 1) -> AppTotal:

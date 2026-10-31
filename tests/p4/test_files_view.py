@@ -183,6 +183,7 @@ def file_view(
     direction: str = "desc",
     search: str | None = None,
     cov: Coverage | None = None,
+    served_gap_count: int | None = None,
     **overrides: object,
 ) -> FileViewResult:
     table_coverage = cov or coverage()
@@ -216,7 +217,7 @@ def file_view(
         unknown_owner_overflow=result_coverage.unknown_owner_overflow,
         coverage=table_coverage,
     )
-    return FileViewResult(table, result_coverage)
+    return FileViewResult(table, result_coverage, served_gap_count)
 
 
 def app_total(app_id: int, name: str, total: int) -> AppTotal:
