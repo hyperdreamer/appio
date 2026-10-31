@@ -1,6 +1,6 @@
 # appio Files tab — frontier implementation specification
 
-**Status:** implementation specification drafted from approved design revision 7
+**Status:** revision 2; resolves all findings in spec review 1
 **Authority:** `docs/superpowers/specs/2026-10-30-appio-files-tab-design.md`, revision 7, commit `b60e0d5`, SHA-256 `8b92de1b08307aff51b5ca569478bdf4f905f50082138463c322a54749021cf3`.
 **Candidate under audit:** `dd8b042` (`fix(router): serve hourly file windows across disclosed gaps`).
 **Scope of this document:** the Files query, provenance, disclosure, and label-preservation work only.
@@ -19,12 +19,12 @@ The header behaviour is a preservation target, not a repair target. Existing ref
 
 The two scope clauses are named here so they cannot be lost during implementation:
 
-1. **Honest-window clause:** for a requested window, the Files tab renders rows from the interval it served and discloses that interval plus the gaps inside it. It must not present requested-window bounds as the bounds of the data.
+1. **Honest-window clause:** for a requested window, the Files tab renders rows from the interval it served and discloses that interval plus this application's served-hour gap evidence and the existing requested-window coverage scalar. It must not present requested-window bounds as the bounds of the data.
 2. **Label-preservation clause:** the header's existing truthful behaviour and precedence are preserved, and the two uncovered status transitions are pinned. No label repair is claimed without a concrete failing observation.
 
 ### 1.2 Goals
 
-1. For a requested window, the Files tab renders the rows of the interval it served and discloses that interval and the gaps inside it.
+1. For a requested window, the Files tab renders the rows of the interval it served and discloses that interval, this application's served-hour gap evidence, and the existing requested-window coverage scalar.
 2. The header's existing truthful behaviour is preserved and its two uncovered transitions are pinned; no precedence or ownership change is made.
 3. The served interval is exposed under an honest name without changing the wire contract.
 4. No honesty rule weakens. In particular, an unavailable, unproved, ambiguous, or overlap-uncertain source is not converted into a zero-valued answer.
@@ -43,7 +43,16 @@ All intervals are half-open: `[start, end)`. A requested window is the `Window` 
 
 For an hourly range, an interval is hour-aligned when both endpoints are multiples of `FILE_HOUR_NS` (`3_600_000_000_000` nanoseconds). The interval must also lie within the requested bounds and not extend beyond the file finalization watermark.
 
-A **gap row** is a persisted `gap` record whose interval has a non-empty intersection with the interval being counted. Counts are counts of intersecting persisted records, not byte totals and not a deduplicated union length. Overlap-uncertain records remain separately visible through `overlap_uncertain_intervals` and are never treated as known non-overlap gaps for provenance admission.
+For an hourly result, a retained `file_coverage` hour is a row for this application and one finalized file hour. The row's `gap_intervals` is application evidence and is not a persisted `gap`-table count.
+
+A persisted `gap` row remains a provenance input. Its intersection with an interval may admit an unproved segment or establish overlap uncertainty, but persisted gap-row counts are never substituted for either app-level display fact.
+
+The two app-level reducers are deliberately different:
+
+- `gaps_in_served_interval` is the served-hour reducer: sum `gap_intervals` over this application's retained `file_coverage` hours that intersect the served interval.
+- `gaps_in_requested_window` is the existing `coverage.gap_intervals` scalar returned by `file_coverage` for this application. Its current semantics are the served-hour contribution used by that query plus the existing requested-window overlay. It is not the served-hour reducer recomputed over a larger interval.
+
+Neither reducer is a boot-wide `gap`-row count, a deduplicated union length, or a byte total. The disclosure must name the reducer and scope so the two values are not presented as comparable measurements.
 
 ### 2.2 `FileServeFacts`
 
@@ -61,22 +70,24 @@ The fields mean exactly:
 
 | Field | Type | Semantics |
 | --- | --- | --- |
-| `served_interval` | `Window \| None` | The effective interval used by the file query. For an hourly query this is the selected largest contiguous hour-aligned interval. It is `None` when no interval is servable. For a complete result it equals the requested scope. For non-hourly/totals-only scopes, it is the requested `Window` when that scope is available; it is not converted into invented monotonic endpoints. |
-| `gaps_in_served_interval` | `int \| None` | The number of persisted gap rows intersecting `served_interval`. It is `None` exactly when `served_interval is None` because there is no interval to count. It is `0` when a served interval exists and no gap row intersects it. Zero is evidence of a measured gap-free served interval; it is not the same as “not known.” |
-| `gaps_in_requested_window` | `int` | The number of persisted gap rows intersecting the original requested window, including rows outside the served interval. It is always an integer, including when no interval is servable. `0` means no intersecting persisted gap row was found; it does not turn a missing ownership or missing file source into a complete result. |
+| `served_interval` | `Window \| None` | The effective interval used by the file query. For an hourly query this is the selected largest contiguous hour-aligned interval. It is `None` when no interval is servable. It may equal the requested `range` or `since_boot` scope even when `coverage.complete is False`; completeness is not the definition of a shortened interval. For a successful totals-only `since_boot` or `lifetime` query after hourly pruning, it is the existing requested `Window`, with no invented monotonic endpoints. |
+| `gaps_in_served_interval` | `int \| None` | For an hourly served scope, the sum of this application's `file_coverage.gap_intervals` over retained hourly rows intersecting the served interval. It does not count persisted `gap` rows. Return `None` when no served interval exists or when the relevant hourly rows are unavailable, including a valid totals-only/pruned `since_boot` or `lifetime` scope; never manufacture `0` from absent rows. Return `0` only when the hourly evidence needed for the served result is retained and its measured sum is zero. |
+| `gaps_in_requested_window` | `int` | Exactly the existing `coverage.gap_intervals` scalar from this application's `file_coverage` result for the requested `Window`. Preserve its current served-hour-plus-requested-window-overlay reducer, including its value when the served interval is shortened. Do not recompute it as `gaps_in_served_interval` at a larger scope and do not replace it with a persisted `gap`-row count. |
 
-The method is:
+The method has an explicit store-local application identity:
 
 ```python
-def file_serve_facts(self, window: Window) -> FileServeFacts:
+def file_serve_facts(self, app_id: int, window: Window) -> FileServeFacts:
     ...
 ```
 
-It must use the same read snapshot and the same requested bounds as the corresponding file query. It must not perform a second, differently scoped query that can produce facts for a different database state. It must not be serialized or added to any daemon response.
+`app_id` is the positive SQLite database-local surrogate, not an `AppKey`. The local caller must resolve the selected external `AppKey` to this store-local `app_id` in the same pinned read snapshot, pass that `app_id`, and verify that the returned table, coverage, and facts all describe that application. A facts call without an application identity is a contract defect because two applications can have different served-hour sums in the same window.
 
-For hourly `range` and `since_boot` requests, the method computes `served_interval` from the same selected interval used by `file_applications`, `file_table`, `file_coverage`, and `unknown_owner_file_coverage`. A reader that computes rows using one interval and facts using another is a contract defect.
+The method must use the same read snapshot and the same requested bounds as the corresponding `file_applications`, `file_table`, and `file_coverage` calls. The local worker must keep those calls in one read transaction or an equivalent snapshot-bound query context; it must not call the method against a second database state. It must not be serialized or added to any daemon response.
 
-When no interval exists, the query layer may still construct an internal unavailable `FileCoverage` for error propagation, but the router must refuse it and the view must render outcome 1 below. No caller may interpret the unavailable placeholder window as a served interval.
+For hourly `range` and `since_boot` requests, the method uses the same selected interval as `file_applications`, `file_table`, `file_coverage`, and `unknown_owner_file_coverage`. For a valid totals-only result, `served_interval` follows the existing requested scope, while `gaps_in_served_interval` remains `None` because the hourly rows needed for the served-hour reducer are not available. A reader that computes rows using one interval, app identity, or snapshot and facts using another is a contract defect.
+
+When no interval exists, the query layer may still construct an internal unavailable `FileCoverage` for error propagation, but the router must refuse it and the view must render outcome 1 below. No caller may interpret the unavailable placeholder window as a served interval or its absent hourly rows as zero gap evidence.
 
 ### 2.3 `FileCoverage` and its computed `served_interval`
 
@@ -98,7 +109,7 @@ def served_interval(self) -> Window | None:
     ...
 ```
 
-For a successful `FileCoverage`, the property returns the interval represented by the existing `unknown_owner_overflow.window` field. It returns `None` for an unavailable lower-level result. A complete result has `served_interval == window`; a partial hourly result has a `range` `Window` with the selected served bounds. The property must not change the dataclass field order, equality shape, durable encoder, decoder, or IPC representation.
+For a successful `FileCoverage`, the property returns the interval represented by the existing `unknown_owner_overflow.window` field. It returns `None` for an unavailable lower-level result. Equality with the requested window means that the effective query scope was not shortened; it does **not** imply `coverage.complete is True`. An hourly result with `coverage.complete is False` may still have `served_interval == window` (notably a full requested `since_boot` scope). Call it a **shortened hourly result** only when an hourly query's effective bounds differ from the requested scope; in that case the property returns a `range` `Window` with the selected served bounds. The property must not change the dataclass field order, equality shape, durable encoder, decoder, or IPC representation.
 
 The `unknown_owner_overflow.window` field remains the compatibility carrier for the served scope. Its meaning is corrected by this specification: it is the interval served, not an assertion that the interval is an unknown-owner overflow interval. The new computed property is the honest API name; no wire rename is permitted.
 
@@ -116,18 +127,51 @@ class FileViewResult:
 
 `served_gap_count` has these exact semantics:
 
-- On the local-store route, it is `FileServeFacts.gaps_in_served_interval`. Therefore it is a non-negative integer for a result with a served interval; `0` means the local route proved no gap row intersects that interval.
-- On the daemon/remote route, it is always `None`. Protocol 1 transports `FileTable` and `FileCoverage`, but not the local gap-row layout needed to prove this count. `None` means “not provable on this route,” not zero.
-- It is never a substitute for `coverage.coverage.gap_intervals`, which remains the requested-window coverage scalar.
+- On the local-store route, it is `FileServeFacts.gaps_in_served_interval` for the explicitly selected store-local `app_id`. It is an integer only when a served interval and the required hourly app evidence are available; a totals-only/pruned scope may therefore carry `None` even when `served_interval` equals the request. `0` is a proved measured zero, not a fallback for missing rows.
+- On the daemon/remote route, it is always `None`. Protocol 1 transports `FileTable` and `FileCoverage`, but not the local hourly source rows or gap-row layout needed to prove the served-hour reducer. `None` means “not provable from this route or retained scope,” not zero.
+- It is never a substitute for `coverage.coverage.gap_intervals`, which remains the existing requested-window coverage scalar.
 - It is never transported, encoded, decoded, cached as a wire field, or used to alter `FileCoverage` equality.
 
-The router must verify that the table, coverage, served interval, and served-gap count were obtained for one snapshot and one scope. A result that combines a requested-window table with served-interval coverage is invalid.
+The router must verify that the table, coverage, served interval, application identity, and served-gap count were obtained for one snapshot and one scope. A result that combines a requested-window table with served-interval coverage is invalid.
 
 ### 2.5 Existing `FileCoverage` transport contract
 
-The state `FileCoverage` and its nested `Coverage`, `HookHits`, and `UnknownOwnerOverflow` values are transported exactly as before. The encoder and decoder field sets must not change. Exact-field-set decoding remains mandatory. No `served_interval`, `gaps_in_served_interval`, or `served_gap_count` key may be added to durable JSON, IPC payloads, HMAC cursors, protocol messages, or ABI records.
+The state `FileCoverage` and its nested `Window`, `Coverage`, `HookHits`, and `UnknownOwnerOverflow` values are transported exactly as before. The encoder and decoder field sets must not change. Exact-field-set decoding remains mandatory. No `served_interval`, `gaps_in_served_interval`, or `served_gap_count` key may be added to durable JSON, IPC payloads, HMAC cursors, protocol messages, or ABI records.
 
-A computed property is allowed because it has no serialized representation. A local `FileServeFacts` or `FileViewResult.served_gap_count` field is allowed because neither crosses the route boundary.
+The implementation must pin the encoder with literal expected field sets, not only a round trip. For a representative `FileCoverage`, `to_wire` must produce exactly these sets (all include the `record` key):
+
+```python
+WINDOW_FIELDS = {
+    "record", "kind", "boot_id", "start_mono_ns", "end_mono_ns",
+}
+HOOK_HITS_FIELDS = {
+    "record", "vfs_read", "vfs_write", "vfs_readv", "vfs_writev",
+    "vfs_iter_read", "vfs_iter_write",
+}
+COVERAGE_FIELDS = {
+    "record", "tier", "complete", "unavailable_reason", "inaccessible_pids",
+    "resets", "reap_corrections", "reap_unapplied", "reap_unobserved",
+    "partial_intervals", "gap_intervals", "overlap_uncertain_intervals",
+    "spans_suspend_intervals", "spans_suspend", "reap_incomplete",
+    "counter_overflow", "device_state", "counted_omitted_files",
+    "counted_omitted_bytes_r", "counted_omitted_bytes_w", "uncounted_overflow_files",
+    "uncounted_overflow_bytes_r", "uncounted_overflow_bytes_w", "skipped_nonfile",
+    "skipped_unsupported_fs", "weak_identity_rows", "hook_hits",
+}
+UNKNOWN_OWNER_FIELDS = {
+    "record", "window", "owner_key", "overflow_files", "overflow_bytes_r",
+    "overflow_bytes_w", "coverage",
+}
+FILE_COVERAGE_FIELDS = {
+    "record", "window", "counted_omitted_files", "counted_omitted_bytes_r",
+    "counted_omitted_bytes_w", "uncounted_overflow_files",
+    "uncounted_overflow_bytes_r", "uncounted_overflow_bytes_w", "skipped_nonfile",
+    "skipped_unsupported_fs", "weak_identity_rows", "hook_hits", "observed_bytes_r",
+    "observed_bytes_w", "unknown_owner_overflow", "coverage", "app_key",
+}
+```
+
+`launch_id` is intentionally absent from the wire `Window` set because the existing codec omits database-local launch identity. The decoder must reject both an added key and a missing key at the top level and at each nested record level (`Window`, `Coverage`, `HookHits`, and `UnknownOwnerOverflow`). A computed property is allowed because it has no serialized representation. A local `FileServeFacts` or `FileViewResult.served_gap_count` field is allowed because neither crosses the route boundary.
 
 ### 2.6 Requested versus served values
 
@@ -147,32 +191,30 @@ For a partial result, `observed_bytes_*` must not be labelled “whole window.�
 
 The view must use one canonical scope disclosure in every populated or empty terminal result. It must not recover bounds by looking at the caller's current window after a result has arrived.
 
-For a served range, format bounds exactly as:
+Successful Files results use only the supported `Window` kinds `range`, `since_boot`, and `lifetime`:
+
+- For `range`, format any monotonic scope exactly as `T0={elapsed(T0)} through T1={elapsed(T1)} after boot`.
+- For `since_boot`, format the requested scope as `since_boot through T1={elapsed(end_mono_ns)} after boot`; the required end bound must remain visible. If an hourly result is shortened, format its served `range` with the `T0`/`T1` form and retain the requested `since_boot` endpoint beside it. If the totals-only boot scope is selected, still say `since_boot`, never the internal query label `boot`.
+- For `lifetime`, say `lifetime` and do not invent `T0` or `T1` values. A valid totals-only lifetime result has the requested lifetime as its served scope.
+- `launch` is rejected by the existing Files query precheck, so it has no successful scope formatter. `boot` is an internal selection scope, not a valid `Window.kind`, and must never appear as one.
+
+The canonical scope text is:
 
 ```text
-T0={elapsed(T0)} through T1={elapsed(T1)} after boot
+served interval{ only if served != requested}: {served_bounds_or_scope}; requested window: {requested_bounds_or_scope}; this application's served-hour gap evidence in served interval: {served_gap_text}; this application's requested-window coverage scalar: {requested_gap_scalar}
 ```
 
-For a non-range scope, use its existing canonical window name (`since_boot`, `boot`, or `lifetime`) and do not invent T0/T1 values. The following canonical scope text is used for hourly range results:
+There is no space before the colon after `interval`; the `only` form is literally `served interval only:`. `served_gap_text` is the decimal local integer, including `0`, when the app-hour evidence is retained and measured, or exactly `unavailable` when the value is `None` because the hourly source is pruned/unavailable or the remote route cannot prove it. The text must not imply that the two values are comparable or that `unavailable` means zero. `{requested_gap_scalar}` is the existing `coverage.coverage.gap_intervals` value for this application.
+
+For the canonical local result with app evidence `1` in the served hours and the existing requested-window reducer equal to `4`, the disclosure must contain exactly:
 
 ```text
-served interval{ only if served != requested}: {served_bounds}; requested window: {requested_bounds}; gaps inside served interval: {served_gap_text}; gaps in requested window: {requested_gap_count}
+served interval only: T0=2h 0m 0s through T1=4h 0m 0s after boot; requested window: T0=0s through T1=6h 0m 0s after boot; this application's served-hour gap evidence in served interval: 1; this application's requested-window coverage scalar: 4
 ```
 
-There is no space before the colon after `interval`; the `only` form is literally `served interval only:`. `served_gap_text` is:
+A result whose served and requested scopes are equal must say `served interval:`, not `served interval only:`. The two labels describe different reducers; no copy such as “the same gaps at a larger scope” is permitted.
 
-- the decimal local integer, including `0`, on the local route; or
-- exactly `unavailable on daemon route` when `served_gap_count is None`.
-
-For example, a local result served from 2 hours through 4 hours for a request ending at 6 hours must contain exactly:
-
-```text
-served interval only: T0=2h 0m 0s through T1=4h 0m 0s after boot; requested window: T0=0s through T1=6h 0m 0s after boot; gaps inside served interval: 1; gaps in requested window: 3
-```
-
-A result whose served and requested ranges are equal must say `served interval:`, not `served interval only:`.
-
-The canonical scope text is placed in `footer_state`. The same served/requested scope names must also be present in `footer_observed` and in every coverage-counter footer line that reports omission, overflow, unknown-owner, skipped-object, weak-identity, or hook data. This prevents a footer line from silently reverting to whole-request language.
+The canonical scope text is placed in `footer_state`. The same served/requested scope names and reducer labels must also be present in `footer_observed` and in every coverage-counter footer line that reports omission, overflow, unknown-owner, skipped-object, weak-identity, or hook data. This prevents a footer line from silently reverting to whole-request language or a boot-wide gap-row claim.
 
 ### 3.2 Five outcomes, evaluated in order
 
@@ -257,10 +299,10 @@ This claims only that no retained file matches the filter. It must not say that 
 **Exact `footer_state` disclosure:**
 
 ```text
-no retained file activity for this application in this window; {scope_text}; coverage: complete
+no retained file activity for this application in the served interval; {scope_text}; coverage: complete
 ```
 
-This is a per-application statement. It does not claim that no application was observed, and it does not replace the separate no-application selector state.
+This is a per-application statement about the served scope. It does not claim that no application was observed, and it does not replace the separate no-application selector state.
 
 #### Outcome 5 — `empty_partial`
 
@@ -274,7 +316,7 @@ This is a per-application statement. It does not claim that no application was o
 no retained file activity in the served interval; coverage: incomplete; {scope_text}
 ```
 
-This exact form is used even when `served_gap_count` is `0`; incomplete coverage can arise from facts other than a known gap. On the remote route it must contain `gaps inside served interval: unavailable on daemon route`, not `0`.
+This exact form is used even when `served_gap_count` is `0`; incomplete coverage can arise from facts other than a known gap. When `served_gap_count is None`, it must contain the canonical `this application's served-hour gap evidence in served interval: unavailable` wording, not `0`.
 
 ### 3.3 Separate empty-application selector state
 
@@ -290,19 +332,18 @@ This state is not one of the five per-application file-table outcomes. It must n
 
 ### 4.1 Local-store route
 
-The local route reads one or more local/exported SQLite stores through `QueryService`. It may prove:
+The local route reads one or more local/exported SQLite stores through `QueryService`. It may inspect:
 
 - the requested bounds;
 - the effective served bounds;
-- the persisted gap rows intersecting the served interval;
-- the persisted gap rows intersecting the requested interval;
+- persisted gap rows for provenance admission and overlap/refusal predicates; and
 - ownership and overlap predicates from the local provenance plan.
 
-The local route must call `file_serve_facts` against the same snapshot used to obtain the table and coverage. It sets `FileViewResult.served_gap_count` to the facts' `gaps_in_served_interval`. It uses the existing requested-window coverage scalar for the requested-window disclosure and must not replace that scalar with the served count.
+Those persisted rows are not the app-level display reducers. The local route must resolve the selected external `AppKey` to the positive store-local `app_id` in the same snapshot, then call `file_serve_facts(app_id, window)` against the snapshot used to obtain the table and coverage. It sets `FileViewResult.served_gap_count` to `facts.gaps_in_served_interval`. It uses `facts.gaps_in_requested_window` (the existing `coverage.coverage.gap_intervals` scalar) for the requested-window disclosure and must not replace that scalar with the served count.
 
 ### 4.2 Daemon/remote route
 
-The remote route receives only the existing `FileTable` and `FileCoverage` response records and must preserve their snapshot and window checks. It can disclose the served bounds carried by the existing `unknown_owner_overflow.window` compatibility field. It cannot prove the served-gap count because the protocol does not transport the local `gap` rows or an equivalent field.
+The remote route receives only the existing `FileTable` and `FileCoverage` response records and must preserve their snapshot and window checks. It can disclose the served bounds carried by the existing `unknown_owner_overflow.window` compatibility field. It cannot prove the served-gap reducer because the protocol does not transport the local hourly `file_coverage` rows or an equivalent field.
 
 The remote route therefore sets:
 
@@ -310,7 +351,7 @@ The remote route therefore sets:
 FileViewResult.served_gap_count = None
 ```
 
-The view must display `unavailable on daemon route` for the served-gap value. It may display the existing requested-window coverage scalar. It must not copy that scalar into the served-gap slot, infer zero from a complete-looking response, or hide the missing scope.
+The view must display the canonical `this application's served-hour gap evidence in served interval: unavailable` text for this value. It may display the existing requested-window coverage scalar. It must not copy that scalar into the served-gap slot, infer zero from a complete-looking response, or hide the missing scope.
 
 ### 4.3 Scope unprovable
 
@@ -320,34 +361,36 @@ No field is added to `QueryRequest`, the server response, `FileTable`, `FileCove
 
 ## 5. Provenance predicates
 
-The router evaluates provenance over the served interval, not automatically over the requested interval. Let `R` be the requested half-open interval and `S` be the selected served interval. A source segment intersects `S` when its interval has a non-empty half-open intersection with `S`.
+The router evaluates provenance over a store-specific served interval, not automatically over the requested interval. Let `R` be the requested half-open interval and let `S_i` be the candidate interval selected independently from store `i`. A source segment intersects `S_i` when its interval has a non-empty half-open intersection with that store's candidate interval.
+
+Selection is per store, not global: each store computes its own `S_i`, finalized-through bound, ownership evidence, known-gap set, and predicates. The router then accepts exactly one surviving store candidate and uses that candidate's `S_i` for rows, coverage, facts, and disclosure. If two stores independently survive, the result is ambiguous and refuses even when their `S_i` intervals differ. A gap, segment, or owner outside a store's own `S_i` cannot disqualify that candidate merely because it exists in another store's calendar.
 
 ### 5.1 Existence and requested-scope facts
 
-`S` must exist before any file rows are accepted. For an hourly request, `S` is the interval selected by `_largest_contiguous_file_interval` and must satisfy:
+For each candidate store `i`, `S_i` must exist before any file rows are accepted. For an hourly request, `S_i` is the interval selected by `_largest_contiguous_file_interval` from that store's own file calendar and must satisfy:
 
 ```text
-S.start >= R.start
-S.end <= R.end
-S.start < S.end
-S.start % FILE_HOUR_NS == 0
-S.end % FILE_HOUR_NS == 0
-S.end <= file_finalized_through_mono_ns
+S_i.start >= R.start
+S_i.end <= R.end
+S_i.start < S_i.end
+S_i.start % FILE_HOUR_NS == 0
+S_i.end % FILE_HOUR_NS == 0
+S_i.end <= store_i.file_finalized_through_mono_ns
 ```
 
-The selected interval is the largest contiguous run of present finalized file hours; ties use the existing helper's deterministic end-bound tie-break. No implementation may choose a shorter interval merely to avoid a provenance refusal.
+The selected interval is the largest contiguous run of present finalized file hours in store `i`; ties use the existing helper's deterministic end-bound tie-break. No implementation may choose a shorter `S_i` merely to avoid a provenance refusal. The router must not intersect candidate intervals from different stores to manufacture one global `S`.
 
 ### 5.2 Single-owner predicate
 
 The single-owner predicate is true exactly when:
 
 ```text
-there is exactly one collector_id among proven segments intersecting S,
-no second collector_id has proven coverage intersecting S,
-and all rows used for S come from that one collector_id.
+there is exactly one collector_id among proven segments intersecting S_i,
+no second collector_id has proven coverage intersecting S_i,
+and all rows used for S_i come from that one collector_id.
 ```
 
-Mirrors of the same collector receipt do not become additive owners. A source or owner outside `S` does not disqualify the result. A handover boundary inside `S` is allowed only when the router's existing ownership plan proves the boundary and still reduces to one authoritative store for the complete served result; otherwise it is an ownership ambiguity and refuses.
+Mirrors of the same collector receipt do not become additive owners. A source or owner outside `S_i` does not disqualify the result. A handover boundary inside `S_i` is allowed only when the router's existing ownership plan proves the boundary and still reduces to one authoritative store for the complete served result; otherwise it is an ownership ambiguity and refuses. After each store evaluates this predicate, more than one surviving store candidate is itself an ambiguity.
 
 Failure reports:
 
@@ -365,24 +408,33 @@ message = "No authoritative file app receipt."
 
 ### 5.3 Proven-segment predicate
 
-For every segment intersecting `S`, one of these must hold:
+For each store candidate `i`, clip every raw source segment and every known-gap interval to `S_i` before evaluating file admission:
 
-1. the segment is proven by the single authoritative collector; or
-2. the segment is unproved, its entire interval is covered by the union of known non-overlap gap rows for the same boot, and both segment endpoints are hour-aligned.
+```text
+clipped_segment = raw_segment ∩ S_i
+clipped_gap = known_gap ∩ S_i
+```
+
+Empty intersections are discarded. Alignment and full-coverage checks are then applied to the non-empty clipped segment, against the union of clipped known non-overlap gaps. The raw segment's portion outside `S_i` is not allowed to fail or widen the candidate.
+
+For every non-empty segment intersecting `S_i`, one of these must hold:
+
+1. the clipped segment is proven by the single authoritative collector; or
+2. the clipped segment is unproved, its entire interval is covered by the union of clipped known non-overlap gap rows for the same boot, and both clipped endpoints are hour-aligned.
 
 Coverage is full interval coverage, not “there is a gap row somewhere in the segment.” The union must have no uncovered hole. A gap row with reason `overlap_uncertain` is not a known non-overlap gap and cannot satisfy this predicate.
 
-An unproved segment outside `S` does not disqualify the file result. The router must not widen `S` to include it.
+A boundary-straddling fixture is mandatory: with `S_i = [2h,4h)`, raw unproved segment `[1h30m,3h)` clips to `[2h,3h)` and is admitted only when `[2h,3h)` is fully covered by a known non-overlap gap; raw unproved segment `[1h30m,3h30m)` clips to `[2h,3h30m)` and refuses because the clipped endpoint is not hour-aligned. An unproved segment wholly outside `S_i` does not disqualify the file result. The router must not widen `S_i` to include it.
 
 Failure reports the same `file_source_unavailable` / `File ownership cannot be represented by one store.` pair. The result must not expose rows from the otherwise unproved segment.
 
 ### 5.4 Overlap-uncertainty predicate
 
-The overlap predicate is true exactly when there is no overlap uncertainty intersecting `S`:
+The overlap predicate is true exactly when there is no overlap uncertainty intersecting `S_i`:
 
 ```text
-worker._overlap_ranges has no non-empty intersection with S
-and no persisted gap row with reason "overlap_uncertain" intersects S.
+store_i.worker._overlap_ranges has no non-empty intersection with S_i
+and no persisted gap row with reason "overlap_uncertain" intersects S_i.
 ```
 
 An ambiguous candidate set from two owners/epochs is overlap uncertainty even if the resulting counters happen to be zero. The router must refuse rather than select a winner by row order, freshness, byte total, or a green test result.
@@ -391,23 +443,34 @@ Failure reports `file_source_unavailable` with `File ownership cannot be represe
 
 ### 5.5 Gap-coverage predicate
 
-The gap-coverage predicate is true exactly when every unproved segment intersecting `S` is fully covered by known non-overlap gaps and has hour-aligned endpoints. It is evaluated independently of the requested-window gap count.
+The gap-coverage predicate is true exactly when every non-empty clipped unproved segment for `S_i` is fully covered by clipped known non-overlap gaps and has hour-aligned endpoints. It is evaluated independently of the requested-window coverage scalar.
 
 For the canonical fixture:
 
 ```text
 requested R = [0h, 6h)
-served S   = [2h, 4h)
-gaps       = [1h, 2h), [3h, 4h), [4h, 5h)
+served S_i = [2h, 4h)
+this app's retained file_coverage rows for S_i:
+  hour [2h,3h): gap_intervals = 0
+  hour [3h,4h): gap_intervals = 1
+persisted gap rows used by the requested-window overlay:
+  [1h,2h), [3h,4h), [4h,5h)
 ```
 
-`gaps_in_served_interval == 1` and `gaps_in_requested_window == 3`. The interval `[1h,2h)` and `[4h,5h)` must not be mistaken for gaps inside `S`; a request-and-serve-same-interval fixture is insufficient evidence.
+The documented reducers therefore produce:
+
+```text
+gaps_in_served_interval  = 0 + 1 = 1
+gaps_in_requested_window = existing coverage.gap_intervals = 1 + 3 = 4
+```
+
+The `[1h,2h)` and `[4h,5h)` records are not app-hour evidence inside `S_i`, and the requested scalar is not a second app-hour sum. Do not deduplicate or compare the two reducers; a request-and-serve-same-interval fixture is insufficient evidence.
 
 ### 5.6 Process-history gap scoping
 
-The file route may keep separate known-gap ranges for its served-interval admission, but `_gap_ranges` must remain scoped to the requested process-history window. `_gap_ranges` feeds process coverage and must not be replaced by the served interval's ranges. A separate `_known_gap_ranges` (or an equivalent local name) may be used for file admission.
+The file route may keep separate known-gap ranges for a store candidate's served-interval admission, but `_gap_ranges` must remain scoped to the requested process-history window `R`. `_gap_ranges` feeds process coverage and must not be replaced by `S_i` or by the candidate's file-admission ranges. A separate `_known_gap_ranges` (or an equivalent local name) may be used for file admission.
 
-This separation is mandatory even when the file result is partial. A gap outside the requested process window must never mark process history incomplete; a gap outside the served file interval may be disclosed as part of the requested-window count but must not be counted as a served gap.
+This separation is mandatory even when the file result is partial. In the required fixture, use `R = [2h,6h)` and `S_i = [2h,4h)`, with a process gap `[4h,5h)` outside `S_i` but inside `R`, and a control gap `[0h,1h)` outside `R`. The process reducer must retain `[4h,5h)` and exclude `[0h,1h)`; the file served-hour reducer must not count `[4h,5h)` because it has no intersecting app-hour row in `S_i`. A second control with only `[0h,1h)` must leave process coverage complete. A gap outside the requested process window must never mark process history incomplete, and a gap outside the served file interval must not become a served gap merely because it is in the request.
 
 ## 6. Adoption of `dd8b042`
 
@@ -428,7 +491,7 @@ The audit must not load BPF, use root, modify source or tests, or run the full t
 
 ### 6.2 Allowed outcomes
 
-- **Pass:** the candidate satisfies every contract in this specification, including requested-window `_gap_ranges` scoping, and its tests falsify the mechanisms rather than only asserting a green result. No source repair is made.
+- **Pass:** the candidate satisfies the mechanisms within the audit scope in section 6.1: per-store served-interval selection and propagation, local provenance over that interval, known-gap coverage and overlap refusal, requested-window `_gap_ranges` preservation, and the candidate's route disclosure behavior. Its tests must falsify those mechanisms rather than only assert a green result. Pass is not a claim that the candidate already implements every contract in sections 2–5 or 8; the full `FileServeFacts` signature, nested wire-field inventory, exact formatter, totals-only semantics, and frozen-snapshot acceptance remain separate implementation gates unless the candidate directly changes them.
 - **Repair:** a defect is local and the design mechanism is sound. Repair only the defective mechanism, add or correct the pin that falsifies it, and re-audit the changed bytes and scope.
 - **Replace:** the mechanism is unsound or cannot be repaired without reinterpreting the design. Implement the section 5 mechanism afresh and record why the candidate was not adopted.
 
@@ -471,35 +534,39 @@ The mutation battery must freeze refresh or retain stale answering facts and mus
 
 ## 8. Test plan per contract
 
-All fixtures below are synthetic unless explicitly marked “real database snapshot.” They must use committed SQLite state and synthetic receipts/hourly observations; they must not load BPF, use root, or depend on a live daemon.
+All fixtures below are synthetic unless explicitly marked “real database snapshot.” Synthetic fixtures must use committed SQLite state and synthetic receipts/hourly observations; they must not load BPF, use root, or depend on a live daemon. The real snapshot is opened read-only and is never mutated by the test.
 
 | Contract pin | Fixture shape | Falsifying mutation | Real database snapshot? |
 | --- | --- | --- | --- |
-| `FileServeFacts` field/type semantics | Request `[0h,6h)`; present/served hours `2h,3h`; persisted gaps `[1h,2h)`, `[3h,4h)`, `[4h,5h)`; assert served `[2h,4h)`, served count `1`, requested count `3`. Add a no-served fixture and assert `served_interval is None`, served count `None`, requested count is an integer. | Reuse requested bounds for all queries; count only gaps in `S`; turn no-served count into `0`; use a request equal to served. | No. |
-| Served interval propagation | Use rows at hours 2 and 3 and a request through hour 6. Assert `FileTable.window` and `FileCoverage.window` remain the request, `FileCoverage.served_interval` is `[2h,4h)`, and observed bytes/rows contain only hours 2 and 3. | Leave `file_applications`, `file_table`, or `file_coverage` on the requested bounds; use `unknown_owner_overflow.window` only for the footer while querying rows from the request. | No. |
-| Complete result | One hour-aligned request with all finalized hours and no gaps. Assert served equals requested, `served_gap_count == 0`, `coverage.complete is True`. | Treat `0` as unknown/`None`; mark complete result partial merely because no unknown-owner rows exist. | No. |
-| FileCoverage wire shape | Encode/decode a representative `FileCoverage` with nested coverage and unknown-owner values; compare exact field sets and round-trip values. | Add any served field to the durable/IPC object; relax exact-field-set decode; encode a computed property. | No. |
-| Local result shape | Local `HistoryRouter` returns `FileViewResult(table, coverage, served_gap_count)` with an integer count and one snapshot. | Omit the facts call; derive count from `coverage.gap_intervals`; combine results from different snapshots. | No. |
-| Remote result shape | Drive the existing remote harness through real `IodClient` encoding/decoding and HMAC cursors. Assert bounds are disclosed, `served_gap_count is None`, and requested coverage count remains available. | Set remote served count to `coverage.gap_intervals`; invent zero; add a wire field. | No. |
+| `FileServeFacts` reducers and types | Request `[0h,6h)`; candidate served interval `S_i=[2h,4h)`; this app's retained hourly `file_coverage` rows have `gap_intervals` `0` and `1`; persisted overlay rows are `[1h,2h)`, `[3h,4h)`, `[4h,5h)`. Assert `served_interval=S_i`, `gaps_in_served_interval=1`, and `gaps_in_requested_window=4`. Add an app B with a different hourly sum and assert explicit `app_id` selects A. Add no-served and totals-only/pruned `since_boot`/`lifetime` fixtures: served scope is the existing request when available, served gap is `None`, and requested scalar remains an integer. | Reuse requested bounds for all queries; count persisted rows for the served value; return app A's facts for app B; turn no-hourly evidence into `0`; use the old requested count `3`. | No. |
+| Served interval propagation and outside rows | Request `[0h,6h)` with file rows at hours 0, 2, 3, and 5, while `S_i=[2h,4h)`. Assert `FileTable.window` and `FileCoverage.window` remain the request, `FileCoverage.served_interval=S_i`, and table rows, observed bytes, and app totals contain only hours 2 and 3. | Leave `file_applications`, `file_table`, or `file_coverage` on the requested bounds; query rows outside `S_i`; use `unknown_owner_overflow.window` only for the footer while querying the request. | No. |
+| Complete result | One hour-aligned request with all finalized hours and no gaps. Assert served equals requested, `served_gap_count == 0`, and `coverage.complete is True`. | Treat `0` as unknown/`None`; mark a result partial merely because no unknown-owner rows exist. | No. |
+| Totals-only/pruned semantics | Return a valid `lifetime` and a valid `since_boot` aggregate after hourly rows have been pruned. Assert `served_interval == requested Window`, no invented endpoints or `boot` label, `gaps_in_served_interval is None`, and requested scalar is preserved. | Infer a zero served gap from aggregate completeness; fabricate `T0`/`T1`; expose the internal `boot` scope. | No. |
+| FileCoverage wire shape | Encode/decode a representative `FileCoverage` with nested `Window`, `Coverage`, `HookHits`, and `UnknownOwnerOverflow`; compare each literal field set in section 2.5 and round-trip values. Mutate each nested record once by adding a key and once by removing a key. | Add any served field to the durable/IPC object; relax exact-field-set decode at one nested level; encode a computed property; test only top-level fields. | No. |
+| Local result shape and identity | Local `HistoryRouter` resolves an external `AppKey` to a store-local `app_id`, calls `file_serve_facts(app_id, window)` in one snapshot, and returns `FileViewResult(table, coverage, served_gap_count)`. | Omit the explicit app argument; derive the served count from `coverage.gap_intervals`; combine results from different snapshots. | No. |
+| Remote result shape | Drive the existing remote harness through real `IodClient` encoding/decoding and HMAC cursors. Assert bounds are disclosed, `served_gap_count is None`, and the requested coverage scalar remains available. | Set remote served count to `coverage.gap_intervals`; invent zero; add a wire field. | No. |
 | No authoritative source | Delete the file app receipt or remove the file calendar so no interval is servable. | Return a zero-row successful result; use `unsupported_window`/`not_retained` as a numeric empty result without the typed refusal. | No. |
-| Ambiguous owner | Add overlap, split, and disjoint second-store ownership fixtures. Keep an unrelated owner outside `S` as a control that must not refuse. | Choose a store by freshness, row order, or byte total; let any owner outside `S` refuse the served interval. | No. |
-| Unproved segment | Remove an ownership interval or add a gap hole inside `S`; separately add a known non-overlap gap that fully covers an hour-aligned unproved segment. | Accept any gap row somewhere in the segment; accept overlap-uncertain rows as known gaps; accept a non-hour-aligned unproved segment. | No. |
-| Overlap uncertainty | Add an `overlap_uncertain` row intersecting `S`, with byte totals that happen to be zero, and a control row outside `S`. | Ignore overlap ranges because totals are zero; use requested-window overlap state for a served interval without intersection testing. | No. |
-| Requested `_gap_ranges` | Request a process window larger than `S`; put one gap inside the request but outside `S`, then a second gap outside the request. Assert process coverage reflects only the requested scope while file served count reflects only `S`. | Replace `_gap_ranges` with served ranges; let the outside-request gap mark process history incomplete; let the outside-served gap become a served gap. | No. |
-| Ordered rows outcome | Return at least one row, including a partial result and a search-filtered result. Assert outcome 2 wins over every empty outcome and order is preserved. | Run the empty predicates before rows; sort/filter rows in the view; label observed bytes as whole-window bytes. | No. |
-| Filtered zero outcome | Valid result, active normalized search, zero matching rows, aggregate observed bytes nonzero or unknown. | Use `empty_partial` for a filtered zero; claim no file activity; omit the filter from the state string. | No. |
+| Per-store candidate selection | Give store A a surviving `S_A=[2h,4h)` and store B a different surviving `S_B=[4h,6h)`; assert two survivors refuse. Add an owner/gap outside A's `S_A` as a control that does not refuse A when A is the only survivor. | Compute one global intersection/union interval; accept the first store; let an owner outside `S_i` refuse that candidate. | No. |
+| Unproved segment clipping | With `S_i=[2h,4h)`, use raw unproved `[1h30m,3h)` and a clipped known gap `[2h,3h)` for acceptance; use raw `[1h30m,3h30m)` for refusal because clipped `[2h,3h30m)` is not aligned. Include a hole and an overlap-uncertain row. | Evaluate alignment/coverage before clipping; accept any gap row somewhere in the raw segment; accept overlap-uncertain rows as known gaps. | No. |
+| Overlap uncertainty | Add an `overlap_uncertain` row intersecting `S_i`, with byte totals that happen to be zero, and a control row outside `S_i`. | Ignore overlap ranges because totals are zero; use requested-window overlap state without intersection testing. | No. |
+| Requested `_gap_ranges` and process isolation | Request process window `R=[2h,6h)`, use `S_i=[2h,4h)`, put one gap at `[4h,5h)` inside R but outside S, and a second at `[0h,1h)` outside R. Assert process coverage sees only `[4h,5h)`, file served-hour facts do not count it, and a control with only `[0h,1h)` remains process-complete. | Replace `_gap_ranges` with served ranges; let the outside-request gap mark process history incomplete; let the outside-served gap become a served app gap. | No. |
+| Ordered rows outcome | Return rows `zeta` with `bytes_total=10` and `alpha` with `bytes_total=5`, request `bytes_total desc`, and separately exercise a partial and search-filtered result. Assert displayed order is `zeta, alpha`, outcome 2 wins, and the view does not reorder. | Replace the query's order with `basename asc` (which changes this fixture to `alpha, zeta`); sort/filter rows in the view; label observed bytes as whole-window bytes. | No. |
+| Filtered zero outcome | Valid result, active normalized search, zero matching rows, and aggregate `observed_bytes_r=7`, `observed_bytes_w=0`. | Use `empty_partial` for a filtered zero; claim no file activity; represent “unknown” with a non-existent byte value; omit the filter from the state string. | No. |
 | Complete empty outcome | Valid complete result for an app with no retained file rows but complete file coverage. | Render unavailable or “no applications observed”; use partial wording. | No. |
-| Partial empty outcome | Valid served interval, no filter, zero rows, `coverage.complete=False`; local count `0` and remote count `None` must both be covered. | Treat zero rows as complete; omit one of the two gap scopes; render remote `None` as `0`. | No. |
-| Exact disclosure placement | Assert `footer_state`, `footer_observed`, and each populated coverage footer line contain the correct served/requested names and bounds; assert empty-state text is in `footer_state`. | Put the scope only in the table header or only in `footer_state`; leave the observed line saying “whole window”; derive labels from the current request after a stale reply. | No. |
+| Partial empty outcome | Valid served interval, no filter, zero rows, `coverage.complete=False`; cover local count `0`, totals-only `None`, and remote `None`. | Treat zero rows as complete; omit one of the two gap scopes; render either `None` as `0`. | No. |
+| Scope formatter and bounds | Exercise full/shortened `range`, full/shortened `since_boot`, and `lifetime`; assert real `since_boot` end bounds, no invented lifetime bounds, no `boot` text, and launch refusal. Assert `served interval only:` appears only when scopes differ. | Drop the `since_boot` end bound; use `boot`; invent lifetime endpoints; derive labels from the current request after a stale reply. | No. |
+| Exact disclosure placement | Assert `footer_state`, `footer_observed`, and each populated coverage footer line contain the correct served/requested names and reducer labels; assert empty-state text is in `footer_state` and `unavailable` is never rendered as `0`. | Put scope only in the table header; leave the observed line saying “whole window”; use “gaps in requested window” for the served-hour reducer. | No. |
 | Stale reply | Defer two requests; retire the first and publish the second. | Publish a retired generation's rows or served facts. | No. |
 | Label probe-only truth | Fake the status socket to answer after stream EOF for three refreshes. | Let EOF demote despite a healthy status witness; let the root activation probe assert answering. | No. |
 | Label recovery | Fake a connected state, one silent status refresh after EOF, then an answering status refresh and reconnection. Assert the intermediate exact label and later verified connection. | Freeze the label; retain stale `answering=True`; assert only the final label without verified reconnection. | No. |
-| Candidate adoption | Read-only diff audit plus targeted candidate tests and the `_gap_ranges` mutation. | Declare adoption solely because the aggregate suite is green. | No. |
-| End-to-end acceptance | Offscreen Files view over a frozen SQLite snapshot containing the canonical request/served/gap fixture; assert rows, bounds, both gap scopes, and label answering while the stream is verified. | Use a request whose served interval equals the request; use a live daemon as the only evidence; assert only that the widget is non-empty. | **Yes.** This is the only required acceptance pin that uses a real database snapshot rather than an in-memory/synthetic fixture. |
+| Candidate adoption | Read-only diff audit plus targeted candidate tests, per-store candidate cases, boundary-clipping case, and the `_gap_ranges` mutation. | Declare adoption solely because the aggregate suite is green. | No. |
+| End-to-end acceptance | Use the required read-only artifact `tests/fixtures/p4/files-tab-real.sqlite`, identified by `tests/fixtures/p4/files-tab-real.sha256` and `tests/fixtures/p4/files-tab-real.json`. The manifest must pin the snapshot SHA-256, capture/source identity, schema/user version, selected external `AppKey`, requested `Window`, surviving store, and expected `S_i`. The snapshot must be copied from that identified target store before acceptance and must not receive test inserts. An independent oracle reads the raw snapshot rows and derives `S_i`, app-hour `gaps_in_served_interval`, requested-window `coverage.gap_intervals` semantics, rows, bounds, and provenance outcome without calling production query helpers or rendering code. The offscreen Files view then asserts those expectations and label answering with a stubbed verified status, not a live daemon. | Use a handcrafted database or synthetic tree at the acceptance path; omit the hash/manifest; derive expectations through `QueryService.file_serve_facts`, `file_coverage`, or the view; use a request whose served interval equals the request; assert only that the widget is non-empty. | **Yes.** This is the only required acceptance pin that uses a real database snapshot rather than an in-memory/synthetic fixture. |
 
 The canonical request/served fixture is mandatory for every relevant test group. A request-and-serve-same-interval test does not count as evidence for the two gap scopes because a reused requested count would pass unchanged.
 
 Every mechanism mutation must be run against a clean baseline, observed to fail at the named assertion, and reverted byte-for-byte before the positive result is recorded. A passing test that was already green before the mutation is not a falsification.
+
+The real acceptance artifact is a deliverable of implementation, not a permission to synthesize a database for the test. The hash file must be checked before opening the database; the manifest and independent oracle output must be retained with the acceptance evidence. A hash mismatch, missing artifact, or oracle that imports the production reducer is an acceptance failure.
 
 ## 9. Risk register
 
@@ -507,14 +574,14 @@ Every mechanism mutation must be run against a clean baseline, observed to fail 
 
 1. **Hour-aligned eligibility narrows what serves.** Selection serves whole-hour intervals and accepts unproved segments only when they are hour-aligned and fully covered by known non-overlap gaps. The result is hour-granular, not minute-granular. A store whose recent history is one sub-hour gap can serve nothing until an eligible hour boundary exists.
 2. **Computed-property cost.** Keeping `served_interval` computed protects the wire contract but requires a pure derivation from existing fields. It must be O(1), side-effect free, and must not requery SQLite. `FileServeFacts` is the one snapshot-local computation of gap counts; the view must not scan gap rows.
-3. **Remote unprovability.** The daemon route can disclose bounds but cannot prove the served-gap count with protocol 1. The UI must expose `unavailable on daemon route`, not silently reuse the requested count or claim zero.
+3. **Remote unprovability.** The daemon route can disclose bounds but cannot prove the served-hour app reducer with protocol 1. The UI must expose the canonical `unavailable` served-gap text, not silently reuse the requested scalar or claim zero. Totals-only/pruned local scopes have the same `None` rule even though their route is local.
 4. **Label authority.** The two-witness rule resolves both directions but makes “answering” a statement about the daemon status witness, not merely the GUI stream. Later copy must not imply that it means the stream is healthy without revisiting the label rule.
 
 ### 9.2 Implementation-specific additions
 
 5. **Requested/served scope regression.** A helper may accidentally reuse the selected served interval for process-history coverage. Keep `_gap_ranges` requested-scoped and give file admission its own known-gap collection.
-6. **Legacy gap multiplicity.** Counting merged coverage ranges instead of persisted gap rows can change the disclosure and the canonical `1` versus `3` fixture. Define and test the count; do not deduplicate silently.
-7. **App coverage versus provenance coverage.** `coverage.gap_intervals` includes the existing app/file coverage overlays. Do not replace it with `served_gap_count`; the two values answer different scopes and may legitimately differ.
+6. **Reducer distinction.** The served-hour reducer sums this application's retained hourly `file_coverage.gap_intervals`; the requested-window reducer preserves the existing app-level `coverage.gap_intervals` scalar and its served-hour-plus-overlay semantics. They may differ because they are different reducers, not because one is a boot-wide persisted-row count. Test the documented `1` versus `4` canonical fixture and do not deduplicate or substitute sources.
+7. **App coverage versus provenance coverage.** `coverage.gap_intervals` is the existing requested-window app scalar and includes its served-hour contribution plus requested-window overlay. Do not replace it with `served_gap_count`, which is the retained app-hour reducer for `S_i`; the two values answer different reducer/scope questions and may legitimately differ.
 8. **Unknown-owner compatibility carrier.** Renaming or replacing `unknown_owner_overflow.window` in the wire/durable model would be a schema/protocol change. Use the computed property and local facts instead.
 9. **Snapshot skew.** Calling `file_table`, `file_coverage`, and `file_serve_facts` in separate snapshots can disclose bounds for one state and rows for another. The local worker must keep one committed snapshot for the result.
 10. **Remote pagination.** A paginated remote table must preserve the first page's metadata, snapshot, requested window, sort, direction, and search. A later page must not widen the served interval or invent gap evidence.
@@ -528,41 +595,21 @@ Every mechanism mutation must be run against a clean baseline, observed to fail 
 The approved design does not give a complete field type table, exact copy for every ordered outcome, or an explicit `None` rule for the no-served gap count. This specification resolves those points as follows:
 
 - `served_interval` is `Window | None`; `gaps_in_served_interval` is `int | None`; `gaps_in_requested_window` is always `int`.
-- A local `served_gap_count` of `0` is a proved zero; a remote `None` is not provable and must be disclosed as such.
+- `gaps_in_served_interval` is the sum of this application's retained hourly `file_coverage.gap_intervals` rows intersecting the served interval. Persisted gap rows are provenance inputs only.
+- `gaps_in_requested_window` is the unchanged `coverage.gap_intervals` scalar for this application: its existing served-hour contribution plus requested-window overlay. It is not the served reducer at a larger scope, and the two values must not be described as comparable.
+- A local `served_gap_count` of `0` is a proved zero. `None` means hourly evidence is unavailable/pruned or the route cannot prove the reducer; it is never converted to zero.
 - The requested `FileCoverage.window` remains distinct from the computed served interval and the compatibility carrier's nested window.
-- The five visible outcome strings and their placement are the exact strings in section 3.
-- A served-gap count is a count of intersecting persisted gap records, while overlap uncertainty remains a separate refusal/coverage fact.
-- Non-hourly/totals-only scopes use the requested `Window` as their served scope when available; they do not receive invented monotonic bounds.
-- `FileServeFacts` is local query evidence. `FileViewResult` transports only the local `served_gap_count` value inside the process; neither is a protocol field. The view receives the requested count from the existing coverage scalar and the served count from `FileViewResult`.
+- The five visible outcome strings and their placement are the exact strings in section 3. The scope formatter preserves real `since_boot` end bounds, uses no invented lifetime bounds, and never displays the internal `boot` label.
+- Each store selects its own candidate `S_i` before router acceptance. The router accepts one surviving candidate only; two surviving stores are ambiguous. Segment alignment and gap coverage are evaluated after clipping non-empty segments and known gaps to that candidate's `S_i`.
+- `_gap_ranges` remains requested-process-window scoped; file admission may use a separate known-gap collection.
+- `FileServeFacts` is local snapshot-bound query evidence with an explicit store-local `app_id`. `FileViewResult` transports only the local `served_gap_count` value inside the process; neither is a protocol field.
+- Exact nested wire field sets are pinned literally, with added-key and missing-key rejection at every nested record level.
+- The real-database acceptance uses the named, hash-pinned frozen snapshot and independently derived expectations required by section 8; synthetic fixtures cannot satisfy that gate.
 
-**Resolved: one measure, two scopes (app-level gap evidence).** The approved design named two
-sources for one figure. Measurement on the live store shows they are different quantities:
-
-```
-coverage.gap_intervals for one app       786     (per-app, accumulated over its hours)
-boot-wide gap rows in the same window    760     (distinct intervals, boot-wide)
-sum of gap_intervals over all app-hours  20478   (sums across apps)
-```
-
-Therefore this specification fixes the measure and forbids mixing it:
-
-| Fact | Definition |
-| --- | --- |
-| `gaps_in_requested_window` | the existing `coverage.gap_intervals` scalar for **this app** — unchanged semantics |
-| `gaps_in_served_interval` | the sum of `gap_intervals` over **this app's** `file_coverage` hours intersecting the served interval |
-
-Both are app-level, so the two figures in the disclosure are comparable and mean the same
-thing at different scopes: gaps affecting this application's retained file evidence. Tests must
-**not** assert equality with the boot-wide `gap` row count, and no code path may substitute that
-count for either fact. The disclosure wording names the scope ("gaps affecting this application"),
-never implying a boot-wide total.
-
-These are spec-level decisions; no product-scope expansion is permitted.
+These are spec-level decisions; no product-scope expansion, schema change, migration, wire change, or protocol change is permitted.
 
 ## 11. Open items
 
-None. The single `OPEN:` item raised at drafting — which source supplies the requested-window gap
-count — is resolved above: both scopes use app-level `gap_intervals` evidence, the requested-window
-figure keeps its existing scalar semantics, and neither is compared to the boot-wide `gap` table.
+None. The only drafting ambiguity, which source supplies the requested-window gap value, is resolved above: the served value uses this application's retained hourly `file_coverage` rows, the requested value keeps the existing app-level scalar semantics, and neither is compared with the boot-wide `gap` table.
 
-No other unresolved product or implementation question is required to execute this specification. If implementation discovers a contradiction in the approved design rather than a defect in the code, it must stop the affected lane and add a new, explicitly reviewed `OPEN:` item instead of silently choosing a broader scope.
+No unresolved product or implementation question is required to execute this specification. If implementation discovers a contradiction in the approved design rather than a defect in the code, it must stop the affected lane and obtain an explicitly reviewed decision instead of silently choosing a broader scope.
