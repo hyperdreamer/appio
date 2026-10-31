@@ -1,0 +1,17 @@
+{
+  "derive_with": "python tests/p4/acceptance/derive_fixture.py derive /tmp/appio-files-tab-capture/iod.sqlite /tmp/files_tab_pivot_case.sqlite",
+  "derived_from_capture_sha256": "5eea10690422e3eba12e3376044c953dfcfe1ae3657bf13e34cb42d5bfe891e6",
+  "expected": {
+    "apps_in_selector": 32,
+    "complete": false,
+    "gaps_inside_served_interval": 12,
+    "served_interval_hours": [
+      48,
+      52
+    ]
+  },
+  "fixture": "files_tab_pivot_case.sqlite.gz",
+  "gz_sha256": "025a256f2da14443a14fd721227390afc0a7766a6d2caff79504b1b256503766",
+  "uncompressed_bytes": 18022400,
+  "uncompressed_sha256": "d13e961113a3555efd5fe2541794f41b8e8fe4f5a41dc2122e80009a2ba100b7"
+}

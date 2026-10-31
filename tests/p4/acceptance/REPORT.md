@@ -70,3 +70,31 @@ with hour-aligned endpoints.
 python tests/p4/acceptance/capture_store.py verify /tmp/appio-files-tab-capture
 APPIO_ACCEPTANCE_REQUIRED=1 python -m pytest -q tests/p4/test_files_tab_real_store.py
 ```
+
+## Reproducibility from HEAD (added after re-audit)
+
+The capture is 1.4 GB and cannot be committed, and a trimmed copy that silently loses `path` rows would
+be a different store pretending to be this one. So reproducibility is provided two ways:
+
+1. **A committed derived fixture** — `files_tab_pivot_case.sqlite.gz` (2.1 MB) is a slice of the capture
+   holding every identity/app/path/boot table in full, `gap` and `collector_interval` from 40h to 64h, and
+   `file_coverage`/`file_sample`/`file_overflow_unknown` from 46h to 54h. It preserves the property under
+   test — an hour-aligned served interval whose unprovable parts are covered by gaps that begin and end off
+   the hour — and it reproduces the same result: `incomplete`, 156 rows, 32 applications, served
+   `[48h, 52h)`. Regenerate it with `derive_fixture.py derive <capture> <out>`; `fixture.json` pins both
+   digests and the expected values.
+2. **The real capture**, when present, runs the identical assertions as ground truth.
+
+The package is self-checking: `capture.json` and `oracle.py` must exist, the manifest digest must equal the
+oracle's `capture_sha256`, and re-running `oracle.py` must reproduce `oracle-out.json` byte for byte.
+Deleting a package file, or drifting a digest, fails the acceptance instead of passing it.
+
+Demonstrated in required mode (`APPIO_ACCEPTANCE_REQUIRED=1`):
+
+```
+capture present                 3 passed
+capture absent                  1 failed (the ground-truth test), 2 passed (package + fixture)
+capture.json deleted            1 failed (package check), 2 passed
+fixture.json digest corrupted   1 failed (fixture check), 2 passed
+pre-pivot predicate restored    1 failed (ownership refusal), 2 passed
+```
