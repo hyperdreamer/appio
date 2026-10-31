@@ -138,3 +138,42 @@ re-audit covers clipped known-gap admission only. The overall `repair` verdict
 and pending candidate-adoption gate remain unchanged; overlap, candidate
 selection/error-classification tasks and independent acceptance Task 24 remain
 to be reviewed.
+
+## T-007 Re-Audit Addendum: Served-Scope Overlap Refusal
+
+**Disposition:** no router source repair was required. The T-006 predicate
+already refuses when planner overlap ranges intersect `served`, and the planner
+marks either persisted `overlap_uncertain` intervals or competing owner/epoch
+candidates as overlap uncertainty. These tests independently pin both sources;
+zero byte totals do not change the refusal.
+
+`test_overlap_uncertainty_is_intersection_scoped_even_with_zero_bytes` covers
+an `overlap_uncertain` row intersecting `S=[2h,4h)` and an outside row
+`[4h,5h)`. Both set file sample read/write counters to zero. The inside row
+refuses with the exact `file_source_unavailable` pair; the outside row succeeds
+with served interval `S` and zero observed read bytes. The separate
+`test_overlapping_owner_epochs_refuse_without_persisted_gap_row` commits GUI
+epoch 1 over `[0h,6h)` and IOD epoch 2 over `[2h,4h)`, verifies there is no
+persisted overlap row, and observes the same refusal.
+
+The overlap tests pass `3 passed in 0.36s`; the combined overlap/clipping
+validation passes `10 passed in 0.52s`. Three disposable, origin-checked probes
+each had a 10-test green control, the named assertion failure, byte-identical
+restore, and a 10-test restored green run:
+
+- `M_overlap_ignored_when_zero` removed intersecting `overlap_uncertain` rows
+  from per-segment persisted evidence; the inside-S `pytest.raises` assertion
+  failed because the table was returned.
+- `M_overlap_uses_R` substituted requested `R` for served `S`; the outside-S
+  acceptance assertion failed, along with the T-006 straddling acceptances.
+- `M_ignore_planned_epoch_overlap` forced the competing-owner predicate false;
+  the no-persisted-row epoch test's refusal assertion failed.
+
+An initial weaker probe that changed only the planner's `uncertain` boolean
+survived because the separate persisted-gap `missing` predicate still rejected
+the segment. It is retained under
+`evidence/T-007/mutants/M_overlap_ignored_when_zero/attempt-1-survived/` and is
+not counted as a killed mutant; the final probe removes the persisted overlap
+evidence from the per-segment classifier and is killed as required. No
+production file changed in T-007. This closes only the overlap predicate gate;
+the candidate `repair` verdict and remaining adoption/acceptance gates persist.
