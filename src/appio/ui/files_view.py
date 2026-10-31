@@ -51,12 +51,37 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from ..contracts import Direction, FileRow, FileSort, HookHits, Window, WindowUnavailableError
+from ..contracts import Direction, FileCoverage, FileRow, FileSort, HookHits, Window, WindowUnavailableError
 from .formatting import UNAVAILABLE as UNAVAILABLE_TEXT
 from .formatting import format_bytes
 
 if TYPE_CHECKING:  # pragma: no cover - typing only, never imported at runtime
     from ..history_router import FileViewResult
+
+def _scope_bounds(window: Window) -> str:
+    """Describe supported successful scopes without inventing endpoints."""
+    if window.kind == "range":
+        return (f"T0={elapsed_text(window.start_mono_ns)} through "
+                f"T1={elapsed_text(window.end_mono_ns)} after boot")
+    if window.kind == "since_boot":
+        return f"since_boot through T1={elapsed_text(window.end_mono_ns)} after boot"
+    if window.kind == "lifetime":
+        return "lifetime"
+    raise ValueError("No successful Files scope for this Window kind.")
+
+
+def _scope_text(coverage: FileCoverage, served_gap_count: int | None) -> str:
+    """Name the two independent reducers and their actual result scopes."""
+    served = coverage.served_interval
+    if served is None:
+        raise ValueError("Unavailable Files result has no scope disclosure.")
+    only = " only" if served != coverage.window else ""
+    gap = "unavailable" if served_gap_count is None else str(served_gap_count)
+    return (f"served interval{only}: {_scope_bounds(served)}; "
+            f"requested window: {_scope_bounds(coverage.window)}; "
+            f"this application's served-hour gap evidence in served interval: {gap}; "
+            f"this application's requested-window coverage scalar: {coverage.coverage.gap_intervals}")
+
 
 __all__ = [
     "COLUMNS",
@@ -741,6 +766,8 @@ class FilesView(QWidget):
                 f"overlaps: {inner.overlap_uncertain_intervals}; "
                 f"reason: {inner.unavailable_reason or 'unspecified'}{disclosure}"
             )
+        scope = _scope_text(coverage, result.served_gap_count)
+        self.footer_state.setText(f"{self.footer_state.text()}; {scope}")
         self.footer_observed.setText(
             self._observed_text(coverage, result.table)
         )
