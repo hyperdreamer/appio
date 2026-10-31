@@ -51,12 +51,37 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from ..contracts import Direction, FileRow, FileSort, HookHits, Window, WindowUnavailableError
+from ..contracts import Direction, FileCoverage, FileRow, FileSort, FileTable, HookHits, Window, WindowUnavailableError
 from .formatting import UNAVAILABLE as UNAVAILABLE_TEXT
 from .formatting import format_bytes
 
 if TYPE_CHECKING:  # pragma: no cover - typing only, never imported at runtime
     from ..history_router import FileViewResult
+
+def _scope_bounds(window: Window) -> str:
+    """Describe supported successful scopes without inventing endpoints."""
+    if window.kind == "range":
+        return (f"T0={elapsed_text(window.start_mono_ns)} through "
+                f"T1={elapsed_text(window.end_mono_ns)} after boot")
+    if window.kind == "since_boot":
+        return f"since_boot through T1={elapsed_text(window.end_mono_ns)} after boot"
+    if window.kind == "lifetime":
+        return "lifetime"
+    raise ValueError("No successful Files scope for this Window kind.")
+
+
+def _scope_text(coverage: FileCoverage, served_gap_count: int | None) -> str:
+    """Name the two independent reducers and their actual result scopes."""
+    served = coverage.served_interval
+    if served is None:
+        raise ValueError("Unavailable Files result has no scope disclosure.")
+    only = " only" if served != coverage.window else ""
+    gap = "unavailable" if served_gap_count is None else str(served_gap_count)
+    return (f"served interval{only}: {_scope_bounds(served)}; "
+            f"requested window: {_scope_bounds(coverage.window)}; "
+            f"this application's served-hour gap evidence in served interval: {gap}; "
+            f"this application's requested-window coverage scalar: {coverage.coverage.gap_intervals}")
+
 
 __all__ = [
     "COLUMNS",
@@ -712,100 +737,70 @@ class FilesView(QWidget):
     def _render_coverage(self, result: FileViewResult, window: Window) -> None:
         coverage = result.coverage
         inner = coverage.coverage
-        covered = coverage.unknown_owner_overflow.window
-        partial_interval = (
-            (covered.start_mono_ns, covered.end_mono_ns)
-            if covered != coverage.window and covered.kind == "range"
-            and covered.boot_id == coverage.window.boot_id
-            else None
-        )
-        scope_prefix = (
-            f"served interval only (T0={elapsed_text(partial_interval[0])} through "
-            f"T1={elapsed_text(partial_interval[1])} after boot): "
-            if partial_interval is not None else ""
-        )
-        if inner.complete:
+        scope = _scope_text(coverage, result.served_gap_count)
+        status = "complete" if inner.complete else "incomplete"
+        if result.table.rows:
+            matching = "" if result.table.search is None else f"; matching {result.table.search!r}"
+            self.footer_state.setText(f"rows retained{matching}; {scope}; coverage: {status}")
+        elif result.table.search is not None:
             self.footer_state.setText(
-                f"coverage: complete; tier: {inner.tier}; window: {window.kind}"
-            )
+                f"no retained file matches {result.table.search!r}; {scope}; coverage: {status}")
+        elif inner.complete:
+            self.footer_state.setText(
+                "no retained file activity for this application in the served interval; "
+                f"{scope}; coverage: complete")
         else:
-            disclosure = (
-                f"; served interval only (T0={elapsed_text(partial_interval[0])} through "
-                f"T1={elapsed_text(partial_interval[1])} after boot); "
-                f"collection has gaps in the requested window"
-                if partial_interval is not None else ""
-            )
             self.footer_state.setText(
-                f"coverage: incomplete; tier: {inner.tier}; window: {window.kind}; "
-                f"gaps: {inner.gap_intervals}; "
-                f"overlaps: {inner.overlap_uncertain_intervals}; "
-                f"reason: {inner.unavailable_reason or 'unspecified'}{disclosure}"
-            )
+                "no retained file activity in the served interval; coverage: incomplete; "
+                f"{scope}")
         self.footer_observed.setText(
-            self._observed_text(coverage, result.table)
+            self._observed_text(coverage, result.table, scope)
         )
         self.footer_counted.setText(
-            f"{scope_prefix}counted omissions (top-100/quota): "
+            "counted omissions (top-100/quota): "
             f"{coverage.counted_omitted_files} files, "
             f"{format_bytes(coverage.counted_omitted_bytes_r)} read, "
-            f"{format_bytes(coverage.counted_omitted_bytes_w)} written"
+            f"{format_bytes(coverage.counted_omitted_bytes_w)} written; {scope}"
         )
         # Counted omissions above and this field below are never added: one was
         # measured and dropped by a deterministic top-N, the other was lost when
         # a map insert failed and cannot be measured at all.
         self.footer_uncounted.setText(
-            f"{scope_prefix}uncounted overflow (BPF map full, not measured): "
+            "uncounted overflow (BPF map full, not measured): "
             f"{coverage.uncounted_overflow_files} files, "
             f"{format_bytes(coverage.uncounted_overflow_bytes_r)} read, "
-            f"{format_bytes(coverage.uncounted_overflow_bytes_w)} written"
+            f"{format_bytes(coverage.uncounted_overflow_bytes_w)} written; {scope}"
         )
         overflow = coverage.unknown_owner_overflow
         self.footer_unknown_owner.setText(
-            f"{scope_prefix}unknown owner overflow (unassigned, never added to an app): "
+            "unknown owner overflow (unassigned, never added to an app): "
             f"{overflow.overflow_files} files, "
             f"{format_bytes(overflow.overflow_bytes_r)} read, "
-            f"{format_bytes(overflow.overflow_bytes_w)} written"
+            f"{format_bytes(overflow.overflow_bytes_w)} written; {scope}"
         )
         self.footer_skipped.setText(
-            f"{scope_prefix}skipped objects (excluded, never counted as file I/O): "
+            "skipped objects (excluded, never counted as file I/O): "
             f"{coverage.skipped_nonfile} non-file, "
-            f"{coverage.skipped_unsupported_fs} unsupported filesystem"
+            f"{coverage.skipped_unsupported_fs} unsupported filesystem; {scope}"
         )
         self.footer_weak.setText(
-            f"{scope_prefix}weak identity rows (dev+inode only, no filesystem UUID): "
-            f"{coverage.weak_identity_rows}"
+            "weak identity rows (dev+inode only, no filesystem UUID): "
+            f"{coverage.weak_identity_rows}; {scope}"
         )
-        self.footer_hooks.setText(scope_prefix + hooks_text(coverage.hook_hits))
+        self.footer_hooks.setText(hooks_text(coverage.hook_hits) + f"; {scope}")
 
     @staticmethod
-    def _observed_text(coverage, table) -> str:
-        """Observed bytes use the coverage scope; row count is displayed.
-
-        A search filter narrows the table but not ``observed_bytes_*``, so the
-        two facts are labelled separately rather than implying that the shown
-        rows sum to the displayed byte total.
-        """
-
+    def _observed_text(coverage: FileCoverage, table: FileTable, scope_text: str) -> str:
+        """Aggregate bytes and the returned row count have independent meanings."""
+        only = " only" if coverage.served_interval != coverage.window else ""
         count = len(table.rows)
-        noun = "row" if count == 1 else "rows"
-        prefix = (
-            "observed (counted, whole window): "
-            f"{format_bytes(coverage.observed_bytes_r)} read, "
-            f"{format_bytes(coverage.observed_bytes_w)} written"
-        )
-        covered = coverage.unknown_owner_overflow.window
-        if (covered != coverage.window and covered.kind == "range"
-                and covered.boot_id == coverage.window.boot_id):
-            prefix = (
-                f"observed (counted, served interval only ("
-                f"T0={elapsed_text(covered.start_mono_ns)} through "
-                f"T1={elapsed_text(covered.end_mono_ns)} after boot)): "
+        text = (f"observed (served interval{only}): "
                 f"{format_bytes(coverage.observed_bytes_r)} read, "
-                f"{format_bytes(coverage.observed_bytes_w)} written"
-            )
-        if table.search:
-            return f"{prefix}; table filtered to {count} {noun} matching {table.search!r}"
-        return f"{prefix}; {count} retained file {noun}"
+                f"{format_bytes(coverage.observed_bytes_w)} written; "
+                f"{count} retained file row(s); {scope_text}")
+        if table.search is not None:
+            text += f"; table filtered to {count} row(s) matching {table.search!r}"
+        return text
 
     def _render_no_applications(self) -> None:
         for label in self._footer_labels():

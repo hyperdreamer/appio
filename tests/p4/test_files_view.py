@@ -358,10 +358,11 @@ def test_partial_file_window_names_the_served_interval_and_discloses_gaps(qtbot)
     assert texts(view)[0][0] == "report.txt"
     assert "served interval only" in view.footer_state.text()
     assert "T0=1h 0m 0s through T1=2h 0m 0s after boot" in view.footer_state.text()
-    assert "collection has gaps in the requested window" in view.footer_state.text()
-    assert footer_text(view).count("served interval only") == 8
+    assert "this application's served-hour gap evidence in served interval: unavailable" in view.footer_state.text()
+    assert "this application's requested-window coverage scalar: 2" in view.footer_state.text()
+    assert footer_text(view).count("served interval only") == 9
     assert "T0=1h 0m 0s through T1=2h 0m 0s after boot" in footer_text(view)
-    assert "collection has gaps in the requested window" in footer_text(view)
+    assert "requested window: since_boot through T1=2h 0m 0s after boot" in footer_text(view)
     assert "covered portion only" not in footer_text(view)
 
 
@@ -520,7 +521,7 @@ def test_each_numeric_column_renders_its_own_contract_field(qtbot):
 
 def test_a_search_filtered_table_does_not_tie_its_row_count_to_whole_window_bytes(qtbot):
     # One shown row, three rows' worth of contract-observed bytes: the footer
-    # must label the byte total as the whole window, not as the shown row.
+    # must label the aggregate byte scope independently of the shown row.
     rows = (file_row(basename="app.log"),)
     router = FakeRouter(
         ranking_rows=APPS,
@@ -529,9 +530,10 @@ def test_a_search_filtered_table_does_not_tie_its_row_count_to_whole_window_byte
     view = build(qtbot, router)
     view.set_window(WINDOW)
     text = view.footer_observed.text()
-    assert "whole window" in text
+    assert "observed (served interval):" in text
+    assert "whole window" not in text
     assert format_bytes(4096) in text and format_bytes(1024) in text
-    assert "filtered to 1 row matching 'log'" in text
+    assert "filtered to 1 row(s) matching 'log'" in text
     assert view.model.rowCount() == 1
 
 
@@ -703,7 +705,11 @@ def test_empty_rows_with_complete_zero_coverage_is_ready_not_unavailable(qtbot):
     assert view.state == "ready"
     assert view.model.rowCount() == 0
     assert "complete" in view.footer_state.text()
-    assert "0 retained file rows" in view.footer_observed.text()
+    assert "0 retained file row(s)" in view.footer_observed.text()
+    assert view.footer_state.text().startswith(
+        "no retained file activity for this application in the served interval; ")
+    assert view.footer_state.text().endswith("; coverage: complete")
+    assert "no applications observed" not in view.footer_state.text()
 
 
 def test_no_observed_applications_is_stated_instead_of_an_empty_zero_table(qtbot):
