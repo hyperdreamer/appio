@@ -156,7 +156,7 @@ without an observed failure.
 
 | Unit | Responsibility | Change |
 | --- | --- | --- |
-| `QueryService.file_serve_facts` | report what was served | **new local method** returning `FileServeFacts(served_interval, gaps_in_served_interval, gaps_in_requested_window)`; not transported |
+| `QueryService.file_serve_facts` | report what was served | **new local method** returning `FileServeFacts(served_interval, gaps_in_served_interval, gaps_in_requested_window)` for an explicit `app_id`; not transported |
 | `QueryService.file_coverage` | coverage as today | unchanged shape; `served_interval` exposed as a **computed property** derived from existing fields |
 | `QueryService.file_applications`, `file_table` | select using served bounds | unchanged behaviour, conversion noted |
 | `_largest_contiguous_file_interval` | compute the interval | unchanged |
@@ -203,16 +203,17 @@ the view never recomputes them from the requested window.
 - Partial coverage → `complete=False`, bounds and **both** gap counts stated.
 - Complete coverage with zero rows → `empty_proven`, never `unavailable`.
 
-Two gap counts exist because they answer different questions, and the previous scalar
-answered only the requested-window question:
+Two gap figures exist because they answer different questions, and they are **different reducers**,
+not one figure at two scopes:
 
-| Count | Meaning |
-| --- | --- |
-| `gaps_in_served_interval` | gaps between T0 and T1 — what the numbers actually omit |
-| `gaps_in_requested_window` | gaps anywhere in the request, including regions outside the served interval |
+| Figure | Reducer | Unavailable when |
+| --- | --- | --- |
+| `gaps_in_served_interval` | sum of `gap_intervals` over **this app's** `file_coverage` hours intersecting the served interval | those hourly rows are pruned (totals-only scopes such as `lifetime`) → `None`, never `0` |
+| `gaps_in_requested_window` | the existing `coverage.gap_intervals` scalar = served-hour sum **plus** the requested-window gap overlay | never; it is the existing scalar |
 
-The view names the scope it displays. Reusing the requested-window scalar as the served count
-is precisely the mislabel review finding 2 identified.
+The view names each scope and must not present the two as comparable measurements. Substituting the
+boot-wide `gap` row count for either figure is forbidden: measurement showed it differs from both
+(786 app-level vs 760 boot-wide in one window).
 
 ## Adoption rule for `dd8b042`
 
