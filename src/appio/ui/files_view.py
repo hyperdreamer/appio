@@ -762,18 +762,9 @@ class FilesView(QWidget):
                 "no retained file activity for this application in the served interval; "
                 f"{scope}; coverage: complete")
         else:
-            disclosure = (
-                f"; served interval only (T0={elapsed_text(partial_interval[0])} through "
-                f"T1={elapsed_text(partial_interval[1])} after boot); "
-                f"collection has gaps in the requested window"
-                if partial_interval is not None else ""
-            )
             self.footer_state.setText(
-                f"coverage: incomplete; tier: {inner.tier}; window: {window.kind}; "
-                f"gaps: {inner.gap_intervals}; "
-                f"overlaps: {inner.overlap_uncertain_intervals}; "
-                f"reason: {inner.unavailable_reason or 'unspecified'}{disclosure}; {scope}"
-            )
+                "no retained file activity in the served interval; coverage: incomplete; "
+                f"{scope}")
         self.footer_observed.setText(
             self._observed_text(coverage, result.table, scope)
         )
