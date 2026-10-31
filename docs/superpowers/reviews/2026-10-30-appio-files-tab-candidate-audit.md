@@ -91,3 +91,50 @@ mutant failure, restored run, and restored SHA-256. The relevant imports came
 from each disposable tree. This closes the requested-process-scope finding
 only; the `repair` verdict remains in force and candidate adoption remains
 pending Tasks 6-9 and independent acceptance Task 24.
+
+## T-006 Re-Audit Addendum: Clipped Known-Gap Admission
+
+**Disposition:** repaired/reworked this admission mechanism only. The candidate
+used an inline check over the planner's already-scoped segments. The lane now
+has the explicit `_check_file_provenance(worker, served, supplying_name)`
+predicate: it clips `_all_segments` and known gap intervals to the candidate's
+own served scope, validates the full aligned union, rejects intersecting
+overlap/unknown chronology and non-single-owner plans, then returns `False`
+for a mirror only after those predicates pass. Fatal provenance refusal is
+retained and raised after scanning every candidate, so later candidates are
+examined without suppressing the request-level refusal. This is not adoption
+of the candidate commit. The request-level process `_gap_ranges` assignment
+from T-005 remains unchanged; `_known_gap_ranges` is separate and excludes
+`overlap_uncertain` rows.
+
+The test fixture observes the raw unproved segment `[1.5h,3h)` and its clipped
+candidate segment `[2h,3h)`. Before the admission change, the baseline had
+`2 failed, 6 passed`: both aligned full-union acceptance cases were refused by
+the strict existing gate. Separately, the scan-order pin was red before the
+deferred-error change: `checked` contained only `first`, not both candidates.
+The final clipping tests pass `7 passed in 1.10s`; the combined clipping and
+process-scope validation passes `9 passed in 1.43s`.
+
+Six origin-checked disposable probes each had a 9-test green control, an
+assertion-level mutant failure, byte-identical restore, and a 9-test restored
+green run:
+
+- `M_align_raw_before_clip`: both aligned acceptance cases and the outside-S
+  case were refused when the raw segment was tested without clipping.
+- `M_any_gap_hit_is_enough`: the hole case was admitted; its expected refusal
+  assertion failed.
+- `M_overlap_gap_is_known`: the explicit classification assertion failed
+  because the `overlap_uncertain` row appeared in `_known_gap_ranges`.
+- `M_widen_S_to_raw_segment`: both accepted cases failed when provenance was
+  planned against requested `R` instead of served `S`.
+- `M_no_alignment_check`: the `[2h,3.5h)` case was admitted; its expected
+  refusal assertion failed.
+- `M_stop_scan_after_first_provenance_error`: the scan-order assertion failed
+  because only `first` was checked after the fatal refusal.
+
+Evidence is under `evidence/T-006/mutants/`, including each module origin,
+mutation diff, control/mutant/restored logs, and checked restore hashes. This
+re-audit covers clipped known-gap admission only. The overall `repair` verdict
+and pending candidate-adoption gate remain unchanged; overlap, candidate
+selection/error-classification tasks and independent acceptance Task 24 remain
+to be reviewed.
