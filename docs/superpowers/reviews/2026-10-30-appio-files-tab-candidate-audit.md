@@ -177,3 +177,58 @@ not counted as a killed mutant; the final probe removes the persisted overlap
 evidence from the per-segment classifier and is killed as required. No
 production file changed in T-007. This closes only the overlap predicate gate;
 the candidate `repair` verdict and remaining adoption/acceptance gates persist.
+
+## T-008 Re-Audit Addendum: Per-Store Candidate Selection
+
+**Disposition:** no router source repair was required. The existing local route
+queries each store inside the candidate loop, takes that result's own
+`served_interval`, plans and validates provenance against it, and appends only
+fully validated candidates. It completes the scan before the survivor-count
+check; two survivors refuse instead of being merged or chosen by order. The
+tests pin this behavior without changing the router or query service.
+
+The disjoint-store fixture keeps both table and coverage request windows at
+`R=[0h,6h)`, while store A's file watermark is `4h` and its served interval is
+`S_A=[2h,4h)`, and store B's watermark is `6h` with `S_B=[4h,6h)`. Instrumented
+provenance calls observe each candidate's own interval in both A-then-B and
+B-then-A order. Both fully valid candidates produce the exact
+`file_source_unavailable` / `File ownership cannot be represented by one
+store.` refusal.
+
+The outside-scope control gives B an owner interval and `collector_gap` at
+`[5h,6h)`, outside A's `S_A`. B has no candidate file hours; A remains the sole
+survivor with `S_A` and 70 observed read bytes. The calendar selection pin
+checks hours `(0,1,3,4)`: the equal two-hour runs select the later `[3h,5h)` run
+at the `5h` file watermark. A second case has a one-hour earlier run and the
+same later two-hour run. After confirming selection, the tests leave ownership
+evidence only for the earlier run; provenance of `[3h,5h)` refuses rather than
+retrying either an earlier tied interval or a shorter interval.
+
+The new file passes `5 passed in 0.45s`; it was green before any production
+edit, and no production edit was needed. Four origin-checked disposable probes
+each had a five-test green control, the intended test failure, byte-identical
+restore, and a five-test restored run:
+
+- `M_global_candidate_interval` substituted requested `R` for each candidate's
+  `S_i`; both store-order cases failed the recorded per-store interval check.
+- `M_accept_first_store` weakened the post-scan count guard; both store-order
+  cases failed because no `WindowUnavailableError` was raised.
+- `M_outside_S_owner_fails` passed raw rather than clipped segments to the
+  provenance predicate; the outside-owner/gap positive control failed.
+- `M_shorter_run_avoids_refusal` queried candidate coverage on the prefix ending
+  at the selected interval's start and used that earlier, shorter interval for
+  provenance. Both largest-run refusal assertions failed with `DID NOT RAISE`,
+  admitting a result whose selected served interval was `[3h,5h)`.
+
+The first attempted shorter-run mutation only changed the tuple comparison
+from `>=` to `>`; the later end-bound still won the equal-length tie, so that
+probe survived and is retained under
+`evidence/T-008/mutants/M_shorter_run_avoids_refusal/attempt-1-survived/` but is
+not counted. The final router mutation substituted an earlier prefix scope and
+was killed at the no-fallback refusal assertions. All final probe module
+origins and restored hashes were verified. Validation used the pinned
+interpreter and passed `5 passed in 0.45s`.
+
+This addendum closes only per-store selection and survivor ambiguity. The
+candidate's `repair` verdict remains; Tasks 9-10 and independent acceptance
+Task 24 still gate adoption.
