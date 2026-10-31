@@ -1,6 +1,11 @@
 # appio Files tab — honest window and honest label
 
-Status: revision 8 — corrects the gap-count measure in revision 7. Revision 7 said the
+Status: revision 9 — pivot approved at Step 8 (see PIVOT-1): the served interval stays
+hour-aligned, but an unproved *segment* inside it no longer has to be hour-aligned. Real stores
+record gaps at the instant a daemon restarted, so the revision-8 rule made every real store
+unservable.
+
+Revision 8 — corrects the gap-count measure in revision 7. Revision 7 said the
 served-gap figure is computed from persisted gap rows; measurement proved that is a different
 quantity (786 app-level vs 760 boot-wide in the same window) and spec review 2 proved the
 displayed pair would then be incomparable. Because the approved snapshot changes, Step 3B must be
@@ -200,6 +205,12 @@ the view never recomputes them from the requested window.
 - Ownership ambiguous, or the app belongs to another store → refuse.
 - Served interval unproven and not fully covered by known non-overlap gaps → refuse.
 - Overlap uncertainty inside the served interval → refuse.
+- **Pivoted admission rule.** The served interval must be hour-aligned, because rows are hourly.
+  An unproved segment inside it is admitted when every unproven sub-interval is covered by
+  known, non-overlap-uncertain gaps, whatever their boundaries are. Requiring the *segments*
+  to be hour-aligned was revision 8's error: gaps fall where restarts happened, so no real
+  store with a restart can satisfy it. Disclosure is unchanged — `complete=False`, both gap
+  counts, and the served bounds — so the reader still knows the interval is not whole.
 - Partial coverage → `complete=False`, bounds and **both** gap counts stated.
 - Complete coverage with zero rows → `empty_proven`, never `unavailable`.
 
