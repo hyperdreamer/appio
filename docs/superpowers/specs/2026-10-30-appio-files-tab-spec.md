@@ -15,7 +15,7 @@ This document is normative for implementation lanes. Where it says **must**, an 
 
 The Files tab has never rendered on the target host, and the header has misreported the daemon. File rows are hourly, so a file query must use an hour-aligned interval. The retained store contains approximately 710 legacy gaps; consequently every useful hour-aligned request can contain a gap. The longest gap-free stretch before the watermark is 614 seconds, below the hourly granularity. Router provenance over the whole request therefore refuses, and provenance over the served interval still refuses while an unproved or overlap-uncertain segment remains inside that interval.
 
-The approved design's intended change is to serve an hour-aligned interval across known, countable gaps when all of the following hold: ownership is unambiguous; no overlap uncertainty is inside the served interval; every unproved segment is fully covered by known non-overlap gaps; and each such unproved segment is hour-aligned. Rows are rendered for the interval actually served, not for the larger requested window.
+The approved design's intended change is to serve an hour-aligned interval across known, countable gaps when all of the following hold: ownership is unambiguous; no overlap uncertainty is inside the served interval; every unproved segment is fully covered by known non-overlap gaps; and the served interval is hour-aligned. Segment boundaries may fall anywhere inside it, because a real gap begins and ends at the instant a daemon restarted or a BPF load failed. Rows are rendered for the interval actually served, not for the larger requested window.
 
 The header behaviour is a preservation target, not a repair target. Existing refresh logic promotes a verified, answering live connection over a silent one-shot probe. The activation probe override is deliberate. Existing unchanged code produces the health transitions that earlier drafts incorrectly called missing. This specification adds pins for the two uncovered transitions without changing precedence, witness authority, ownership reconciliation, `display_state`, or `decide_owner`.
 
@@ -422,11 +422,11 @@ Empty intersections are discarded. Alignment and full-coverage checks are then a
 For every non-empty segment intersecting `S_i`, one of these must hold:
 
 1. the clipped segment is proven by the single authoritative collector; or
-2. the clipped segment is unproved, its entire interval is covered by the union of clipped known non-overlap gap rows for the same boot, and both clipped endpoints are hour-aligned.
+2. the clipped segment is unproved and its entire interval is covered by the union of clipped known non-overlap gap rows for the same boot. The clipped endpoints need not be hour-aligned; only the served interval must be.
 
 Coverage is full interval coverage, not “there is a gap row somewhere in the segment.” The union must have no uncovered hole. A gap row with reason `overlap_uncertain` is not a known non-overlap gap and cannot satisfy this predicate.
 
-A boundary-straddling fixture is mandatory: with `S_i = [2h,4h)`, raw unproved segment `[1h30m,3h)` clips to `[2h,3h)` and is admitted only when `[2h,3h)` is fully covered by a known non-overlap gap; raw unproved segment `[1h30m,3h30m)` clips to `[2h,3h30m)` and refuses because the clipped endpoint is not hour-aligned. An unproved segment wholly outside `S_i` does not fail this candidate's proven-segment predicate. The router must not widen `S_i` to include it.
+A boundary-straddling fixture is mandatory: with `S_i = [2h,4h)`, raw unproved segment `[1h30m,3h)` clips to `[2h,3h)` and is admitted only when `[2h,3h)` is fully covered by a known non-overlap gap; raw unproved segment `[1h30m,3h30m)` clips to `[2h,3h30m)` and is likewise admitted when fully gap-covered, since a mid-hour endpoint no longer forbids serving (PIVOT-1). An unproved segment wholly outside `S_i` does not fail this candidate's proven-segment predicate. The router must not widen `S_i` to include it.
 
 Failure reports the same `file_source_unavailable` / `File ownership cannot be represented by one store.` pair. The result must not expose rows from the otherwise unproved segment.
 
@@ -445,7 +445,7 @@ Failure reports `file_source_unavailable` with `File ownership cannot be represe
 
 ### 5.5 Gap-coverage predicate
 
-The gap-coverage predicate is true exactly when every non-empty clipped unproved segment for `S_i` is fully covered by clipped known non-overlap gaps and has hour-aligned endpoints. It is evaluated independently of the requested-window coverage scalar.
+The gap-coverage predicate is true exactly when every non-empty clipped unproved segment for `S_i` is fully covered by clipped known non-overlap gaps. `S_i` itself must be hour-aligned; the segments need not be (PIVOT-1). It is evaluated independently of the requested-window coverage scalar.
 
 The canonical fixture contains **two applications in the same store and snapshot**, not two alternative descriptions of one application:
 
@@ -606,7 +606,7 @@ The real acceptance artifact is a deliverable of implementation, not a permissio
 
 ### 9.1 Risks carried from the approved design
 
-1. **Hour-aligned eligibility narrows what serves.** Selection serves whole-hour intervals and accepts unproved segments only when they are hour-aligned and fully covered by known non-overlap gaps. The result is hour-granular, not minute-granular. A store whose recent history is one sub-hour gap can serve nothing until an eligible hour boundary exists.
+1. **Hour-aligned eligibility narrows what serves.** Selection serves whole-hour intervals and accepts an unproved segment whenever it is fully covered by known non-overlap gaps, whatever its boundaries. The result is hour-granular in its rows, and segment boundaries inside it reflect real restarts rather than a rule. A store whose recent history is entirely gap still serves nothing, but a store with ordinary mid-hour restarts now serves.
 2. **Computed-property cost.** Keeping `served_interval` computed protects the wire contract but requires a pure derivation from existing fields. It must be O(1), side-effect free, and must not requery SQLite. `FileServeFacts` is the one snapshot-local computation of gap counts; the view must not scan gap rows.
 3. **Remote unprovability.** The daemon route can disclose bounds but cannot prove the served-hour app reducer with protocol 1. The UI must expose the canonical `unavailable` served-gap text, not silently reuse the requested scalar or claim zero. Totals-only/pruned local scopes have the same `None` rule even though their route is local.
 4. **Label authority.** The two-witness rule resolves both directions but makes “answering” a statement about the daemon status witness, not merely the GUI stream. Later copy must not imply that it means the stream is healthy without revisiting the label rule.
