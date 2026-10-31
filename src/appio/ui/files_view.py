@@ -51,7 +51,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from ..contracts import Direction, FileCoverage, FileRow, FileSort, HookHits, Window, WindowUnavailableError
+from ..contracts import Direction, FileCoverage, FileRow, FileSort, FileTable, HookHits, Window, WindowUnavailableError
 from .formatting import UNAVAILABLE as UNAVAILABLE_TEXT
 from .formatting import format_bytes
 
@@ -749,9 +749,14 @@ class FilesView(QWidget):
             f"T1={elapsed_text(partial_interval[1])} after boot): "
             if partial_interval is not None else ""
         )
-        if inner.complete:
+        scope = _scope_text(coverage, result.served_gap_count)
+        status = "complete" if inner.complete else "incomplete"
+        if result.table.rows:
+            matching = "" if result.table.search is None else f"; matching {result.table.search!r}"
+            self.footer_state.setText(f"rows retained{matching}; {scope}; coverage: {status}")
+        elif inner.complete:
             self.footer_state.setText(
-                f"coverage: complete; tier: {inner.tier}; window: {window.kind}"
+                f"coverage: complete; tier: {inner.tier}; window: {window.kind}; {scope}"
             )
         else:
             disclosure = (
@@ -764,12 +769,10 @@ class FilesView(QWidget):
                 f"coverage: incomplete; tier: {inner.tier}; window: {window.kind}; "
                 f"gaps: {inner.gap_intervals}; "
                 f"overlaps: {inner.overlap_uncertain_intervals}; "
-                f"reason: {inner.unavailable_reason or 'unspecified'}{disclosure}"
+                f"reason: {inner.unavailable_reason or 'unspecified'}{disclosure}; {scope}"
             )
-        scope = _scope_text(coverage, result.served_gap_count)
-        self.footer_state.setText(f"{self.footer_state.text()}; {scope}")
         self.footer_observed.setText(
-            self._observed_text(coverage, result.table)
+            self._observed_text(coverage, result.table, scope)
         )
         self.footer_counted.setText(
             f"{scope_prefix}counted omissions (top-100/quota): "
@@ -805,34 +808,17 @@ class FilesView(QWidget):
         self.footer_hooks.setText(scope_prefix + hooks_text(coverage.hook_hits))
 
     @staticmethod
-    def _observed_text(coverage, table) -> str:
-        """Observed bytes use the coverage scope; row count is displayed.
-
-        A search filter narrows the table but not ``observed_bytes_*``, so the
-        two facts are labelled separately rather than implying that the shown
-        rows sum to the displayed byte total.
-        """
-
+    def _observed_text(coverage: FileCoverage, table: FileTable, scope_text: str) -> str:
+        """Aggregate bytes and the returned row count have independent meanings."""
+        only = " only" if coverage.served_interval != coverage.window else ""
         count = len(table.rows)
-        noun = "row" if count == 1 else "rows"
-        prefix = (
-            "observed (counted, whole window): "
-            f"{format_bytes(coverage.observed_bytes_r)} read, "
-            f"{format_bytes(coverage.observed_bytes_w)} written"
-        )
-        covered = coverage.unknown_owner_overflow.window
-        if (covered != coverage.window and covered.kind == "range"
-                and covered.boot_id == coverage.window.boot_id):
-            prefix = (
-                f"observed (counted, served interval only ("
-                f"T0={elapsed_text(covered.start_mono_ns)} through "
-                f"T1={elapsed_text(covered.end_mono_ns)} after boot)): "
+        text = (f"observed (served interval{only}): "
                 f"{format_bytes(coverage.observed_bytes_r)} read, "
-                f"{format_bytes(coverage.observed_bytes_w)} written"
-            )
-        if table.search:
-            return f"{prefix}; table filtered to {count} {noun} matching {table.search!r}"
-        return f"{prefix}; {count} retained file {noun}"
+                f"{format_bytes(coverage.observed_bytes_w)} written; "
+                f"{count} retained file row(s); {scope_text}")
+        if table.search is not None:
+            text += f"; table filtered to {count} row(s) matching {table.search!r}"
+        return text
 
     def _render_no_applications(self) -> None:
         for label in self._footer_labels():

@@ -233,7 +233,9 @@ def test_real_router_disclosure_names_the_served_interval(histories, qtbot):
     for label in labels:
         assert "served interval only" in label.text()
         assert "T0=2h 0m 0s through T1=4h 0m 0s after boot" in label.text()
-    assert "collection has gaps in the requested window" in view.footer_state.text()
+    assert "rows retained;" in view.footer_state.text()
+    assert "this application's served-hour gap evidence in served interval: 0" in view.footer_state.text()
+    assert "this application's requested-window coverage scalar: 2" in view.footer_state.text()
     assert view.state == "incomplete"
     assert view.last_result.table.window == REQUESTED
     assert view.last_result.coverage.window == REQUESTED
