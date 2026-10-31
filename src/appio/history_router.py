@@ -26,7 +26,7 @@ import sqlite3
 from types import SimpleNamespace
 
 from .contracts import (
-    AppTotal, Direction, DiskShare, FileCoverage, FileSort, FileTable, Series, Window,
+    AppTotal, Direction, DiskShare, FileCoverage, FileSort, FileTable, Series, Window, FILE_HOUR_NS,
     WindowUnavailableError, SQLITE_INT_MAX, validate_enum, validate_search, validate_sqlite_integer,
 )
 from .durable import decode_handover
@@ -94,6 +94,7 @@ def _coverage(rows, *, gaps=0, overlaps=0, unavailable=False):
 class FileViewResult:
     table: FileTable
     coverage: FileCoverage
+    served_gap_count: int | None
 
 
 class HistoryRouter:
@@ -116,6 +117,7 @@ class HistoryRouter:
         self._queue = []
         self._remote_parts = {}
         self._gap_ranges = []
+        self._known_gap_ranges = []
         self._overlap_ranges = []
         self._has_local_history = False
         self._not_retained = False
@@ -165,7 +167,9 @@ class HistoryRouter:
         return self._file_status
 
     @staticmethod
-    def _check_file_result(table, coverage):
+    def _check_file_result(table, coverage, served_gap_count: int | None = None):
+        if table.app_id != coverage.app_id:
+            raise WindowUnavailableError("file_source_unavailable", "File coverage does not match the table snapshot.")
         if table.window != coverage.window or table.coverage.tier != coverage.coverage.tier:
             raise WindowUnavailableError("file_source_unavailable", "Mixed file scope or retention tiers.")
         for evidence in (table.coverage, coverage.coverage):
@@ -173,7 +177,58 @@ class HistoryRouter:
                 raise WindowUnavailableError(evidence.unavailable_reason, "File history is not available for this window.")
         if table.coverage != coverage.coverage or table.unknown_owner_overflow != coverage.unknown_owner_overflow:
             raise WindowUnavailableError("file_source_unavailable", "File coverage does not match the table snapshot.")
-        return FileViewResult(table, coverage)
+        if coverage.served_interval is None:
+            raise WindowUnavailableError(
+                "file_source_unavailable", "File ownership cannot be represented by one store.")
+        return FileViewResult(table, coverage, served_gap_count)
+
+    @staticmethod
+    def _check_file_provenance(worker, served: Window, supplying_name: str) -> bool:
+        start = served.start_mono_ns or 0
+        end = served.end_mono_ns or SQLITE_INT_MAX
+        segments = []
+        for segment in worker._all_segments:
+            if served.boot_id is not None and segment.boot_id != served.boot_id:
+                continue
+            left, right = max(segment.start_ns, start), min(segment.end_ns, end)
+            if left < right:
+                segments.append(replace(segment, start_ns=left, end_ns=right))
+
+        known = []
+        for boot, left, right in worker._known_gap_ranges:
+            if served.boot_id is not None and boot != served.boot_id:
+                continue
+            clipped_left, clipped_right = max(left, start), min(right, end)
+            if clipped_left < clipped_right:
+                known.append((boot, clipped_left, clipped_right))
+
+        def fully_covered(segment):
+            if segment.start_ns % FILE_HOUR_NS or segment.end_ns % FILE_HOUR_NS:
+                return False
+            cursor = segment.start_ns
+            for boot, left, right in sorted(known):
+                if boot != segment.boot_id or right <= cursor:
+                    continue
+                if left > cursor:
+                    return False
+                cursor = max(cursor, right)
+                if cursor >= segment.end_ns:
+                    return True
+            return False
+
+        proven_names = {segment.collector_id for segment in segments if segment.proven}
+        unproved = [segment for segment in segments if not segment.proven]
+        overlap = any(
+            (served.boot_id is None or boot == served.boot_id)
+            and left < end and right > start
+            for boot, left, right in worker._overlap_ranges
+        )
+        if (not segments or worker._chronology_unproved or overlap
+                or len(proven_names) != 1
+                or any(not fully_covered(segment) for segment in unproved)):
+            raise WindowUnavailableError(
+                "file_source_unavailable", "File ownership cannot be represented by one store.")
+        return proven_names == {supplying_name}
 
     @staticmethod
     def _read_local_files(paths, window, key, app_id, sort, direction, search):
@@ -196,35 +251,49 @@ class HistoryRouter:
                 sources.append((name, QueryService(copy), owner))
             results = []
             unavailable = WindowUnavailableError("file_source_unavailable", "No authoritative file app receipt.")
+            provenance_error = None
             for name, service, _ in sources:
-                row = service.connection.execute("SELECT app_id FROM app WHERE key=?", (key,)).fetchone()
-                if row is None:
-                    continue
                 try:
                     with service._snapshot():
-                        table = service.file_table(row[0], window, sort, direction, search)
-                        coverage = service.file_coverage(row[0], window)
-                    result = HistoryRouter._check_file_result(
-                        replace(table, app_id=app_id), replace(coverage, app_id=app_id))
+                        row = service.connection.execute("SELECT app_id FROM app WHERE key=?", (key,)).fetchone()
+                        if row is None:
+                            continue
+                        local_app_id = row[0]
+                        table = service.file_table(local_app_id, window, sort, direction, search)
+                        coverage = service.file_coverage(local_app_id, window)
+                        facts = service.file_serve_facts(local_app_id, window)
+                        if (table.app_id != local_app_id or coverage.app_id != local_app_id
+                                or table.window != window or coverage.window != window
+                                or facts.served_interval != coverage.served_interval
+                                or facts.gaps_in_requested_window != coverage.coverage.gap_intervals):
+                            raise WindowUnavailableError(
+                                "file_source_unavailable", "File coverage does not match the table snapshot.")
+                        result = HistoryRouter._check_file_result(
+                            replace(table, app_id=app_id), replace(coverage, app_id=app_id),
+                            facts.gaps_in_served_interval)
                 except WindowUnavailableError as error:
                     unavailable = error
+                    continue
+                served = result.coverage.served_interval
+                if served is None:
+                    unavailable = WindowUnavailableError(
+                        "file_source_unavailable", "File ownership cannot be represented by one store.")
                     continue
                 worker = HistoryRouter(service, SimpleNamespace(state=None), AppRegistry())
                 try:
                     worker._sources = {source: (query, owner) for source, query, owner in sources}
-                    served = result.coverage.unknown_owner_overflow.window
                     worker._window = served
                     worker._plan(served)
-                    names = {s.collector_id for s in worker.segments if s.proven}
-                    if (len(names) != 1 or not worker.segments
-                            or any(not s.proven for s in worker.segments) or worker._chronology_unproved):
-                        raise WindowUnavailableError("file_source_unavailable",
-                            "File ownership cannot be represented by one store.")
-                    if names != {name}:
+                    if not HistoryRouter._check_file_provenance(worker, served, name):
                         continue  # A discarded mirror cannot supply the rows.
                     results.append(result)
+                except WindowUnavailableError as error:
+                    if provenance_error is None:
+                        provenance_error = error
                 finally:
                     worker.close()
+            if provenance_error is not None:
+                raise provenance_error
             if not results:
                 raise unavailable
             if len(results) != 1:
@@ -308,7 +377,7 @@ class HistoryRouter:
                 if not isinstance(coverage, FileCoverage) or response.get("next_cursor") is not None:
                     raise WindowUnavailableError("file_source_unavailable", "Invalid remote file coverage.")
                 table = replace(pages[0], rows=tuple(row for page in pages for row in page.rows), app_id=app_id)
-                value = self._check_file_result(table, replace(coverage, app_id=app_id))
+                value = self._check_file_result(table, replace(coverage, app_id=app_id), None)
                 self._settle_file(out, generation, value=value)
             except Exception as error:
                 self._settle_file(out, generation, error=error)
@@ -509,6 +578,16 @@ class HistoryRouter:
                 scoped.append(replace(segment, start_ns=left, end_ns=right))
         self.segments = tuple(scoped)
         self._gap_ranges = [(s.boot_id, s.start_ns, s.end_ns) for s in scoped if not s.proven]
+        self._known_gap_ranges = [
+            (boot, max(left, window.start_mono_ns or 0),
+             min(right, window.end_mono_ns or SQLITE_INT_MAX))
+            for boot, _, left, right, reason in gaps
+            if reason != "overlap_uncertain"
+            and (window.boot_id is None or boot == window.boot_id)
+            and left < (window.end_mono_ns or SQLITE_INT_MAX)
+            and right > (window.start_mono_ns or 0)
+            and max(left, window.start_mono_ns or 0) < min(right, window.end_mono_ns or SQLITE_INT_MAX)
+        ]
         self._overlap_ranges = [(boot, max(left, window.start_mono_ns or 0),
                                  min(right, window.end_mono_ns or SQLITE_INT_MAX))
             for boot, left, right in self._overlap_ranges
@@ -668,7 +747,7 @@ class HistoryRouter:
         self._cancel_file_requests()
         self._window, self._ready = window, False
         self.segments, self.boundaries = (), ()
-        self._gap_ranges, self._overlap_ranges = [], []
+        self._gap_ranges, self._known_gap_ranges, self._overlap_ranges = [], [], []
         self._has_local_history = False
         self._ranking, self._remote_parts, self._queue, self._cached_parts = [], {}, [], {}
         self._remote = self._remote_snapshot = None

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from dataclasses import dataclass
 import json
 import sqlite3
 import unicodedata
@@ -40,6 +41,14 @@ from appio.contracts import (
 from appio.ownership import device_interval_start, intersects, ownership_exclusions, uncertain_intervals
 from appio.reconcile import rate_bps
 from appio.tier import select_tier
+
+
+@dataclass(frozen=True)
+class FileServeFacts:
+    served_interval: Window | None
+    gaps_in_served_interval: int | None
+    gaps_in_requested_window: int
+
 
 _COUNTERS = ("rchar", "wchar", "read_bytes", "write_bytes")
 _COUNTS = (
@@ -948,12 +957,14 @@ class QueryService:
                 ).fetchall()
             else:
                 unknown = self._unknown_owner(window, scope, boot_id, start, end)
-                query_start, query_end = start, end
-                if unknown.window != window and unknown.window.kind == "range":
-                    query_start = unknown.window.start_mono_ns
-                    query_end = unknown.window.end_mono_ns
-                first = _ceil_bucket(query_start, FILE_HOUR_NS)
-                last = (query_end // FILE_HOUR_NS) * FILE_HOUR_NS
+                effective_window = unknown.window
+                effective_start, effective_end = start, end
+                if (scope == "hourly" and effective_window != window
+                        and effective_window.kind == "range"):
+                    effective_start = effective_window.start_mono_ns
+                    effective_end = effective_window.end_mono_ns
+                first = _ceil_bucket(effective_start, FILE_HOUR_NS)
+                last = (effective_end // FILE_HOUR_NS) * FILE_HOUR_NS
                 if first >= last:
                     return ()
                 rows = self.connection.execute(
@@ -983,12 +994,14 @@ class QueryService:
                 raise ValueError("app_id must be positive")
             self._require_app(app_id)
             unknown = self._unknown_owner(window, scope, boot_id, start, end)
-            query_start, query_end = start, end
-            if scope == "hourly" and unknown.window != window and unknown.window.kind == "range":
-                query_start = unknown.window.start_mono_ns
-                query_end = unknown.window.end_mono_ns
+            effective_window = unknown.window
+            effective_start, effective_end = start, end
+            if (scope == "hourly" and effective_window != window
+                    and effective_window.kind == "range"):
+                effective_start = effective_window.start_mono_ns
+                effective_end = effective_window.end_mono_ns
             reduced, base, reason = self._file_app_coverage(
-                app_id, window, scope, boot_id, query_start, query_end
+                app_id, window, scope, boot_id, effective_start, effective_end
             )
             coverage_reason = _unavailable_reason(reason, unknown.coverage.unavailable_reason)
             base = base and unknown.coverage.complete
@@ -998,7 +1011,7 @@ class QueryService:
                 unknown_owner_files=(unknown.overflow_files or unknown.overflow_bytes_r or unknown.overflow_bytes_w),
             )
             raw_rows = (
-                self._file_rows(app_id, scope, boot_id, query_start, query_end)
+                self._file_rows(app_id, scope, boot_id, effective_start, effective_end)
                 if reason != "not_retained" and reduced["device_states"] else []
             )
             normalized_search = unicodedata.normalize("NFC", search).casefold() if search else None
@@ -1026,6 +1039,25 @@ class QueryService:
             ) for row in raw_rows)
             return FileTable(app_id, window, rows, sort, direction, search, unknown, coverage)
 
+    def file_serve_facts(self, app_id: int, window: Window) -> FileServeFacts:
+        self._precheck(window)
+        with self._snapshot():
+            coverage = self.file_coverage(app_id, window)
+            served = coverage.served_interval
+            _, scope, _, _, _ = self._file_query_context(window)
+            measured = None
+            if served is not None and scope == "hourly":
+                boot, start, end = _bounds(served)
+                rows = self._file_coverage_rows("hourly", boot, start, end, app_id)
+                first = _ceil_bucket(start, FILE_HOUR_NS)
+                last = (end // FILE_HOUR_NS) * FILE_HOUR_NS
+                expected = (last - first) // FILE_HOUR_NS
+                if expected > 0 and len({row[0] for row in rows}) == expected:
+                    reduced = self._file_reduced(rows)
+                    if not reduced["invalid"]:
+                        measured = reduced["gap_intervals"]
+            return FileServeFacts(served, measured, coverage.coverage.gap_intervals)
+
     def file_coverage(self, app_id: int, window: Window) -> FileCoverage:
         self._precheck(window)
         with self._snapshot():
@@ -1035,12 +1067,14 @@ class QueryService:
                 raise ValueError("app_id must be positive")
             self._require_app(app_id)
             unknown = self._unknown_owner(window, scope, boot_id, start, end)
-            query_start, query_end = start, end
-            if scope == "hourly" and unknown.window != window and unknown.window.kind == "range":
-                query_start = unknown.window.start_mono_ns
-                query_end = unknown.window.end_mono_ns
+            effective_window = unknown.window
+            effective_start, effective_end = start, end
+            if (scope == "hourly" and effective_window != window
+                    and effective_window.kind == "range"):
+                effective_start = effective_window.start_mono_ns
+                effective_end = effective_window.end_mono_ns
             reduced, base, reason = self._file_app_coverage(
-                app_id, window, scope, boot_id, query_start, query_end
+                app_id, window, scope, boot_id, effective_start, effective_end
             )
             coverage_reason = _unavailable_reason(reason, unknown.coverage.unavailable_reason)
             coverage = _model_coverage(
@@ -1049,7 +1083,7 @@ class QueryService:
                 unknown_owner_files=(unknown.overflow_files or unknown.overflow_bytes_r or unknown.overflow_bytes_w),
             )
             rows = (
-                self._file_rows(app_id, scope, boot_id, query_start, query_end)
+                self._file_rows(app_id, scope, boot_id, effective_start, effective_end)
                 if reason != "not_retained" and reduced["device_states"] else []
             )
             file_values = reduced["file"]
