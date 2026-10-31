@@ -705,7 +705,11 @@ def test_empty_rows_with_complete_zero_coverage_is_ready_not_unavailable(qtbot):
     assert view.state == "ready"
     assert view.model.rowCount() == 0
     assert "complete" in view.footer_state.text()
-    assert "0 retained file rows" in view.footer_observed.text()
+    assert "0 retained file row(s)" in view.footer_observed.text()
+    assert view.footer_state.text().startswith(
+        "no retained file activity for this application in the served interval; ")
+    assert view.footer_state.text().endswith("; coverage: complete")
+    assert "no applications observed" not in view.footer_state.text()
 
 
 def test_no_observed_applications_is_stated_instead_of_an_empty_zero_table(qtbot):

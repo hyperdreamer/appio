@@ -759,8 +759,8 @@ class FilesView(QWidget):
                 f"no retained file matches {result.table.search!r}; {scope}; coverage: {status}")
         elif inner.complete:
             self.footer_state.setText(
-                f"coverage: complete; tier: {inner.tier}; window: {window.kind}; {scope}"
-            )
+                "no retained file activity for this application in the served interval; "
+                f"{scope}; coverage: complete")
         else:
             disclosure = (
                 f"; served interval only (T0={elapsed_text(partial_interval[0])} through "
