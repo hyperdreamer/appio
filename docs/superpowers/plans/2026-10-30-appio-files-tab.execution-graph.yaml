@@ -543,3 +543,51 @@ tasks:
           PYTHONDONTWRITEBYTECODE: "1"
           QT_QPA_PLATFORM: "offscreen"
           PYTEST_QT_API: "pyqt6"
+waves:
+  - wave: 1
+    lanes:
+      - foundation
+  - wave: 2
+    lanes:
+      - propagation
+  - wave: 3
+    lanes:
+      - remote
+  - wave: 4
+    lanes:
+      - rendering
+  - wave: 5
+    lanes:
+      - refusal
+  - wave: 6
+    lanes:
+      - label
+  - wave: 7
+    lanes:
+      - candidate-repair
+  - wave: 8
+    lanes:
+      - acceptance
+resources:
+  - path: "src/appio/history_router.py"
+    exclusive: true
+    lanes:
+      - foundation
+      - remote
+      - label
+  - path: "src/appio/ui/files_view.py"
+    exclusive: true
+    lanes:
+      - remote
+      - rendering
+  - path: "tests/p3/test_collector_window.py"
+    exclusive: true
+    lanes:
+      - foundation
+      - candidate-repair
+  - path: "tests/p4/test_files_view.py"
+    exclusive: true
+    lanes:
+      - foundation
+      - rendering
+      - label
