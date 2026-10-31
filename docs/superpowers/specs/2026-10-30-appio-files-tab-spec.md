@@ -535,12 +535,34 @@ The approved design does not give a complete field type table, exact copy for ev
 - Non-hourly/totals-only scopes use the requested `Window` as their served scope when available; they do not receive invented monotonic bounds.
 - `FileServeFacts` is local query evidence. `FileViewResult` transports only the local `served_gap_count` value inside the process; neither is a protocol field. The view receives the requested count from the existing coverage scalar and the served count from `FileViewResult`.
 
-**Ambiguity in the approved design:** it names `FileServeFacts.gaps_in_requested_window` as a fact computed alongside the served-gap count, while also saying that the displayed requested-window count comes from the existing `coverage.gap_intervals` scalar. It does not state whether the new fact must equal that app-level scalar or whether the two are distinct measures (raw persisted gap rows versus aggregated file-coverage gap evidence). This specification defines `FileServeFacts.gaps_in_requested_window` as the number of persisted gap rows intersecting the requested interval and retains the existing `coverage.gap_intervals` scalar as the UI's requested-window count, but **OPEN: Should the public requested-window disclosure be sourced from raw persisted gap-row count or the existing aggregated `coverage.gap_intervals` scalar, and must these values be equal?** Until this is resolved, tests must assert each source's defined value separately and must not assert equality between them.
+**Resolved: one measure, two scopes (app-level gap evidence).** The approved design named two
+sources for one figure. Measurement on the live store shows they are different quantities:
 
-These are spec-level decisions except for the explicit `OPEN:` above; no other product-scope expansion is permitted.
+```
+coverage.gap_intervals for one app       786     (per-app, accumulated over its hours)
+boot-wide gap rows in the same window    760     (distinct intervals, boot-wide)
+sum of gap_intervals over all app-hours  20478   (sums across apps)
+```
+
+Therefore this specification fixes the measure and forbids mixing it:
+
+| Fact | Definition |
+| --- | --- |
+| `gaps_in_requested_window` | the existing `coverage.gap_intervals` scalar for **this app** — unchanged semantics |
+| `gaps_in_served_interval` | the sum of `gap_intervals` over **this app's** `file_coverage` hours intersecting the served interval |
+
+Both are app-level, so the two figures in the disclosure are comparable and mean the same
+thing at different scopes: gaps affecting this application's retained file evidence. Tests must
+**not** assert equality with the boot-wide `gap` row count, and no code path may substitute that
+count for either fact. The disclosure wording names the scope ("gaps affecting this application"),
+never implying a boot-wide total.
+
+These are spec-level decisions; no product-scope expansion is permitted.
 
 ## 11. Open items
 
-- **OPEN:** Should the public requested-window disclosure be sourced from raw persisted gap-row count or the existing aggregated `coverage.gap_intervals` scalar, and must these values be equal?
+None. The single `OPEN:` item raised at drafting — which source supplies the requested-window gap
+count — is resolved above: both scopes use app-level `gap_intervals` evidence, the requested-window
+figure keeps its existing scalar semantics, and neither is compared to the boot-wide `gap` table.
 
 No other unresolved product or implementation question is required to execute this specification. If implementation discovers a contradiction in the approved design rather than a defect in the code, it must stop the affected lane and add a new, explicitly reviewed `OPEN:` item instead of silently choosing a broader scope.
