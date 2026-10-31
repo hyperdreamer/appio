@@ -306,6 +306,135 @@ def test_verified_status_round_trip_clears_silent_header_while_window_open(qtbot
             server.close()
 
 
+def test_probe_only_truth_stays_answering_for_three_refreshes_after_EOF(qtbot):
+    """A dead stream must not demote a daemon the unprivileged probe still reaches.
+
+    The window's own connection is gone, so the only remaining witness for
+    "does the status socket answer" is ``SetupClient.refresh()``. Three
+    separate refreshes are checked, each with its own invocation count, so a
+    loop that never re-probes cannot pass as a steady state.
+    """
+
+    from test_iodclient import Harness
+
+    window, coordinator, history, setup = build(qtbot, facts=ON)
+    window._timer.stop()
+    harness = Harness()
+    history.client = harness.client
+    window._pump = harness.client.pump
+    try:
+        harness.handshake()
+        window.refresh()
+        assert harness.client.state.verified and harness.client.state.answering
+        assert window.state_text == COLLECTOR_STATE_ON_ANSWERING
+        assert len(harness.servers) == 1
+
+        harness.eof()
+        harness.client.pump()
+        assert not harness.client.state.verified
+        assert not harness.client.state.answering
+
+        probes_before = setup.refresh_calls
+        ticks_before = coordinator.ticks
+        for tick in range(1, 4):
+            setup.facts = ON
+            window.refresh()
+            # The loop really ran the probe and really completed a refresh tick.
+            assert setup.refresh_calls == probes_before + tick
+            assert coordinator.ticks == ticks_before + tick
+            # ... and the stream is still dead, so the probe is the only witness.
+            assert not harness.client.state.verified
+            assert len(harness.servers) == 1
+            assert window.state_text == COLLECTOR_STATE_ON_ANSWERING
+            assert window.banner_status.text() == COLLECTOR_STATE_ON_ANSWERING
+            assert window.settings.status_label.text() == COLLECTOR_STATE_ON_ANSWERING
+            assert coordinator.reconciles[-1].daemon_verified
+            assert coordinator.reconciles[-1].answering
+        # No root helper was ever consulted: the unprivileged probe is enough.
+        assert setup.calls == []
+    finally:
+        window._timer.stop()
+        harness.client.close()
+        for server in harness.servers:
+            server.close()
+
+
+def test_label_recovers_after_silent_refresh_and_connection_reverification(qtbot):
+    """Demote on one silent probe, then prove recovery is a *verified* link.
+
+    The intermediate ``enabled, not answering`` is the load-bearing step: an
+    answering/label-only trace cannot tell a live label from a frozen one. The
+    final state is deliberately not satisfied by the probe alone -- the probe
+    answers before any reconnection, so the pin only passes once this window's
+    new connection completes its own status exchange.
+    """
+
+    from test_iodclient import Harness
+
+    window, coordinator, history, setup = build(qtbot, facts=ON)
+    window._timer.stop()
+    label = window.settings.status_label
+    harness = Harness()
+    history.client = harness.client
+    window._pump = harness.client.pump
+    try:
+        harness.handshake()
+        window.refresh()
+        assert window.state_text == COLLECTOR_STATE_ON_ANSWERING
+        assert harness.client.state.verified and harness.client.state.answering
+        assert len(harness.servers) == 1
+
+        harness.eof()
+        harness.client.pump()
+        probes_before = setup.refresh_calls
+        setup.facts = SILENT
+        window.refresh()
+        # Observable intermediate demotion: one silent probe is enough to
+        # withdraw the answering claim while the stream is gone.
+        assert setup.refresh_calls == probes_before + 1
+        assert window.state_text == "enabled, not answering"
+        assert window.state_text == COLLECTOR_STATE_SILENT
+        assert window.banner_status.text() == "enabled, not answering"
+        assert window.settings.status_label.text() == "enabled, not answering"
+        assert not harness.client.state.verified
+        assert coordinator.reconciles[-1].daemon_verified is False
+        assert coordinator.reconciles[-1].answering is False
+
+        # The probe answers again. The label answers from the probe, but this
+        # window's stream is still unverified -- so the label alone is not the
+        # recovery evidence the next assertions require.
+        setup.facts = ON
+        window.refresh()
+        assert setup.refresh_calls == probes_before + 2
+        assert window.state_text == COLLECTOR_STATE_ON_ANSWERING
+        assert not harness.client.state.verified
+
+        # Reconnect on the harness clock, then complete the new link's own
+        # status exchange before calling the connection verified.
+        harness.clock.advance(60)
+        harness.client.pump()
+        assert len(harness.servers) == 2, "a new connection must be established"
+        assert not harness.client.state.verified, "nothing is proven yet"
+        status_request = harness.one_request("status")
+        assert status_request["type"] == "status"
+        harness.status()
+        harness.client.pump()
+        assert harness.client.state.verified and harness.client.state.answering
+
+        window.refresh()
+        assert window.state_text == COLLECTOR_STATE_ON_ANSWERING
+        assert window.settings.status_label.text() == COLLECTOR_STATE_ON_ANSWERING
+        # Recovered in place: no restart, no replacement window or label.
+        assert window.settings.status_label is label
+        assert window.isVisible()
+        assert setup.calls == []
+    finally:
+        window._timer.stop()
+        harness.client.close()
+        for server in harness.servers:
+            server.close()
+
+
 @pytest.mark.parametrize("verified,answering,pending,expected", [
     (False, True, False, COLLECTOR_STATE_SILENT),
     (True, False, False, COLLECTOR_STATE_SILENT),
@@ -523,9 +652,16 @@ def test_the_gui_probe_not_the_helper_body_decides_whether_the_daemon_answers(qt
     window.choice.choose("reboot")
     # The helper claims answering; this session\'s own probe cannot reach the socket.
     setup.facts = SILENT
+    probes_before = setup.refresh_calls
     setup.complete("enable", ok("enable", {"answering": True, "pending_activation": True,
                                            "state": "on, answering"}))
+    # The unprivileged probe ran after the helper replied, and its silence wins.
+    assert setup.refresh_calls > probes_before
     assert window.state_text == COLLECTOR_STATE_SILENT
+    assert window.banner_status.text() == COLLECTOR_STATE_SILENT
+    assert window.settings.status_label.text() == COLLECTOR_STATE_SILENT
+    assert coordinator.reconciles[-1].daemon_verified is False
+    assert coordinator.reconciles[-1].answering is False
     assert window.settings.switch.isChecked() is True
 
 
