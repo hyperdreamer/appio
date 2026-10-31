@@ -12,11 +12,11 @@ def _inject_first_result_error(monkeypatch, reason, message):
     original = HistoryRouter._check_file_result
     calls = []
 
-    def check(table, coverage):
+    def check(table, coverage, served_gap_count=None):
         calls.append((table.app_id, coverage.app_id))
         if len(calls) == 1:
             raise WindowUnavailableError(reason, message)
-        return original(table, coverage)
+        return original(table, coverage, served_gap_count)
 
     monkeypatch.setattr(HistoryRouter, "_check_file_result", staticmethod(check))
     return calls
