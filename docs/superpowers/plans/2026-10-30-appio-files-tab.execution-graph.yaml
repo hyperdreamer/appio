@@ -260,7 +260,7 @@ tasks:
     plan_task: 11
     title: "Keep remote served-hour evidence explicitly unavailable"
     implementer_tier: "Advanced"
-    lane: remote
+    lane: remote-a
     sequence: 1
     depends_on: ["T-010"]
     owns:
@@ -282,7 +282,7 @@ tasks:
     plan_task: 21
     title: "Retire stale rows and facts together"
     implementer_tier: "Advanced"
-    lane: remote
+    lane: remote-b
     sequence: 2
     depends_on: ["T-011", "T-020"]
     owns:
@@ -552,42 +552,23 @@ waves:
       - propagation
   - wave: 3
     lanes:
-      - remote
+      - remote-a
   - wave: 4
     lanes:
-      - rendering
+      - refusal
   - wave: 5
     lanes:
-      - refusal
+      - label
   - wave: 6
     lanes:
-      - label
+      - rendering
   - wave: 7
     lanes:
-      - candidate-repair
+      - remote-b
   - wave: 8
     lanes:
-      - acceptance
-resources:
-  - path: "src/appio/history_router.py"
-    exclusive: true
-    lanes:
-      - foundation
-      - remote
-      - label
-  - path: "src/appio/ui/files_view.py"
-    exclusive: true
-    lanes:
-      - remote
-      - rendering
-  - path: "tests/p3/test_collector_window.py"
-    exclusive: true
-    lanes:
-      - foundation
       - candidate-repair
-  - path: "tests/p4/test_files_view.py"
-    exclusive: true
+  - wave: 9
     lanes:
-      - foundation
-      - rendering
-      - label
+      - acceptance
+serialization_reason: 'lane conflict edges make the graph cyclic, so lanes run one at a time in a dependency-respecting order'
