@@ -1,0 +1,545 @@
+# appio Files tab execution manifest — derived deterministically from the plan and signed documents.
+# Inspection/canonical scheduling source for the PM; the DOT beside it is generated from this file.
+schema_version: 1
+epoch: 1
+source_plan:
+  path: "docs/superpowers/plans/2026-10-30-appio-files-tab.md"
+  sha256: "6d0d413a4b5914c381dfb0542ed293c5a87460ac1803c3e6437076de9d7d8d38"
+  tasks: 24
+source_documents:
+  - path: "docs/superpowers/specs/2026-10-30-appio-files-tab-spec.md"
+    sha256: "95d6c9c4b767ed96337746e572d67c5c1de2d149a5212a412c81526361e51b30"
+  - path: "docs/superpowers/specs/2026-10-30-appio-files-tab-design.md"
+    sha256: "ed64c5e36ddcdeebaa3e1495473225d58e6903897321b737e53e6a2aacf40492"
+derivation:
+  lane_from: PM-assigned chain partition over the plan's declared '**Depends on:**' edges
+  depends_on_from: plan '**Depends on:**' task numbers
+  ownership_from: plan '**Files (exclusive modification allowlist):**' backticked paths
+  validation_from: plan named test files per task; the audit gate validates its own report artefact
+tasks:
+  - id: T-001
+    plan_task: 1
+    title: "Read-only candidate audit and disposition gate"
+    implementer_tier: "Capable"
+    lane: foundation
+    sequence: 1
+    depends_on: []
+    owns:
+      - "docs/superpowers/reviews/2026-10-30-appio-files-tab-candidate-audit.md"
+    validation:
+      - argv:
+          - "git"
+          - "show"
+          - "--stat"
+          - "dd8b042"
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+          QT_QPA_PLATFORM: "offscreen"
+          PYTEST_QT_API: "pyqt6"
+  - id: T-002
+    plan_task: 2
+    title: "Preserve requested identity and expose the effective served scope"
+    implementer_tier: "Advanced"
+    lane: foundation
+    sequence: 2
+    depends_on: ["T-001"]
+    owns:
+      - "src/appio/contracts.py"
+      - "src/appio/query.py"
+      - "tests/p4/files_tab_support.py"
+      - "tests/p4/test_files_tab_propagation.py"
+      - "tests/test_query.py"
+    validation:
+      - argv:
+          - "python"
+          - "-m"
+          - "pytest"
+          - "-q"
+          - "tests/p4/files_tab_support.py"
+          - "tests/p4/test_files_tab_propagation.py"
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+          QT_QPA_PLATFORM: "offscreen"
+          PYTEST_QT_API: "pyqt6"
+  - id: T-003
+    plan_task: 3
+    title: "Add application-specific snapshot-local serve facts"
+    implementer_tier: "Advanced"
+    lane: foundation
+    sequence: 3
+    depends_on: ["T-002"]
+    owns:
+      - "src/appio/query.py:1-40,930-1073"
+      - "tests/p4/test_files_tab_facts.py"
+    validation:
+      - argv:
+          - "python"
+          - "-m"
+          - "pytest"
+          - "-q"
+          - "tests/p4/test_files_tab_facts.py"
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+          QT_QPA_PLATFORM: "offscreen"
+          PYTEST_QT_API: "pyqt6"
+  - id: T-005
+    plan_task: 5
+    title: "Restore requested-window process gap isolation"
+    implementer_tier: "Advanced"
+    lane: foundation
+    sequence: 4
+    depends_on: ["T-003"]
+    owns:
+      - "docs/superpowers/reviews/2026-10-30-appio-files-tab-candidate-audit.md"
+      - "src/appio/history_router.py:109-120,505-524,666-684"
+      - "tests/p4/test_files_tab_process_scope.py"
+    validation:
+      - argv:
+          - "python"
+          - "-m"
+          - "pytest"
+          - "-q"
+          - "tests/p4/test_files_tab_process_scope.py"
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+          QT_QPA_PLATFORM: "offscreen"
+          PYTEST_QT_API: "pyqt6"
+  - id: T-006
+    plan_task: 6
+    title: "Clip unproved segments before known-gap admission"
+    implementer_tier: "Capable"
+    lane: foundation
+    sequence: 5
+    depends_on: ["T-005"]
+    owns:
+      - "docs/superpowers/reviews/2026-10-30-appio-files-tab-candidate-audit.md"
+      - "src/appio/history_router.py:26-38,109-120,190-238,505-524,666-684"
+      - "tests/p4/test_files_tab_clipping.py"
+    validation:
+      - argv:
+          - "python"
+          - "-m"
+          - "pytest"
+          - "-q"
+          - "tests/p4/test_files_tab_clipping.py"
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+          QT_QPA_PLATFORM: "offscreen"
+          PYTEST_QT_API: "pyqt6"
+  - id: T-007
+    plan_task: 7
+    title: "Refuse intersecting overlap even when counters are zero"
+    implementer_tier: "Advanced"
+    lane: foundation
+    sequence: 6
+    depends_on: ["T-006"]
+    owns:
+      - "docs/superpowers/reviews/2026-10-30-appio-files-tab-candidate-audit.md"
+      - "src/appio/history_router.py:190-238,385-524"
+      - "tests/p4/test_files_tab_overlap.py"
+    validation:
+      - argv:
+          - "python"
+          - "-m"
+          - "pytest"
+          - "-q"
+          - "tests/p4/test_files_tab_overlap.py"
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+          QT_QPA_PLATFORM: "offscreen"
+          PYTEST_QT_API: "pyqt6"
+  - id: T-008
+    plan_task: 8
+    title: "Select candidates independently per store and reject multiple survivors"
+    implementer_tier: "Advanced"
+    lane: foundation
+    sequence: 7
+    depends_on: ["T-006"]
+    owns:
+      - "docs/superpowers/reviews/2026-10-30-appio-files-tab-candidate-audit.md"
+      - "src/appio/history_router.py"
+      - "tests/p4/test_files_tab_candidates.py"
+    validation:
+      - argv:
+          - "python"
+          - "-m"
+          - "pytest"
+          - "-q"
+          - "tests/p4/test_files_tab_candidates.py"
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+          QT_QPA_PLATFORM: "offscreen"
+          PYTEST_QT_API: "pyqt6"
+  - id: T-009
+    plan_task: 9
+    title: "Pin fatal versus skippable candidate handling by stage"
+    implementer_tier: "Capable"
+    lane: foundation
+    sequence: 8
+    depends_on: ["T-008"]
+    owns:
+      - "docs/superpowers/reviews/2026-10-30-appio-files-tab-candidate-audit.md"
+      - "src/appio/history_router.py"
+      - "tests/p4/test_files_tab_candidate_failures.py"
+    validation:
+      - argv:
+          - "python"
+          - "-m"
+          - "pytest"
+          - "-q"
+          - "tests/p4/test_files_tab_candidate_failures.py"
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+          QT_QPA_PLATFORM: "offscreen"
+          PYTEST_QT_API: "pyqt6"
+  - id: T-010
+    plan_task: 10
+    title: "Bind local result identity, snapshot, and served-hour count"
+    implementer_tier: "Advanced"
+    lane: foundation
+    sequence: 9
+    depends_on: ["T-003", "T-007", "T-009"]
+    owns:
+      - "src/appio/history_router.py:95-100,172-238,283-310"
+      - "tests/p3/test_collector_window.py"
+      - "tests/p4/test_files_tab_local_result.py"
+      - "tests/p4/test_files_view.py"
+    validation:
+      - argv:
+          - "python"
+          - "-m"
+          - "pytest"
+          - "-q"
+          - "tests/p4/test_files_tab_local_result.py"
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+          QT_QPA_PLATFORM: "offscreen"
+          PYTEST_QT_API: "pyqt6"
+  - id: T-004
+    plan_task: 4
+    title: "Pin literal nested transport field inventories"
+    implementer_tier: "Standard"
+    lane: propagation
+    sequence: 1
+    depends_on: ["T-002"]
+    owns:
+      - "tests/p4/test_files_tab_wire_shape.py"
+    validation:
+      - argv:
+          - "python"
+          - "-m"
+          - "pytest"
+          - "-q"
+          - "tests/p4/test_files_tab_wire_shape.py"
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+          QT_QPA_PLATFORM: "offscreen"
+          PYTEST_QT_API: "pyqt6"
+  - id: T-013
+    plan_task: 13
+    title: "Preserve totals-only scope without inventing hourly evidence"
+    implementer_tier: "Advanced"
+    lane: refusal
+    sequence: 1
+    depends_on: ["T-003"]
+    owns:
+      - "src/appio/query.py:699-810,1029-1073"
+      - "tests/p4/test_files_tab_totals.py"
+    validation:
+      - argv:
+          - "python"
+          - "-m"
+          - "pytest"
+          - "-q"
+          - "tests/p4/test_files_tab_totals.py"
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+          QT_QPA_PLATFORM: "offscreen"
+          PYTEST_QT_API: "pyqt6"
+  - id: T-011
+    plan_task: 11
+    title: "Keep remote served-hour evidence explicitly unavailable"
+    implementer_tier: "Advanced"
+    lane: remote
+    sequence: 1
+    depends_on: ["T-010"]
+    owns:
+      - "src/appio/history_router.py"
+      - "tests/p4/test_file_history_router.py"
+      - "tests/p4/test_files_tab_remote_result.py"
+    validation:
+      - argv:
+          - "python"
+          - "-m"
+          - "pytest"
+          - "-q"
+          - "tests/p4/test_files_tab_remote_result.py"
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+          QT_QPA_PLATFORM: "offscreen"
+          PYTEST_QT_API: "pyqt6"
+  - id: T-021
+    plan_task: 21
+    title: "Retire stale rows and facts together"
+    implementer_tier: "Advanced"
+    lane: remote
+    sequence: 2
+    depends_on: ["T-011", "T-020"]
+    owns:
+      - "src/appio/history_router.py:130-156,279-347"
+      - "src/appio/ui/files_view.py"
+      - "tests/p4/test_files_tab_stale.py"
+    validation:
+      - argv:
+          - "python"
+          - "-m"
+          - "pytest"
+          - "-q"
+          - "tests/p4/test_files_tab_stale.py"
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+          QT_QPA_PLATFORM: "offscreen"
+          PYTEST_QT_API: "pyqt6"
+  - id: T-012
+    plan_task: 12
+    title: "Prove complete retained scope yields measured zero"
+    implementer_tier: "Standard"
+    lane: rendering
+    sequence: 1
+    depends_on: ["T-010"]
+    owns:
+      - "tests/p4/test_files_tab_complete.py"
+    validation:
+      - argv:
+          - "python"
+          - "-m"
+          - "pytest"
+          - "-q"
+          - "tests/p4/test_files_tab_complete.py"
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+          QT_QPA_PLATFORM: "offscreen"
+          PYTEST_QT_API: "pyqt6"
+  - id: T-015
+    plan_task: 15
+    title: "Implement canonical served/requested scope formatting"
+    implementer_tier: "Advanced"
+    lane: rendering
+    sequence: 2
+    depends_on: ["T-011", "T-012", "T-013", "T-014"]
+    owns:
+      - "src/appio/ui/files_view.py:1-80,707-788"
+      - "tests/p4/files_tab_view_cases.py"
+      - "tests/p4/test_files_tab_scope_text.py"
+    validation:
+      - argv:
+          - "python"
+          - "-m"
+          - "pytest"
+          - "-q"
+          - "tests/p4/files_tab_view_cases.py"
+          - "tests/p4/test_files_tab_scope_text.py"
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+          QT_QPA_PLATFORM: "offscreen"
+          PYTEST_QT_API: "pyqt6"
+  - id: T-016
+    plan_task: 16
+    title: "Render retained rows in query order with truthful observed bytes"
+    implementer_tier: "Advanced"
+    lane: rendering
+    sequence: 3
+    depends_on: ["T-015"]
+    owns:
+      - "src/appio/ui/files_view.py"
+      - "tests/p4/test_file_served_interval.py"
+      - "tests/p4/test_files_tab_rows.py"
+      - "tests/p4/test_files_view.py:343-365,432-449,520-536"
+    validation:
+      - argv:
+          - "python"
+          - "-m"
+          - "pytest"
+          - "-q"
+          - "tests/p4/test_files_tab_rows.py"
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+          QT_QPA_PLATFORM: "offscreen"
+          PYTEST_QT_API: "pyqt6"
+  - id: T-017
+    plan_task: 17
+    title: "Distinguish a filtered zero from absence of activity"
+    implementer_tier: "Standard"
+    lane: rendering
+    sequence: 4
+    depends_on: ["T-016"]
+    owns:
+      - "src/appio/ui/files_view.py"
+      - "tests/p4/test_files_tab_no_matches.py"
+    validation:
+      - argv:
+          - "python"
+          - "-m"
+          - "pytest"
+          - "-q"
+          - "tests/p4/test_files_tab_no_matches.py"
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+          QT_QPA_PLATFORM: "offscreen"
+          PYTEST_QT_API: "pyqt6"
+  - id: T-018
+    plan_task: 18
+    title: "Render complete empty activity for the selected application"
+    implementer_tier: "Standard"
+    lane: rendering
+    sequence: 5
+    depends_on: ["T-017"]
+    owns:
+      - "src/appio/ui/files_view.py"
+      - "tests/p4/test_files_tab_empty_proven.py"
+      - "tests/p4/test_files_view.py"
+    validation:
+      - argv:
+          - "python"
+          - "-m"
+          - "pytest"
+          - "-q"
+          - "tests/p4/test_files_tab_empty_proven.py"
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+          QT_QPA_PLATFORM: "offscreen"
+          PYTEST_QT_API: "pyqt6"
+  - id: T-019
+    plan_task: 19
+    title: "Render incomplete empty results without collapsing unknown evidence"
+    implementer_tier: "Standard"
+    lane: rendering
+    sequence: 6
+    depends_on: ["T-018"]
+    owns:
+      - "src/appio/ui/files_view.py"
+      - "tests/p4/test_files_tab_empty_partial.py"
+    validation:
+      - argv:
+          - "python"
+          - "-m"
+          - "pytest"
+          - "-q"
+          - "tests/p4/test_files_tab_empty_partial.py"
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+          QT_QPA_PLATFORM: "offscreen"
+          PYTEST_QT_API: "pyqt6"
+  - id: T-020
+    plan_task: 20
+    title: "Apply canonical disclosure to every coverage footer line"
+    implementer_tier: "Advanced"
+    lane: rendering
+    sequence: 7
+    depends_on: ["T-019"]
+    owns:
+      - "src/appio/ui/files_view.py"
+      - "tests/p4/test_file_served_interval.py"
+      - "tests/p4/test_files_tab_disclosure.py"
+      - "tests/p4/test_files_view.py:343-365,520-565,723-845"
+    validation:
+      - argv:
+          - "python"
+          - "-m"
+          - "pytest"
+          - "-q"
+          - "tests/p4/test_files_tab_disclosure.py"
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+          QT_QPA_PLATFORM: "offscreen"
+          PYTEST_QT_API: "pyqt6"
+  - id: T-014
+    plan_task: 14
+    title: "Refuse unavailable sources instead of publishing numeric emptiness"
+    implementer_tier: "Advanced"
+    lane: label
+    sequence: 1
+    depends_on: ["T-010"]
+    owns:
+      - "src/appio/history_router.py"
+      - "src/appio/ui/files_view.py:692-707,818-832"
+      - "tests/p4/test_files_tab_unavailable.py"
+      - "tests/p4/test_files_view.py"
+    validation:
+      - argv:
+          - "python"
+          - "-m"
+          - "pytest"
+          - "-q"
+          - "tests/p4/test_files_tab_unavailable.py"
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+          QT_QPA_PLATFORM: "offscreen"
+          PYTEST_QT_API: "pyqt6"
+  - id: T-022
+    plan_task: 22
+    title: "Preserve probe-only answering truth after stream EOF"
+    implementer_tier: "Advanced"
+    lane: candidate-repair
+    sequence: 1
+    depends_on: ["T-010"]
+    owns:
+      - "tests/p3/test_collector_window.py:275-341,516-531"
+    validation:
+      - argv:
+          - "git"
+          - "show"
+          - "--stat"
+          - "dd8b042"
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+          QT_QPA_PLATFORM: "offscreen"
+          PYTEST_QT_API: "pyqt6"
+  - id: T-023
+    plan_task: 23
+    title: "Pin intermediate demotion and verified connection recovery"
+    implementer_tier: "Advanced"
+    lane: candidate-repair
+    sequence: 2
+    depends_on: ["T-022"]
+    owns:
+      - "tests/p3/test_collector_window.py"
+    validation:
+      - argv:
+          - "git"
+          - "show"
+          - "--stat"
+          - "dd8b042"
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+          QT_QPA_PLATFORM: "offscreen"
+          PYTEST_QT_API: "pyqt6"
+  - id: T-024
+    plan_task: 24
+    title: "Accept against a hash-pinned real target-store snapshot"
+    implementer_tier: "Capable"
+    lane: acceptance
+    sequence: 1
+    depends_on: ["T-004", "T-021", "T-023"]
+    owns:
+      - "docs/superpowers/reviews/2026-10-30-appio-files-tab-acceptance.md"
+      - "tests/fixtures/p4/files-tab-real.json"
+      - "tests/fixtures/p4/files-tab-real.oracle.json"
+      - "tests/fixtures/p4/files-tab-real.sha256"
+      - "tests/fixtures/p4/files-tab-real.sqlite"
+      - "tests/p4/capture_files_tab_snapshot.py"
+      - "tests/p4/files_tab_real_oracle.py"
+      - "tests/p4/test_files_tab_real_acceptance.py"
+    validation:
+      - argv:
+          - "python"
+          - "-m"
+          - "pytest"
+          - "-q"
+          - "tests/p4/capture_files_tab_snapshot.py"
+          - "tests/p4/files_tab_real_oracle.py"
+          - "tests/p4/test_files_tab_real_acceptance.py"
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+          QT_QPA_PLATFORM: "offscreen"
+          PYTEST_QT_API: "pyqt6"

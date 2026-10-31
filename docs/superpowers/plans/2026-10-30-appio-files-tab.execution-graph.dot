@@ -1,0 +1,83 @@
+digraph appio_files_tab {
+  rankdir=LR;
+  node [shape=box, style="rounded,filled", fillcolor="#eef"];
+  subgraph cluster_foundation {
+    label="foundation";
+    "T-001" [label="T-001\nRead-only candidate audit and disposit\n(Capable)"];
+    "T-002" [label="T-002\nPreserve requested identity and expose\n(Advanced)"];
+    "T-003" [label="T-003\nAdd application-specific snapshot-loca\n(Advanced)"];
+    "T-005" [label="T-005\nRestore requested-window process gap i\n(Advanced)"];
+    "T-006" [label="T-006\nClip unproved segments before known-ga\n(Capable)"];
+    "T-007" [label="T-007\nRefuse intersecting overlap even when \n(Advanced)"];
+    "T-008" [label="T-008\nSelect candidates independently per st\n(Advanced)"];
+    "T-009" [label="T-009\nPin fatal versus skippable candidate h\n(Capable)"];
+    "T-010" [label="T-010\nBind local result identity, snapshot, \n(Advanced)"];
+  }
+  subgraph cluster_propagation {
+    label="propagation";
+    "T-004" [label="T-004\nPin literal nested transport field inv\n(Standard)"];
+  }
+  subgraph cluster_refusal {
+    label="refusal";
+    "T-013" [label="T-013\nPreserve totals-only scope without inv\n(Advanced)"];
+  }
+  subgraph cluster_remote {
+    label="remote";
+    "T-011" [label="T-011\nKeep remote served-hour evidence expli\n(Advanced)"];
+    "T-021" [label="T-021\nRetire stale rows and facts together\n(Advanced)"];
+  }
+  subgraph cluster_rendering {
+    label="rendering";
+    "T-012" [label="T-012\nProve complete retained scope yields m\n(Standard)"];
+    "T-015" [label="T-015\nImplement canonical served/requested s\n(Advanced)"];
+    "T-016" [label="T-016\nRender retained rows in query order wi\n(Advanced)"];
+    "T-017" [label="T-017\nDistinguish a filtered zero from absen\n(Standard)"];
+    "T-018" [label="T-018\nRender complete empty activity for the\n(Standard)"];
+    "T-019" [label="T-019\nRender incomplete empty results withou\n(Standard)"];
+    "T-020" [label="T-020\nApply canonical disclosure to every co\n(Advanced)"];
+  }
+  subgraph cluster_label {
+    label="label";
+    "T-014" [label="T-014\nRefuse unavailable sources instead of \n(Advanced)"];
+  }
+  subgraph cluster_candidate_repair {
+    label="candidate-repair";
+    "T-022" [label="T-022\nPreserve probe-only answering truth af\n(Advanced)"];
+    "T-023" [label="T-023\nPin intermediate demotion and verified\n(Advanced)"];
+  }
+  subgraph cluster_acceptance {
+    label="acceptance";
+    "T-024" [label="T-024\nAccept against a hash-pinned real targ\n(Capable)"];
+  }
+  "T-001" -> "T-002";
+  "T-002" -> "T-003";
+  "T-003" -> "T-005";
+  "T-005" -> "T-006";
+  "T-006" -> "T-007";
+  "T-006" -> "T-008";
+  "T-008" -> "T-009";
+  "T-003" -> "T-010";
+  "T-007" -> "T-010";
+  "T-009" -> "T-010";
+  "T-002" -> "T-004";
+  "T-003" -> "T-013";
+  "T-010" -> "T-011";
+  "T-011" -> "T-021";
+  "T-020" -> "T-021";
+  "T-010" -> "T-012";
+  "T-011" -> "T-015";
+  "T-012" -> "T-015";
+  "T-013" -> "T-015";
+  "T-014" -> "T-015";
+  "T-015" -> "T-016";
+  "T-016" -> "T-017";
+  "T-017" -> "T-018";
+  "T-018" -> "T-019";
+  "T-019" -> "T-020";
+  "T-010" -> "T-014";
+  "T-010" -> "T-022";
+  "T-022" -> "T-023";
+  "T-004" -> "T-024";
+  "T-021" -> "T-024";
+  "T-023" -> "T-024";
+}
