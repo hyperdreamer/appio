@@ -562,6 +562,9 @@ def test_missing_finalized_file_hour_serves_the_covered_prefix_as_partial(file_d
     )
     values = service.file_coverage(1, requested)
     assert (values.observed_bytes_r, values.observed_bytes_w) == (7, 0)
+    assert values.served_interval == Window(
+        "range", "boot-A", start_mono_ns=0, end_mono_ns=FILE_HOUR_NS
+    )
     assert values.coverage.complete is False
     assert values.coverage.unavailable_reason is None
     unknown = service.unknown_owner_file_coverage(requested)
@@ -598,6 +601,9 @@ def test_since_boot_file_window_serves_covered_suffix_and_names_its_boundary(fil
     )
     observed = service.file_coverage(1, requested)
     assert (observed.observed_bytes_r, observed.observed_bytes_w) == (34, 0)
+    assert observed.served_interval == Window(
+        "range", "boot-A", start_mono_ns=start, end_mono_ns=end
+    )
     assert observed.coverage.complete is False
     assert observed.window == requested
 
@@ -630,6 +636,7 @@ def test_complete_since_boot_file_window_keeps_its_requested_scope(file_db, monk
     assert sum(row.bytes_r for row in table.rows) == 34
     assert table.coverage.complete is True
     assert table.unknown_owner_overflow.window == requested
+    assert service.file_coverage(1, requested).served_interval == requested
 
 
 def test_no_coverage_since_boot_file_window_remains_unavailable(file_db, monkeypatch):
@@ -684,7 +691,7 @@ def test_interior_file_gaps_serve_the_largest_interval_and_name_both_bounds(file
     assert result.unknown_owner_overflow.window == served
     values = service.file_coverage(1, requested)
     assert (values.observed_bytes_r, values.observed_bytes_w) == (50, 0)
-    assert values.unknown_owner_overflow.window == served
+    assert values.served_interval == served
     assert values.coverage.complete is False
     assert values.coverage.gap_intervals >= 2
 

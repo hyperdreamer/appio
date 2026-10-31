@@ -698,6 +698,13 @@ class FileCoverage:
     unknown_owner_overflow: UnknownOwnerOverflow
     coverage: Coverage
 
+    @property
+    def served_interval(self) -> Window | None:
+        if (self.coverage.unavailable_reason is not None or
+                self.unknown_owner_overflow.coverage.unavailable_reason is not None):
+            return None
+        return self.unknown_owner_overflow.window
+
     def __post_init__(self) -> None:
         _require_positive(self.app_id, "file_coverage.app_id")
         if not isinstance(self.window, Window):

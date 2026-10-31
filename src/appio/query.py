@@ -948,12 +948,14 @@ class QueryService:
                 ).fetchall()
             else:
                 unknown = self._unknown_owner(window, scope, boot_id, start, end)
-                query_start, query_end = start, end
-                if unknown.window != window and unknown.window.kind == "range":
-                    query_start = unknown.window.start_mono_ns
-                    query_end = unknown.window.end_mono_ns
-                first = _ceil_bucket(query_start, FILE_HOUR_NS)
-                last = (query_end // FILE_HOUR_NS) * FILE_HOUR_NS
+                effective_window = unknown.window
+                effective_start, effective_end = start, end
+                if (scope == "hourly" and effective_window != window
+                        and effective_window.kind == "range"):
+                    effective_start = effective_window.start_mono_ns
+                    effective_end = effective_window.end_mono_ns
+                first = _ceil_bucket(effective_start, FILE_HOUR_NS)
+                last = (effective_end // FILE_HOUR_NS) * FILE_HOUR_NS
                 if first >= last:
                     return ()
                 rows = self.connection.execute(
@@ -983,12 +985,14 @@ class QueryService:
                 raise ValueError("app_id must be positive")
             self._require_app(app_id)
             unknown = self._unknown_owner(window, scope, boot_id, start, end)
-            query_start, query_end = start, end
-            if scope == "hourly" and unknown.window != window and unknown.window.kind == "range":
-                query_start = unknown.window.start_mono_ns
-                query_end = unknown.window.end_mono_ns
+            effective_window = unknown.window
+            effective_start, effective_end = start, end
+            if (scope == "hourly" and effective_window != window
+                    and effective_window.kind == "range"):
+                effective_start = effective_window.start_mono_ns
+                effective_end = effective_window.end_mono_ns
             reduced, base, reason = self._file_app_coverage(
-                app_id, window, scope, boot_id, query_start, query_end
+                app_id, window, scope, boot_id, effective_start, effective_end
             )
             coverage_reason = _unavailable_reason(reason, unknown.coverage.unavailable_reason)
             base = base and unknown.coverage.complete
@@ -998,7 +1002,7 @@ class QueryService:
                 unknown_owner_files=(unknown.overflow_files or unknown.overflow_bytes_r or unknown.overflow_bytes_w),
             )
             raw_rows = (
-                self._file_rows(app_id, scope, boot_id, query_start, query_end)
+                self._file_rows(app_id, scope, boot_id, effective_start, effective_end)
                 if reason != "not_retained" and reduced["device_states"] else []
             )
             normalized_search = unicodedata.normalize("NFC", search).casefold() if search else None
@@ -1035,12 +1039,14 @@ class QueryService:
                 raise ValueError("app_id must be positive")
             self._require_app(app_id)
             unknown = self._unknown_owner(window, scope, boot_id, start, end)
-            query_start, query_end = start, end
-            if scope == "hourly" and unknown.window != window and unknown.window.kind == "range":
-                query_start = unknown.window.start_mono_ns
-                query_end = unknown.window.end_mono_ns
+            effective_window = unknown.window
+            effective_start, effective_end = start, end
+            if (scope == "hourly" and effective_window != window
+                    and effective_window.kind == "range"):
+                effective_start = effective_window.start_mono_ns
+                effective_end = effective_window.end_mono_ns
             reduced, base, reason = self._file_app_coverage(
-                app_id, window, scope, boot_id, query_start, query_end
+                app_id, window, scope, boot_id, effective_start, effective_end
             )
             coverage_reason = _unavailable_reason(reason, unknown.coverage.unavailable_reason)
             coverage = _model_coverage(
@@ -1049,7 +1055,7 @@ class QueryService:
                 unknown_owner_files=(unknown.overflow_files or unknown.overflow_bytes_r or unknown.overflow_bytes_w),
             )
             rows = (
-                self._file_rows(app_id, scope, boot_id, query_start, query_end)
+                self._file_rows(app_id, scope, boot_id, effective_start, effective_end)
                 if reason != "not_retained" and reduced["device_states"] else []
             )
             file_values = reduced["file"]
