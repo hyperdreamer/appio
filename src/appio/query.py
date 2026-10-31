@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from dataclasses import dataclass
 import json
 import sqlite3
 import unicodedata
@@ -40,6 +41,14 @@ from appio.contracts import (
 from appio.ownership import device_interval_start, intersects, ownership_exclusions, uncertain_intervals
 from appio.reconcile import rate_bps
 from appio.tier import select_tier
+
+
+@dataclass(frozen=True)
+class FileServeFacts:
+    served_interval: Window | None
+    gaps_in_served_interval: int | None
+    gaps_in_requested_window: int
+
 
 _COUNTERS = ("rchar", "wchar", "read_bytes", "write_bytes")
 _COUNTS = (
@@ -1029,6 +1038,25 @@ class QueryService:
                 row["bytes_w"], row["bytes_r"] + row["bytes_w"], row["last_seen_boot_id"], row["last_seen_mono_ns"],
             ) for row in raw_rows)
             return FileTable(app_id, window, rows, sort, direction, search, unknown, coverage)
+
+    def file_serve_facts(self, app_id: int, window: Window) -> FileServeFacts:
+        self._precheck(window)
+        with self._snapshot():
+            coverage = self.file_coverage(app_id, window)
+            served = coverage.served_interval
+            _, scope, _, _, _ = self._file_query_context(window)
+            measured = None
+            if served is not None and scope == "hourly":
+                boot, start, end = _bounds(served)
+                rows = self._file_coverage_rows("hourly", boot, start, end, app_id)
+                first = _ceil_bucket(start, FILE_HOUR_NS)
+                last = (end // FILE_HOUR_NS) * FILE_HOUR_NS
+                expected = (last - first) // FILE_HOUR_NS
+                if expected > 0 and len({row[0] for row in rows}) == expected:
+                    reduced = self._file_reduced(rows)
+                    if not reduced["invalid"]:
+                        measured = reduced["gap_intervals"]
+            return FileServeFacts(served, measured, coverage.coverage.gap_intervals)
 
     def file_coverage(self, app_id: int, window: Window) -> FileCoverage:
         self._precheck(window)
