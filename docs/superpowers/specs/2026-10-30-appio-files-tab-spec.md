@@ -1,9 +1,11 @@
 # appio Files tab — frontier implementation specification
 
-**Status:** revision 2; resolves all findings in spec review 1
-**Authority:** `docs/superpowers/specs/2026-10-30-appio-files-tab-design.md`, revision 7, commit `b60e0d5`, SHA-256 `8b92de1b08307aff51b5ca569478bdf4f905f50082138463c322a54749021cf3`.
+**Status:** revision 3; resolves the two findings in spec review 2, preserving the revision-2 contracts except for the clarifications and stronger fixtures below
+**Authority:** `docs/superpowers/specs/2026-10-30-appio-files-tab-design.md`, revision 8, commit `0e92f44`, SHA-256 `ed64c5e36ddcdeebaa3e1495473225d58e6903897321b737e53e6a2aacf40492`.
 **Candidate under audit:** `dd8b042` (`fix(router): serve hourly file windows across disclosed gaps`).
 **Scope of this document:** the Files query, provenance, disclosure, and label-preservation work only.
+
+**Documentary correction:** the approved design itself previously specified the superseded persisted-gap-row served measure in revision 7. It was corrected in revision 8: the served figure is this application's retained served-hour reducer; the requested scalar is a different existing reducer; pruned hourly evidence gives `None`, never an invented zero. This specification follows corrected design revision 8, not revision 7.
 
 This document is normative for implementation lanes. Where it says **must**, an implementation that differs is not an alternative interpretation; it is a contract defect. No implementation may broaden the product scope below by adding a schema, migration, wire field, protocol message, ABI field, collection cadence, or Overview behaviour.
 
@@ -87,7 +89,7 @@ The method must use the same read snapshot and the same requested bounds as the 
 
 For hourly `range` and `since_boot` requests, the method uses the same selected interval as `file_applications`, `file_table`, `file_coverage`, and `unknown_owner_file_coverage`. For a valid totals-only result, `served_interval` follows the existing requested scope, while `gaps_in_served_interval` remains `None` because the hourly rows needed for the served-hour reducer are not available. A reader that computes rows using one interval, app identity, or snapshot and facts using another is a contract defect.
 
-When no interval exists, the query layer may still construct an internal unavailable `FileCoverage` for error propagation, but the router must refuse it and the view must render outcome 1 below. No caller may interpret the unavailable placeholder window as a served interval or its absent hourly rows as zero gap evidence.
+When no interval exists, the query layer may still construct an internal unavailable `FileCoverage` for error propagation, but the router must reject that candidate under section 5.7 and never publish its placeholder as a successful result. If no other candidate can be accepted, or a fatal refusal fires, the view must render outcome 1 below. No caller may interpret the unavailable placeholder window as a served interval or its absent hourly rows as zero gap evidence.
 
 ### 2.3 `FileCoverage` and its computed `served_interval`
 
@@ -206,7 +208,7 @@ served interval{ only if served != requested}: {served_bounds_or_scope}; request
 
 There is no space before the colon after `interval`; the `only` form is literally `served interval only:`. `served_gap_text` is the decimal local integer, including `0`, when the app-hour evidence is retained and measured, or exactly `unavailable` when the value is `None` because the hourly source is pruned/unavailable or the remote route cannot prove it. The text must not imply that the two values are comparable or that `unavailable` means zero. `{requested_gap_scalar}` is the existing `coverage.coverage.gap_intervals` value for this application.
 
-For the canonical local result with app evidence `1` in the served hours and the existing requested-window reducer equal to `4`, the disclosure must contain exactly:
+For app A in the canonical local fixture in section 5.5, with app evidence `1` in the served hours and the existing requested-window reducer equal to `4`, the disclosure must contain exactly:
 
 ```text
 served interval only: T0=2h 0m 0s through T1=4h 0m 0s after boot; requested window: T0=0s through T1=6h 0m 0s after boot; this application's served-hour gap evidence in served interval: 1; this application's requested-window coverage scalar: 4
@@ -222,7 +224,7 @@ The renderer evaluates these predicates top-to-bottom. The first matching rule i
 
 #### Outcome 1 — `unavailable`
 
-**Predicate:** no `served_interval` exists, or any router/query refusal fires, or the returned coverage has an unavailable reason.
+**Predicate:** no `served_interval` exists for an accepted result, or a request-level router/query refusal fires after the permitted candidate skips in section 5.7, or the returned coverage has an unavailable reason.
 
 **Visible placement:** `state_label`; clear the model and all numeric footer lines. Do not render rows, zeroes, a served interval, or a gap count.
 
@@ -355,7 +357,7 @@ The view must display the canonical `this application's served-hour gap evidence
 
 ### 4.3 Scope unprovable
 
-If a route cannot prove a valid served interval, a route cannot bind the rows and coverage to the same snapshot/window, or a required provenance refusal fires, the route returns `WindowUnavailableError` and the view uses outcome 1. It does not return a zero-row `FileViewResult` as a proxy for “nothing happened.”
+If a route cannot prove a valid served interval, a route cannot bind the rows and coverage to the same snapshot/window, or a required request-level provenance refusal fires, the route returns `WindowUnavailableError` and the view uses outcome 1. On the local route, section 5.7 governs candidate skips before this terminal outcome; no skip authorises ignoring a fatal provenance refusal. The route does not return a zero-row `FileViewResult` as a proxy for “nothing happened.”
 
 No field is added to `QueryRequest`, the server response, `FileTable`, `FileCoverage`, the durable JSON, the HMAC cursor, or any ABI. A local-only `FileServeFacts` and a local-only `FileViewResult.served_gap_count` are the complete addition.
 
@@ -363,7 +365,7 @@ No field is added to `QueryRequest`, the server response, `FileTable`, `FileCove
 
 The router evaluates provenance over a store-specific served interval, not automatically over the requested interval. Let `R` be the requested half-open interval and let `S_i` be the candidate interval selected independently from store `i`. A source segment intersects `S_i` when its interval has a non-empty half-open intersection with that store's candidate interval.
 
-Selection is per store, not global: each store computes its own `S_i`, finalized-through bound, ownership evidence, known-gap set, and predicates. The router then accepts exactly one surviving store candidate and uses that candidate's `S_i` for rows, coverage, facts, and disclosure. If two stores independently survive, the result is ambiguous and refuses even when their `S_i` intervals differ. A gap, segment, or owner outside a store's own `S_i` cannot disqualify that candidate merely because it exists in another store's calendar.
+Selection is per store, not global: each store selects its own `S_i` and finalized-through bound from its file calendar. The existing ownership plan over all registered sources is evaluated for that candidate's `S_i`, with segments and known gaps clipped to that interval. This does not mean “discard every candidate whose provenance fails”: section 5.7 distinguishes skippable exclusions from fatal request refusals. Only after all candidates have been examined without a fatal refusal may the router accept exactly one fully validated candidate and use its `S_i` for rows, coverage, facts, and disclosure. Two fully validated stores are ambiguous and refuse even when their `S_i` intervals differ. Evidence outside a candidate's `S_i` cannot fail that candidate's predicates; this scoping rule does not authorise ignoring a fatal refusal from another candidate.
 
 ### 5.1 Existence and requested-scope facts
 
@@ -390,7 +392,7 @@ no second collector_id has proven coverage intersecting S_i,
 and all rows used for S_i come from that one collector_id.
 ```
 
-Mirrors of the same collector receipt do not become additive owners. A source or owner outside `S_i` does not disqualify the result. A handover boundary inside `S_i` is allowed only when the router's existing ownership plan proves the boundary and still reduces to one authoritative store for the complete served result; otherwise it is an ownership ambiguity and refuses. After each store evaluates this predicate, more than one surviving store candidate is itself an ambiguity.
+Mirrors of the same collector receipt do not become additive owners. Evidence of a source or owner wholly outside `S_i` does not fail this candidate's single-owner predicate. A handover boundary inside `S_i` is allowed only when the router's existing ownership plan proves the boundary and still reduces to one authoritative store for the complete served result; otherwise it is an ownership ambiguity and refuses. The mirror skip applies only after all provenance predicates pass; it is not permission to discard a provenance failure. Section 5.7 defines fatal/skippable handling and the final candidate-count check.
 
 Failure reports:
 
@@ -424,7 +426,7 @@ For every non-empty segment intersecting `S_i`, one of these must hold:
 
 Coverage is full interval coverage, not “there is a gap row somewhere in the segment.” The union must have no uncovered hole. A gap row with reason `overlap_uncertain` is not a known non-overlap gap and cannot satisfy this predicate.
 
-A boundary-straddling fixture is mandatory: with `S_i = [2h,4h)`, raw unproved segment `[1h30m,3h)` clips to `[2h,3h)` and is admitted only when `[2h,3h)` is fully covered by a known non-overlap gap; raw unproved segment `[1h30m,3h30m)` clips to `[2h,3h30m)` and refuses because the clipped endpoint is not hour-aligned. An unproved segment wholly outside `S_i` does not disqualify the file result. The router must not widen `S_i` to include it.
+A boundary-straddling fixture is mandatory: with `S_i = [2h,4h)`, raw unproved segment `[1h30m,3h)` clips to `[2h,3h)` and is admitted only when `[2h,3h)` is fully covered by a known non-overlap gap; raw unproved segment `[1h30m,3h30m)` clips to `[2h,3h30m)` and refuses because the clipped endpoint is not hour-aligned. An unproved segment wholly outside `S_i` does not fail this candidate's proven-segment predicate. The router must not widen `S_i` to include it.
 
 Failure reports the same `file_source_unavailable` / `File ownership cannot be represented by one store.` pair. The result must not expose rows from the otherwise unproved segment.
 
@@ -445,32 +447,63 @@ Failure reports `file_source_unavailable` with `File ownership cannot be represe
 
 The gap-coverage predicate is true exactly when every non-empty clipped unproved segment for `S_i` is fully covered by clipped known non-overlap gaps and has hour-aligned endpoints. It is evaluated independently of the requested-window coverage scalar.
 
-For the canonical fixture:
+The canonical fixture contains **two applications in the same store and snapshot**, not two alternative descriptions of one application:
 
 ```text
 requested R = [0h, 6h)
-served S_i = [2h, 4h)
-this app's retained file_coverage rows for S_i:
-  hour [2h,3h): gap_intervals = 0
-  hour [3h,4h): gap_intervals = 1
+served S_i = [2h, 4h) for both apps
+retained file_coverage.gap_intervals by app and hour:
+                  [2h,3h)  [3h,4h)  served-hour sum
+  app A (app_id=1)     0         1          1
+  app B (app_id=2)     1         1          2
 persisted gap rows used by the requested-window overlay:
-  [1h,2h), [3h,4h), [4h,5h)
+  [1h,2h), [3h,4h), [4h,5h), all known non-overlap gaps
+persisted rows intersecting S_i = 1
+persisted rows intersecting R   = 3
 ```
 
-The documented reducers therefore produce:
+Commit the synthetic hourly evidence and gap rows before querying. Retain both apps' required hourly rows; their different application counters must not be derived from the persisted gap-row count. Query both app IDs explicitly in the same pinned snapshot as their corresponding tables and coverage. The required assertions are:
 
-```text
-gaps_in_served_interval  = 0 + 1 = 1
-gaps_in_requested_window = existing coverage.gap_intervals = 1 + 3 = 4
+```python
+facts_A = service.file_serve_facts(1, R)
+facts_B = service.file_serve_facts(2, R)
+assert facts_A == FileServeFacts(S_i, 1, 4)  # 0 + 1; (0 + 1) + 3
+assert facts_B == FileServeFacts(S_i, 2, 5)  # 1 + 1; (1 + 1) + 3
 ```
 
-The `[1h,2h)` and `[4h,5h)` records are not app-hour evidence inside `S_i`, and the requested scalar is not a second app-hour sum. Do not deduplicate or compare the two reducers; a request-and-serve-same-interval fixture is insufficient evidence.
+Also assert that each app's table and coverage carry that app's identity, retain requested `window == R`, and report `S_i` through `table.unknown_owner_overflow.window` and `coverage.served_interval`. The existing requested-window `coverage.coverage.gap_intervals` scalars must be respectively `4` and `5`. Independently assert the persisted-row counts `1` in `S_i` and `3` in `R` so the fixture's distinguishing evidence is pinned.
+
+These assertions must kill the following named mutations:
+
+- **`M_served_uses_persisted_rows` — “counted persisted rows instead”:** replacing the served-hour sum with the number of persisted rows intersecting `S_i` returns `1` for B instead of `2`. B's served-value assertion must fail. A's served `1` alone cannot kill this mutation.
+- **`M_B_reuses_A_facts` — “returned app A's facts for app B”:** ignoring B's explicit `app_id` and returning A's facts yields `FileServeFacts(S_i, 1, 4)` instead of B's required `FileServeFacts(S_i, 2, 5)`. B's facts assertion must fail; merely creating B without asserting its result is not evidence.
+
+The `[1h,2h)` and `[4h,5h)` records are not app-hour evidence inside `S_i`, and the requested scalar is not a second app-hour sum. Do not deduplicate or compare the two reducers. A request-and-serve-same-interval fixture, an A-only assertion, or equal served sums for both apps is insufficient evidence.
 
 ### 5.6 Process-history gap scoping
 
 The file route may keep separate known-gap ranges for a store candidate's served-interval admission, but `_gap_ranges` must remain scoped to the requested process-history window `R`. `_gap_ranges` feeds process coverage and must not be replaced by `S_i` or by the candidate's file-admission ranges. A separate `_known_gap_ranges` (or an equivalent local name) may be used for file admission.
 
 This separation is mandatory even when the file result is partial. In the required fixture, use `R = [2h,6h)` and `S_i = [2h,4h)`, with a process gap `[4h,5h)` outside `S_i` but inside `R`, and a control gap `[0h,1h)` outside `R`. The process reducer must retain `[4h,5h)` and exclude `[0h,1h)`; the file served-hour reducer must not count `[4h,5h)` because it has no intersecting app-hour row in `S_i`. A second control with only `[0h,1h)` must leave process coverage complete. A gap outside the requested process window must never mark process history incomplete, and a gap outside the served file interval must not become a served gap merely because it is in the request.
+
+### 5.7 Candidate failure classification and acceptance order
+
+The failure **stage**, not the exception's reason string, determines whether another store may be tried. Preserve the existing narrow `WindowUnavailableError` catch around the table/coverage query and `_check_file_result` in `HistoryRouter._read_local_files` (`src/appio/history_router.py:199–211`), and the provenance refusal outside that catch (`:218–231`). The approved known-gap admission in sections 5.3–5.5 is the only authorised relaxation of provenance; there is no authority to turn any remaining provenance refusal into a candidate skip.
+
+| Stage or condition | Classification | Required handling |
+| --- | --- | --- |
+| The selected external `AppKey` has no app receipt in this store. | **Skippable** | Continue without inventing rows or updating the remembered query error. |
+| The table/coverage query or existing result validation raises `WindowUnavailableError` before provenance, including an unavailable/no-served-interval result. | **Skippable** | Remember that typed query/result-validation error and continue, as the existing catch does. A later fully validated candidate may answer. The same `file_source_unavailable` reason can instead be fatal when raised by provenance below; do not classify by reason alone. |
+| All provenance predicates pass, but the single authoritative collector/store is not the store supplying this candidate's rows (`names != {name}`). | **Skippable discarded mirror** | Continue without adding its rows or replacing the remembered query error. The mismatch is skippable only after the other provenance predicates have passed. |
+| A candidate reaches provenance but fails single-owner, non-empty segment, chronology, clipped proven/known-gap coverage, alignment, or overlap-uncertainty requirements. | **Fatal to the request** | Raise `WindowUnavailableError("file_source_unavailable", "File ownership cannot be represented by one store.")`. Do not discard the failed candidate and try to answer from another one. An already accumulated valid result cannot mask this refusal. |
+| An unexpected read, snapshot, query, or planning exception is outside the existing typed query/result-validation skip. | **Fatal to the request** | Abort and retain the existing outward error propagation/normalization. Do not broaden the catch to turn SQL, I/O, malformed evidence, or planning failures into skips or numeric empty results. |
+| The scan finishes without a fatal refusal and more than one fully validated candidate remains. | **Fatal ambiguity** | Refuse with the same ownership error pair, even if the candidates serve disjoint intervals. Never return the first valid result before the scan finishes. |
+
+After the scan, exactly one fully validated candidate is returned only if no fatal refusal fired. If none remains, raise the last remembered typed query/result-validation error, or the existing `file_source_unavailable` / `No authoritative file app receipt.` default if none was remembered. Neither a missing receipt nor a discarded mirror replaces that remembered error. This preserves existing fallback and refusal behaviour rather than adding a new candidate ranking or error-precedence policy.
+
+**Mandatory mixed valid/invalid-candidate fixture:** request `R=[0h,6h)` for the same external `AppKey` in two committed stores. A's file calendar selects `S_A=[2h,4h)` and B's selects `S_B=[5h,6h)`; both candidates' table/coverage queries pass result validation. A has one proven owner on `[3h,4h)` but an unproved `[2h,3h)` segment with no known-gap union covering it. B has valid ownership throughout `[5h,6h)` and no intersecting overlap uncertainty. No B evidence intersects A's served interval. The result **must refuse** with the ownership error pair, not accept B. Run in both A-then-B and B-then-A orders: in the latter, B's provisional success must still be overridden by A's fatal refusal. B alone must succeed as the positive control.
+
+Pin the skippable controls separately: with A's pre-provenance query returning typed unavailability (for example, no servable file calendar), B is accepted; with no app receipt in A, B is accepted; a discarded mirror is skipped only after successful provenance. Include a mirror-order refusal control: A still serves `[2h,4h)` with uncovered unproved `[2h,3h)`, but its lone proven collector on `[3h,4h)` is B (`names == {B}`, not `{A}`); B's own `[5h,6h)` candidate is valid. A's provenance failure must remain fatal before the mirror-mismatch skip can run. These controls distinguish preserving existing fallback from making every candidate failure fatal or moving the mirror skip ahead of provenance. The mixed fixture must kill **`M_provenance_failure_becomes_skip`**, which catches A's provenance error and continues to B, and the B-first ordering must kill an early-return-on-first-valid-result mutation.
 
 ## 6. Adoption of `dd8b042`
 
@@ -479,7 +512,7 @@ This separation is mandatory even when the file result is partial. In the requir
 The candidate audit is read-only and limited to:
 
 - selection and propagation of the served interval;
-- local provenance over that interval;
+- local provenance over that interval, including the fatal/skippable candidate handling in section 5.7;
 - known-gap coverage and overlap refusal;
 - preservation of requested-window process-history coverage;
 - local and remote disclosure of bounds and gap counts;
@@ -538,15 +571,16 @@ All fixtures below are synthetic unless explicitly marked “real database snaps
 
 | Contract pin | Fixture shape | Falsifying mutation | Real database snapshot? |
 | --- | --- | --- | --- |
-| `FileServeFacts` reducers and types | Request `[0h,6h)`; candidate served interval `S_i=[2h,4h)`; this app's retained hourly `file_coverage` rows have `gap_intervals` `0` and `1`; persisted overlay rows are `[1h,2h)`, `[3h,4h)`, `[4h,5h)`. Assert `served_interval=S_i`, `gaps_in_served_interval=1`, and `gaps_in_requested_window=4`. Add an app B with a different hourly sum and assert explicit `app_id` selects A. Add no-served and totals-only/pruned `since_boot`/`lifetime` fixtures: served scope is the existing request when available, served gap is `None`, and requested scalar remains an integer. | Reuse requested bounds for all queries; count persisted rows for the served value; return app A's facts for app B; turn no-hourly evidence into `0`; use the old requested count `3`. | No. |
+| `FileServeFacts` reducers and types | Use the two-app canonical fixture in section 5.5: `R=[0h,6h)`, `S_i=[2h,4h)`, A's hourly counters `0,1`, B's `1,1`, and persisted overlay rows `[1h,2h)`, `[3h,4h)`, `[4h,5h)`. Explicitly call and assert **both** `file_serve_facts(1,R) == FileServeFacts(S_i,1,4)` and `file_serve_facts(2,R) == FileServeFacts(S_i,2,5)`, matching each app's table/coverage. Assert persisted counts `1` in S and `3` in R; B's served sum `2` must differ from the served persisted-row count `1`. Add no-served and totals-only/pruned `since_boot`/`lifetime` fixtures: no-served facts have interval/count `None`; valid totals-only facts have the existing requested scope and served count `None`; requested scalar remains an integer. | `M_served_uses_persisted_rows` must fail B's served `2` assertion; `M_B_reuses_A_facts` must fail B's `(S_i,2,5)` assertion. Also falsify reused requested bounds, no-hourly evidence turned into `0`, and the old requested count `3`. A-only assertions are insufficient. | No. |
 | Served interval propagation and outside rows | Request `[0h,6h)` with file rows at hours 0, 2, 3, and 5, while `S_i=[2h,4h)`. Assert `FileTable.window` and `FileCoverage.window` remain the request, `FileCoverage.served_interval=S_i`, and table rows, observed bytes, and app totals contain only hours 2 and 3. | Leave `file_applications`, `file_table`, or `file_coverage` on the requested bounds; query rows outside `S_i`; use `unknown_owner_overflow.window` only for the footer while querying the request. | No. |
 | Complete result | One hour-aligned request with all finalized hours and no gaps. Assert served equals requested, `served_gap_count == 0`, and `coverage.complete is True`. | Treat `0` as unknown/`None`; mark a result partial merely because no unknown-owner rows exist. | No. |
 | Totals-only/pruned semantics | Return a valid `lifetime` and a valid `since_boot` aggregate after hourly rows have been pruned. Assert `served_interval == requested Window`, no invented endpoints or `boot` label, `gaps_in_served_interval is None`, and requested scalar is preserved. | Infer a zero served gap from aggregate completeness; fabricate `T0`/`T1`; expose the internal `boot` scope. | No. |
 | FileCoverage wire shape | Encode/decode a representative `FileCoverage` with nested `Window`, `Coverage`, `HookHits`, and `UnknownOwnerOverflow`; compare each literal field set in section 2.5 and round-trip values. Mutate each nested record once by adding a key and once by removing a key. | Add any served field to the durable/IPC object; relax exact-field-set decode at one nested level; encode a computed property; test only top-level fields. | No. |
 | Local result shape and identity | Local `HistoryRouter` resolves an external `AppKey` to a store-local `app_id`, calls `file_serve_facts(app_id, window)` in one snapshot, and returns `FileViewResult(table, coverage, served_gap_count)`. | Omit the explicit app argument; derive the served count from `coverage.gap_intervals`; combine results from different snapshots. | No. |
 | Remote result shape | Drive the existing remote harness through real `IodClient` encoding/decoding and HMAC cursors. Assert bounds are disclosed, `served_gap_count is None`, and the requested coverage scalar remains available. | Set remote served count to `coverage.gap_intervals`; invent zero; add a wire field. | No. |
-| No authoritative source | Delete the file app receipt or remove the file calendar so no interval is servable. | Return a zero-row successful result; use `unsupported_window`/`not_retained` as a numeric empty result without the typed refusal. | No. |
-| Per-store candidate selection | Give store A a surviving `S_A=[2h,4h)` and store B a different surviving `S_B=[4h,6h)`; assert two survivors refuse. Add an owner/gap outside A's `S_A` as a control that does not refuse A when A is the only survivor. | Compute one global intersection/union interval; accept the first store; let an owner outside `S_i` refuse that candidate. | No. |
+| No authoritative source | Delete the file app receipt or remove the file calendar so no store can supply a validated candidate; assert typed refusal, not a numeric empty result. | Return a zero-row successful result; use `unsupported_window`/`not_retained` as a numeric empty result without the typed refusal. | No. |
+| Per-store candidate selection | Give store A a fully validated `S_A=[2h,4h)` and store B a different fully validated `S_B=[4h,6h)`; assert two candidates refuse. Add an owner/gap outside A's `S_A` as a control that does not fail A's predicates when A is the only accepted candidate and no other candidate raises a fatal refusal. | Compute one global intersection/union interval; accept the first store; let evidence outside `S_i` fail that candidate's predicates. | No. |
+| Fatal versus skippable candidate failures | Use section 5.7's mixed fixture: A's `S_A=[2h,4h)` has uncovered unproved `[2h,3h)`, while B's `S_B=[5h,6h)` is fully valid. Both queries pass validation. Assert the exact fatal ownership reason/message in **both store orders**, and B-alone success. Separately assert B succeeds when A has typed pre-provenance query unavailability or no app receipt. Assert a valid mirror is skipped, while the mirror-order control in section 5.7 refuses before a mismatch can skip failed provenance. | `M_provenance_failure_becomes_skip` accepts B instead of refusing; early return accepts B in B-first order; widening fatal handling to all query unavailability breaks the fallback controls; skipping a mirror before checking its provenance bypasses a fatal refusal. | No. |
 | Unproved segment clipping | With `S_i=[2h,4h)`, use raw unproved `[1h30m,3h)` and a clipped known gap `[2h,3h)` for acceptance; use raw `[1h30m,3h30m)` for refusal because clipped `[2h,3h30m)` is not aligned. Include a hole and an overlap-uncertain row. | Evaluate alignment/coverage before clipping; accept any gap row somewhere in the raw segment; accept overlap-uncertain rows as known gaps. | No. |
 | Overlap uncertainty | Add an `overlap_uncertain` row intersecting `S_i`, with byte totals that happen to be zero, and a control row outside `S_i`. | Ignore overlap ranges because totals are zero; use requested-window overlap state without intersection testing. | No. |
 | Requested `_gap_ranges` and process isolation | Request process window `R=[2h,6h)`, use `S_i=[2h,4h)`, put one gap at `[4h,5h)` inside R but outside S, and a second at `[0h,1h)` outside R. Assert process coverage sees only `[4h,5h)`, file served-hour facts do not count it, and a control with only `[0h,1h)` remains process-complete. | Replace `_gap_ranges` with served ranges; let the outside-request gap mark process history incomplete; let the outside-served gap become a served app gap. | No. |
@@ -559,10 +593,10 @@ All fixtures below are synthetic unless explicitly marked “real database snaps
 | Stale reply | Defer two requests; retire the first and publish the second. | Publish a retired generation's rows or served facts. | No. |
 | Label probe-only truth | Fake the status socket to answer after stream EOF for three refreshes. | Let EOF demote despite a healthy status witness; let the root activation probe assert answering. | No. |
 | Label recovery | Fake a connected state, one silent status refresh after EOF, then an answering status refresh and reconnection. Assert the intermediate exact label and later verified connection. | Freeze the label; retain stale `answering=True`; assert only the final label without verified reconnection. | No. |
-| Candidate adoption | Read-only diff audit plus targeted candidate tests, per-store candidate cases, boundary-clipping case, and the `_gap_ranges` mutation. | Declare adoption solely because the aggregate suite is green. | No. |
+| Candidate adoption | Read-only diff audit plus targeted candidate tests, per-store candidate cases including section 5.7's mixed fatal/skippable cases, boundary-clipping case, and the `_gap_ranges` mutation. | Declare adoption solely because the aggregate suite is green. | No. |
 | End-to-end acceptance | Use the required read-only artifact `tests/fixtures/p4/files-tab-real.sqlite`, identified by `tests/fixtures/p4/files-tab-real.sha256` and `tests/fixtures/p4/files-tab-real.json`. The manifest must pin the snapshot SHA-256, capture/source identity, schema/user version, selected external `AppKey`, requested `Window`, surviving store, and expected `S_i`. The snapshot must be copied from that identified target store before acceptance and must not receive test inserts. An independent oracle reads the raw snapshot rows and derives `S_i`, app-hour `gaps_in_served_interval`, requested-window `coverage.gap_intervals` semantics, rows, bounds, and provenance outcome without calling production query helpers or rendering code. The offscreen Files view then asserts those expectations and label answering with a stubbed verified status, not a live daemon. | Use a handcrafted database or synthetic tree at the acceptance path; omit the hash/manifest; derive expectations through `QueryService.file_serve_facts`, `file_coverage`, or the view; use a request whose served interval equals the request; assert only that the widget is non-empty. | **Yes.** This is the only required acceptance pin that uses a real database snapshot rather than an in-memory/synthetic fixture. |
 
-The canonical request/served fixture is mandatory for every relevant test group. A request-and-serve-same-interval test does not count as evidence for the two gap scopes because a reused requested count would pass unchanged.
+The canonical request/served fixture remains mandatory for every relevant test group. Its reducer/identity assertions must cover **both** applications and B's served-hour/persisted-row inequality. A request-and-serve-same-interval test does not count as evidence for the two gap scopes because a reused requested count would pass unchanged. A fixture that asserts only A cannot falsify either of the two named reducer/identity mutations in section 5.5.
 
 Every mechanism mutation must be run against a clean baseline, observed to fail at the named assertion, and reverted byte-for-byte before the positive result is recorded. A passing test that was already green before the mutation is not a falsification.
 
@@ -580,7 +614,7 @@ The real acceptance artifact is a deliverable of implementation, not a permissio
 ### 9.2 Implementation-specific additions
 
 5. **Requested/served scope regression.** A helper may accidentally reuse the selected served interval for process-history coverage. Keep `_gap_ranges` requested-scoped and give file admission its own known-gap collection.
-6. **Reducer distinction.** The served-hour reducer sums this application's retained hourly `file_coverage.gap_intervals`; the requested-window reducer preserves the existing app-level `coverage.gap_intervals` scalar and its served-hour-plus-overlay semantics. They may differ because they are different reducers, not because one is a boot-wide persisted-row count. Test the documented `1` versus `4` canonical fixture and do not deduplicate or substitute sources.
+6. **Reducer distinction.** The served-hour reducer sums this application's retained hourly `file_coverage.gap_intervals`; the requested-window reducer preserves the existing app-level `coverage.gap_intervals` scalar and its served-hour-plus-overlay semantics. They may differ because they are different reducers, not because one is a boot-wide persisted-row count. Assert A's `1` versus `4` and B's `2` versus `5` from the canonical fixture, including B's inequality with the one persisted served-scope row; do not deduplicate or substitute sources.
 7. **App coverage versus provenance coverage.** `coverage.gap_intervals` is the existing requested-window app scalar and includes its served-hour contribution plus requested-window overlay. Do not replace it with `served_gap_count`, which is the retained app-hour reducer for `S_i`; the two values answer different reducer/scope questions and may legitimately differ.
 8. **Unknown-owner compatibility carrier.** Renaming or replacing `unknown_owner_overflow.window` in the wire/durable model would be a schema/protocol change. Use the computed property and local facts instead.
 9. **Snapshot skew.** Calling `file_table`, `file_coverage`, and `file_serve_facts` in separate snapshots can disclose bounds for one state and rows for another. The local worker must keep one committed snapshot for the result.
@@ -592,7 +626,9 @@ The real acceptance artifact is a deliverable of implementation, not a permissio
 
 ## 10. Approved-design ambiguities resolved by this specification
 
-The approved design does not give a complete field type table, exact copy for every ordered outcome, or an explicit `None` rule for the no-served gap count. This specification resolves those points as follows:
+Design revision 8 is the authority for this specification. Revision 7 of the approved design itself specified the superseded persisted-gap-row served measure; revision 8, finalized at `0e92f44`, corrects it to an app-level served-hour reducer, preserves the requested scalar as a different reducer, and requires `None` when the hourly source is pruned. This is a documentary correction to the approved design, not an ambiguity that this specification may resolve in favour of revision 7.
+
+The specification fills out the field types, no-served-interval rule, exact copy, and candidate-failure precedence without changing that design:
 
 - `served_interval` is `Window | None`; `gaps_in_served_interval` is `int | None`; `gaps_in_requested_window` is always `int`.
 - `gaps_in_served_interval` is the sum of this application's retained hourly `file_coverage.gap_intervals` rows intersecting the served interval. Persisted gap rows are provenance inputs only.
@@ -600,9 +636,10 @@ The approved design does not give a complete field type table, exact copy for ev
 - A local `served_gap_count` of `0` is a proved zero. `None` means hourly evidence is unavailable/pruned or the route cannot prove the reducer; it is never converted to zero.
 - The requested `FileCoverage.window` remains distinct from the computed served interval and the compatibility carrier's nested window.
 - The five visible outcome strings and their placement are the exact strings in section 3. The scope formatter preserves real `since_boot` end bounds, uses no invented lifetime bounds, and never displays the internal `boot` label.
-- Each store selects its own candidate `S_i` before router acceptance. The router accepts one surviving candidate only; two surviving stores are ambiguous. Segment alignment and gap coverage are evaluated after clipping non-empty segments and known gaps to that candidate's `S_i`.
+- Each store selects its own candidate `S_i` before router acceptance. Only missing-app receipts, typed query/result-validation unavailability, and a mirror discarded after successful provenance are skippable, as specified in section 5.7. Provenance failure is fatal to the request even when another candidate is valid; one fully validated candidate is accepted only after the scan finishes without a fatal refusal, and two are ambiguous. Segment alignment and gap coverage are evaluated after clipping non-empty segments and known gaps to the candidate's `S_i`.
 - `_gap_ranges` remains requested-process-window scoped; file admission may use a separate known-gap collection.
 - `FileServeFacts` is local snapshot-bound query evidence with an explicit store-local `app_id`. `FileViewResult` transports only the local `served_gap_count` value inside the process; neither is a protocol field.
+- The canonical reducer fixture must assert both applications: A has served/requested values `1`/`4`, B has `2`/`5`, and exactly one persisted gap row intersects their common served interval. B's assertions must kill both the persisted-row served reducer and reuse of A's facts for B; A-only assertions do not satisfy this gate.
 - Exact nested wire field sets are pinned literally, with added-key and missing-key rejection at every nested record level.
 - The real-database acceptance uses the named, hash-pinned frozen snapshot and independently derived expectations required by section 8; synthetic fixtures cannot satisfy that gate.
 
@@ -610,6 +647,6 @@ These are spec-level decisions; no product-scope expansion, schema change, migra
 
 ## 11. Open items
 
-None. The only drafting ambiguity, which source supplies the requested-window gap value, is resolved above: the served value uses this application's retained hourly `file_coverage` rows, the requested value keeps the existing app-level scalar semantics, and neither is compared with the boot-wide `gap` table.
+None. The gap sources follow corrected approved design revision 8: the served value uses this application's retained hourly `file_coverage` rows, the requested value keeps the existing different scalar reducer, and pruned hourly evidence yields `None`. Candidate handling preserves the existing stage-based fallback and fatal provenance refusals under section 5.7. Neither review finding requires a new product-behaviour decision.
 
 No unresolved product or implementation question is required to execute this specification. If implementation discovers a contradiction in the approved design rather than a defect in the code, it must stop the affected lane and obtain an explicitly reviewed decision instead of silently choosing a broader scope.
