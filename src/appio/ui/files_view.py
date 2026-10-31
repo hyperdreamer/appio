@@ -737,18 +737,6 @@ class FilesView(QWidget):
     def _render_coverage(self, result: FileViewResult, window: Window) -> None:
         coverage = result.coverage
         inner = coverage.coverage
-        covered = coverage.unknown_owner_overflow.window
-        partial_interval = (
-            (covered.start_mono_ns, covered.end_mono_ns)
-            if covered != coverage.window and covered.kind == "range"
-            and covered.boot_id == coverage.window.boot_id
-            else None
-        )
-        scope_prefix = (
-            f"served interval only (T0={elapsed_text(partial_interval[0])} through "
-            f"T1={elapsed_text(partial_interval[1])} after boot): "
-            if partial_interval is not None else ""
-        )
         scope = _scope_text(coverage, result.served_gap_count)
         status = "complete" if inner.complete else "incomplete"
         if result.table.rows:
@@ -769,37 +757,37 @@ class FilesView(QWidget):
             self._observed_text(coverage, result.table, scope)
         )
         self.footer_counted.setText(
-            f"{scope_prefix}counted omissions (top-100/quota): "
+            "counted omissions (top-100/quota): "
             f"{coverage.counted_omitted_files} files, "
             f"{format_bytes(coverage.counted_omitted_bytes_r)} read, "
-            f"{format_bytes(coverage.counted_omitted_bytes_w)} written"
+            f"{format_bytes(coverage.counted_omitted_bytes_w)} written; {scope}"
         )
         # Counted omissions above and this field below are never added: one was
         # measured and dropped by a deterministic top-N, the other was lost when
         # a map insert failed and cannot be measured at all.
         self.footer_uncounted.setText(
-            f"{scope_prefix}uncounted overflow (BPF map full, not measured): "
+            "uncounted overflow (BPF map full, not measured): "
             f"{coverage.uncounted_overflow_files} files, "
             f"{format_bytes(coverage.uncounted_overflow_bytes_r)} read, "
-            f"{format_bytes(coverage.uncounted_overflow_bytes_w)} written"
+            f"{format_bytes(coverage.uncounted_overflow_bytes_w)} written; {scope}"
         )
         overflow = coverage.unknown_owner_overflow
         self.footer_unknown_owner.setText(
-            f"{scope_prefix}unknown owner overflow (unassigned, never added to an app): "
+            "unknown owner overflow (unassigned, never added to an app): "
             f"{overflow.overflow_files} files, "
             f"{format_bytes(overflow.overflow_bytes_r)} read, "
-            f"{format_bytes(overflow.overflow_bytes_w)} written"
+            f"{format_bytes(overflow.overflow_bytes_w)} written; {scope}"
         )
         self.footer_skipped.setText(
-            f"{scope_prefix}skipped objects (excluded, never counted as file I/O): "
+            "skipped objects (excluded, never counted as file I/O): "
             f"{coverage.skipped_nonfile} non-file, "
-            f"{coverage.skipped_unsupported_fs} unsupported filesystem"
+            f"{coverage.skipped_unsupported_fs} unsupported filesystem; {scope}"
         )
         self.footer_weak.setText(
-            f"{scope_prefix}weak identity rows (dev+inode only, no filesystem UUID): "
-            f"{coverage.weak_identity_rows}"
+            "weak identity rows (dev+inode only, no filesystem UUID): "
+            f"{coverage.weak_identity_rows}; {scope}"
         )
-        self.footer_hooks.setText(scope_prefix + hooks_text(coverage.hook_hits))
+        self.footer_hooks.setText(hooks_text(coverage.hook_hits) + f"; {scope}")
 
     @staticmethod
     def _observed_text(coverage: FileCoverage, table: FileTable, scope_text: str) -> str:
