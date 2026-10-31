@@ -69,7 +69,13 @@ def _materialise_fixture() -> Path:
             f"committed fixture missing at {FIXTURE}; acceptance must be reproducible from HEAD, so this "
             "is a failure and not a skip"
         )
-    payload = gzip.decompress(FIXTURE.read_bytes())
+    archive = FIXTURE.read_bytes()
+    # Pin the compressed artifact too, not just its payload: a corrupted recorded digest, or an
+    # archive whose gzip header changed while the payload stayed identical, must not pass.
+    archive_digest = hashlib.sha256(archive).hexdigest()
+    if archive_digest != FIXTURE_META["gz_sha256"]:
+        pytest.fail(f"fixture archive digest drift: {archive_digest} != {FIXTURE_META['gz_sha256']}")
+    payload = gzip.decompress(archive)
     actual = hashlib.sha256(payload).hexdigest()
     if actual != FIXTURE_META["uncompressed_sha256"]:
         pytest.fail(f"fixture digest drift: {actual} != {FIXTURE_META['uncompressed_sha256']}")
