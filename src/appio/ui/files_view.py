@@ -687,7 +687,6 @@ class FilesView(QWidget):
     # -- rendering --------------------------------------------------------
 
     def _publish(self, result: FileViewResult) -> None:
-        self.last_result = result
         coverage = result.coverage
         inner = coverage.coverage
         if inner.unavailable_reason is not None:
@@ -696,6 +695,15 @@ class FilesView(QWidget):
             self._set_unavailable(inner.unavailable_reason,
                                   "file history is not available for this window")
             return
+        if coverage.served_interval is None:
+            # An unavailable placeholder is not an accepted served scope: its
+            # absent rows are unknown, not measured emptiness, so it must not
+            # reach the model or any numeric footer line.
+            self._set_unavailable(
+                coverage.unknown_owner_overflow.coverage.unavailable_reason,
+                "file history is not available for this window")
+            return
+        self.last_result = result
         window = result.table.window
         self.model.set_rows(result.table.rows, window)
         self._render_coverage(result, window)
