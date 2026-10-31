@@ -1,19 +1,24 @@
-"""Real-store acceptance for the Files tab (T-026).
+"""Real-store acceptance for the Files tab (T-024/T-026).
 
-Runs against the PM's frozen capture of the live daemon store and asserts that the Files tab
-serves a real interval from it. Expectations are derived from the capture's **raw rows** by a
-small independent scan below, never by asking the code under test what it should produce — a
-handcrafted store that happens to satisfy the implementation is exactly what this test exists to
-prevent.
+The Files tab is only correct if it serves a real interval from a store that existed *before* the
+code under test. That cannot be synthesised, so this test runs against the frozen capture in
+``tests/p4/acceptance/`` (tool, manifest, oracle output and report all committed beside it).
 
-The capture is deliberately awkward: every file-bearing hour contains gap boundaries that fall
-off the hour, because gaps begin when a daemon restarted. Under the pre-pivot rule that made the
-whole store unservable (PIVOT-1); the served interval now only has to be hour-aligned itself.
+Two modes, and the difference is the point:
+
+* default suite — if the capture is absent this test **skips**, and a skip is visibly not a pass;
+* acceptance run — set ``APPIO_ACCEPTANCE_REQUIRED=1`` and an absent or drifted capture is a
+  **failure**. A missing input can never be mistaken for a green acceptance.
+
+Expectations come from ``oracle-out.json``, produced by ``oracle.py`` scanning the capture's raw
+rows with the standard library only. Nothing here asks ``appio`` what its own answer should be.
 """
 
 from __future__ import annotations
 
 import hashlib
+import json
+import os
 import sqlite3
 import time
 from pathlib import Path
@@ -21,14 +26,16 @@ from pathlib import Path
 import pytest
 from PyQt6.QtWidgets import QApplication
 
-from appio.contracts import FILE_HOUR_NS, Window
+from appio.contracts import Window
 from appio.history_router import HistoryRouter
 from appio.iodclient import AppRegistry, ClientState
 from appio.query import QueryService
 from appio.ui.files_view import FilesView
 
-CAPTURE = Path("/tmp/appio-files-tab-capture/iod.sqlite")
-CAPTURE_SHA256 = "5eea10690422e3eba12e3376044c953dfcfe1ae3657bf13e34cb42d5bfe891e6"
+HERE = Path(__file__).with_name("acceptance")
+CAPTURE_DIR = Path(os.environ.get("APPIO_ACCEPTANCE_CAPTURE", "/tmp/appio-files-tab-capture"))
+REQUIRED = os.environ.get("APPIO_ACCEPTANCE_REQUIRED") == "1"
+ORACLE = json.loads((HERE / "oracle-out.json").read_text())
 
 
 class _NoDaemon:
@@ -48,66 +55,33 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _expected_served_interval(connection, boot: str, end: int) -> tuple[int, int]:
-    """Largest contiguous run of *file-bearing hours*, computed from raw rows only.
-
-    Deliberately a plain loop over ``file_coverage`` timestamps: no coverage model, no QueryService,
-    no reuse of the production interval selector.
-    """
-    hours = {
-        row[0]
-        for row in connection.execute(
-            "SELECT DISTINCT ts_mono_ns FROM file_coverage WHERE boot_id=? AND ts_mono_ns<?",
-            (boot, end),
+def _require_capture() -> Path:
+    snapshot = CAPTURE_DIR / "iod.sqlite"
+    if not snapshot.exists():
+        message = (
+            f"frozen capture missing at {snapshot}; reproduce it with "
+            f"`python tests/p4/acceptance/capture_store.py capture <live store> {CAPTURE_DIR}`"
         )
-    }
-    assert hours, "capture must contain file-bearing hours"
-    best: tuple[int, int] = (0, 0)
-    run_start = run_end = None
-    for hour in sorted(hours):
-        if run_end is not None and hour == run_end:
-            run_end = hour + FILE_HOUR_NS
-        else:
-            run_start, run_end = hour, hour + FILE_HOUR_NS
-        if run_end - run_start > best[1] - best[0]:
-            best = (run_start, run_end)
-    return best
+        if REQUIRED:
+            pytest.fail(message)  # acceptance run: absent input is a failure, never a skip
+        pytest.skip(message + " (set APPIO_ACCEPTANCE_REQUIRED=1 to make this a failure)")
+    actual = _sha256(snapshot)
+    if actual != ORACLE["capture_sha256"]:
+        pytest.fail(f"capture digest drift: {actual} != {ORACLE['capture_sha256']}")
+    return snapshot
 
 
-def _gaps_inside(connection, boot: str, start: int, end: int) -> int:
-    rows = connection.execute(
-        "SELECT from_mono_ns, to_mono_ns FROM gap WHERE boot_id=? AND to_mono_ns>? AND from_mono_ns<?",
-        (boot, start, end),
-    )
-    # An hour is affected when any gap overlaps it; the app counts per app-hour evidence, so this
-    # independent figure is only used to prove the served interval really does contain gaps.
-    return sum(1 for _ in rows)
-
-
-@pytest.fixture(scope="module")
-def capture():
-    if not CAPTURE.exists():
-        pytest.skip(f"frozen capture not present at {CAPTURE}")
-    before = _sha256(CAPTURE)
-    assert before == CAPTURE_SHA256, (
-        "the frozen capture changed; regenerate it deliberately rather than accepting drift"
-    )
-    yield CAPTURE
-    assert _sha256(CAPTURE) == before, "the acceptance run must not modify the frozen capture"
-
-
-def test_real_capture_serves_an_interval_shorter_than_the_request(capture):
-    connection = sqlite3.connect(f"file:{capture}?mode=ro", uri=True)
+def test_real_capture_serves_the_interval_the_raw_rows_imply():
+    snapshot = _require_capture()
+    before = _sha256(snapshot)
+    connection = sqlite3.connect(f"file:{snapshot}?mode=ro", uri=True)
     app = QApplication.instance() or QApplication([])
     try:
-        boot, end = connection.execute(
-            "SELECT boot_id, file_finalized_through_mono_ns FROM boot ORDER BY rowid DESC LIMIT 1"
-        ).fetchone()
-        expected_start, expected_end = _expected_served_interval(connection, boot, end)
-        expected_gaps = _gaps_inside(connection, boot, expected_start, expected_end)
-        assert expected_gaps > 0, "the chosen real interval must actually contain gaps"
+        boot = ORACLE["boot_id"]
+        watermark = ORACLE["file_finalized_through_mono_ns"]
+        expected = tuple(ORACLE["expected_served_interval_ns"])
+        requested = Window("since_boot", boot, end_mono_ns=watermark)
 
-        requested = Window("since_boot", boot, end_mono_ns=end)
         router = HistoryRouter(QueryService(connection), _NoDaemon(), AppRegistry())
         try:
             router.prepare(requested)
@@ -130,16 +104,18 @@ def test_real_capture_serves_an_interval_shorter_than_the_request(capture):
                 result = view.last_result
                 assert result is not None
                 served = result.coverage.unknown_owner_overflow.window
-                assert (served.start_mono_ns, served.end_mono_ns) == (expected_start, expected_end)
-                # The served interval is a strict subset of the request: this is the disclosure case.
-                assert served.end_mono_ns - served.start_mono_ns < end
+                # The interval comes from the raw rows, not from the implementation.
+                assert (served.start_mono_ns, served.end_mono_ns) == expected
+                # Served is strictly narrower than requested: this is the disclosure case.
+                assert served.end_mono_ns - served.start_mono_ns < (watermark or 0)
                 assert result.coverage.coverage.complete is False
-                assert result.coverage.coverage.gap_intervals >= 0
                 assert result.served_gap_count is not None, "the local route must report its own count"
-                assert view.app_selector.count() > 0, "file rows must yield selectable applications"
+                assert ORACLE["gaps_inside_expected_served_interval"] > 0
+                assert view.app_selector.count() == ORACLE["apps_with_rows_in_served_interval"]
             finally:
                 view.close()
         finally:
             router.close()
     finally:
         connection.close()
+        assert _sha256(snapshot) == before, "the acceptance run must not modify the frozen capture"

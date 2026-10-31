@@ -1,0 +1,26 @@
+{
+  "apps_with_rows_in_served_interval": 32,
+  "boot_id": "c753ab5f-87a1-4285-9c4e-d749ce9ac758",
+  "capture_sha256": "5eea10690422e3eba12e3376044c953dfcfe1ae3657bf13e34cb42d5bfe891e6",
+  "expected_served_interval_hours": [
+    48,
+    52
+  ],
+  "expected_served_interval_ns": [
+    172800000000000,
+    187200000000000
+  ],
+  "file_bearing_hours": [
+    46,
+    48,
+    49,
+    50,
+    51,
+    57,
+    58,
+    59
+  ],
+  "file_finalized_through_mono_ns": 216000000000000,
+  "gaps_inside_expected_served_interval": 12,
+  "rows_in_served_interval": 3169
+}
