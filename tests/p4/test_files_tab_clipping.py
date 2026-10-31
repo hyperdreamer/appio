@@ -12,11 +12,11 @@ from tests.p4.files_tab_support import tab_store, read_files, BOOT, H, S
 @pytest.mark.parametrize("resume,gaps,accepted", [
     (3*H, ((2*H,3*H,"collector_gap"),), True),
     (3*H, ((2*H,5*H//2,"collector_gap"),(5*H//2,3*H,"collector_gap")), True),
-    (7*H//2, ((2*H,7*H//2,"collector_gap"),), False),
+    (7*H//2, ((2*H,7*H//2,"collector_gap"),), True),  # PIVOT-1: fully gap-covered, mid-hour endpoint
     (3*H, ((2*H,12*H//5,"collector_gap"),(13*H//5,3*H,"collector_gap")), False),
     (3*H, ((2*H,3*H,"overlap_uncertain"),), False),
 ])
-def test_clipped_unproved_segment_requires_aligned_complete_known_gap_union(
+def test_clipped_unproved_segment_requires_complete_known_gap_union(
         tab_store, resume, gaps, accepted):
     db = tab_store(hours=(2,3), app_gaps={}, gaps=gaps)
     db.execute("DELETE FROM collector_interval")

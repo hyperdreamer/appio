@@ -203,8 +203,10 @@ class HistoryRouter:
                 known.append((boot, clipped_left, clipped_right))
 
         def fully_covered(segment):
-            if segment.start_ns % FILE_HOUR_NS or segment.end_ns % FILE_HOUR_NS:
-                return False
+            # PIVOT-1: the *served interval* must be hour-aligned (rows are hourly), but a
+            # segment inside it may start or end anywhere: real gaps begin and end at the
+            # instant a daemon restarted, so demanding hour-aligned segments made every
+            # real store unservable. Coverage must still be fully explained by known gaps.
             cursor = segment.start_ns
             for boot, left, right in sorted(known):
                 if boot != segment.boot_id or right <= cursor:

@@ -110,15 +110,34 @@ def test_gapped_window_renders_proven_served_interval_rows(histories, qtbot, win
     assert router.file_source_status().available
 
 
-@pytest.mark.parametrize("unproved", ["gap", "missing-owner"])
-def test_unproven_served_interval_still_refuses(histories, qtbot, unproved):
+def test_gap_covered_mid_hour_unproved_segment_is_served(histories, qtbot):
+    """PIVOT-1: an unproved segment need not be hour-aligned when known gaps explain it.
+
+    The inserted gap sits at 2h30m and is ten nanoseconds wide, so the unproved segment is
+    exactly that gap: fully covered by known evidence, merely off an hour boundary. Revision 8
+    refused this; the approved pivot serves it, with coverage still incomplete and disclosed.
+    """
     make, route = histories
     db = make()
-    if unproved == "gap":
-        db.execute("INSERT INTO gap VALUES(3,?,'gui',1,3,?,?,'collector_gap')",
-                   (BOOT, 2 * H + H // 2, 2 * H + H // 2 + 10))
-    else:
-        db.execute("UPDATE collector_interval SET to_mono_ns=?", (3 * H,))
+    db.execute("INSERT INTO gap VALUES(3,?,'gui',1,3,?,?,'collector_gap')",
+               (BOOT, 2 * H + H // 2, 2 * H + H // 2 + 10))
+    db.commit()
+    direct = QueryService(db).file_table(1, REQUESTED, "bytes_total", "desc", None)
+    assert direct.unknown_owner_overflow.window == SERVED
+    assert len(direct.rows) == 2
+    assert direct.coverage.unavailable_reason is None
+    router = route(db)
+    view = rendered(qtbot, router, REQUESTED)
+    assert view.state == "incomplete", view.state_label.text()
+    assert view.model.rowCount() == 2
+    assert view.last_result.coverage.coverage.complete is False
+    assert router.file_source_status().available
+
+
+def test_unproven_served_interval_without_gap_evidence_still_refuses(histories, qtbot):
+    make, route = histories
+    db = make()
+    db.execute("UPDATE collector_interval SET to_mono_ns=?", (3 * H,))
     db.commit()
     direct = QueryService(db).file_table(1, REQUESTED, "bytes_total", "desc", None)
     assert direct.unknown_owner_overflow.window == SERVED
