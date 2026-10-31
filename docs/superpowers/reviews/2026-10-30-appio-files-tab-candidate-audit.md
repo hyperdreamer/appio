@@ -232,3 +232,74 @@ interpreter and passed `5 passed in 0.45s`.
 This addendum closes only per-store selection and survivor ambiguity. The
 candidate's `repair` verdict remains; Tasks 9-10 and independent acceptance
 Task 24 still gate adoption.
+
+## T-009 Re-Audit Addendum: Fatal and Skippable Candidate Handling by Stage
+
+**Disposition:** no production repair was required. The existing route keeps
+the typed `WindowUnavailableError` catch around the table/coverage query and
+result validation, leaves provenance outside that catch, remembers a provenance
+refusal until the candidate scan completes, and returns only one validated
+candidate. A missing app receipt and a successfully validated mirror do not
+overwrite the remembered query error. Unexpected read and planning exceptions
+remain outside the typed skip.
+
+The mixed fixture keeps both candidate table/coverage queries valid for
+`R=[0h,6h)`. A selects `S_A=[2h,4h)` with uncovered unproved `[2h,3h)`; B
+selects `S_B=[5h,6h)` and is independently valid with 60 observed read bytes.
+A-alone provenance failure remains fatal in A-then-B and B-then-A order, with
+the exact `file_source_unavailable` / `File ownership cannot be represented by
+one store.` pair. B alone is the positive control. The mirror-order fixture
+places B's proven ownership on `[3h,4h)` and `[5h,6h)` while A's uncovered
+`[2h,3h)` remains outside any known-gap union; owner-name mismatch cannot turn
+that failed provenance into a skippable mirror. A separate equal-bounds mirror
+fixture poisons the mirror's file bytes to 999 and confirms the `local` source
+remains the sole result with 70 observed read bytes.
+
+The skippable controls inject both `not_retained` and
+`file_source_unavailable` at result validation before provenance and accept B;
+a missing app receipt also permits B. When a typed query error precedes a
+missing receipt and no candidate survives, the exact earlier reason/message
+is retained. Unexpected `sqlite3.OperationalError` during a read and
+`ValueError` during planning both abort the raw local worker rather than
+falling through to B.
+
+The final test baseline passes `10 passed in 0.63s` before production edits; the
+exact task validation passes `10 passed in 0.65s`. No production edit was
+needed. Eight origin-checked disposable probes each had a 10-test green control,
+the intended failure, byte-identical source restore, and a 10-test restored
+run:
+
+- `M_provenance_failure_becomes_skip` failed both mixed-fixture orderings with
+  `DID NOT RAISE` at the fatal refusal assertion.
+- `M_return_first_valid` failed the mixed fixture, including B-first, with
+  `DID NOT RAISE`; the scan cannot return B before checking A.
+- `M_every_unavailability_is_fatal` failed both typed pre-provenance fallback
+  cases by propagating the query error instead of accepting B.
+- `M_mirror_skip_before_provenance` failed both mirror-order controls with
+  `DID NOT RAISE` after skipping the earlier provenance failure.
+- `M_missing_receipt_replaces_error` failed the exact remembered
+  reason/message assertion after replacing it with the default missing-receipt
+  error.
+- `M_catch_all_reads_and_continue` failed the unexpected-read assertion with
+  `DID NOT RAISE OperationalError`; the planning-error control independently
+  remained fatal.
+- `M_skip_mirror_before_provenance_call` failed the valid-mirror test's explicit
+  provenance-call observation, even though the local 70-byte result still
+  matched.
+- `M_catch_planning_and_continue` failed the planning-error branch with
+  `DID NOT RAISE ValueError` after treating the injected planning exception as
+  skippable.
+
+The initial fixture run that used an overlapping default ownership interval
+and an invalid collector source value is retained as
+`evidence/T-009/fixture-contamination.log`; those setup failures were corrected
+and are not counted as RED assertions or mutant kills. The final clean baseline
+and validation use the pinned interpreter.
+
+Together, the T-005 through T-009 addenda cover requested-window process-gap
+isolation, clipped known-gap admission, overlap refusal, per-store candidate
+selection, and stage-based candidate failures. This scoped re-audit does not
+change the Task 1 `repair` verdict or adopt `dd8b042`. Task 10's local result,
+facts, and rendering contracts and independent Task 24 frozen real-capture
+acceptance remain pending. A green targeted or aggregate suite alone is not
+evidence for candidate adoption.
