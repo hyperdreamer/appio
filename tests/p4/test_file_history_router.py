@@ -5,6 +5,7 @@ future publication; dropping HMAC continuations or snapshot/scope checks;
 claiming an unavailable source is a complete empty table.
 """
 from dataclasses import replace
+import json
 import threading
 
 import pytest
@@ -19,6 +20,7 @@ from PyQt6.QtCore import Qt
 
 from appio.bpf_fileio import BpfFileSource, VectorLoader
 from appio.contracts import FILE_HOUR_NS as H, Window, WindowUnavailableError
+from appio.durable import canonical_json
 from appio.file_runtime import FileRuntime
 from appio.files import FileIdentityResolver
 from appio.history_router import FileViewResult, HistoryRouter
@@ -55,6 +57,29 @@ def retained(tmp_path):
     rt.consume(*f.tick(H, amount=200))
     yield f
     f.db.close()
+
+
+def inject_requested_gap_evidence(db, app_id=1, gaps=1):
+    """Commit synthetic hourly gap evidence before ``HistoryRpc`` pins a snapshot.
+
+    The requested-window scalar is the app's retained hourly ``gap_intervals``
+    contribution plus the requested overlay. Bumping an hourly row proves the
+    remote route still transports a nonzero scalar while the served-hour reducer
+    stays unprovable because the hourly rows themselves never cross the wire.
+    """
+    rows = db.execute(
+        "SELECT boot_id,ts_mono_ns,coverage_json FROM file_coverage WHERE app_id=?", (app_id,)
+    ).fetchall()
+    assert rows, "the retained fixture must keep hourly file coverage"
+    for boot, ts, text in rows:
+        payload = json.loads(text)
+        payload["gap_intervals"] = gaps
+        db.execute(
+            "UPDATE file_coverage SET coverage_json=? WHERE boot_id=? AND ts_mono_ns=? AND app_id=?",
+            (canonical_json(payload), boot, ts, app_id),
+        )
+    db.commit()
+    assert not db.in_transaction
 
 
 def local_router(retained):
@@ -217,7 +242,7 @@ def test_retained_local_file_history_is_queried_without_answering_daemon(retaine
 
 class Remote:
     """Drive real IodClient encoding/decoding plus real HistoryRpc HMAC cursors."""
-    def __init__(self, tmp_path, retained):
+    def __init__(self, tmp_path, retained, *, window=WINDOW):
         self.h = Harness()
         self.h.handshake()
         msg = snapshot_frame(1, boot_id="boot-A", epoch=1)
@@ -228,13 +253,14 @@ class Remote:
         self.store = AppIoStore(tmp_path / "local-empty.db")
         self.router = HistoryRouter(QueryService(self.store), self.h.client, AppRegistry())
         self.requests = []
-        self.router.prepare(WINDOW)
+        self.replies = []
+        self.router.prepare(window)
         self.router._local_future.result(timeout=10)
         for _ in range(15):
             self.respond()
-            if self.router.ready(WINDOW):
+            if self.router.ready(window):
                 break
-        assert self.router.ready(WINDOW) and self.router._remote is not None
+        assert self.router.ready(window) and self.router._remote is not None
 
     def respond(self, mutate=None):
         self.h.client.pump()
@@ -248,6 +274,7 @@ class Remote:
                                      request_id=wire["request_id"])
             if mutate:
                 mutate(reply)
+            self.replies.append(reply)
             self.h.send(reply)
         self.h.client.pump()
 
@@ -269,6 +296,8 @@ class Remote:
 @pytest.mark.parametrize("sort", SORTS)
 @pytest.mark.parametrize("direction", ["asc", "desc"])
 def test_remote_real_IodClient_pages_preserve_HMAC_snapshot_sort_search_and_coverage(retained, tmp_path, sort, direction):
+    # A nonzero hourly scalar proves the served slot never reuses the requested one.
+    inject_requested_gap_evidence(retained.db)
     remote = Remote(tmp_path, retained)
     try:
         aid = id_for(remote.router)
@@ -278,6 +307,9 @@ def test_remote_real_IodClient_pages_preserve_HMAC_snapshot_sort_search_and_cove
         assert view.table.rows == tuple(replace(row, path_id=0) for row in expected.rows)
         assert view.table.coverage == expected.coverage
         assert view.coverage.observed_bytes_r == 46
+        assert view.coverage.coverage.gap_intervals == 1
+        assert type(view.coverage.coverage.gap_intervals) is int
+        assert view.served_gap_count is None
         files = [r for r in remote.requests if r.kind == "files"]
         assert len(files) == 2 and files[0].cursor is None and files[1].cursor
         assert all((r.sort, r.direction, r.search) == (sort, direction, "CAFÉ") for r in files)
@@ -287,7 +319,7 @@ def test_remote_real_IodClient_pages_preserve_HMAC_snapshot_sort_search_and_cove
         remote.close()
 
 
-@pytest.mark.parametrize("fault", ["snapshot", "cursor", "stale", "coverage_snapshot", "mixed_tier", "scope", "advanced_cursor", "app", "coverage_app"])
+@pytest.mark.parametrize("fault", ["snapshot", "cursor", "stale", "coverage_snapshot", "mixed_tier", "scope", "advanced_cursor", "app", "coverage_app", "page_served_scope", "page_requested_window"])
 def test_remote_scope_snapshot_stale_cursor_and_invalidate_fail_closed(retained, tmp_path, fault):
     remote = Remote(tmp_path, retained)
     try:
@@ -298,8 +330,11 @@ def test_remote_scope_snapshot_stale_cursor_and_invalidate_fail_closed(retained,
             remote.h.send(snapshot_frame(2, boot_id="boot-A", epoch=1))
             remote.h.client.pump()
         cursor_corrupted = False
+        files_seen = 0
         def corrupt(reply):
-            nonlocal cursor_corrupted
+            nonlocal cursor_corrupted, files_seen
+            if reply.get("kind") == "files":
+                files_seen += 1
             if fault == "snapshot" and reply.get("kind") == "files":
                 reply["payload"][0]["snapshot"] = "other"
             if fault == "cursor" and reply.get("kind") == "files" and not cursor_corrupted:
@@ -316,6 +351,13 @@ def test_remote_scope_snapshot_stale_cursor_and_invalidate_fail_closed(retained,
             if fault == "mixed_tier" and reply.get("kind") == "coverage":
                 coverage = reply["payload"]["value"]["coverage"]
                 coverage["tier"] = "totals_only" if coverage["tier"] == "raw" else "raw"
+            if fault == "page_requested_window" and reply.get("kind") == "files" and files_seen > 1:
+                # A later page may not widen or shorten the requested window.
+                reply["payload"][0]["value"]["window"]["end_mono_ns"] = H - 1
+            if fault == "page_served_scope" and reply.get("kind") == "files" and files_seen > 1:
+                # A later page may not claim a different served scope than page one.
+                reply["payload"][0]["value"]["unknown_owner_overflow"]["window"].update(
+                    kind="range", start_mono_ns=0, end_mono_ns=H)
         for _ in range(15):
             remote.respond(corrupt)
             if future.done():
@@ -325,6 +367,9 @@ def test_remote_scope_snapshot_stale_cursor_and_invalidate_fail_closed(retained,
         assert caught.value.reason in ("file_source_unavailable", "stale_cursor")
         if fault == "cursor":
             assert caught.value.reason == "stale_cursor"
+        if fault in ("page_served_scope", "page_requested_window"):
+            assert files_seen > 1, "the later-page fault must have been delivered"
+            assert caught.value.reason == "file_source_unavailable"
     finally:
         remote.close()
 
