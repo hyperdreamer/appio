@@ -754,6 +754,9 @@ class FilesView(QWidget):
         if result.table.rows:
             matching = "" if result.table.search is None else f"; matching {result.table.search!r}"
             self.footer_state.setText(f"rows retained{matching}; {scope}; coverage: {status}")
+        elif result.table.search is not None:
+            self.footer_state.setText(
+                f"no retained file matches {result.table.search!r}; {scope}; coverage: {status}")
         elif inner.complete:
             self.footer_state.setText(
                 f"coverage: complete; tier: {inner.tier}; window: {window.kind}; {scope}"
