@@ -1,6 +1,12 @@
 # appio Files tab — honest window and honest label
 
-Status: revision 7 (approved by design review 6) — addresses design reviews 1-3. The label clause is now a
+Status: revision 8 — corrects the gap-count measure in revision 7. Revision 7 said the
+served-gap figure is computed from persisted gap rows; measurement proved that is a different
+quantity (786 app-level vs 760 boot-wide in the same window) and spec review 2 proved the
+displayed pair would then be incomparable. Because the approved snapshot changes, Step 3B must be
+re-rendered before Steps 4-10 proceed.
+
+Revision 7 was approved by design review 6 — addresses design reviews 1-3. The label clause is now a
 preservation pin, not a repair: review 3 showed the behaviour I called a defect is
 required by tests and produced by unchanged code.
 Date: 2026-10-30
@@ -87,13 +93,14 @@ no supported file observations (`files.py:309`), producing coverage with rows=0,
 no refusal, and a served interval equal to the request. `empty_partial` is its terminal outcome.
 
 **Per-route disclosure.** The Files tab is fed either by the local store or by the daemon over
-the history route. The served-gap count needs the gap rows, and the remote consumer receives
-only `FileTable` + `FileCoverage` — two different gap layouts encode identically. Therefore the
+the history route. The served-gap figure is an **app-level served-hour reducer** over that app's
+`file_coverage` hours (see the gap model below), so it needs those hourly rows; the remote consumer
+receives only a paginated `FileTable` + `FileCoverage` and cannot reconstruct them. Therefore the
 design states what each route can prove, rather than assuming both can prove the same thing:
 
 | Route | Bounds | Gaps inside served interval | Gaps inside requested window |
 | --- | --- | --- | --- |
-| local store | yes | yes — `file_serve_facts` computes it from the gap rows | yes — existing scalar |
+| local store | yes | yes — `file_serve_facts` sums this app's hourly `gap_intervals` | yes — existing scalar |
 | daemon / remote | yes | **no** — stated as unavailable for that route | yes — existing scalar |
 
 No wire change is made to enable the remote column. The disclosure names the scope it can
@@ -159,11 +166,12 @@ without an observed failure.
 | `CollectorWindow` | status | two-witness rule; bounded refresh |
 
 **Two mechanisms, deliberately.** `served_interval` is derivable from fields already on
-`FileCoverage`, so it is a computed property. `gaps_in_served_interval` is **not** derivable
-from those fields — it needs the gap rows and a connection — so it is produced once per query
-by `file_serve_facts` and passed alongside the coverage. Neither is added to the transported
-record: `FileCoverage` is encoded by dataclass field and decoded with an exact field-set
-match, so a new field would break the wire contract this design keeps.
+`FileCoverage`, so it is a computed property. `gaps_in_served_interval` is **not** derivable from
+those fields — it needs this app's hourly coverage rows and a connection — so
+`file_serve_facts(app_id, window)` produces it once per query, in the same snapshot as the table and
+coverage it accompanies, and passes it alongside. Neither is added to the transported record:
+`FileCoverage` is encoded by dataclass field and decoded with an exact field-set match, so a new
+field would break the wire contract this design keeps.
 
 **Reader conversion table.** Every current reader of the nested window must be accounted for:
 
@@ -229,10 +237,13 @@ Two conditions are non-negotiable before adoption:
 1. **Audit gate** (read-only) with the scope above; explicit pass/repair/replace verdict.
 2. **`served_interval`**: largest contiguous, hour-aligned interval inside the request;
    `None` when nothing serves; equals the request when complete.
-3. **Gap counts distinguished**: request `[0h,6h)` while serving `[2h,4h)` with gaps at
-   `[1h,2h)`, `[4h,5h)` and `[3h,4h)`. Assert served count `1` and requested count `3`. A
-   fixture where request equals served cannot fail a reused requested count and is therefore
-   not acceptable evidence.
+3. **Gap figures distinguished**: request `[0h,6h)` while serving `[2h,4h)` with gaps at
+   `[1h,2h)`, `[4h,5h)` and `[3h,4h)`. Assert served `1` and requested `4` (the requested scalar
+   is the served-hour contribution plus the requested-window overlay, so `1 + 3`). The fixture
+   must contain **two applications** and assert both, with at least one app whose served-hour sum
+   differs from the number of persisted gap rows intersecting its served interval — otherwise the
+   "counted persisted rows instead" and "returned app A's facts for app B" mutations pass. A
+   fixture where request equals served, or with a single app, is not acceptable evidence.
 4. **Router refusals**, each pinned independently so one predicate cannot satisfy several.
 5. **Wire contract**: encoded field set and exact-match decode of `FileCoverage` unchanged.
 6. **View outcomes**: all five, each reached by its own predicate in the stated order,
