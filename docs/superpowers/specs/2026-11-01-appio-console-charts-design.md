@@ -187,25 +187,41 @@ lanes draw nothing, and the ranking highlight is cleared per the rule above.
 **Files stays alive across a replacement.**
 
 ```python
-def begin_suspend(self) -> None   # _suspended = True; self._generation += 1; keep the model
-def end_suspend(self, *, requery: bool) -> None   # _suspended = False; requery → one request_refresh()
+class FilesView:
+    def begin_suspend(self) -> None: ...        # self._hold += 1; self._generation += 1
+    def end_suspend(self) -> None: ...          # self._hold = max(0, self._hold - 1)
+    def set_pending_scope(self, pending: bool) -> None: ...   # controls and footer only
+    def is_suspended(self) -> bool: ...         # self._hold > 0
 ```
 
-`_on_delivered()` and `_settle()` return immediately while `_suspended`. Bumping the
-generation retires any outstanding delivery through the check that already exists
-(`src/appio/ui/files_view.py:609-611`). The model is never cleared, so table and footer
-survive. `HistoryRouter.prepare()` and `invalidate()` retire file futures with
-`WindowUnavailableError("file_source_unavailable", "File history generation
-retired.")` (`src/appio/history_router.py:137-153`, called from `:415` and `:749`);
-without the suspend window that error reaches `_on_delivered()`
+Suspension is a **counter**, so overlapping reasons nest instead of cancelling: the
+host holds it for the whole of any section that can invalidate the router, and for the
+whole life of a pending preparation. While the count is above zero, `_on_delivered()`
+and `_settle()` return immediately and the model is never cleared. Each
+`begin_suspend()` also bumps the delivery generation, retiring an outstanding delivery
+through the check that already exists (`src/appio/ui/files_view.py:609-611`).
+
+Why the retired delivery has to be absorbed: `HistoryRouter.invalidate()` and
+`prepare()` retire file futures with `WindowUnavailableError("file_source_unavailable",
+"File history generation retired.")` (`src/appio/history_router.py:137-153`, called from
+`:415` and `:749`); unsuspended, that error reaches `_on_delivered()`
 (`src/appio/ui/files_view.py:609-617`) and empties the table (`:815`).
 
-**Suspension covers the whole risky section, not only `prepare()`.** Invalidation is
-also triggered by `reconcile()`, by a sampling `tick_local()`, by `add_source()`
-(`src/appio/history_router.py:429`) and by `record_transport_gap()` (`:447`). The host
-therefore calls `begin_suspend()` **before** the reconciliation and sampling calls of
-the tick, and `end_suspend(requery=True)` when a new render model is applied,
-`end_suspend(requery=False)` when the tick ends without one.
+**Suspension covers every invalidation entry point, including those outside
+`prepare()`:** `_pump()` → `on_gap()` → `record_transport_gap()`
+(`src/appio/ui/collector_window.py:1125-1128` → `src/appio/history_router.py:447`),
+`accept_export()` → `add_source()` (`src/appio/ui/collector_window.py:944` →
+`src/appio/collector_owner.py:252` → `src/appio/history_router.py:429`), `reconcile()`
+(`src/appio/collector_owner.py:196`) and a sampling `tick_local()` (`:208`). The host
+holds the suspension **for the whole tick**, from before `_pump()` until the tick's
+window step finishes, and additionally for the whole life of `_pending`; no tick work
+runs unsuspended while a table is on screen.
+
+**Re-querying is deliberate, never automatic.** `end_suspend()` never queries. When a
+model for a window other than the table's is applied, the host calls
+`files_view.set_window(window)` and one `files_view.request_refresh()`. When no model
+was applied, the table simply stays as it was, and its controls stay disabled by
+`set_pending_scope(True)`.
 
 ### 5.5 Target, displayed and pending
 
@@ -229,28 +245,35 @@ def _history_retired(self) -> bool:
 That single predicate covers `reconcile()`, a sampling `tick_local()`, `add_source()`
 and `record_transport_gap()` without the host needing to enumerate them.
 
-Every tick, after facts are applied:
+Every tick:
 
 ```
 1. _target = _current_window()
+   files_view.set_pending_scope(_pending is not None)
    if _target is None:
        _displayed = _pending = None
        show "waiting for the first sample" inside the Overview tab; return
 2. if _pending is not None:
-       if _history_retired():                 # an in-flight preparation was retired
-           _pending = None                    # fall through to step 3
+       if _history_retired():                 # the in-flight preparation was retired
+           _pending = None; files_view.end_suspend()     # fall through to step 3
        elif history.ready(_pending):
-           apply(); _displayed = _pending; _pending = None
-           files_view.end_suspend(requery=True); return
+           _apply_frame(); return
        else:
            return
 3. _invalidated = _history_retired() and _displayed is not None
    if _pending is None and (_invalidated or _displayed is None or _target != _displayed):
-       files_view.begin_suspend()
+       files_view.begin_suspend()             # held for the whole life of _pending
        history.prepare(_target); _pending = _target
+       files_view.set_pending_scope(True)
        if history.ready(_pending):
-           apply(); _displayed = _pending; _pending = None
-           files_view.end_suspend(requery=True)
+           _apply_frame()
+
+_apply_frame():
+    apply the render model for _pending
+    _displayed = _pending; _pending = None; _invalidated = False
+    files_view.end_suspend(); files_view.set_pending_scope(False)
+    if the Files table's window != _displayed:
+        files_view.set_window(_displayed); files_view.request_refresh()
 ```
 
 Properties this guarantees, each with a test in §7.4:
@@ -272,22 +295,28 @@ retire the generation the window is waiting for
 
 **Files while a replacement is pending.** The tabs stay visible in every state. While
 `_pending is not None`, the Files tab keeps the table it already has, the footer reads
-`updating to <scope>` and its query controls are disabled; `end_suspend()` restores
-them. Before the first frame, Files shows today's exact page-level texts:
-`waiting for the first sample`, or the degraded-source message built at
-`src/appio/ui/collector_window.py:578-583`.
+`updating to <scope>` and its query controls are disabled through
+`set_pending_scope(True)`; `_apply_frame()` re-enables them. Before the first frame,
+Files shows today's exact page-level texts: `waiting for the first sample`, or the
+degraded-source message built at `src/appio/ui/collector_window.py:578-583`.
 
 ### 5.6 Probes off the drawing thread, and what stays on it
 
-The tick becomes:
+Every tick, in this order:
 
-1. `self._pump()` — unchanged, first, every tick; it drives the daemon client's reads,
-   writes, deadlines and reconnects (`IodClient.pump()`, `src/appio/iodclient.py:793`).
-2. Poll the pending preparation (§5.5 step 2) — every tick, independent of the probe.
-   The old `_poll_history` early-return when the view is visible is deleted.
-3. If no probe is in flight, submit `setup.refresh()` to a single-slot
+1. `files_view.begin_suspend()` when a table is on screen — the tick's own `_pump()`
+   can invalidate the router through `on_gap()`.
+2. `self._pump()` — drives the client's reads, writes, deadlines and reconnects
+   (`IodClient.pump()`, `src/appio/iodclient.py:793`).
+3. §5.5 steps 1–3: compute `_target`, poll the pending preparation (retiring it when
+   the router reports a retired state), and prepare exactly one replacement when
+   needed. These run **every tick**, independently of the probe; the old
+   `_poll_history` early-return when the view is visible is deleted.
+4. If no probe is in flight, submit `setup.refresh()` to a single-slot
    `ThreadPoolExecutor`. If one is in flight, skip **only the submission**.
-4. Completion arrives on the Qt thread through a queued signal → `_apply_facts(facts)`.
+5. If step 3 left no preparation pending and applied no frame, close this tick's hold
+   with `files_view.end_suspend()`; otherwise `_apply_frame()` closes it.
+6. Completion arrives on the Qt thread through a queued signal → `_apply_facts(payload)`.
 
 **Guarantee.** No `subprocess`, no blocking socket connect/recv and no `time.sleep`
 runs on the Qt thread from a refresh tick.
@@ -302,24 +331,33 @@ runs on the Qt thread from a refresh tick.
 | `history.ready()` (`src/appio/history_router.py:841`) | consumes completed futures, remaps ranking rows, queues and dispatches detail requests | bounded by the application count |
 | non-blocking send in `IodClient._flush()` (`src/appio/iodclient.py:1313`) | `sock.send()` on a non-blocking socket | does not block |
 
-**Arbitration with setup operations: a setup generation, not just `_busy`.**
+**Arbitration with setup operations: a submission ticket, not just `_busy`.**
 
 | Field | Meaning |
 | --- | --- |
 | `_setup_generation: int` | incremented when a helper operation starts **and** when it completes |
-| `_probe_generation: int` | the value `_setup_generation` had when the in-flight probe was submitted |
+| `_probe_ticket: int` | incremented for every submission; only the newest ticket may be applied |
 
-`_apply_facts()` applies a result only when `_probe_generation == _setup_generation`
-**and** `_busy` is false. Anything else is dropped and counted in `_dropped_facts`.
+Each submission hands the executor a payload `(facts, ticket, generation)` captured at
+submission time, and `_apply_facts(payload)` applies it only when **all** of these hold:
 
-This closes the case a `_busy`-only guard cannot: a probe that starts before an
-enable, observes OFF, stays in flight through the whole helper operation, and delivers
-after `_on_reply()` has cleared `_busy`. Its generation is stale, so it is dropped.
-`_on_reply()` clears `_busy`, increments `_setup_generation`, and submits a fresh probe
-immediately; only results submitted after that point can be applied. Dropping matters
-because `decide_owner()` grants local collection for inactive/absent facts
-(`src/appio/collector_owner.py:58-64`) and `reconcile()` can acquire the lease and build
-the local collector (`:177-190`).
+- `payload.ticket == self._probe_ticket` — no newer submission exists;
+- `payload.generation == self._setup_generation` — no setup operation happened since;
+- `_busy` is false.
+
+Anything else is dropped and counted in `_dropped_facts`.
+
+The ticket is what closes the case a `_busy`-only guard misses: a probe that starts
+before an enable, observes OFF, stays in flight through the whole helper operation, and
+delivers after `_on_reply()` cleared `_busy`. `_on_reply()` increments
+`_setup_generation`, clears `_busy`, and immediately submits a fresh probe, which
+allocates a **new** ticket; the older probe's ticket is then behind `_probe_ticket`, so
+its result is rejected even though it arrives after the operation ended. A single
+generation field cannot do this, because the fresh submission would overwrite it.
+
+Dropping matters because `decide_owner()` grants local collection for inactive/absent
+facts (`src/appio/collector_owner.py:58-64`) and `reconcile()` can acquire the lease and
+build the local collector (`:177-190`).
 
 When a result **is** applied, the existing promotion of a verified, answering history
 connection over a silent one-shot probe runs first
@@ -407,14 +445,16 @@ point exists in the contracts.
 
 ```
 QTimer tick (1 s)
-  → _pump()
-  → §5.5 step 2: pending ready? apply : retired? retire
-  → probe in flight? skip submission
-  → executor.submit(setup.refresh)   [_probe_generation = _setup_generation]
-  → queued signal → _apply_facts
-  → _apply_facts: generation stale or _busy? drop and count; return
+  → files_view.begin_suspend()              [when a table is on screen]
+  → _pump()                                  [on_gap may invalidate: covered by the hold]
+  → §5.5 steps 1-3 (compute target → poll pending → retire → prepare)
+  → probe in flight? skip the submission only
+  → executor.submit(setup.refresh)           [payload = (facts, ticket, generation)]
+  → queued signal → _apply_facts(payload)
+  → _apply_facts: ticket or generation stale, or _busy? drop, count, return
                   promote verified connection → reconcile (unless keep-pending)
-                  → tick_local → banner/switch → §5.5 step 3
+                  → tick_local → banner/switch → §5.5 steps 1-3 again
+  → no preparation pending and no frame applied? files_view.end_suspend()
 ```
 
 ### 5.9 State fields
@@ -427,7 +467,7 @@ QTimer tick (1 s)
 | `_invalidated` | router reports a retired state | derived each tick from `view_state` |
 | `_facts` | last applied facts | `_apply_facts` |
 | `_dropped_facts` | counter of results dropped for staleness or busy | `_apply_facts` |
-| `_probe_inflight` / `_probe_generation` | single probe and its setup generation | submit / delivery |
+| `_probe_inflight` / `_probe_ticket` | single probe, and the ticket of the newest submission | submit / delivery |
 | `_setup_generation` | setup-operation generation | `_start`, `_on_reply` |
 
 ## 6. Error handling
@@ -472,6 +512,10 @@ All tests are offscreen (`pytest-qt`, PyQt6 pinned as existing tests do).
 - **downsampling**: over `2 × width` points, `columns()` has at most `width` entries,
   byte sums are preserved, `peak_read_bps`/`peak_write_bps` are the maxima of their
   buckets, and a column straddling a break has `starts_run == True`;
+- **downsampling across a gap**: with a hole narrower than one column inside a
+  downsampled range, `segments()` still reports at least two runs and no polygon point
+  lies inside the hole — a single aggregate column spanning the hole must not become a
+  bridge (guards T-5);
 - `DonutChart.shares()` matches the byte fractions and `ShareBars.fractions()` matches
   per-device totals against the largest device;
 - painting smoke: each widget `grab()`s to a non-empty pixmap, and an unavailable chart
@@ -511,10 +555,19 @@ All tests are offscreen (`pytest-qt`, PyQt6 pinned as existing tests do).
   and applies nothing, while the probe submitted at operation completion is applied
   (guards S-3);
 - an OFF probe completing during enable never reacquires the local writer;
-- Files during preparation: with an outstanding file future, an invalidation does not
-  clear the table, the footer reads `updating to ...`, controls are disabled, and
-  `end_suspend(requery=True)` issues exactly one query (guards S-2, suspension begins
-  before the invalidating call);
+- Files suspension covers the whole tick: with an outstanding file future, an
+  invalidation produced by **`_pump()` → `on_gap()` → `record_transport_gap()`**, and a
+  second one produced by `accept_export()` → `add_source()`, neither clears the table;
+  the footer reads `updating to ...` while a preparation is pending (guards T-1);
+- Files controls follow the pending predicate, not the suspension count:
+  `set_pending_scope(True)` disables sort, search and selector, and
+  `set_pending_scope(False)` re-enables them after the frame is applied; enabling them
+  while the router is unready issues no query and clears nothing (guards T-2);
+- a probe that spans a setup operation and delivers **after** the replacement probe was
+  submitted is rejected by ticket, does not overwrite the newer result, and increments
+  `_dropped_facts` (guards T-3);
+- two overlapping suspensions (tick hold plus pending hold) leave the view suspended
+  until both are released, and `end_suspend()` on the last release issues no query;
 - mixed window: ranked A plus file-only B — the selector lists both and B is queried;
 - close during a probe applies nothing and raises nothing;
 - `open_files_unavailable()` selects the Files tab; the banner has no `files_nav`.
@@ -590,7 +643,9 @@ audit.
 | A preparation loop re-preparing the displayed window | step 3 requires a changed target or a retired state; tested |
 | Reconciliation retiring the generation under a read | keep-pending rule in §5.5 and a test |
 | A probe that spans a setup operation applying stale facts | setup generation stamped at submission; tested |
-| Files table cleared by a retired file future | suspension begins before the invalidating call; tested with an outstanding future |
+| Files table cleared by a retired file future | suspension is a level-triggered hold covering `_pump()`, export replies, reconcile, sampling and prepare (§5.4, tested) |
+| Controls re-enabled while a replacement is pending | controls follow `set_pending_scope(_pending is not None)`, independent of the suspension count (§5.4-5.5, tested) |
+| A stale probe overwriting the fresh one | per-submission ticket plus setup generation, not a single mutable field (§5.6, tested) |
 | `QTabWidget` changes focus order and existing tests | every affected assertion is named in §7.5 |
 | Late probe callbacks after close | executor shutdown, `_closed`, close-during-probe test |
 | Repaint cost at 1 Hz | one `paintEvent` per widget per tick, downsampled, no per-point allocation |
