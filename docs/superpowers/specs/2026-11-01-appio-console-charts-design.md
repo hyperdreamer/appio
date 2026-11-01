@@ -1,7 +1,7 @@
 # appio console: calm redraw, tabs, drawn charts
 
 Date: 2026-11-01
-Status: revised after eleven independent design reviews (D-1…D-13, R-1…R-9, S-1…S-8, T-1…T-13, U-1…U-9, V-1…V-5, W-1…W-3, X-1, Y-1…Y-3, Z-1…Z-2, AA-1…AA-4)
+Status: revised after twelve independent design reviews (D-1…D-13, R-1…R-9, S-1…S-8, T-1…T-13, U-1…U-9, V-1…V-5, W-1…W-3, X-1, Y-1…Y-3, Z-1…Z-2, AA-1…AA-4, AB-1…AB-2)
 Supersedes nothing. Extends `2026-10-21-app-io-monitor-design.md` §8 for the P3 shell.
 
 Behavioural authority is this document. Layout authority is the three mockups in
@@ -199,14 +199,20 @@ class FilesView:
 
 Three rules replace any hold or counter:
 
-1. **Transient classification.** `set_transient_scope(True)` is set immediately before a
-   call that can invalidate the router and cleared immediately after it in a
-   `try/finally`. While it is true, a delivery that fails with `WindowUnavailableError`
-   does **not** call `_set_unavailable()`: the row model and footer stay as they are, the
-   footer gains `updating to <scope>`, and `_refresh_wanted` is set. Outside that window
-   the existing behaviour stands unchanged (`_set_unavailable()` clears the table,
-   `src/appio/ui/files_view.py:815-817`). Being an idempotent boolean set and cleared
-   inside one call, it cannot leak or become unbalanced.
+1. **Transient classification.** A failed delivery is classified as transient when **either**
+   of two conditions holds:
+   - `set_transient_scope(True)` is active — the invalidating call settles the future on the
+     calling thread, so the delivery runs inside that call;
+   - `set_scope_ready(False)` is active — a replacement is pending, so **any** retirement is
+     expected, including one produced on a worker thread whose queued delivery arrives
+     after the invalidating call has returned.
+
+   In both cases the row model and footer stay as they are, the footer gains
+   `updating to <scope>`, and `_refresh_wanted` is set. Outside both conditions the existing
+   behaviour stands unchanged (`_set_unavailable()` clears the table,
+   `src/appio/ui/files_view.py:815-817`). The transient flag is an idempotent boolean set
+   and cleared inside one call, so it cannot leak; the pending condition is level-triggered
+   by `_pending`, so it cannot be missed by a late delivery.
 2. **Query admission.** `set_scope_ready(False)` while a preparation is pending. While it
    is false, every programmatic entry point — `set_window()` when adopting,
    `set_app_id()`, `set_sort()` and `request_refresh()` — records `_refresh_wanted` and
@@ -225,9 +231,13 @@ Three rules replace any hold or counter:
 Why a discarded result must be classified rather than ignored: `HistoryRouter.invalidate()`
 and `prepare()` retire file futures with
 `WindowUnavailableError("file_source_unavailable", "File history generation retired.")`
-(`src/appio/history_router.py:137-153`, called from `:415` and `:749`), and they settle
-those futures on the calling thread, so the delivery reaches `_on_delivered()`
-(`src/appio/ui/files_view.py:609-617`) **inside** the invalidating call itself.
+(`src/appio/history_router.py:137-153`, called from `:415` and `:749`). Two schedules exist,
+and only the second one needs the pending condition:
+
+| Schedule | When the future settles | Covered by |
+| --- | --- | --- |
+| the invalidating call cancels an outstanding request | on the calling thread, inside the call | `transient_scope()` |
+| a worker completes between the generation bump at `:414` and the cancel at `:415`, hits the generation mismatch at `:145-146` and settles at `:153` | on that worker; the queued delivery lands after the call returns | `set_scope_ready(False)` while the replacement is pending |
 
 **Every invalidating call site is wrapped:** `_pump()` → `on_gap()` →
 `record_transport_gap()` (`src/appio/ui/collector_window.py:1125-1128` →
@@ -535,6 +545,7 @@ QTimer tick (1 s)
 | `_invalidated` | router reports a retired state | derived each tick from `view_state` |
 | `_facts` | last applied facts | `_apply_facts` |
 | `_dropped_facts` | counter of results dropped for staleness or busy | `_apply_facts` |
+| `_facts_applied` | counter of probe results actually applied; a test waits on it to know that a fact decision has landed | `_apply_facts` |
 | `_probe_inflight` / `_probe_ticket` | single probe, and the ticket of the newest submission | submit / delivery |
 | `_setup_generation` | setup-operation generation | `_start`, `_on_reply` |
 
@@ -628,6 +639,11 @@ All tests are offscreen (`pytest-qt`, PyQt6 pinned as existing tests do).
   by **`_pump()` → `on_gap()` → `record_transport_gap()`**, and one produced by
   `accept_export()` → `add_source()`, each leave the table intact with the footer reading
   `updating to ...`, because the call was wrapped in `transient_scope()` (guards U-1, U-2);
+- **worker-wins cancellation**: a file future settled by its worker between the router's
+  generation bump and its cancel retires a delivery that arrives **after** the invalidating
+  call has returned. With a replacement pending, the table is still preserved and the footer
+  reads `updating to ...`, because `set_scope_ready(False)` also classifies the failure as
+  transient; the deferred flush then issues one fresh query (guards AB-2);
 - query admission while a scope is pending: `set_app_id()`, `set_sort()`, `set_window()`
   and a ranking-list subject change set `_refresh_wanted` and issue **no** query;
   `flush_refresh()` after the frame is applied issues exactly one (guards U-3, U-4);
@@ -664,8 +680,8 @@ so every acceptance path that expects an applied frame must be migrated:
 | --- | --- |
 | `P3Harness.until` `:383-388` | gain `process_events: bool = True`; when true, call `QApplication.processEvents()` each iteration. It drives nothing itself, so each caller chooses what to drive |
 | `P3Harness.query` `:552-556` | **unchanged, undriven, and event-free**: it calls `until(..., process_events=False)`. Preparing a scope and then delivering a queued probe result would let reconciliation retire that scope before the wait finished |
-| `P3Harness.settle` `:457-461` | drive the window like the timer: process events and call `window.refresh()` once, then — if `window._target is None` — return immediately, because a settled no-target state is a real outcome (a crashed GUI with no local boot row, `tests/p3/test_p3_acceptance.py:85-89`). Otherwise loop until `window._displayed == window._target`. The captured `scope = history._window` and its `scope is None` early skip are both deleted |
-| `P3Harness.advance` `:491-503` | the same loop after `window.refresh()`, with the same no-target termination rule |
+| `P3Harness.settle` `:457-461` | drive the window like the timer: record `window.facts_applied`, then loop (process events + `window.refresh()`) until **at least one new probe result has been applied** (`window.facts_applied` increased). Only then decide: if `window._target is None`, return — that no-target outcome is now established by applied facts, which is what the crashed-GUI case needs (`tests/p3/test_p3_acceptance.py:85-89`); otherwise loop until `window._displayed == window._target`. The captured `scope = history._window` and its `scope is None` early skip are both deleted |
+| `P3Harness.advance` `:491-503` | the same two steps after `window.refresh()`, with the same "a probe result was applied first" rule before any no-target return |
 | `P3Harness.render` `:558-567` | delete the direct `_show_ready(since)` / `view.set_window(window)` calls and the intervening `self.query(window)`. Use `gui.window.show_window(since)`, then loop `apply_ready_frame()` **with `process_events=False`** until `_displayed == since`; then `gui.window.show_window(window)` and the same loop until `_displayed == window`. No `_tick_target()` and no fact delivery occur in that loop, so the requested scope cannot be displaced |
 
 The test bodies keep their assertions and become correct once the harness drives the apply
