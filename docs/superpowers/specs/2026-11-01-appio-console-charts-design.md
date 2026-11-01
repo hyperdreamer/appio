@@ -1,7 +1,7 @@
 # appio console: calm redraw, tabs, drawn charts
 
 Date: 2026-11-01
-Status: revised after six independent design reviews (D-1…D-13, R-1…R-9, S-1…S-8, T-1…T-13, U-1…U-9, V-1…V-5)
+Status: revised after seven independent design reviews (D-1…D-13, R-1…R-9, S-1…S-8, T-1…T-13, U-1…U-9, V-1…V-5, W-1…W-3)
 Supersedes nothing. Extends `2026-10-21-app-io-monitor-design.md` §8 for the P3 shell.
 
 Behavioural authority is this document. Layout authority is the three mockups in
@@ -240,6 +240,11 @@ those futures on the calling thread, so the delivery reaches `_on_delivered()`
 is listed separately because it reaches `reconcile()` outside the fact-application flow,
 and `reconcile()` always invalidates (`src/appio/collector_owner.py:196`).
 
+**Teardown is outside the guarantee.** `shutdown()` → `history.close()` → `invalidate()`
+(`src/appio/ui/collector_window.py:648-660` → `src/appio/history_router.py:454-455`) is
+not an operational invalidation: the window is being destroyed, so no table has to survive
+it. The wrapping rule covers every invalidating call made while the window is live.
+
 ### 5.5 Target, displayed and pending
 
 | Field | Meaning |
@@ -266,10 +271,12 @@ Every tick:
 
 ```
 1. _target = _current_window()
-   files_view.set_scope_ready(_pending is None)
    if _target is None:
-       _displayed = None; _pending = None
+       _displayed = None; _pending = None; _invalidated = False
+       files_view.set_scope_ready(True)      # nothing is pending: admission restored
+       _sync_files()                         # Files falls back to its page-level message
        show "waiting for the first sample" inside the Overview tab; return
+   files_view.set_scope_ready(_pending is None)
 2. if _pending is not None:
        if _history_retired():                 # the in-flight preparation was retired
            _pending = None                    # fall through to step 3
@@ -610,7 +617,7 @@ Structural (tabs replace the stacked pages):
 | `test_a_degraded_file_source_is_reported_while_history_is_still_loading` `:532-537` | stack identity; keep the degraded message and hidden table |
 | `test_files_page_keeps_an_explicit_unavailable_message_and_settings_link` `:553-564` | stack identity; keep the unavailable text, no-query, diagnostic and settings link |
 | `test_the_files_surface_never_appears_inside_the_overview_window` `:572-578` | "Files is not a descendant of the overview window" — Files now lives in the window; replace with "Files is not inside the Overview **tab**" |
-| `tests/acceptance/test_no_later_scope.py::test_window_has_no_later_plan_widgets_actions_or_flows` `:18` | asserts `findChildren(QTabWidget) == []` on the real window built by `tests/acceptance/test_p1_p2.py:201`; replace with "exactly two tabs, no tray and no later-plan widget" |
+| `tests/acceptance/test_no_later_scope.py::test_window_has_no_later_plan_widgets_actions_or_flows` `:18-24` | three separate guards must change: `findChildren(QTabWidget) == []` becomes "exactly two tabs"; `"files"` must leave the forbidden objectName tuple, because the planned surface uses `files_view` and `files_app_selector` (`src/appio/ui/files_view.py:344,359`) and the tab label reads `Files`; keep the tray, menu, daemon, socket, bpf, polkit, privilege and setup prohibitions and add a positive assertion that the Files surface exists exactly once |
 
 **Supported unchanged, no migration needed.** `_prepared` survives as a read-only
 property alias for `_displayed`, and `_show_ready(window)` remains the name of the apply
