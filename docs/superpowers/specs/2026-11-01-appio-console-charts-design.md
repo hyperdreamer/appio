@@ -267,9 +267,10 @@ def _history_retired(self) -> bool:
 That single predicate covers `reconcile()`, a sampling `tick_local()`, `add_source()`
 and `record_transport_gap()` without the host needing to enumerate them.
 
-Every tick:
+Two production calls, split so that a caller can drive one without disturbing the other:
 
 ```
+_tick_target():            # timer only: decide what should be displayed and prepare it
 1. _target = _current_window()
    if _target is None:
        _displayed = None; _pending = None; _invalidated = False
@@ -277,21 +278,23 @@ Every tick:
        _sync_files()                         # Files falls back to its page-level message
        show "waiting for the first sample" inside the Overview tab; return
    files_view.set_scope_ready(_pending is None)
-2. if _pending is not None:
-       if _history_retired():                 # the in-flight preparation was retired
-           _pending = None                    # fall through to step 3
-       elif history.ready(_pending):
-           _apply_frame(); return
-       else:
-           return
-3. _invalidated = _history_retired() and _displayed is not None
-   if _pending is None and (_invalidated or _displayed is None or _target != _displayed):
-       with files_view.transient_scope():      # §5.4 rule 1
+2. _invalidated = _history_retired() and _displayed is not None
+3. if _pending is None and (_invalidated or _displayed is None or _target != _displayed):
+       with files_view.transient_scope():    # §5.4 rule 1
            history.prepare(_target)
        _pending = _target
        files_view.set_scope_ready(False)
-       if history.ready(_pending):
-           _apply_frame()
+
+apply_ready_frame() -> bool:   # poll only: never computes a target, safe for any caller
+   if _pending is None: return False
+   if _history_retired(): _pending = None; return False   # retired preparation
+   if history.ready(_pending): _apply_frame(); return True
+   return False
+
+show_window(window):           # explicit scope for a caller that is not the clock-tick
+   files_view.set_scope_ready(False)
+   with files_view.transient_scope(): history.prepare(window)
+   _pending = window
 
 _apply_frame():
     window = _pending
@@ -301,6 +304,13 @@ _apply_frame():
     _show_ready(window)                     # renders, then _sync_files adopts + queries once
     files_view.flush_refresh()              # no-op when adoption just cleared the flag
 ```
+
+**Why the split matters.** `_tick_target()` is the only place that decides *which* window
+should be displayed; `apply_ready_frame()` only finishes the preparation already in flight.
+A caller that wants a specific scope (the acceptance harness rendering an explicit range)
+prepares it with `show_window()` and drives `apply_ready_frame()`, so the clock target can
+never replace the scope under test; the 1 s timer calls `_tick_target()` and then
+`apply_ready_frame()`, so production still follows the clock.
 
 Setting `_displayed` **before** `_show_ready()` is required, not cosmetic: `_show_ready()`
 calls `_sync_files(request=False)` (`src/appio/ui/collector_window.py:753`), which reads
@@ -322,19 +332,19 @@ Properties this guarantees, each with a test in §7.4:
 - With local collection active, each sampled frame invalidates, so one replacement
   preparation follows each sample; the frame stays on screen throughout.
 
-**One apply path, driven by the timer or by a caller.** Two public methods expose it:
+**One apply path, split across three callers.**
 
 ```python
-def show_window(self, window: Window) -> None   # prepare a specific scope, mark it pending
-def apply_ready_frame(self) -> bool             # §5.5 steps 1-3 once; True when a frame was applied
+def _tick_target(self) -> None            # timer only: decide which window should be shown
+def apply_ready_frame(self) -> bool       # poll only: finish the pending preparation
+def show_window(self, window: Window)     # prepare an explicit scope (acceptance harness)
 ```
 
-The 1 s timer is one caller; the P3 acceptance harness is the other. `show_window()`
-performs exactly the prepare step of §5.5 step 3 for the given window and leaves `_pending`
-set; `apply_ready_frame()` runs steps 1-3 once, so a caller that loops it (processing Qt
-events between iterations) reaches the same `_apply_frame()` the timer would. No other path
-may assign `_displayed` or call `_show_ready()` directly — that is what keeps the Files
-ordering in §5.5 correct for every caller.
+The 1 s timer calls `_tick_target()` then `apply_ready_frame()`. The P3 acceptance harness
+uses `show_window()` plus a loop of `apply_ready_frame()`, which never re-evaluates the
+clock, so the scope under test cannot be displaced. No other path may assign `_displayed`
+or call `_show_ready()` directly — that is what keeps the Files ordering in §5.5 correct
+for every caller.
 
 **Reconcile policy.** `reconcile()` is skipped when `facts == _facts` **and** `_pending
 is not None`, because reconciliation would retire the generation the window is waiting
@@ -357,10 +367,11 @@ Every tick, in this order:
    router through `on_gap()`, and those futures settle inside the call. It drives the
    client's reads, writes, deadlines and reconnects (`IodClient.pump()`,
    `src/appio/iodclient.py:793`).
-2. §5.5 steps 1–3: compute `_target`, poll the pending preparation (retiring it when
-   the router reports a retired state), and prepare exactly one replacement when
-   needed. These run **every tick**, independently of the probe; the old
-   `_poll_history` early-return when the view is visible is deleted.
+2. `_tick_target()` then `apply_ready_frame()` — the first decides which window should be
+displayed (computing `_target`, retiring a retired preparation and arming exactly one
+replacement); the second finishes a preparation that is already ready. Both run **every
+tick**, independently of the probe; the old `_poll_history` early-return when the view is
+visible is deleted.
 3. If no probe is in flight, submit `setup.refresh()` to a single-slot
    `ThreadPoolExecutor`. If one is in flight, skip **only the submission**.
 4. Completion arrives on the Qt thread through a queued signal → `_apply_facts(payload)`,
@@ -642,10 +653,11 @@ so every acceptance path that expects an applied frame must be migrated:
 
 | Harness path | Required change |
 | --- | --- |
-| `P3Harness.until` `:383-388` | process Qt events (`QApplication.processEvents()`) each iteration and call `gui.window.apply_ready_frame()` once, so a queued `_apply_facts` is delivered and a preparation that becomes ready is applied |
-| `P3Harness.settle` `:457-461` | remove the `scope is None` early skip — the first iteration must still drive the window — and wait until `window._displayed == scope` in addition to `history.ready(scope)` |
-| `P3Harness.advance` `:491-503` | same driving loop after `window.refresh()`, waiting for `_displayed` to catch up with the new scope |
-| `P3Harness.render` `:558-567` | it currently calls `window._show_ready(since)` and then `gui.window.view.set_window(window)` directly, bypassing `_apply_frame()`; replace both with `gui.window.show_window(since)` driven by `settle()`, then `gui.window.show_window(window)` driven by `settle()`, so the final scope goes through the shared path and Files is synced for it |
+| `P3Harness.until` `:383-388` | process Qt events (`QApplication.processEvents()`) each iteration and accept an optional `drive` callable, so each caller chooses what to drive; it must not drive unconditionally |
+| `P3Harness.query` `:552-556` | **unchanged and undriven.** It prepares a specific scope and waits only on `history.ready(window)`; driving frames here would let `_tick_target()` replace the scope under test |
+| `P3Harness.settle` `:457-461` | drive the window like the timer: loop `processEvents()` + `window.refresh()` until `window._target is not None and window._displayed == window._target`. The captured `scope = history._window` and its `scope is None` early skip are both deleted, because the scope is now taken from the window's own target after the first probe is applied |
+| `P3Harness.advance` `:491-503` | the same loop after `window.refresh()`, so the advanced clock's target becomes displayed |
+| `P3Harness.render` `:558-567` | delete the direct `_show_ready(since)` / `view.set_window(window)` calls and the intervening `self.query(window)`. Use `gui.window.show_window(since)` then loop `apply_ready_frame()` until `_displayed == since`; then `gui.window.show_window(window)` and the same loop until `_displayed == window`. Because `show_window()` sets no clock target and the loop never calls `_tick_target()`, the requested scope cannot be displaced |
 
 The test bodies keep their assertions and become correct once the harness drives the apply
 path: `tests/p3/test_p3_acceptance.py:43-44` (with `_prepared` non-null and naming the
