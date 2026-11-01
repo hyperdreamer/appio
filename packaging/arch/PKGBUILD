@@ -1,0 +1,61 @@
+# Maintainer: appio project
+# Local/dev package: the source tarball is exported from this checkout by
+# packaging/arch/build-package.sh, which also verifies the digest below.
+pkgname=appio
+pkgver=0.1.1
+pkgrel=1
+pkgdesc='Application I/O monitor: system-wide collector, IPC protocol and Qt viewer'
+arch=('x86_64')
+license=('unknown')  # the checkout declares no license file
+depends=('python>=3.14' 'python-pyqt6' 'libbpf' 'polkit' 'systemd')
+makedepends=('clang' 'pkgconf' 'python-build' 'python-installer' 'python-setuptools')
+# fileio.bpf.o keeps its BTF section: stripping it would break every CO-RE
+# relocation the loader depends on. `!debug` skips the debug-source copy, which
+# would otherwise drop C sources for the BPF object under /usr/src/debug.
+options=('!strip' '!debug')
+source=("appio-$pkgver.tar.gz")
+sha256sums=('9cc1945beb1c87939ed2f8a67f412e6ebb481de27d430f3029cebb2ec09d7956')
+
+build() {
+  cd "$srcdir/$pkgname-$pkgver"
+
+  python -m build --wheel --no-isolation --outdir "$srcdir/dist"
+
+  # BPF object plus its userspace loader; the loader is the only component that
+  # touches the kernel, and appio.file_runtime only ever execs the installed path.
+  # -g is needed for BTF, so map the build path out of the embedded debug info.
+  make -C appio_iod/bpf OUT_DIR="$srcdir/bpf-build" \
+    CLANG="clang -fdebug-prefix-map=$srcdir/=" \
+    CC="cc -ffile-prefix-map=$srcdir/=" \
+    check
+}
+
+package() {
+  cd "$srcdir/$pkgname-$pkgver"
+
+  # Install into the system interpreter's purelib. /usr/bin/appio-setup verifies
+  # that the interpreter and every appio module file, plus each ancestor
+  # directory, is root-owned and not group/other writable before importing
+  # privileged code, so these files must be root-owned 0644/0755.
+  python -m installer --destdir="$pkgdir" --no-compile-bytecode "$srcdir"/dist/appio-*.whl
+
+  # Fixed -I launchers replace the setuptools console scripts: neither the root
+  # daemon nor the polkit shim may inherit PYTHONPATH or user site-packages.
+  install -Dm755 data/bin/appio "$pkgdir/usr/bin/appio"
+  install -Dm755 data/bin/appio-iod "$pkgdir/usr/bin/appio-iod"
+  install -Dm755 data/libexec/appio-setup "$pkgdir/usr/bin/appio-setup"
+
+  # A packaged unit lives in /usr/lib/systemd/system; an /etc/systemd/system
+  # copy from an earlier manual staging would shadow it.
+  install -Dm644 data/systemd/appio-iod.service \
+    "$pkgdir/usr/lib/systemd/system/appio-iod.service"
+  install -Dm644 data/polkit/io.github.appio.setup.policy \
+    "$pkgdir/usr/share/polkit-1/actions/io.github.appio.setup.policy"
+  install -Dm644 data/sysusers/appio.conf "$pkgdir/usr/lib/sysusers.d/appio.conf"
+
+  install -Dm644 "$srcdir/bpf-build/fileio.bpf.o" "$pkgdir/usr/lib/appio/fileio.bpf.o"
+  install -Dm755 "$srcdir/bpf-build/fileio_loader" "$pkgdir/usr/lib/appio/fileio_loader"
+
+  install -Dm644 docs/acceptance/appio-p3-root.md \
+    "$pkgdir/usr/share/doc/$pkgname/appio-p3-root.md"
+}

@@ -1,0 +1,3 @@
+#!/usr/bin/python -I
+from appio.iod import main
+raise SystemExit(main())
