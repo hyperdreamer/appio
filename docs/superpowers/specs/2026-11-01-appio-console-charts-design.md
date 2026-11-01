@@ -1,7 +1,7 @@
 # appio console: calm redraw, tabs, drawn charts
 
 Date: 2026-11-01
-Status: revised after eight independent design reviews (D-1…D-13, R-1…R-9, S-1…S-8, T-1…T-13, U-1…U-9, V-1…V-5, W-1…W-3, X-1)
+Status: revised after nine independent design reviews (D-1…D-13, R-1…R-9, S-1…S-8, T-1…T-13, U-1…U-9, V-1…V-5, W-1…W-3, X-1, Y-1…Y-3)
 Supersedes nothing. Extends `2026-10-21-app-io-monitor-design.md` §8 for the P3 shell.
 
 Behavioural authority is this document. Layout authority is the three mockups in
@@ -322,6 +322,20 @@ Properties this guarantees, each with a test in §7.4:
 - With local collection active, each sampled frame invalidates, so one replacement
   preparation follows each sample; the frame stays on screen throughout.
 
+**One apply path, driven by the timer or by a caller.** Two public methods expose it:
+
+```python
+def show_window(self, window: Window) -> None   # prepare a specific scope, mark it pending
+def apply_ready_frame(self) -> bool             # §5.5 steps 1-3 once; True when a frame was applied
+```
+
+The 1 s timer is one caller; the P3 acceptance harness is the other. `show_window()`
+performs exactly the prepare step of §5.5 step 3 for the given window and leaves `_pending`
+set; `apply_ready_frame()` runs steps 1-3 once, so a caller that loops it (processing Qt
+events between iterations) reaches the same `_apply_frame()` the timer would. No other path
+may assign `_displayed` or call `_show_ready()` directly — that is what keeps the Files
+ordering in §5.5 correct for every caller.
+
 **Reconcile policy.** `reconcile()` is skipped when `facts == _facts` **and** `_pending
 is not None`, because reconciliation would retire the generation the window is waiting
 for. This deliberately generalizes today's `keep_pending` guard
@@ -619,20 +633,24 @@ Structural (tabs replace the stacked pages):
 | `test_the_files_surface_never_appears_inside_the_overview_window` `:572-578` | "Files is not a descendant of the overview window" — Files now lives in the window; replace with "Files is not inside the Overview **tab**" |
 | `tests/acceptance/test_no_later_scope.py::test_window_has_no_later_plan_widgets_actions_or_flows` `:18-24` | three separate guards must change: `findChildren(QTabWidget) == []` becomes "exactly two tabs"; `"files"` must leave the forbidden objectName tuple, because the planned surface uses `files_view` and `files_app_selector` (`src/appio/ui/files_view.py:344,359`) and the tab label reads `Files`; keep the tray, menu, daemon, socket, bpf, polkit, privilege and setup prohibitions and add a positive assertion that the Files surface exists exactly once |
 
-**Names preserved, harness timing changes.** `_prepared` survives as a read-only property
-alias for `_displayed`, and `_show_ready(window)` stays the name of the apply step, so the
-calls themselves survive. Timing does not: probe results now arrive through a queued
-signal, and `_displayed` advances only when a ready preparation is applied. The P3 harness
-therefore needs one behavioural change, listed as a migration:
+**Method names survive; every caller must drive the apply path.** `_prepared` stays a
+read-only property alias for `_displayed`, and `_show_ready(window)` stays the apply step's
+name, but probe results now arrive through a queued signal and `_displayed` advances only
+when a ready preparation is applied by `apply_ready_frame()`. The harness stops both timers
+(`:446`, `:454`) and its `until()` loop neither processes Qt events nor drives the window,
+so every acceptance path that expects an applied frame must be migrated:
 
 | Harness path | Required change |
 | --- | --- |
-| `tests/p3/acceptance_harness.py::P3Harness.settle` `:457-461` and `::advance` `:491-503` | `until()` must process Qt events (`QApplication.processEvents()`) in its loop, and `settle()` must wait for the applied frame — `window._displayed is not None` and equal to the prepared scope — as well as for `history.ready(scope)`. Without that the queued `_apply_facts` is never delivered, because the harness stops `_timer` at `:446` and `_poll_timer` at `:454` and nothing else drives the apply |
+| `P3Harness.until` `:383-388` | process Qt events (`QApplication.processEvents()`) each iteration and call `gui.window.apply_ready_frame()` once, so a queued `_apply_facts` is delivered and a preparation that becomes ready is applied |
+| `P3Harness.settle` `:457-461` | remove the `scope is None` early skip — the first iteration must still drive the window — and wait until `window._displayed == scope` in addition to `history.ready(scope)` |
+| `P3Harness.advance` `:491-503` | same driving loop after `window.refresh()`, waiting for `_displayed` to catch up with the new scope |
+| `P3Harness.render` `:558-567` | it currently calls `window._show_ready(since)` and then `gui.window.view.set_window(window)` directly, bypassing `_apply_frame()`; replace both with `gui.window.show_window(since)` driven by `settle()`, then `gui.window.show_window(window)` driven by `settle()`, so the final scope goes through the shared path and Files is synced for it |
 
-The test bodies keep their assertions and become correct once the harness pumps events:
-`tests/p3/test_p3_acceptance.py:43-44` (with `_prepared` non-null and naming the boot),
-`:110-114,127` and `:163,169,175` (banner and owner state),
-`tests/p3/test_history_overlap_entry.py:110,125`, and
+The test bodies keep their assertions and become correct once the harness drives the apply
+path: `tests/p3/test_p3_acceptance.py:43-44` (with `_prepared` non-null and naming the
+boot), `:110-114,127`, `:163,169,175`, and the `render()` users at `:66`, `:120`, `:141`,
+`:210`; `tests/p3/test_history_overlap_entry.py:110,125`; and
 `tests/p3/test_collector_window.py:1379`. The alias reports **display** state only, so a
 test that needs the requested scope reads `_pending` or `_target` instead.
 
@@ -706,8 +724,10 @@ audit.
 
 - `assets/2026-10-21-detail-view.png` shows range chips and an hour-of-day intensity
   strip; both are non-goals in §3.
-- That mockup also shows a search field in the ranking list; this change keeps the list
-  without one.
+- The written 2026-10-21 design specifies a search field in the ranking list
+  (`docs/superpowers/specs/2026-10-21-app-io-monitor-design.md:483`); this change keeps the
+  list without one. The layout mockup shows no search field, so the exclusion follows the
+  text, not the image.
 - `assets/2026-11-01-chart-sets.png`, option A, captions the omission as "Hour-of-day
   strip is left out because no data source exists for it." That caption is superseded:
   §1.3 establishes that wall-mapped series data exists, and the strip is excluded as a
