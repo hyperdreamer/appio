@@ -17,7 +17,7 @@ Three faults were reported against the shipped P3 shell.
 | Cause | Where | Effect |
 | --- | --- | --- |
 | The ranking list is emptied and rebuilt on every refresh | `AppIoWindow.refresh()` calls `QListWidget.clear()` then re-adds every row | Rows blink; the selected row and the scroll position are lost, then restored one tick later |
-| The measurement window advances every 10 s and is treated as a new scope | `CollectorWindow._current_window()` computes `end = (now // RAW_BUCKET_NS + 1) * RAW_BUCKET_NS`; `Raw_BUCKET_NS` is 10 s (`contracts.py`), so the `Window` identity changes every 10 s, `_render_history()` calls `history.prepare()`, and while `history.ready(window)` is false the code calls `_hide_view()` | The whole detail area disappears, `loading history (...)` is shown, then the view returns |
+| The measurement window advances every 10 s and is treated as a new scope | `CollectorWindow._current_window()` computes `end = (now // RAW_BUCKET_NS + 1) * RAW_BUCKET_NS`; `RAW_BUCKET_NS` is 10 s (`contracts.py`), so the `Window` identity changes every 10 s, `_render_history()` calls `history.prepare()`, and while `history.ready(window)` is false the code calls `_hide_view()` | The whole detail area disappears, `loading history (...)` is shown, then the view returns |
 | The refresh tick blocks the drawing thread | `CollectorWindow.refresh()` calls `setup.refresh()` → `production_probe()`, which runs `systemctl show` through `subprocess.run(timeout=5)` and opens a daemon socket with a 2 s deadline, synchronously inside the `QTimer` slot | The interface freezes for the duration of both calls, then catches up in a jump |
 
 **1.2 Files has no return path.** `files_nav` swaps `QStackedWidget` pages; the Files
