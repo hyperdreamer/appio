@@ -1,7 +1,7 @@
 # appio console: calm redraw, tabs, drawn charts
 
 Date: 2026-11-01
-Status: revised twice after independent design review (round 1: D-1…D-13; round 2: R-1…R-9)
+Status: revised after three independent design reviews (D-1…D-13, R-1…R-9, S-1…S-8)
 Supersedes nothing. Extends `2026-10-21-app-io-monitor-design.md` §8 for the P3 shell.
 
 Behavioural authority is this document. Layout authority is the three mockups in
@@ -17,16 +17,17 @@ Three faults were reported against the shipped P3 shell.
 | Cause | Evidence | Effect |
 | --- | --- | --- |
 | The ranking list is emptied and rebuilt on every refresh | `AppIoWindow.refresh()` calls `self._list.clear()` then re-adds every row (`src/appio/ui/main_window.py:203-219`) | Rows blink and the scroll position resets. The selected row is *not* lost: the same call recomputes its index and calls `setCurrentRow(target)` (`:219`). The flicker comes from item destruction and re-creation |
-| The measurement window advances every 10 s and is treated as a new scope | `CollectorWindow._current_window()` computes `end = (now // RAW_BUCKET_NS + 1) * RAW_BUCKET_NS`; `RAW_BUCKET_NS` is 10 s (`src/appio/contracts.py:97`). `_render_history()` calls `history.prepare(window)`, and while `history.ready(window)` is false it calls `_hide_view()` and shows `loading history (...)` (`src/appio/ui/collector_window.py:683-712`) | The whole detail area disappears and returns every 10 s |
+| The measurement window advances every 10 s and is treated as a new scope | `CollectorWindow._current_window()` computes `end = (now // RAW_BUCKET_NS + 1) * RAW_BUCKET_NS`; `RAW_BUCKET_NS` is 10 s (`src/appio/contracts.py:97`). `_render_history()` calls `history.prepare(window)` at `src/appio/ui/collector_window.py:720`, checks readiness at `:721`, and otherwise calls `_hide_view()` at `:724` and shows `loading history (...)` at `:725` | The whole detail area disappears and returns every 10 s |
 | The refresh tick blocks the drawing thread | `CollectorWindow.refresh()` calls `setup.refresh()` (`:618`) → `production_probe()` → `subprocess.run(timeout=5)` for `systemctl show` (`:1000`) and a daemon socket round-trip with a 2 s deadline (`:1006`), synchronously inside the `QTimer` slot | The interface freezes for the duration of both calls |
-| Every invalidation re-prepares the same scope | `CollectorCoordinator.reconcile()` always calls `history.invalidate()` (`src/appio/collector_owner.py:196`) and `tick_local()` invalidates again on every sampled frame (`:208`); the window re-prepares on the next tick | With local collection active, a preparation is retired and restarted about once per second |
+| Every invalidation re-prepares the same scope | `CollectorCoordinator.reconcile()` always calls `history.invalidate()` (`src/appio/collector_owner.py:196`) and `tick_local()` invalidates again on every sampled frame (`:208`); `HistoryRouter.invalidate()` also runs for imported sources (`src/appio/history_router.py:429`) and transport gaps (`:447`), and sets `view_state = "unavailable"` (`:413-421`) | With local collection active, a preparation is retired and restarted about once per second |
 
 ### 1.2 Files has no return path
 
-`files_nav` swaps `QStackedWidget` pages (`src/appio/ui/collector_window.py:466`);
-the Files page holds `files_view`, `files_message` and `files_open_settings` and no
-control that returns to the overview (`:546`). The approved design never had a Files
-page: it describes a *detail pane with `Overview` and `Files` tabs*.
+`files_nav` is built at `src/appio/ui/collector_window.py:466`, connected at `:522`,
+and its slot switches the stacked page at `:554`. The Files page is built at `:491`
+with the table, message and settings button added at `:507-510`, and it carries no
+control that returns to the overview. The approved design never had a Files page: it
+describes a *detail pane with `Overview` and `Files` tabs*.
 
 ### 1.3 The infographics were never built
 
@@ -38,8 +39,8 @@ reconciliation strip. The shipped window renders labels and numbers only
 
 The hour-of-day intensity strip is **out of scope by choice, not for lack of data**:
 `SeriesPoint` carries `wall_start_seconds` (`src/appio/contracts.py:430`), populated
-from the persisted clock map (`src/appio/query.py:657-665`), so the aggregation is
-buildable from existing data. It is excluded to keep this change small.
+from the persisted clock map (`src/appio/query.py:657-665`). §9 records that the
+approved chart-set mockup's caption says otherwise.
 
 ## 2. Goals
 
@@ -155,7 +156,12 @@ the right of the ranking list.
 
 **One subject.** The window keeps a single `_subject_app_id`, updated from either the
 ranking list or the Files selector. The Overview and the Files table both render that
-subject. The ranking list highlights a row only when the subject is ranked.
+subject.
+
+**One highlight contract.** The ranking list highlight follows the subject exactly:
+a ranked subject highlights its row; a subject that is not in the ranking clears the
+highlight (no row selected) while the list keeps its scroll position. There is no
+second highlight state.
 
 **Files population is a union.** `FilesView` replaces `_load_ranking()` with
 `_load_choices()`:
@@ -165,91 +171,110 @@ subject. The ranking list highlights a row only when the subject is ranked.
    `registry.id_for(app_key)` has no ranking row, appended by name.
 
 `QueryService.file_applications()` returns `(app_key, name, total_bytes)` tuples
-(`src/appio/query.py:939`, `:981-983`), so those rows are keyed through
-`registry.id_for(app_key)` exactly as `_load_ranking()` already does for the
-ranking-empty case (`src/appio/ui/files_view.py:683-690`). The union is what makes a
-file-only application reachable in a **mixed** window; the existing fallback only
-covers a window whose entire ranking is empty.
+(`src/appio/query.py:939`, `:981-983`), keyed through `registry.id_for(app_key)`
+exactly as `_load_ranking()` already does for the ranking-empty case
+(`src/appio/ui/files_view.py:683-690`). The union is what makes a file-only
+application reachable in a **mixed** window; the existing fallback only covers a
+window whose entire ranking is empty.
 
 `FilesView` owns the selector's visibility: `app_selector.setVisible(len(choices) >
-len(ranked))`. When the selector is hidden, the ranking list is the only selector,
-which is what the mockup shows.
+len(ranked))`. When hidden, the ranking list is the only selector, as the mockup shows.
 
 **Subject not in the ranking.** When the subject comes from a file-only row, the
 Overview KPIs read `unavailable` with the reason `not in the process ranking`, the
-lanes draw nothing, and the ranking list keeps its own scroll and highlight state.
+lanes draw nothing, and the ranking highlight is cleared per the rule above.
 
-**Files stays alive across a replacement.** `FilesView` gains:
+**Files stays alive across a replacement.**
 
 ```python
-def begin_suspend(self) -> None   # bump self._generation; set _suspended; keep the model
-def end_suspend(self) -> None     # clear _suspended; one request_refresh() when window+app exist
+def begin_suspend(self) -> None   # _suspended = True; self._generation += 1; keep the model
+def end_suspend(self, *, requery: bool) -> None   # _suspended = False; requery → one request_refresh()
 ```
 
 `_on_delivered()` and `_settle()` return immediately while `_suspended`. Bumping the
-generation is what retires an outstanding delivery; it is the same mechanism
-`_on_delivered()` already uses (`src/appio/ui/files_view.py:609-611`). The model is
-never cleared, so the table and footer survive. `HistoryRouter.prepare()` retires
-file futures with `WindowUnavailableError("file_source_unavailable", "File history
-generation retired.")` (`src/appio/history_router.py:137-153`, `:749`); without the
-suspend window that error reaches `_set_unavailable()`
-(`src/appio/ui/files_view.py:609-617`) and empties the table (`:815`). The host calls
-`begin_suspend()` immediately before every `history.prepare()` and `end_suspend()`
-immediately after the render model is applied (or when the prepare is abandoned).
+generation retires any outstanding delivery through the check that already exists
+(`src/appio/ui/files_view.py:609-611`). The model is never cleared, so table and footer
+survive. `HistoryRouter.prepare()` and `invalidate()` retire file futures with
+`WindowUnavailableError("file_source_unavailable", "File history generation
+retired.")` (`src/appio/history_router.py:137-153`, called from `:415` and `:749`);
+without the suspend window that error reaches `_on_delivered()`
+(`src/appio/ui/files_view.py:609-617`) and empties the table (`:815`).
+
+**Suspension covers the whole risky section, not only `prepare()`.** Invalidation is
+also triggered by `reconcile()`, by a sampling `tick_local()`, by `add_source()`
+(`src/appio/history_router.py:429`) and by `record_transport_gap()` (`:447`). The host
+therefore calls `begin_suspend()` **before** the reconciliation and sampling calls of
+the tick, and `end_suspend(requery=True)` when a new render model is applied,
+`end_suspend(requery=False)` when the tick ends without one.
 
 ### 5.5 Target, displayed and pending
-
-`CollectorWindow` keeps four fields:
 
 | Field | Meaning |
 | --- | --- |
 | `_target: Window \| None` | the window the clock and boot row currently imply |
 | `_displayed: Window \| None` | the window whose render model is on screen |
 | `_pending: Window \| None` | the window whose preparation is in flight |
-| `_invalidated: bool` | the host invalidated the router since the last prepare |
+| `_invalidated: bool` | derived, not asserted: the router reports a retired state |
+
+**`_invalidated` is derived from the router, never tracked by call site.** Every
+invalidation path ends in `HistoryRouter.invalidate()`, which sets
+`view_state = "unavailable"` (`src/appio/history_router.py:413-421`), and every
+preparation sets `view_state = "loading"` (`:757`). The window therefore derives:
+
+```python
+def _history_retired(self) -> bool:
+    return self.history.view_state.startswith("unavailable")
+```
+
+That single predicate covers `reconcile()`, a sampling `tick_local()`, `add_source()`
+and `record_transport_gap()` without the host needing to enumerate them.
 
 Every tick, after facts are applied:
 
 ```
 1. _target = _current_window()
    if _target is None:
-       _displayed = _pending = None; _invalidated = False
+       _displayed = _pending = None
        show "waiting for the first sample" inside the Overview tab; return
 2. if _pending is not None:
-       if history.ready(_pending): apply(); _displayed = _pending; _pending = None
-                                  files_view.end_suspend(); _invalidated = False
-       return                              # exactly one preparation in flight
-3. if _invalidated or _displayed is None or _target != _displayed:
+       if _history_retired():                 # an in-flight preparation was retired
+           _pending = None                    # fall through to step 3
+       elif history.ready(_pending):
+           apply(); _displayed = _pending; _pending = None
+           files_view.end_suspend(requery=True); return
+       else:
+           return
+3. _invalidated = _history_retired() and _displayed is not None
+   if _pending is None and (_invalidated or _displayed is None or _target != _displayed):
        files_view.begin_suspend()
-       history.prepare(_target); _pending = _target; _invalidated = False
-       if history.ready(_pending): apply(); _displayed = _pending; _pending = None
-                                  files_view.end_suspend()
+       history.prepare(_target); _pending = _target
+       if history.ready(_pending):
+           apply(); _displayed = _pending; _pending = None
+           files_view.end_suspend(requery=True)
 ```
 
-This closes the loop the second review found: after a frame is applied,
-`_pending` is `None` and `_target == _displayed`, so step 3 does **not** reissue a
-prepare until the window changes or `_invalidated` is set. A preparation is never
-reissued for a window already being prepared.
+Properties this guarantees, each with a test in §7.4:
 
-**Who sets `_invalidated`.** Only the host, immediately after a call that invalidates
-the router:
-
-| Call | Invalidates | Host action |
-| --- | --- | --- |
-| `coordinator.reconcile(facts)` | always (`src/appio/collector_owner.py:196`) | set `_invalidated = True` **only when the call is made** |
-| `coordinator.tick_local()` | whenever it samples (`:208`) | `tick_local()` gains an additive `-> bool` return telling the caller whether it sampled; set `_invalidated` accordingly. Existing callers ignore the return value |
+- A frame is applied at most once per preparation, and no preparation is issued while
+  one is in flight (no reprepare loop).
+- An invalidation during a preparation retires that preparation and causes exactly one
+  replacement preparation for the current target — the case that previously stalled
+  forever, because `ready()` can never become true for a retired generation.
+- After a frame is applied and nothing invalidates, no further preparation is issued
+  until the target changes.
+- With local collection active, each sampled frame invalidates, so one replacement
+  preparation follows each sample; the frame stays on screen throughout.
 
 **Reconcile policy (the `keep_pending` guard, restated).** `reconcile()` is skipped
 when `facts == _facts` **and** `_pending is not None`, because reconciliation would
-retire the very generation the window is waiting for
-(`src/appio/ui/collector_window.py:628-640` preserves this today). When it does run,
-`_invalidated` is set and exactly one fresh preparation follows.
+retire the generation the window is waiting for
+(`src/appio/ui/collector_window.py:628-640` preserves this today).
 
 **Files while a replacement is pending.** The tabs stay visible in every state. While
 `_pending is not None`, the Files tab keeps the table it already has, the footer reads
 `updating to <scope>` and its query controls are disabled; `end_suspend()` restores
-them with one refresh. Before the first frame, Files shows today's exact page-level
-texts: `waiting for the first sample`, or the degraded-source message built at
+them. Before the first frame, Files shows today's exact page-level texts:
+`waiting for the first sample`, or the degraded-source message built at
 `src/appio/ui/collector_window.py:578-583`.
 
 ### 5.6 Probes off the drawing thread, and what stays on it
@@ -261,7 +286,7 @@ The tick becomes:
 2. Poll the pending preparation (§5.5 step 2) — every tick, independent of the probe.
    The old `_poll_history` early-return when the view is visible is deleted.
 3. If no probe is in flight, submit `setup.refresh()` to a single-slot
-   `ThreadPoolExecutor`. If a probe is in flight, skip **only the submission**.
+   `ThreadPoolExecutor`. If one is in flight, skip **only the submission**.
 4. Completion arrives on the Qt thread through a queued signal → `_apply_facts(facts)`.
 
 **Guarantee.** No `subprocess`, no blocking socket connect/recv and no `time.sleep`
@@ -275,21 +300,31 @@ runs on the Qt thread from a refresh tick.
 | `_current_window()` (`src/appio/ui/collector_window.py:690-703`) | one `SELECT boot_id FROM boot` | one indexed row |
 | `history.prepare()` (`src/appio/history_router.py:742`) | window validation, file-request retirement, state reset, one `PRAGMA database_list` per source, local submit, possible remote dispatch | once per window change or invalidation |
 | `history.ready()` (`src/appio/history_router.py:841`) | consumes completed futures, remaps ranking rows, queues and dispatches detail requests | bounded by the application count |
-| non-blocking sends in `IodClient` (`src/appio/iodclient.py:813-1307`) | `sock.send()` on a non-blocking socket | does not block |
+| non-blocking send in `IodClient._flush()` (`src/appio/iodclient.py:1313`) | `sock.send()` on a non-blocking socket | does not block |
 
-**Arbitration with setup operations.** `_busy` keeps its meaning. `_apply_facts()`:
+**Arbitration with setup operations: a setup generation, not just `_busy`.**
 
-- if `_busy` is true: **drop** the facts. They describe the machine before or during a
-  transition and are not replayed afterwards — replaying a deferred OFF result after a
-  successful enable would reacquire the local writer, because
-  `decide_owner()` grants local collection for inactive/absent facts
-  (`src/appio/collector_owner.py:58-64`, `:177-190`). The drop is counted in
-  `_dropped_facts` for tests;
-- when a helper operation completes, `_on_reply()` clears `_busy` **and immediately
-  submits a fresh probe**, so the next applied facts are always post-transition;
-- if `_busy` is false: apply the existing promotion of a verified, answering history
-  connection over a silent one-shot probe (`src/appio/ui/collector_window.py:624-627`),
-  then reconcile, then tick, then the §5.5 window step.
+| Field | Meaning |
+| --- | --- |
+| `_setup_generation: int` | incremented when a helper operation starts **and** when it completes |
+| `_probe_generation: int` | the value `_setup_generation` had when the in-flight probe was submitted |
+
+`_apply_facts()` applies a result only when `_probe_generation == _setup_generation`
+**and** `_busy` is false. Anything else is dropped and counted in `_dropped_facts`.
+
+This closes the case a `_busy`-only guard cannot: a probe that starts before an
+enable, observes OFF, stays in flight through the whole helper operation, and delivers
+after `_on_reply()` has cleared `_busy`. Its generation is stale, so it is dropped.
+`_on_reply()` clears `_busy`, increments `_setup_generation`, and submits a fresh probe
+immediately; only results submitted after that point can be applied. Dropping matters
+because `decide_owner()` grants local collection for inactive/absent facts
+(`src/appio/collector_owner.py:58-64`) and `reconcile()` can acquire the lease and build
+the local collector (`:177-190`).
+
+When a result **is** applied, the existing promotion of a verified, answering history
+connection over a silent one-shot probe runs first
+(`src/appio/ui/collector_window.py:624-627`), then `reconcile()`, then `tick_local()`,
+then the §5.5 window step.
 
 `window.shutdown()` stops both timers, shuts the executor down, and `_closed` guards
 every apply path.
@@ -308,7 +343,7 @@ class ChartColumn:            # one drawn column, after downsampling
     write_bytes: int
     peak_read_bps: int | None
     peak_write_bps: int | None
-    starts_run: bool          # True when this column begins a new run (a break precedes it)
+    starts_run: bool          # True when this column begins a new run
 
 class SeriesChart(QWidget):
     def set_task_points(self, points: Sequence[SeriesPoint]) -> None: ...
@@ -316,11 +351,24 @@ class SeriesChart(QWidget):
     def columns(self) -> tuple[ChartColumn, ...]      # aggregated values actually drawn
     def segments(self) -> tuple[ChartSegment, ...]    # (side, run index, polygon points)
     def is_available(self) -> bool: ...
+    def unavailable_reason(self) -> str | None: ...
+
+class DonutChart(QWidget):
+    def set_shares(self, read_bytes: int, write_bytes: int) -> None: ...
+    def set_unavailable(self, reason: str) -> None: ...
+    def shares(self) -> tuple[float, float] | None    # read fraction, write fraction
+    def unavailable_reason(self) -> str | None: ...
+
+class ShareBars(QWidget):
+    def set_rows(self, rows: Sequence[tuple[str, int]]) -> None: ...
+    def set_unavailable(self, reason: str) -> None: ...
+    def fractions(self) -> tuple[tuple[str, float], ...]
+    def unavailable_reason(self) -> str | None: ...
 ```
 
-`columns()` is the observation surface for aggregation; `segments()` is the geometry
-surface for break tests. A test can therefore prove that peaks survive downsampling,
-which polygons alone cannot show.
+`columns()` is the observation surface for aggregation, `segments()` the geometry
+surface, and `shares()` / `fractions()` the composition surface; every widget also
+reports why it is unavailable.
 
 - `DualSeriesChart` draws read above a centre line and write below, each side scaled to
   its own maximum, with a right-hand gutter (`r 41.0 · w 342.2`).
@@ -360,24 +408,27 @@ point exists in the contracts.
 ```
 QTimer tick (1 s)
   → _pump()
-  → §5.5 step 2: pending ready? apply
+  → §5.5 step 2: pending ready? apply : retired? retire
   → probe in flight? skip submission
-  → executor.submit(setup.refresh) → queued signal → _apply_facts
-  → _apply_facts: if _busy: _dropped_facts += 1; return
+  → executor.submit(setup.refresh)   [_probe_generation = _setup_generation]
+  → queued signal → _apply_facts
+  → _apply_facts: generation stale or _busy? drop and count; return
                   promote verified connection → reconcile (unless keep-pending)
-                  → tick_local → banner/switch → §5.5 step 3 (target/prepare)
+                  → tick_local → banner/switch → §5.5 step 3
 ```
 
 ### 5.9 State fields
 
-| Field | Meaning | Cleared/set by |
+| Field | Meaning | Set by |
 | --- | --- | --- |
 | `_target` | window implied by clock and boot row | each tick |
 | `_displayed` | window whose model is on screen | apply; `None` when no target |
-| `_pending` | preparation in flight | prepare; `None` on apply |
-| `_invalidated` | router invalidated since last prepare | host after reconcile/tick_local that sampled |
-| `_facts` / `_deferred_facts` → `_dropped_facts` | last applied facts; dropped-while-busy counter | apply / drop |
-| `_probe_inflight` | one probe at a time | submit / delivery |
+| `_pending` | preparation in flight | prepare; `None` on apply or retirement |
+| `_invalidated` | router reports a retired state | derived each tick from `view_state` |
+| `_facts` | last applied facts | `_apply_facts` |
+| `_dropped_facts` | counter of results dropped for staleness or busy | `_apply_facts` |
+| `_probe_inflight` / `_probe_generation` | single probe and its setup generation | submit / delivery |
+| `_setup_generation` | setup-operation generation | `_start`, `_on_reply` |
 
 ## 6. Error handling
 
@@ -389,8 +440,9 @@ QTimer tick (1 s)
 | Device attribution unavailable | donut still shows task read/write; DEVICE KPI and residual `unavailable`; strip reads `device attribution unavailable: <reason>` |
 | Recorded gaps | coverage line states `gaps: <n>`, `suspends: <bool>`, complete/incomplete; lanes break only where §5.7 proves a hole |
 | Empty ranking | `no applications observed`; Overview KPIs `unavailable`, no charts |
-| File-only subject | KPIs `unavailable`, reason `not in the process ranking` |
+| File-only subject | KPIs `unavailable`, reason `not in the process ranking`; ranking highlight cleared |
 | Pending replacement | last frame stays; `updating (<view_state>)`; Files suspended with controls disabled |
+| Retired preparation | retirement detected from `view_state`, one replacement preparation, frame unchanged meanwhile |
 | Files source unavailable | existing message at `src/appio/ui/collector_window.py:578-583` |
 | Probe raises | existing `_show_error` path; last banner and frame stay |
 | Close while a probe runs | timers stop, executor shuts down, `_closed` guards |
@@ -415,12 +467,13 @@ All tests are offscreen (`pytest-qt`, PyQt6 pinned as existing tests do).
 - contiguous points produce exactly one run per side;
 - a one-bucket hole produces two runs, and no polygon point lies inside the hole;
 - a `spans_suspend` point splits the task run;
-- `set_unavailable` leaves `segments()` empty and `is_available()` false;
+- `set_unavailable` leaves `segments()` empty, `is_available()` false, and
+  `unavailable_reason()` equal to the reason;
 - **downsampling**: over `2 × width` points, `columns()` has at most `width` entries,
   byte sums are preserved, `peak_read_bps`/`peak_write_bps` are the maxima of their
-  buckets (**asserted through `columns()`, not through polygons**), and a column
-  straddling a break has `starts_run == True`;
-- `DonutChart` reports both shares and `ShareBars` its per-device fractions;
+  buckets, and a column straddling a break has `starts_run == True`;
+- `DonutChart.shares()` matches the byte fractions and `ShareBars.fractions()` matches
+  per-device totals against the largest device;
 - painting smoke: each widget `grab()`s to a non-empty pixmap, and an unavailable chart
   renders its reason text.
 
@@ -432,8 +485,10 @@ All tests are offscreen (`pytest-qt`, PyQt6 pinned as existing tests do).
 - the tab widget holds exactly `Overview` then `Files`;
 - switching tabs twice preserves the subject and does not call `set_window` again;
 - the Files selector is hidden when every file application is ranked, and shown when a
-  file-only application exists; selecting one changes the subject, leaves the ranking
-  highlight alone, and puts the Overview in the `not in the process ranking` state;
+  file-only application exists;
+- selecting a file-only application sets the subject, **clears the ranking highlight**,
+  keeps the list scroll position, and puts the Overview in the `not in the process
+  ranking` state;
 - an unavailable series leaves the lane marked unavailable and no KPI reading `0`.
 
 ### 7.4 Shell tests (`tests/p3/test_collector_window.py`)
@@ -443,25 +498,28 @@ All tests are offscreen (`pytest-qt`, PyQt6 pinned as existing tests do).
   pending history window still becomes ready during the probe;
 - a window advance replaces the frame: the old frame stays, `loading history` never
   appears once a frame exists, and the **new** window is eventually displayed;
-- after a frame is applied, no further `prepare()` is issued until the window changes or
-  an invalidation happens (guards the loop R-1 found);
-- unchanged facts while a read is in flight do not call `reconcile()` (guards R-2);
-- `tick_local()` returning `True` leads to exactly one fresh preparation;
-- a probe completing while `_busy` increments `_dropped_facts`, applies nothing, and a
-  fresh probe is submitted when the operation ends (guards R-5);
+- after a frame is applied, no further `prepare()` is issued until the target changes or
+  the router is invalidated;
+- unchanged facts while a read is in flight do not call `reconcile()`;
+- **invalidation retires a pending preparation**: prepare A, invalidate the router
+  (through `reconcile()`, a sampling `tick_local()`, `add_source()` or
+  `record_transport_gap()`), and assert that the next tick issues exactly one
+  replacement preparation for A and that A is displayed when it becomes ready (guards
+  S-1, which previously stalled forever);
+- **a probe spanning a setup operation is rejected**: start a slow probe, run and
+  complete an enable, then deliver the old probe result; it increments `_dropped_facts`
+  and applies nothing, while the probe submitted at operation completion is applied
+  (guards S-3);
 - an OFF probe completing during enable never reacquires the local writer;
-- Files during preparation: with an outstanding file future, the retirement error does
-  not clear the table, the footer reads `updating to ...`, controls are disabled, and
-  `end_suspend()` issues exactly one query (guards R-3);
-- mixed window: ranked A plus file-only B — the selector lists both and B is queried
-  (guards R-4);
+- Files during preparation: with an outstanding file future, an invalidation does not
+  clear the table, the footer reads `updating to ...`, controls are disabled, and
+  `end_suspend(requery=True)` issues exactly one query (guards S-2, suspension begins
+  before the invalidating call);
+- mixed window: ranked A plus file-only B — the selector lists both and B is queried;
 - close during a probe applies nothing and raises nothing;
 - `open_files_unavailable()` selects the Files tab; the banner has no `files_nav`.
 
 ### 7.5 Existing tests that must change
-
-Behavioural assertions are kept; the observation point moves (after probe completion,
-or onto the new fields).
 
 Structural (tabs replace the stacked pages):
 
@@ -475,11 +533,17 @@ Structural (tabs replace the stacked pages):
 | `test_files_page_keeps_an_explicit_unavailable_message_and_settings_link` `:553-564` | stack identity; keep the unavailable text, no-query, diagnostic and settings link |
 | `test_the_files_surface_never_appears_inside_the_overview_window` `:572-578` | "Files is not a descendant of the overview window" — Files now lives in the window; replace with "Files is not inside the Overview **tab**" |
 
+Behavioural rewrite (not a sequencing change):
+
+| Test | Required new phases |
+| --- | --- |
+| `test_pending_history_yields_to_new_scope_ownership_or_invalidation` `:1035-1046` | The new algorithm **retains** a pending preparation instead of replacing it. Rewrite as three cases: (a) *retain* — prepare A, change the target to B, assert A is still `_pending` and no second prepare happened; make A ready and assert A is displayed; then assert B is prepared and displayed; (b) *invalidation* — prepare A, invalidate, assert one replacement preparation for A and that it displays; (c) *ownership* — reconcile with changed facts, assert one replacement preparation. Keep the original ownership assertions. |
+
 Sequencing (immediate application becomes "after probe completion"):
 
 | Test | Assertions to migrate |
 | --- | --- |
-| `test_window_keeps_in_flight_history_for_the_same_scope` `:1152`, `:1379` | its final ranking assertion reads `window._prepared`; migrate to `_displayed` **and keep its liveness assertions** (`pumps > 1`, `probes > 1`, `ranking_settled > 0`) — it is the existing regression proving an unchanged scope still populates across repeated pumps |
+| `test_window_keeps_in_flight_history_for_the_same_scope` `:1152`, `:1379` | its final ranking assertion reads `window._prepared`; migrate to `_displayed` **and keep its liveness assertions** (`pumps > 1`, `probes > 1`, `ranking_settled > 0`) |
 | `test_verified_status_round_trip_clears_silent_header_while_window_open` `:285` | immediate SILENT state; keep `:292-295` |
 | `test_probe_only_truth_stays_answering_for_three_refreshes_after_EOF` `:343-352` | probe count and immediate state per direct refresh |
 | `test_label_recovers_after_silent_refresh_and_connection_reverification` `:383,394-409,425-426` | immediate probe counts and applied facts |
@@ -490,7 +554,6 @@ Sequencing (immediate application becomes "after probe completion"):
 | `test_pending_activation_stays_visible_across_a_restart` `:678-679` | activation state after refresh |
 | `test_periodic_refresh_never_invokes_the_helper` `:929-931` | three refreshes ⇒ three probes; keep `setup.calls == []` |
 | `test_history_is_prepared_before_rendering_and_stale_detail_is_hidden` `:1002-1005` | `_prepared` and loading text immediately after refresh; the hidden-view expectation stays |
-| `test_pending_history_yields_to_new_scope_ownership_or_invalidation` `:1035-1046` | two preparations/ticks and ownership state from direct calls |
 | `test_a_refresh_failure_is_reported_instead_of_crashing_the_timer` `:1066` | error text immediately after refresh |
 | `test_real_history_router_gates_rendering_until_ready` `:1141` | `_prepared` equals the requested window; split into `_pending` (requested) and `_displayed` (after readiness) |
 | `test_the_switch_never_shows_the_click_before_the_probe` `:613-618` | probed switch state, consent visible, no elevation |
@@ -500,7 +563,7 @@ Sequencing (immediate application becomes "after probe completion"):
 | `test_a_dismissal_after_a_previous_success_reverts_to_the_probed_on_state` `:740-745` | probed ON state, dismissal result |
 | `test_a_container_host_reason_disables_the_switch_and_is_shown_verbatim` `:757-758` | exact reason, disabled switch |
 | `test_a_missing_helper_reports_one_hundred_twenty_seven` `:768-770` | exit 127, message, disabled switch |
-| `test_enable_quiesces_local_collection_before_the_first_elevation` `:786-792` | quiesce precedes invocation; plus the deferred-facts case from 7.4 |
+| `test_enable_quiesces_local_collection_before_the_first_elevation` `:786-792` | quiesce precedes invocation; plus the spanning-probe case from 7.4 |
 | `test_a_failed_quiesce_aborts_the_elevation` `:808-810` | no elevation, error, not busy |
 | `test_restart_choice_warns_and_needs_a_distinct_confirmation` `:818-834` | invocation sequence, warning, confirmation |
 | `test_reboot_choice_never_runs_restart_or_reboot` `:847-852` | permitted calls only; activation state after the async refresh |
@@ -523,10 +586,11 @@ audit.
 
 | Risk | Mitigation |
 | --- | --- |
-| A preparation loop re-preparing the displayed window | §5.5 step 3 requires `_invalidated` or a changed target, and a test asserts no prepare after apply until then |
+| A preparation retired mid-flight stalls the window | retirement is detected from `view_state` and replaced with exactly one fresh preparation (§5.5, tested) |
+| A preparation loop re-preparing the displayed window | step 3 requires a changed target or a retired state; tested |
 | Reconciliation retiring the generation under a read | keep-pending rule in §5.5 and a test |
-| Replaying stale facts after a setup transition | facts are dropped while `_busy`; a fresh probe is submitted at completion |
-| Files table cleared by a retired file future | `begin_suspend()`/`end_suspend()` plus a test with an outstanding future |
+| A probe that spans a setup operation applying stale facts | setup generation stamped at submission; tested |
+| Files table cleared by a retired file future | suspension begins before the invalidating call; tested with an outstanding future |
 | `QTabWidget` changes focus order and existing tests | every affected assertion is named in §7.5 |
 | Late probe callbacks after close | executor shutdown, `_closed`, close-during-probe test |
 | Repaint cost at 1 Hz | one `paintEvent` per widget per tick, downsampled, no per-point allocation |
@@ -539,10 +603,13 @@ audit.
   strip; both are non-goals in §3.
 - That mockup also shows a search field in the ranking list; this change keeps the list
   without one.
+- `assets/2026-11-01-chart-sets.png`, option A, captions the omission as "Hour-of-day
+  strip is left out because no data source exists for it." That caption is superseded:
+  §1.3 establishes that wall-mapped series data exists, and the strip is excluded as a
+  scope choice, not for lack of data.
 - The target-state mockup says the in-page application dropdown is gone. This design
   keeps it, hidden by default and shown only when an application has retained file
-  history but no process-ranking row; that exception is the only way such an
-  application stays reachable in a mixed window (§5.4).
+  history but no process-ranking row (§5.4).
 - The target-state mockup draws a record gap as a break in every lane. Per §5.7 a
   suspension break is drawn only in the task lane, because `DeviceSeriesPoint` carries
   no `spans_suspend`; device lanes break only where buckets are missing.
