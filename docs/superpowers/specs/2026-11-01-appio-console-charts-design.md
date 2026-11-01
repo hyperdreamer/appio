@@ -1,7 +1,7 @@
 # appio console: calm redraw, tabs, drawn charts
 
 Date: 2026-11-01
-Status: revised after seven independent design reviews (D-1…D-13, R-1…R-9, S-1…S-8, T-1…T-13, U-1…U-9, V-1…V-5, W-1…W-3)
+Status: revised after eight independent design reviews (D-1…D-13, R-1…R-9, S-1…S-8, T-1…T-13, U-1…U-9, V-1…V-5, W-1…W-3, X-1)
 Supersedes nothing. Extends `2026-10-21-app-io-monitor-design.md` §8 for the P3 shell.
 
 Behavioural authority is this document. Layout authority is the three mockups in
@@ -619,13 +619,21 @@ Structural (tabs replace the stacked pages):
 | `test_the_files_surface_never_appears_inside_the_overview_window` `:572-578` | "Files is not a descendant of the overview window" — Files now lives in the window; replace with "Files is not inside the Overview **tab**" |
 | `tests/acceptance/test_no_later_scope.py::test_window_has_no_later_plan_widgets_actions_or_flows` `:18-24` | three separate guards must change: `findChildren(QTabWidget) == []` becomes "exactly two tabs"; `"files"` must leave the forbidden objectName tuple, because the planned surface uses `files_view` and `files_app_selector` (`src/appio/ui/files_view.py:344,359`) and the tab label reads `Files`; keep the tray, menu, daemon, socket, bpf, polkit, privilege and setup prohibitions and add a positive assertion that the Files surface exists exactly once |
 
-**Supported unchanged, no migration needed.** `_prepared` survives as a read-only
-property alias for `_displayed`, and `_show_ready(window)` remains the name of the apply
-step, so the acceptance harness keeps working without edits
-(`tests/p3/acceptance_harness.py::P3Harness.render`, the `_show_ready(since)` and
-`gui.window.view.set_window(window)` calls). Three readers also keep working unchanged:
-`tests/p3/test_p3_acceptance.py:43-44`, `tests/p3/test_history_overlap_entry.py:110,125`,
-and `tests/p3/test_collector_window.py:1379`. The alias reports **display** state only; a
+**Names preserved, harness timing changes.** `_prepared` survives as a read-only property
+alias for `_displayed`, and `_show_ready(window)` stays the name of the apply step, so the
+calls themselves survive. Timing does not: probe results now arrive through a queued
+signal, and `_displayed` advances only when a ready preparation is applied. The P3 harness
+therefore needs one behavioural change, listed as a migration:
+
+| Harness path | Required change |
+| --- | --- |
+| `tests/p3/acceptance_harness.py::P3Harness.settle` `:457-461` and `::advance` `:491-503` | `until()` must process Qt events (`QApplication.processEvents()`) in its loop, and `settle()` must wait for the applied frame — `window._displayed is not None` and equal to the prepared scope — as well as for `history.ready(scope)`. Without that the queued `_apply_facts` is never delivered, because the harness stops `_timer` at `:446` and `_poll_timer` at `:454` and nothing else drives the apply |
+
+The test bodies keep their assertions and become correct once the harness pumps events:
+`tests/p3/test_p3_acceptance.py:43-44` (with `_prepared` non-null and naming the boot),
+`:110-114,127` and `:163,169,175` (banner and owner state),
+`tests/p3/test_history_overlap_entry.py:110,125`, and
+`tests/p3/test_collector_window.py:1379`. The alias reports **display** state only, so a
 test that needs the requested scope reads `_pending` or `_target` instead.
 
 Behavioural rewrite (not a sequencing change):
