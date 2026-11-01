@@ -1,7 +1,7 @@
 # appio console: calm redraw, tabs, drawn charts
 
 Date: 2026-11-01
-Status: revised after three independent design reviews (D-1…D-13, R-1…R-9, S-1…S-8)
+Status: revised after six independent design reviews (D-1…D-13, R-1…R-9, S-1…S-8, T-1…T-13, U-1…U-9, V-1…V-5)
 Supersedes nothing. Extends `2026-10-21-app-io-monitor-design.md` §8 for the P3 shell.
 
 Behavioural authority is this document. Layout authority is the three mockups in
@@ -213,13 +213,14 @@ Three rules replace any hold or counter:
    returns without issuing a query, and the selector, sort and search controls are
    disabled. This covers the ranking list changing the shared subject while a window is
    pending, which disabling widgets alone does not.
-3. **One flush, one owner.** After `_apply_frame()` the host calls
-   `set_scope_ready(True)` and then `flush_refresh()`, which issues **exactly one** query
-   when `_refresh_wanted` is set and the router is ready for the displayed window, and
-   clears the flag. If no frame was applied and the router is ready again, the host flushes
-   on the next tick. `set_window()` keeps its current semantics (a different window adopts
-   *and* queries), and `_apply_frame()` never adds a second `request_refresh()` for the same
-   window.
+3. **One flush, one owner.** `set_window(w)` on a different window adopts it, issues
+   exactly **one** query, and clears `_refresh_wanted`, because adopting already satisfies
+   any deferred refresh. `flush_refresh()` issues at most one query when `_refresh_wanted`
+   is still set and the router is ready for the displayed window, then clears it. A single
+   applied frame therefore never produces two queries: either the table adopted a new
+   window (the flag is already cleared) or the window was unchanged, and the flush is the
+   only query. If no frame was applied and the router is ready again, the host flushes on
+   the next tick.
 
 Why a discarded result must be classified rather than ignored: `HistoryRouter.invalidate()`
 and `prepare()` retire file futures with
@@ -232,9 +233,12 @@ those futures on the calling thread, so the delivery reaches `_on_delivered()`
 `record_transport_gap()` (`src/appio/ui/collector_window.py:1125-1128` →
 `src/appio/history_router.py:447`), `reconcile()` (`src/appio/collector_owner.py:196`),
 `tick_local()` when it samples (`:208`), `prepare()` (`src/appio/history_router.py:742`),
-and `_after_disable()` → `accept_export()` → `add_source()`
-(`src/appio/ui/collector_window.py:944` → `src/appio/collector_owner.py:252` →
-`src/appio/history_router.py:429`).
+`_begin("enable")` → `_quiesce_local()` → `reconcile(QUIESCE_FACTS)`
+(`src/appio/ui/collector_window.py:806`, `:822`), and `_after_disable()` →
+`accept_export()` → `add_source()` (`src/appio/ui/collector_window.py:944` →
+`src/appio/collector_owner.py:252` → `src/appio/history_router.py:429`). The quiesce path
+is listed separately because it reaches `reconcile()` outside the fact-application flow,
+and `reconcile()` always invalidates (`src/appio/collector_owner.py:196`).
 
 ### 5.5 Target, displayed and pending
 
@@ -283,13 +287,21 @@ Every tick:
            _apply_frame()
 
 _apply_frame():
-    apply the render model for _pending through _show_ready(_pending)
-    _displayed = _pending; _pending = None; _invalidated = False
-    files_view.set_scope_ready(True)
-    if the Files table's window != _displayed:
-        files_view.set_window(_displayed)      # adopts and queries once
-    files_view.flush_refresh()                 # at most one query, only if wanted
+    window = _pending
+    _displayed = window                     # the _prepared alias must name the new window
+    _pending = None; _invalidated = False
+    files_view.set_scope_ready(True)        # admit queries before Files is synced
+    _show_ready(window)                     # renders, then _sync_files adopts + queries once
+    files_view.flush_refresh()              # no-op when adoption just cleared the flag
 ```
+
+Setting `_displayed` **before** `_show_ready()` is required, not cosmetic: `_show_ready()`
+calls `_sync_files(request=False)` (`src/appio/ui/collector_window.py:753`), which reads
+the `_prepared` alias and calls `files_view.set_window(window)`
+(`src/appio/ui/collector_window.py:597-604`). With the alias already naming the new
+window and the router ready for it, the Files table is adopted and stays visible; were the
+alias still naming the old window, `_history_ready(old)` would be false and the table would
+be hidden.
 
 Properties this guarantees, each with a test in §7.4:
 
@@ -603,7 +615,8 @@ Structural (tabs replace the stacked pages):
 **Supported unchanged, no migration needed.** `_prepared` survives as a read-only
 property alias for `_displayed`, and `_show_ready(window)` remains the name of the apply
 step, so the acceptance harness keeps working without edits
-(`tests/p3/acceptance_harness.py:552`). Three readers also keep working unchanged:
+(`tests/p3/acceptance_harness.py::P3Harness.render`, the `_show_ready(since)` and
+`gui.window.view.set_window(window)` calls). Three readers also keep working unchanged:
 `tests/p3/test_p3_acceptance.py:43-44`, `tests/p3/test_history_overlap_entry.py:110,125`,
 and `tests/p3/test_collector_window.py:1379`. The alias reports **display** state only; a
 test that needs the requested scope reads `_pending` or `_target` instead.
