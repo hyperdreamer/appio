@@ -1,7 +1,7 @@
 # appio console: calm redraw, tabs, drawn charts
 
 Date: 2026-11-01
-Status: revised after twelve independent design reviews (D-1…D-13, R-1…R-9, S-1…S-8, T-1…T-13, U-1…U-9, V-1…V-5, W-1…W-3, X-1, Y-1…Y-3, Z-1…Z-2, AA-1…AA-4, AB-1…AB-2)
+Status: revised after thirteen independent design reviews (D-1…D-13, R-1…R-9, S-1…S-8, T-1…T-13, U-1…U-9, V-1…V-5, W-1…W-3, X-1, Y-1…Y-3, Z-1…Z-2, AA-1…AA-4, AB-1…AB-2, AC-1)
 Supersedes nothing. Extends `2026-10-21-app-io-monitor-design.md` §8 for the P3 shell.
 
 Behavioural authority is this document. Layout authority is the three mockups in
@@ -193,6 +193,7 @@ class FilesView:
     @contextmanager
     def transient_scope(self) -> Iterator[None]: ...             # set in, clear in a finally
     def set_scope_ready(self, ready: bool) -> None: ...          # query admission and controls
+    def retire_deliveries(self) -> None: ...                     # bump the delivery generation
     def refresh_wanted(self) -> bool: ...
     def flush_refresh(self) -> None: ...                         # at most one query
 ```
@@ -212,7 +213,8 @@ Three rules replace any hold or counter:
    behaviour stands unchanged (`_set_unavailable()` clears the table,
    `src/appio/ui/files_view.py:815-817`). The transient flag is an idempotent boolean set
    and cleared inside one call, so it cannot leak; the pending condition is level-triggered
-   by `_pending`, so it cannot be missed by a late delivery.
+   by `_pending`; and a delivery that arrives after readiness is restored is retired by
+   rule 4 below, so no schedule is left uncovered.
 2. **Query admission.** `set_scope_ready(False)` while a preparation is pending. While it
    is false, every programmatic entry point — `set_window()` when adopting,
    `set_app_id()`, `set_sort()` and `request_refresh()` — records `_refresh_wanted` and
@@ -227,6 +229,14 @@ Three rules replace any hold or counter:
    window (the flag is already cleared) or the window was unchanged, and the flush is the
    only query. If no frame was applied and the router is ready again, the host flushes on
    the next tick.
+4. **Retirement outlives readiness.** A delivery queued by a worker can arrive *after* the
+   frame is applied and `set_scope_ready(True)` has run, when neither transient condition
+   holds any more. `_apply_frame()` therefore calls `retire_deliveries()` **before** it
+   restores readiness: that bumps the view's delivery generation (so the queued delivery is
+   dropped by the existing generation check, `src/appio/ui/files_view.py:609-611`) and sets
+   `_refresh_wanted` when a request was outstanding. The same apply step then issues exactly
+   one replacement query — either `set_window()` adopting a different window or
+   `flush_refresh()` for an unchanged one.
 
 Why a discarded result must be classified rather than ignored: `HistoryRouter.invalidate()`
 and `prepare()` retire file futures with
@@ -312,9 +322,10 @@ _apply_frame():
     window = _pending
     _displayed = window                     # the _prepared alias must name the new window
     _pending = None; _invalidated = False
+    files_view.retire_deliveries()          # a queued delivery can no longer publish or clear
     files_view.set_scope_ready(True)        # admit queries before Files is synced
     _show_ready(window)                     # renders, then _sync_files adopts + queries once
-    files_view.flush_refresh()              # no-op when adoption just cleared the flag
+    files_view.flush_refresh()              # one query for an unchanged window; no-op after adoption
 ```
 
 **Why the split matters.** `_tick_target()` is the only place that decides *which* window
@@ -643,7 +654,12 @@ All tests are offscreen (`pytest-qt`, PyQt6 pinned as existing tests do).
   generation bump and its cancel retires a delivery that arrives **after** the invalidating
   call has returned. With a replacement pending, the table is still preserved and the footer
   reads `updating to ...`, because `set_scope_ready(False)` also classifies the failure as
-  transient; the deferred flush then issues one fresh query (guards AB-2);
+  transient (guards AB-2);
+- **late delivery after readiness is restored**: the same queued delivery arrives *after*
+  `_apply_frame()`'s `retire_deliveries()` and `set_scope_ready(True)`. The table still stays
+  intact, because the delivery generation moved; and the apply step issued exactly **one**
+  replacement query for the unchanged window, so the table's requested update is not lost
+  (guards AC-1);
 - query admission while a scope is pending: `set_app_id()`, `set_sort()`, `set_window()`
   and a ranking-list subject change set `_refresh_wanted` and issue **no** query;
   `flush_refresh()` after the frame is applied issues exactly one (guards U-3, U-4);
