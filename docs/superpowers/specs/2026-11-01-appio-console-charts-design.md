@@ -1,7 +1,7 @@
 # appio console: calm redraw, tabs, drawn charts
 
 Date: 2026-11-01
-Status: revised after nine independent design reviews (D-1…D-13, R-1…R-9, S-1…S-8, T-1…T-13, U-1…U-9, V-1…V-5, W-1…W-3, X-1, Y-1…Y-3)
+Status: revised after eleven independent design reviews (D-1…D-13, R-1…R-9, S-1…S-8, T-1…T-13, U-1…U-9, V-1…V-5, W-1…W-3, X-1, Y-1…Y-3, Z-1…Z-2, AA-1…AA-4)
 Supersedes nothing. Extends `2026-10-21-app-io-monitor-design.md` §8 for the P3 shell.
 
 Behavioural authority is this document. Layout authority is the three mockups in
@@ -270,16 +270,18 @@ and `record_transport_gap()` without the host needing to enumerate them.
 Two production calls, split so that a caller can drive one without disturbing the other:
 
 ```
-_tick_target():            # timer only: decide what should be displayed and prepare it
-1. _target = _current_window()
+_tick_target():            # timer only: retire, decide what should be displayed, prepare it
+1. if _pending is not None and _history_retired():
+       _pending = None                       # retire BEFORE deciding, so one tick replaces it
+2. _target = _current_window()
    if _target is None:
        _displayed = None; _pending = None; _invalidated = False
        files_view.set_scope_ready(True)      # nothing is pending: admission restored
        _sync_files()                         # Files falls back to its page-level message
        show "waiting for the first sample" inside the Overview tab; return
    files_view.set_scope_ready(_pending is None)
-2. _invalidated = _history_retired() and _displayed is not None
-3. if _pending is None and (_invalidated or _displayed is None or _target != _displayed):
+3. _invalidated = _history_retired() and _displayed is not None
+4. if _pending is None and (_invalidated or _displayed is None or _target != _displayed):
        with files_view.transient_scope():    # §5.4 rule 1
            history.prepare(_target)
        _pending = _target
@@ -345,6 +347,13 @@ uses `show_window()` plus a loop of `apply_ready_frame()`, which never re-evalua
 clock, so the scope under test cannot be displaced. No other path may assign `_displayed`
 or call `_show_ready()` directly — that is what keeps the Files ordering in §5.5 correct
 for every caller.
+
+**Event policy for callers.** Fact results arrive through a queued Qt signal, so they are
+applied only when a caller processes events. An explicit-scope driver (`show_window()` +
+`apply_ready_frame()`) processes **no** Qt events: its only work is polling the router, so
+no probe result can reconcile, invalidate the generation and retire the scope under test.
+Only `settle()` and `advance()` process events, because their job is precisely to deliver a
+probe result and follow the clock.
 
 **Reconcile policy.** `reconcile()` is skipped when `facts == _facts` **and** `_pending
 is not None`, because reconciliation would retire the generation the window is waiting
@@ -653,11 +662,11 @@ so every acceptance path that expects an applied frame must be migrated:
 
 | Harness path | Required change |
 | --- | --- |
-| `P3Harness.until` `:383-388` | process Qt events (`QApplication.processEvents()`) each iteration and accept an optional `drive` callable, so each caller chooses what to drive; it must not drive unconditionally |
-| `P3Harness.query` `:552-556` | **unchanged and undriven.** It prepares a specific scope and waits only on `history.ready(window)`; driving frames here would let `_tick_target()` replace the scope under test |
-| `P3Harness.settle` `:457-461` | drive the window like the timer: loop `processEvents()` + `window.refresh()` until `window._target is not None and window._displayed == window._target`. The captured `scope = history._window` and its `scope is None` early skip are both deleted, because the scope is now taken from the window's own target after the first probe is applied |
-| `P3Harness.advance` `:491-503` | the same loop after `window.refresh()`, so the advanced clock's target becomes displayed |
-| `P3Harness.render` `:558-567` | delete the direct `_show_ready(since)` / `view.set_window(window)` calls and the intervening `self.query(window)`. Use `gui.window.show_window(since)` then loop `apply_ready_frame()` until `_displayed == since`; then `gui.window.show_window(window)` and the same loop until `_displayed == window`. Because `show_window()` sets no clock target and the loop never calls `_tick_target()`, the requested scope cannot be displaced |
+| `P3Harness.until` `:383-388` | gain `process_events: bool = True`; when true, call `QApplication.processEvents()` each iteration. It drives nothing itself, so each caller chooses what to drive |
+| `P3Harness.query` `:552-556` | **unchanged, undriven, and event-free**: it calls `until(..., process_events=False)`. Preparing a scope and then delivering a queued probe result would let reconciliation retire that scope before the wait finished |
+| `P3Harness.settle` `:457-461` | drive the window like the timer: process events and call `window.refresh()` once, then — if `window._target is None` — return immediately, because a settled no-target state is a real outcome (a crashed GUI with no local boot row, `tests/p3/test_p3_acceptance.py:85-89`). Otherwise loop until `window._displayed == window._target`. The captured `scope = history._window` and its `scope is None` early skip are both deleted |
+| `P3Harness.advance` `:491-503` | the same loop after `window.refresh()`, with the same no-target termination rule |
+| `P3Harness.render` `:558-567` | delete the direct `_show_ready(since)` / `view.set_window(window)` calls and the intervening `self.query(window)`. Use `gui.window.show_window(since)`, then loop `apply_ready_frame()` **with `process_events=False`** until `_displayed == since`; then `gui.window.show_window(window)` and the same loop until `_displayed == window`. No `_tick_target()` and no fact delivery occur in that loop, so the requested scope cannot be displaced |
 
 The test bodies keep their assertions and become correct once the harness drives the apply
 path: `tests/p3/test_p3_acceptance.py:43-44` (with `_prepared` non-null and naming the
@@ -705,6 +714,7 @@ Sequencing (immediate application becomes "after probe completion"):
 | `test_disable_without_verified_export_metadata_imports_nothing` `:901-903` | no export, retained ON state |
 | `test_an_explicit_recheck_invokes_status_and_shows_the_probe_verdict` `:916-922` | status consent/call and rendered verdict |
 | `test_a_pending_operation_rejects_a_second_one_across_a_qt_heartbeat` `:944-957` | single invocation, busy/disabled state |
+| `tests/p3/test_p3_adversarial.py::test_helper_denial_and_absence_preserve_gui_ownership` `:399-402` | it asserts `coordinator._local is not None` immediately after `not window.busy`. Enable quiesces local collection and the operation's completion only *submits* a fresh probe (`src/appio/ui/collector_window.py:806,822` → `src/appio/collector_owner.py:150-166`), so ownership is restored when that probe is applied, not when `busy` clears. The test must drive the probe application (pump events until the post-operation facts are applied) and then keep its ownership assertion |
 | `test_a_reply_completed_on_a_worker_thread_updates_only_on_the_qt_thread` `:989-991` | choice and Qt-thread delivery after the initial async probe |
 
 All use a shared helper that pumps the Qt event loop until a probe completes, so no
