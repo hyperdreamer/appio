@@ -220,11 +220,34 @@ def file_view(
     return FileViewResult(table, result_coverage, served_gap_count)
 
 
-def app_total(app_id: int, name: str, total: int) -> AppTotal:
+def app_total(app_id: int, name: str, total: int, *, key: str | None = None) -> AppTotal:
     read = total // 2
     write = total - read
-    return AppTotal(app_id, f"unit:{name}.service", name, read, write, total, read,
+    return AppTotal(app_id, key or f"unit:{name}.service", name, read, write, total, read,
                     write, None, None, None, coverage())
+
+
+class _LocalChoices:
+    """The structural ``history.local`` seam: retained file applications."""
+
+    def __init__(self, router: "FakeRouter") -> None:
+        self.router = router
+
+    def file_applications(self, window: Window):
+        self.router.choice_calls.append(window)
+        if self.router.choice_error is not None:
+            raise self.router.choice_error
+        return tuple(self.router.local_applications)
+
+
+class _RegistryIds:
+    """The structural ``history.registry`` seam: stable application IDs."""
+
+    def __init__(self, ids: dict[str, int]) -> None:
+        self.ids = dict(ids)
+
+    def id_for(self, key: str) -> int:
+        return self.ids[key]
 
 
 class FakeRouter:
@@ -240,6 +263,11 @@ class FakeRouter:
         ranking_rows: tuple[AppTotal, ...] = (),
         ranking_error: BaseException | None = None,
         defer: bool = False,
+        ready: bool = True,
+        view_state: str = "ready",
+        local_applications: tuple[tuple[str, str, int], ...] | None = None,
+        registry_ids: dict[str, int] | None = None,
+        choice_error: BaseException | None = None,
     ) -> None:
         self.result = result
         self.error = error
@@ -251,6 +279,17 @@ class FakeRouter:
         self.ranking_calls: list[tuple[Window, str]] = []
         self.requests: list[tuple[object, ...]] = []
         self.pending: list[Future] = []
+        # Controlled readiness/view state and counters for the spec 5.5 races.
+        self.ready_scope = ready
+        self.ready_calls: list[Window] = []
+        self.view_state = view_state
+        self.status_calls = 0
+        self.choice_calls: list[Window] = []
+        self.local_applications = tuple(local_applications or ())
+        self.choice_error = choice_error
+        if local_applications is not None or registry_ids is not None or choice_error is not None:
+            self.local = _LocalChoices(self)
+            self.registry = _RegistryIds(registry_ids or {})
 
     def ranking(self, window: Window, metric: str):
         self.ranking_calls.append((window, metric))
@@ -258,7 +297,12 @@ class FakeRouter:
             raise self.ranking_error
         return list(self.ranking_rows)
 
+    def ready(self, window: Window) -> bool:
+        self.ready_calls.append(window)
+        return self.ready_scope
+
     def file_source_status(self) -> FileAvailability:
+        self.status_calls += 1
         return self.status
 
     def file_source_diagnostic(self) -> str | None:
@@ -367,27 +411,22 @@ def test_partial_file_window_names_the_served_interval_and_discloses_gaps(qtbot)
 
 
 def test_file_selector_uses_retained_file_apps_when_process_ranking_is_empty(qtbot):
-    router = FakeRouter()
     app_key = "unit:retained-only.service"
-
-    class LocalFiles:
-        def file_applications(self, window):
-            assert window == WINDOW
-            return ((app_key, "retained-only", 512),)
-
-    class Registry:
-        def id_for(self, key):
-            assert key == app_key
-            return 41
-
-    router.local = LocalFiles()
-    router.registry = Registry()
+    router = FakeRouter(
+        local_applications=((app_key, "retained-only", 512),),
+        registry_ids={app_key: 41},
+    )
     view = build(qtbot, router)
     view.set_window(WINDOW)
 
+    # The union is read once for the applied preparation, and the file-only
+    # application keeps its registry identity.
+    assert router.ranking_calls == [(WINDOW, "total_bytes")]
+    assert router.choice_calls == [WINDOW]
     assert view.app_selector.count() == 1
     assert view.app_selector.itemText(0) == "retained-only  512 B"
     assert view.app_selector.itemData(0) == 41
+    assert view.app_selector.isVisible() is True
     assert router.requests[0][0] == 41
 
 
@@ -585,6 +624,13 @@ def test_app_selection_requests_the_selected_app_and_ranks_once_per_window(qtbot
     assert len(router.ranking_calls) == before
     assert view.model.rowCount() == 0  # never one ranking query per rendered row
 
+    # Choices refresh exactly once per *applied preparation*, even when the
+    # Window value is unchanged; that refresh never issues a table query.
+    requests_before = len(router.requests)
+    view.set_window(WINDOW)
+    assert [call[0] for call in router.ranking_calls] == [WINDOW, WINDOW]
+    assert len(router.requests) == requests_before
+
 
 def test_search_sends_nfc_normalized_text_and_none_when_blank(qtbot):
     router = FakeRouter(ranking_rows=APPS)
@@ -598,18 +644,39 @@ def test_search_sends_nfc_normalized_text_and_none_when_blank(qtbot):
     assert router.requests[-1][4] is None
 
 
-def test_a_new_window_requeries_and_clears_the_previous_rows(qtbot):
-    router = FakeRouter(ranking_rows=APPS)
+def test_a_new_window_requeries_and_preserves_previous_rows_until_settled(qtbot):
+    router = FakeRouter(ranking_rows=APPS, defer=True)
     view = build(qtbot, router)
     view.set_window(WINDOW)
+    assert view.state == "loading"
     assert view.model.rowCount() == 0
-    assert view.last_result is not None
+    first = router.pending[-1]
+    first.set_result(file_view((file_row(basename="kept.txt"),)))
+    assert view.state == "ready"
+    assert [row[0] for row in texts(view)] == ["kept.txt"]
+    settled_result = view.last_result
+    before = footer_text(view)
+
     router.requests.clear()
     view.set_window(NEXT_WINDOW)
     assert router.requests[-1][1] == NEXT_WINDOW
-    assert view.model.rowCount() == 0
+    # The displayed scope keeps its rows, result and every footer quantity and
+    # only names its destination while the replacement is pending (spec 5.1).
+    assert [row[0] for row in texts(view)] == ["kept.txt"]
+    assert view.last_result is settled_result
+    assert footer_text(view) == before
     assert view.state == "ready"
-    assert view.last_result is not None
+    assert view.files_updating.text() == f"updating to {NEXT_WINDOW.kind}"
+    assert view.files_updating.isVisible() is True
+
+    second = router.pending[-1]
+    second.set_result(
+        file_view((file_row(basename="fresh.txt"),), window=NEXT_WINDOW)
+    )
+    assert [row[0] for row in texts(view)] == ["fresh.txt"]
+    assert view.state == "ready"
+    assert view.last_result is not None and view.last_result is not settled_result
+    assert view.files_updating.text() == ""
 
 
 # --------------------------------------------------------------------------- #
@@ -954,3 +1021,614 @@ print(json.dumps(sorted(name for name in sys.modules if name.startswith("appio."
     )
     assert not (set(forbidden) & loaded), sorted(set(forbidden) & loaded)
     assert UNAVAILABLE == "unavailable"
+
+
+# --------------------------------------------------------------------------- #
+# Scope admission, delivery retirement and the ranked/file-only union
+#
+# Spec 5.1-5.5: a preparation closes query admission, every invalidating call is
+# classified transient, a retirement outlives readiness, and an applied frame
+# owns exactly one query.  The union keeps ranked order and appends file-only
+# applications that no basename could identify.
+# --------------------------------------------------------------------------- #
+
+#: ``FakeRouter.requests`` records the exact five-field contract query.
+_REQUEST_FIELDS = {"app_id": 0, "window": 1, "sort": 2, "direction": 3, "search": 4}
+
+
+def many_rows(count: int = 40) -> tuple[FileRow, ...]:
+    return tuple(
+        file_row(path_id=index + 1, basename=f"row-{index:02d}.txt")
+        for index in range(count)
+    )
+
+
+def published_view(qtbot, *, rows: tuple[FileRow, ...] | None = None, **router_kwargs):
+    """A view with published rows and a scrolled table: the state to preserve."""
+
+    if rows is None:
+        rows = many_rows()
+    router = FakeRouter(ranking_rows=APPS, result=file_view(rows, search=None),
+                        **router_kwargs)
+    view = build(qtbot, router)
+    view.set_window(WINDOW)
+    assert view.state == "ready"
+    assert view.model.rowCount() == len(rows)
+    bar = view.table.verticalScrollBar()
+    if len(rows) > 8:
+        qtbot.waitUntil(lambda: bar.maximum() > 0, timeout=2000)
+        bar.setValue(min(5, bar.maximum()))
+        assert bar.value() == min(5, bar.maximum())
+    return view, router
+
+
+def preserved(view) -> tuple:
+    """Every existing observation a deferred replacement must leave untouched."""
+
+    return (
+        texts(view),
+        view.last_result,
+        tuple(label.text() for label in view._footer_labels()),
+        view.footer_note.text(),
+        view.footer_state.text(),
+        view.state,
+        view.state_label.text(),
+        view.table.verticalScrollBar().value(),
+    )
+
+
+def deferred_request(view, router) -> Future:
+    """Arm exactly one outstanding delivery for the displayed key."""
+
+    router.defer = True
+    before = len(router.requests)
+    view.request_refresh()
+    assert len(router.requests) == before + 1
+    return router.pending[-1]
+
+
+BLOCKED_ENTRIES = (
+    pytest.param(
+        lambda view: view.set_window(NEXT_WINDOW),
+        lambda view: view.set_window(NEXT_WINDOW),
+        {"window": NEXT_WINDOW},
+        id="window",
+    ),
+    pytest.param(lambda view: view.set_app_id(2), None, {"app_id": 2}, id="app"),
+    pytest.param(lambda view: view.set_sort("reads", "asc"), None,
+                 {"sort": "reads", "direction": "asc"}, id="sort"),
+    pytest.param(
+        lambda view: view.request_refresh(), None,
+        {"app_id": 1, "window": WINDOW, "sort": "bytes_total", "direction": "desc",
+         "search": None},
+        id="request",
+    ),
+    pytest.param(lambda view: view.search_field.setText("report"), None,
+                 {"search": "report"}, id="search"),
+    pytest.param(lambda view: view._on_direction_clicked(), None,
+                 {"direction": "asc"}, id="direction"),
+    pytest.param(
+        lambda view: view.table.horizontalHeader().sectionClicked.emit(
+            COLUMN_SORTS.index("reads")),
+        None,
+        {"sort": "reads", "direction": "desc"},
+        id="header",
+    ),
+)
+
+
+@pytest.mark.parametrize(("block", "adopt", "expected"), BLOCKED_ENTRIES)
+def test_scope_admission_defers_all_entry_points_and_flushes_latest_key_once(
+    qtbot, block, adopt, expected
+):
+    view, router = published_view(qtbot)
+    before = preserved(view)
+    requests_before = len(router.requests)
+    ranking_before = len(router.ranking_calls)
+    status_before = router.status_calls
+
+    view.set_scope_ready(False)
+    block(view)
+
+    # Every entry point is gated before it reads the source, the choices or the
+    # query surface, and the displayed state is untouched (spec 5.2).
+    assert len(router.requests) == requests_before
+    assert len(router.ranking_calls) == ranking_before
+    assert router.status_calls == status_before
+    assert preserved(view) == before
+    assert view.refresh_wanted() is True
+    assert view.files_updating.text() == f"updating to {WINDOW.kind}"
+    assert view.files_updating.isVisible() is True
+    for control in (view.app_selector, view.search_field, view.direction_button,
+                    view.refresh_button):
+        assert control.isEnabled() is False
+    assert view.table.horizontalHeader().sectionsClickable() is False
+
+    view.set_scope_ready(True)
+    if adopt is not None:
+        adopt(view)
+    view.flush_refresh()
+
+    # Exactly one request, for the latest stored key; the deferred flag was
+    # consumed by that single attempt.
+    assert len(router.requests) == requests_before + 1
+    request = router.requests[-1]
+    for name, value in expected.items():
+        assert request[_REQUEST_FIELDS[name]] == value, name
+    assert view.refresh_wanted() is False
+    for control in (view.app_selector, view.search_field, view.direction_button,
+                    view.refresh_button):
+        assert control.isEnabled() is True
+    assert view.table.horizontalHeader().sectionsClickable() is True
+
+
+def test_transient_context_retires_only_invalidating_or_forced_exits(qtbot):
+    def armed(*, view_state: str = "ready"):
+        router = FakeRouter(ranking_rows=APPS, defer=True)
+        view = build(qtbot, router)
+        view.set_window(WINDOW)
+        router.view_state = view_state
+        return view, router, view._generation
+
+    # An initial admitted load keeps the existing loading text; a deferred
+    # refresh on that same view names its destination even before a result.
+    view, router, _generation = armed()
+    assert view.last_result is None and view.state == "loading"
+    assert view.files_updating.text() == ""
+    view.set_scope_ready(False)
+    view.set_sort("reads", "asc")
+    assert view.files_updating.text() == f"updating to {WINDOW.kind}"
+    view.set_scope_ready(True)
+
+    # A healthy exit, including an ordinary timer tick, retires nothing.
+    view, router, generation = armed()
+    with view.transient_scope():
+        assert view._transient is True
+    assert view._transient is False
+    assert view._generation == generation
+    assert view.refresh_wanted() is False
+
+    # An invalidating exit retires its delivery and asks for one replacement.
+    view, router, generation = armed(view_state="unavailable: local history evidence")
+    pending = router.pending[-1]
+    with view.transient_scope():
+        pass
+    assert view._generation == generation + 1
+    assert view.refresh_wanted() is True
+    drained: list[int] = []
+    view._bridge.delivered.connect(lambda payload: drained.append(payload[0]))
+    pending.set_result(file_view((file_row(basename="retired.txt"),)))
+    assert drained == [generation]  # the queued delivery drains and is dropped
+    assert view.model.rowCount() == 0
+    assert view.last_result is None
+
+    # A prepare caller forces retirement because prepare() leaves the router in
+    # ``loading`` rather than ``unavailable``.
+    view, router, generation = armed()
+    with view.transient_scope(retire_on_exit=True):
+        pass
+    assert view._generation == generation + 1
+    assert view.refresh_wanted() is True
+
+    # Nested scopes restore the outer classification; only the forced inner
+    # exit retires, and the healthy outer exit adds no second retirement.
+    view, router, generation = armed()
+    with view.transient_scope():
+        with view.transient_scope(retire_on_exit=True):
+            assert view._transient is True
+        assert view._transient is True
+        assert view._generation == generation + 1
+    assert view._transient is False
+    assert view._generation == generation + 1
+    assert view.refresh_wanted() is True
+
+
+def test_file_delivery_outcomes_preserve_or_clear_the_correct_state(qtbot):
+    def deliver(view, router, outcome, mode: str) -> None:
+        future = deferred_request(view, router)
+        if mode == "transient":
+            with view.transient_scope():
+                outcome(future)
+        elif mode == "blocked":
+            view.set_scope_ready(False)
+            outcome(future)
+            view.set_scope_ready(True)
+        else:
+            outcome(future)
+
+    def retired(future):
+        future.set_exception(WindowUnavailableError(
+            "file_source_unavailable", "File history generation retired."))
+
+    def invalid_reason(future):
+        future.set_result(file_view(
+            (file_row(basename="invalid.txt"),),
+            cov=coverage(unavailable_reason="file_source_unavailable"),
+        ))
+
+    def absent_served(future):
+        future.set_result(file_view(
+            (file_row(basename="placeholder.txt"),),
+            unknown_owner_overflow=unknown_owner(
+                cov=coverage(unavailable_reason="not_retained")),
+        ))
+
+    outcomes = {
+        "failed future": (retired, "File history generation retired."),
+        "invalid result": (invalid_reason, "file history is not available for this window"),
+        "absent served interval": (absent_served,
+                                   "file history is not available for this window"),
+    }
+    for label, (outcome, fragment) in outcomes.items():
+        for mode in ("transient", "blocked"):
+            view, router = published_view(qtbot)
+            before = preserved(view)
+            deliver(view, router, outcome, mode)
+            assert preserved(view) == before, (label, mode)
+            assert view.state != "unavailable", (label, mode)
+            assert view.refresh_wanted() is True, (label, mode)
+            assert view.files_updating.text() == f"updating to {WINDOW.kind}"
+            assert view.files_updating.isVisible() is True
+            # Deferral, not a retry loop: one flush issues one request.
+            requests_before = len(router.requests)
+            router.defer = False
+            view.flush_refresh()
+            assert len(router.requests) == requests_before + 1, (label, mode)
+            assert view.refresh_wanted() is False
+
+        view, router = published_view(qtbot)
+        deliver(view, router, outcome, "terminal")
+        assert view.state == "unavailable", label
+        assert view.last_result is None, label
+        assert view.model.rowCount() == 0, label
+        assert [text.text() for text in view._footer_labels()] == [UNAVAILABLE] * 8, label
+        assert view.refresh_wanted() is False, label
+        assert view.files_updating.text() == "", label
+        assert fragment in view.state_label.text(), label
+        requests_before = len(router.requests)
+        view.flush_refresh()
+        assert len(router.requests) == requests_before, label
+
+    # Synchronous status/request failures use the same classification boundary.
+    class FlakyRouter(FakeRouter):
+        status_error: BaseException | None = None
+        request_error: BaseException | None = None
+
+        def file_source_status(self):
+            self.status_calls += 1
+            if self.status_error is not None:
+                raise self.status_error
+            return self.status
+
+        def request_file_view(self, *args):
+            if self.request_error is not None:
+                raise self.request_error
+            return super().request_file_view(*args)
+
+    synchronous = (
+        ("status", "status_error", OSError("socket disappeared"), 0),
+        ("request", "request_error", RuntimeError("request rejected"), 1),
+    )
+    for label, attribute, error, attempts in synchronous:
+        for mode in ("transient", "terminal"):
+            router = FlakyRouter(ranking_rows=APPS,
+                                 result=file_view((file_row(basename="kept.txt"),)))
+            view = build(qtbot, router)
+            view.set_window(WINDOW)
+            before = preserved(view)
+            setattr(router, attribute, error)
+            router_requests = len(router.requests)
+            view_requests = len(view.requests)
+            if mode == "transient":
+                with view.transient_scope():
+                    view.request_refresh()
+                assert preserved(view) == before, (label, mode)
+                assert view.state != "unavailable", (label, mode)
+                assert view.refresh_wanted() is True, (label, mode)
+            else:
+                view.request_refresh()
+                assert view.state == "unavailable", (label, mode)
+                assert view.refresh_wanted() is False, (label, mode)
+                assert [text.text() for text in view._footer_labels()] == [
+                    UNAVAILABLE] * 8, (label, mode)
+            # The view records only the attempts it actually issues, and a
+            # refused read never reaches the router's request surface.
+            assert len(view.requests) == view_requests + attempts, (label, mode)
+            assert len(router.requests) == router_requests, (label, mode)
+            requests_after = len(view.requests)
+            router_after = len(router.requests)
+            view.flush_refresh()
+            # A transient failure leaves exactly one deferred attempt: outside a
+            # transient scope that attempt is admitted and settles terminally.
+            expected = attempts if mode == "transient" else 0
+            assert len(view.requests) == requests_after + expected, (label, mode)
+            assert len(router.requests) == router_after, (label, mode)
+
+
+def test_retired_file_delivery_does_not_release_a_new_request(qtbot):
+    def arm():
+        view, router = published_view(qtbot)
+        stale = deferred_request(view, router)
+        view.set_scope_ready(False)
+        view.set_app_id(2)  # changed key while blocked: retire, then defer
+        assert view.refresh_wanted() is True
+        view.set_scope_ready(True)
+        view.flush_refresh()
+        assert router.pending[-1] is not stale
+        assert router.requests[-1][0] == 2
+        assert view._outstanding is True
+        return view, router, stale
+
+    def stale_success(future):
+        future.set_result(file_view((file_row(basename="stale.txt"),)))
+
+    def stale_error(future):
+        future.set_exception(WindowUnavailableError(
+            "file_source_unavailable", "File history generation retired."))
+
+    for label, settle in (("success", stale_success), ("error", stale_error)):
+        view, router, stale = arm()
+        rows = view.model.rowCount()
+        requests = len(router.requests)
+
+        # A retired success/failure drains late.  Neither may release the newer
+        # slot, consume its wanted flag, clear the table or issue a query.
+        settle(stale)
+        assert view._outstanding is True, label
+        assert view.refresh_wanted() is False, label
+        assert view.state != "unavailable", label
+        assert view.model.rowCount() == rows, label
+        assert len(router.requests) == requests, label
+
+        # Because the newer slot was never released, the next invalidation still
+        # knows a replacement is owed.
+        view.retire_deliveries()
+        assert view.refresh_wanted() is True, label
+        assert view._outstanding is False, label
+
+
+@pytest.mark.parametrize(
+    ("change", "latest"),
+    (
+        pytest.param(lambda view: view.set_app_id(2),
+                     (2, WINDOW, "bytes_total", "desc", None), id="app"),
+        pytest.param(lambda view: view.set_sort("reads", "asc"),
+                     (1, WINDOW, "reads", "asc", None), id="sort"),
+        pytest.param(lambda view: view.search_field.setText("kept"),
+                     (1, WINDOW, "bytes_total", "desc", "kept"), id="search"),
+    ),
+)
+def test_changed_query_key_retires_old_success_while_blocked(qtbot, change, latest):
+    view, router = published_view(qtbot, rows=(file_row(basename="kept.txt"),))
+    stale = deferred_request(view, router)
+    before = preserved(view)
+    view.set_scope_ready(False)
+    change(view)
+    assert view.refresh_wanted() is True
+
+    # The old key's successful reply drains while admission is closed.  It was
+    # retired before the new key was stored, so it cannot publish.
+    stale.set_result(file_view((file_row(basename="stale.txt"),)))
+    assert preserved(view) == before
+    assert view._outstanding is False
+    assert view.refresh_wanted() is True
+
+    view.set_scope_ready(True)
+    view.flush_refresh()
+    assert router.requests[-1] == latest
+    assert view.refresh_wanted() is False
+
+
+def test_valid_empty_file_success_replaces_rows_without_becoming_unavailable(qtbot):
+    view, router = published_view(qtbot, rows=(file_row(basename="kept.txt"),))
+    empty = file_view((), cov=coverage(complete=True))
+    router.defer = True
+    view.request_refresh()
+    router.pending[-1].set_result(empty)
+
+    assert view.state == "ready"
+    assert view.last_result is empty
+    assert view.model.rowCount() == 0
+    assert view.footer_state.text().startswith(
+        "no retained file activity for this application in the served interval; ")
+    assert view.footer_state.text().endswith("; coverage: complete")
+    assert [text.text() for text in view._footer_labels()] != [UNAVAILABLE] * 8
+    assert "unavailable" not in view.state_label.text()
+    assert view.refresh_wanted() is False
+    assert view.files_updating.text() == ""
+
+
+def test_choices_union_preserves_ranked_order_and_sorted_file_extras(qtbot):
+    ranked = (app_total(1, "beta", 300), app_total(2, "alpha", 100))
+    applications = (
+        ("unit:alpha.service", "alpha", 100),  # same identity as a ranked row
+        ("unit:zeta.service", "zeta", 9),
+        ("unit:delta.service", "delta", 3),
+        ("unit:unit-b.service", "same", 2),
+        ("unit:unit-a.service", "same", 1),
+    )
+    registry = {
+        "unit:alpha.service": 2,
+        "unit:zeta.service": 9,
+        "unit:delta.service": 3,
+        "unit:unit-b.service": 10,
+        "unit:unit-a.service": 11,
+    }
+    router = FakeRouter(ranking_rows=ranked, local_applications=applications,
+                        registry_ids=registry, defer=True)
+    view = build(qtbot, router)
+    view.set_window(WINDOW)
+
+    selector = view.app_selector
+    ids = [selector.itemData(index) for index in range(selector.count())]
+    # Ranked order survives (beta before alpha), the duplicate ranked ID is not
+    # repeated, and extras sort by (name, UTF-8 app_key).
+    assert ids == [1, 2, 3, 11, 10, 9]
+    assert [selector.itemText(index) for index in range(selector.count())] == [
+        f"beta  {format_bytes(300)}",
+        f"alpha  {format_bytes(100)}",
+        f"delta  {format_bytes(3)}",
+        f"same  {format_bytes(1)}",
+        f"same  {format_bytes(2)}",
+        f"zeta  {format_bytes(9)}",
+    ]
+    assert router.choice_calls == [WINDOW]
+    assert selector.isVisible() is True
+
+    # A wholly ranked population needs no selector: the ranking list selects.
+    hidden = build(qtbot, FakeRouter(ranking_rows=APPS))
+    hidden.set_window(WINDOW)
+    assert hidden.app_selector.count() == len(APPS)
+    assert hidden.app_selector.isVisible() is False
+
+
+def test_same_window_adoption_refreshes_choices_without_a_table_query(qtbot):
+    router = FakeRouter(
+        ranking_rows=(app_total(1, "a", 30),),
+        local_applications=(),
+        registry_ids={"unit:b.service": 41, "unit:c.service": 43},
+    )
+    view = build(qtbot, router)
+
+    def ids() -> list:
+        selector = view.app_selector
+        return [selector.itemData(index) for index in range(selector.count())]
+
+    view.set_window(WINDOW)
+    assert ids() == [1]
+    assert view.app_selector.isVisible() is False
+    requests = len(router.requests)
+    ranks = len(router.ranking_calls)
+
+    # A newly reachable file-only application joins the union without a query.
+    router.local_applications = (("unit:b.service", "b", 20),)
+    view.set_window(WINDOW)
+    assert ids() == [1, 41]
+    assert view.app_selector.isVisible() is True
+    assert len(router.requests) == requests
+    assert len(router.ranking_calls) == ranks + 1
+
+    # A newly ranked application enters ranked order; the file-only extra stays
+    # appended and the retained subject is untouched.
+    router.ranking_rows = (app_total(2, "c", 90), app_total(1, "a", 30))
+    view.set_window(WINDOW)
+    assert ids() == [2, 1, 41]
+    assert view.app_selector.currentData() == 1
+    assert len(router.requests) == requests
+    assert len(router.ranking_calls) == ranks + 2
+
+    # The subject vanishes: the fallback is deferred to the one later flush.
+    router.ranking_rows = (app_total(2, "c", 90),)
+    view.set_window(WINDOW)
+    assert ids() == [2, 41]
+    assert view.app_selector.currentData() == 2
+    assert len(router.requests) == requests
+    assert view.refresh_wanted() is True
+    view.flush_refresh()
+    assert len(router.requests) == requests + 1
+    assert router.requests[-1][0] == 2
+
+    # A deferred subject change is also owned by the flush, never the union read.
+    view.set_app_id(41, request=False)
+    assert view.refresh_wanted() is True
+    requests = len(router.requests)
+    ranks = len(router.ranking_calls)
+    view.set_window(WINDOW)
+    assert len(router.requests) == requests
+    assert len(router.ranking_calls) == ranks + 1
+    assert view.last_result is not None
+    view.flush_refresh()
+    assert len(router.requests) == requests + 1
+    assert router.requests[-1][0] == 41
+
+
+def test_vanished_subject_falls_back_with_one_deferred_query(qtbot):
+    # A ranked subject vanishes: the first remaining ranked choice wins.
+    router = FakeRouter(
+        ranking_rows=(app_total(1, "alpha", 300),),
+        local_applications=(("unit:beta.service", "beta", 40),),
+        registry_ids={"unit:beta.service": 41},
+    )
+    view = build(qtbot, router)
+    changes: list = []
+    view.subject_changed.connect(changes.append)
+    view.set_window(WINDOW)
+    assert changes == [1], "the first ranked choice becomes the subject once"
+    assert [view.app_selector.itemData(index) for index in range(2)] == [1, 41]
+
+    view.app_selector.setCurrentIndex(1)  # the user picks the file-only app
+    assert changes == [1, 41]
+    assert router.requests[-1][0] == 41
+
+    router.local_applications = ()  # beta vanishes from the retained evidence
+    router.defer = True
+    requests = len(router.requests)
+    view.set_window(WINDOW)
+    assert changes == [1, 41, 1]
+    assert len(router.requests) == requests, "the fallback is deferred, not immediate"
+    assert view.refresh_wanted() is True
+    view.flush_refresh()
+    assert len(router.requests) == requests + 1
+    assert router.requests[-1][0] == 1
+
+    # With no ranked rows the fallback prefers the first remaining file-only
+    # choice, still through exactly one deferred query.
+    router = FakeRouter(
+        local_applications=(
+            ("unit:b.service", "b", 5),
+            ("unit:c.service", "c", 7),
+        ),
+        registry_ids={"unit:b.service": 41, "unit:c.service": 43},
+    )
+    view = build(qtbot, router)
+    changes = []
+    view.subject_changed.connect(changes.append)
+    view.set_window(WINDOW)
+    assert changes == [41]
+    assert [view.app_selector.itemData(index) for index in range(2)] == [41, 43]
+
+    router.local_applications = (("unit:c.service", "c", 7),)
+    router.defer = True
+    requests = len(router.requests)
+    view.set_window(WINDOW)
+    assert changes == [41, 43]
+    assert view.app_selector.count() == 1
+    assert len(router.requests) == requests
+    assert view.refresh_wanted() is True
+    view.flush_refresh()
+    assert len(router.requests) == requests + 1
+    assert router.requests[-1][0] == 43
+
+
+def test_empty_choice_union_retires_subject_and_notifies_once(qtbot):
+    router = FakeRouter(ranking_rows=APPS)
+    view = build(qtbot, router)
+    changes: list = []
+    view.subject_changed.connect(changes.append)
+    view.set_window(WINDOW)
+    assert changes == [1]
+
+    outstanding = deferred_request(view, router)
+    router.ranking_rows = ()
+    requests = len(router.requests)
+    view.set_window(WINDOW)
+
+    assert view.app_selector.count() == 0
+    assert view.app_selector.currentIndex() == -1
+    assert view.state == "ready"
+    assert view.last_result is None
+    assert view.model.rowCount() == 0
+    assert view.footer_state.text() == (
+        "coverage: not applicable; no applications observed in this window")
+    assert changes == [1, None], "the host is notified exactly once"
+    assert view._outstanding is False
+    assert view.refresh_wanted() is False
+
+    # The retired old-subject delivery cannot republish the cleared table, and
+    # an empty union issues no query even when a flush is requested.
+    outstanding.set_result(file_view((file_row(basename="retired.txt"),)))
+    assert view.model.rowCount() == 0
+    assert view.last_result is None
+    assert changes == [1, None]
+    view.flush_refresh()
+    assert len(router.requests) == requests

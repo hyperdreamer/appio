@@ -31,8 +31,9 @@ Files surface is a client of the query contract, not part of the producer.
 from __future__ import annotations
 
 from collections import deque
+from contextlib import contextmanager
 from dataclasses import fields as dataclass_fields
-from typing import TYPE_CHECKING, NamedTuple
+from typing import TYPE_CHECKING, Iterator, NamedTuple
 
 import unicodedata
 
@@ -320,6 +321,8 @@ class FilesView(QWidget):
     """Searchable, sortable, honest per-file table with a coverage footer."""
 
     state_changed = pyqtSignal(str)
+    #: `positive int` for a selected application, `None` for an empty union.
+    subject_changed = pyqtSignal(object)
 
     def __init__(self, history, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -333,6 +336,18 @@ class FilesView(QWidget):
         self._closed = False
         self._unavailable_reason: str | None = None
         self._unavailable_message: str | None = None
+
+        # Scope admission and delivery classification (spec 5.1).  These are
+        # flags, not counters: one outstanding request at a time, and a retired
+        # generation can never publish.
+        self._transient = False
+        self._scope_ready = True
+        self._refresh_wanted = False
+        self._outstanding = False
+        self._updating_scope: Window | None = None
+        self._deferred_window: Window | None = None
+        #: True when the last `_load_choices()` call read a usable union.
+        self._choices_loaded = False
 
         #: Test seams: the last settled result and the last issued query.
         self.last_result: FileViewResult | None = None
@@ -413,10 +428,13 @@ class FilesView(QWidget):
         # Unframed inside the existing page: the shell already provides the
         # only border, and no second design system is introduced.
         self.table.setFrameShape(QFrame.Shape.NoFrame)
-        self.table.verticalHeader().setVisible(False)
-        self.table.verticalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Fixed)
-        self.table.verticalHeader().setDefaultSectionSize(_ROW_HEIGHT)
+        vertical = self.table.verticalHeader()
+        assert vertical is not None  # a QTableView always owns a vertical header
+        vertical.setVisible(False)
+        vertical.setSectionResizeMode(QHeaderView.ResizeMode.Fixed)
+        vertical.setDefaultSectionSize(_ROW_HEIGHT)
         header = self.table.horizontalHeader()
+        assert header is not None  # a QTableView always owns a horizontal header
         header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
         # The name column absorbs slack and elides; numeric columns keep an
         # opaque, fixed-ish width so a late value cannot reflow the page.
@@ -441,6 +459,10 @@ class FilesView(QWidget):
         for label in self._footer_labels():
             outer.addWidget(label)
         outer.addWidget(self.footer_note)
+
+        self.files_updating = self._footer_label("files_updating")
+        self.files_updating.setVisible(False)
+        outer.addWidget(self.files_updating)
 
         self.app_selector.currentIndexChanged.connect(self._on_app_changed)
         self.search_field.textChanged.connect(self._on_search_changed)
@@ -491,39 +513,128 @@ class FilesView(QWidget):
         text = unicodedata.normalize("NFC", self.search_field.text()).strip()
         return text or None
 
-    def set_window(self, window: Window) -> None:
-        """Adopt a prepared window; a different window re-ranks and re-queries."""
+    # -- scope admission and delivery classification ----------------------
 
-        if window == self._window:
-            return
-        self._window = window
-        self.last_result = None
-        self.model.clear()
-        self._set_state(STATE_LOADING)
-        # "The file source is unavailable" outranks "no applications observed":
-        # the second is a claim about apps, not about whether F could be read.
+    def set_transient_scope(self, transient: bool) -> None:
+        """Classify the deliveries that arrive while an invalidating call runs."""
+
+        if not isinstance(transient, bool):
+            raise ValueError("transient must be a bool")
+        self._transient = transient
+
+    @contextmanager
+    def transient_scope(self, retire_on_exit: bool = False) -> Iterator[None]:
+        """Mark invalidating calls transient and retire what they invalidate.
+
+        ``prepare()`` leaves the router in ``loading`` after it has already
+        retired file requests, so its callers pass ``retire_on_exit=True``.  An
+        ordinary invalidating scope can rely on the router reporting an
+        ``unavailable`` view state, which is what a healthy timer tick never
+        does (spec 5.1).
+        """
+
+        previous = self._transient
+        self.set_transient_scope(True)
         try:
-            status = self._history.file_source_status()
+            yield
+        finally:
+            self._transient = previous
+            if retire_on_exit or self._history_view_unavailable():
+                self.retire_deliveries()
+
+    def set_scope_ready(self, ready: bool) -> None:
+        """Open or close query admission without touching the displayed state."""
+
+        if not isinstance(ready, bool):
+            raise ValueError("scope readiness must be a bool")
+        self._scope_ready = ready
+        for control in (
+            self.app_selector,
+            self.search_field,
+            self.direction_button,
+            self.refresh_button,
+        ):
+            control.setEnabled(ready)
+        header = self.table.horizontalHeader()
+        if header is not None:  # a QTableView always owns a horizontal header
+            header.setSectionsClickable(ready)
+        self._update_updating_label()
+
+    def set_updating_scope(self, window: Window | None) -> None:
+        """Name the pending destination in the footer; never adopt it here."""
+
+        if window is not None and not isinstance(window, Window):
+            raise ValueError("updating scope must be a Window or None")
+        self._updating_scope = window
+        self._update_updating_label()
+
+    def retire_deliveries(self) -> None:
+        """Retire every in-flight delivery; ask for one replacement if needed."""
+
+        self._generation += 1
+        if self._outstanding and not self._closed:
+            self._refresh_wanted = True
+        self._outstanding = False
+        self._update_updating_label()
+
+    def refresh_wanted(self) -> bool:
+        """Report the deferred refresh flag without consuming it."""
+
+        return self._refresh_wanted
+
+    def flush_refresh(self) -> None:
+        """Make at most one deferred attempt; never spin on a failure."""
+
+        if self._closed or not self._scope_ready:
+            return
+        if not self._refresh_wanted:
+            return
+        if self._window is None or self._app_id is None:
+            return
+        try:
+            ready = self._history.ready(self._window)
         except Exception as error:
-            self._set_unavailable(None, str(error) or type(error).__name__)
+            self._handle_failure(getattr(error, "reason", None),
+                                 str(error) or type(error).__name__)
             return
-        if not getattr(status, "available", False):
-            self._set_unavailable(
-                getattr(status, "reason", None),
-                getattr(status, "diagnostic", None) or "the file source is unavailable",
-            )
+        if not ready:
             return
-        self._load_ranking()
-        if self._state == STATE_UNAVAILABLE:
-            return
-        if self._app_id is None:
-            self._render_no_applications()
-            return
+        self._refresh_wanted = False
         self.request_refresh()
 
-    def set_app_id(self, app_id: int) -> None:
+    # -- public interface -------------------------------------------------
+
+    def set_window(self, window: Window) -> None:
+        """Adopt a prepared window and refresh the choice union exactly once."""
+
+        if self._closed:
+            return
+        if not self._scope_ready:
+            # The host's canonical frame is not authoritative here: record the
+            # deferred scope and wait for the admitted adoption (spec 5.2).
+            self._deferred_window = window
+            self._refresh_wanted = True
+            self._update_updating_label()
+            return
+        self._deferred_window = None
+        changed = window != self._window
+        self._window = window
+        if not self._read_union():
+            return
+        if self._app_id is None:
+            return
+        if changed:
+            # Adoption satisfies any deferred refresh: exactly one request.
+            self._refresh_wanted = False
+            self.request_refresh()
+
+    def set_app_id(self, app_id: int, *, request: bool = True) -> None:
         if not isinstance(app_id, int) or isinstance(app_id, bool) or app_id <= 0:
             raise ValueError("app_id must be a positive integer")
+        changed = app_id != self._app_id
+        if changed and self._outstanding:
+            # The old subject's success must not publish under the new key.
+            self.retire_deliveries()
         self._app_id = app_id
         index = self.app_selector.findData(app_id)
         self.app_selector.blockSignals(True)
@@ -531,18 +642,36 @@ class FilesView(QWidget):
             self.app_selector.setCurrentIndex(index)
         finally:
             self.app_selector.blockSignals(False)
-        self.request_refresh()
+        if not changed:
+            return
+        if not self._scope_ready:
+            self._refresh_wanted = True
+            self._update_updating_label()
+            return
+        if request:
+            self.request_refresh()
+            return
+        self._refresh_wanted = True
+        self._update_updating_label()
 
     def set_sort(self, sort: FileSort, direction: Direction | None = None) -> None:
         if sort not in SORT_KEYS:
             raise ValueError(f"unknown file sort key: {sort!r}")
+        if direction is not None and direction not in ("asc", "desc"):
+            raise ValueError(f"unknown sort direction: {direction!r}")
+        changed = sort != self._sort or (direction is not None and direction != self._direction)
+        if changed and self._outstanding:
+            self.retire_deliveries()
         self._sort = sort  # type: ignore[assignment]
         if direction is not None:
-            if direction not in ("asc", "desc"):
-                raise ValueError(f"unknown sort direction: {direction!r}")
             self._direction = direction
         self._update_sort_indicator()
-        self.request_refresh()
+        if not self._scope_ready:
+            self._refresh_wanted = True
+            self._update_updating_label()
+            return
+        if changed:
+            self.request_refresh()
 
     def sort_by_column(self, column: int) -> None:
         """A header click selects that column's contract sort key."""
@@ -559,15 +688,21 @@ class FilesView(QWidget):
     def request_refresh(self) -> None:
         """Issue exactly one query for the current app/window/sort/direction/search."""
 
-        if self._closed or self._window is None or self._app_id is None:
+        if self._closed:
+            return
+        if not self._scope_ready:
+            self._refresh_wanted = True
+            self._update_updating_label()
+            return
+        if self._window is None or self._app_id is None:
             return
         try:
             status = self._history.file_source_status()
         except Exception as error:  # a socket-backed source may fail mid-session
-            self._set_unavailable(None, str(error) or type(error).__name__)
+            self._handle_failure(None, str(error) or type(error).__name__)
             return
         if not getattr(status, "available", False):
-            self._set_unavailable(
+            self._handle_failure(
                 getattr(status, "reason", None),
                 getattr(status, "diagnostic", None) or "the file source is unavailable",
             )
@@ -579,9 +714,15 @@ class FilesView(QWidget):
         )
         self.last_request = request
         self.requests.append(request)
-        for label in self._footer_labels():
-            label.setText(LOADING_TEXT)
-        self._set_state(STATE_LOADING)
+        self._outstanding = True
+        self._refresh_wanted = False
+        if self.last_result is None:
+            # An initial request has no rows to keep; a replacement keeps every
+            # footer quantity and only names its destination (spec 5.1, 7).
+            for label in self._footer_labels():
+                label.setText(LOADING_TEXT)
+            self._set_state(STATE_LOADING)
+        self._update_updating_label()
         try:
             future = self._history.request_file_view(*request)
         except Exception as error:  # a rejected request is still an explicit state
@@ -594,6 +735,39 @@ class FilesView(QWidget):
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt override
         self._closed = True
         super().closeEvent(event)
+
+    # -- request outcome classification -----------------------------------
+
+    def _handle_failure(self, reason: str | None, message: str) -> None:
+        """The single failure boundary for every Files outcome (spec 5.4)."""
+
+        if self._closed:
+            return
+        if self._transient or not self._scope_ready:
+            # The retirement is expected: keep the table/footer and defer one
+            # replacement until admission is restored.
+            self._refresh_wanted = True
+            self._update_updating_label()
+            return
+        self._outstanding = False
+        self._refresh_wanted = False
+        self._set_unavailable(reason, message)
+
+    def _history_view_unavailable(self) -> bool:
+        return str(getattr(self._history, "view_state", "")).startswith("unavailable")
+
+    def _update_updating_label(self) -> None:
+        # A refresh that was deferred, or a replacement that is pending over a
+        # displayed result, names its destination.  A first admitted request is
+        # still an initial load and keeps the existing loading text (spec 5.1).
+        pending = self._refresh_wanted or (self._outstanding and self.last_result is not None)
+        scope = self._updating_scope if self._updating_scope is not None else self._window
+        if not pending or scope is None:
+            self.files_updating.setText("")
+            self.files_updating.setVisible(False)
+            return
+        self.files_updating.setText(f"updating to {scope.kind}")
+        self.files_updating.setVisible(True)
 
     # -- request plumbing -------------------------------------------------
 
@@ -608,21 +782,24 @@ class FilesView(QWidget):
     def _on_delivered(self, payload) -> None:
         generation, future = payload
         if self._closed or generation != self._generation:
-            return  # a retired generation can never publish
+            # A retired generation never clears a newer slot or wanted flag.
+            return
+        self._outstanding = False
         try:
             result = future.result()
         except WindowUnavailableError as error:
-            self._set_unavailable(error.reason, str(error))
+            self._handle_failure(error.reason, str(error) or type(error).__name__)
         except Exception as error:
-            self._set_unavailable(None, str(error) or type(error).__name__)
+            self._handle_failure(None, str(error) or type(error).__name__)
         else:
             self._publish(result)
 
     def _settle(self, generation: int, *, error: BaseException) -> None:
-        if generation != self._generation:
+        if self._closed or generation != self._generation:
             return
-        self._set_unavailable(getattr(error, "reason", None),
-                              str(error) or type(error).__name__)
+        self._outstanding = False
+        self._handle_failure(getattr(error, "reason", None),
+                             str(error) or type(error).__name__)
 
     # -- controls ---------------------------------------------------------
 
@@ -630,12 +807,26 @@ class FilesView(QWidget):
         if index < 0:
             return
         app_id = self.app_selector.itemData(index)
-        if not isinstance(app_id, int) or isinstance(app_id, bool):
+        if not isinstance(app_id, int) or isinstance(app_id, bool) or app_id <= 0:
             return
-        self._app_id = app_id
+        if app_id != self._app_id:
+            if self._outstanding:
+                self.retire_deliveries()
+            self._app_id = app_id
+            self.subject_changed.emit(app_id)
+        if not self._scope_ready:
+            self._refresh_wanted = True
+            self._update_updating_label()
+            return
         self.request_refresh()
 
     def _on_search_changed(self, _text: str) -> None:
+        if not self._scope_ready:
+            if self._outstanding:
+                self.retire_deliveries()
+            self._refresh_wanted = True
+            self._update_updating_label()
+            return
         self.request_refresh()
 
     def _on_direction_clicked(self) -> None:
@@ -644,6 +835,7 @@ class FilesView(QWidget):
 
     def _update_sort_indicator(self) -> None:
         header = self.table.horizontalHeader()
+        assert header is not None  # a QTableView always owns a horizontal header
         direction_glyph = "▼" if self._direction == "desc" else "▲"
         self.direction_button.setText(direction_glyph)
         self.direction_button.setToolTip(
@@ -668,31 +860,84 @@ class FilesView(QWidget):
             else Qt.SortOrder.AscendingOrder,
         )
 
-    # -- ranking and app choice -------------------------------------------
+    # -- choice union -----------------------------------------------------
 
-    def _load_ranking(self) -> None:
-        """Read the app selector's source once per window; never per row."""
+    def _read_union(self) -> bool:
+        """Read source status then the union; True when choices are usable."""
 
+        # "The file source is unavailable" outranks "no applications observed":
+        # the second is a claim about apps, not about whether F could be read.
+        try:
+            status = self._history.file_source_status()
+        except Exception as error:
+            self._handle_failure(None, str(error) or type(error).__name__)
+            return False
+        if not getattr(status, "available", False):
+            self._handle_failure(
+                getattr(status, "reason", None),
+                getattr(status, "diagnostic", None) or "the file source is unavailable",
+            )
+            return False
+        self._load_choices()
+        return self._choices_loaded
+
+    def _load_choices(self) -> None:
+        """Read the ranked/file-only union once per applied preparation.
+
+        The ranking keeps its own order; file-only applications are appended
+        after it, deduplicated against the ranked IDs and sorted by name with a
+        UTF-8 application-key tie-break (spec 5.3).  No basename ever becomes an
+        application identity.
+        """
+
+        self._choices_loaded = False
+        previous = self._app_id
         try:
             rows = list(self._history.ranking(self._window, "total_bytes"))
         except Exception as error:
-            self._set_unavailable(getattr(error, "reason", None),
-                                  str(error) or type(error).__name__)
+            self._handle_failure(getattr(error, "reason", None),
+                                 str(error) or type(error).__name__)
             return
-        choices = [(row.name, row.total_bytes, row.app_id) for row in rows]
-        if not rows:
-            local = getattr(self._history, "local", None)
-            registry = getattr(self._history, "registry", None)
-            if local is not None and registry is not None:
-                try:
-                    choices = [
-                        (name, total_bytes, registry.id_for(key))
-                        for key, name, total_bytes in local.file_applications(self._window)
-                    ]
-                except Exception as error:
-                    self._set_unavailable(getattr(error, "reason", None),
-                                          str(error) or type(error).__name__)
-                    return
+        ranked = [(row.name, row.total_bytes, row.app_id) for row in rows]
+        extras: list[tuple[str, str, int, int]] = []
+        local = getattr(self._history, "local", None)
+        registry = getattr(self._history, "registry", None)
+        if local is not None and registry is not None:
+            try:
+                applications = list(local.file_applications(self._window))
+                mapped = [(name, total_bytes, registry.id_for(key), key)
+                          for key, name, total_bytes in applications]
+            except Exception as error:
+                # A genuine choice failure is never an empty success.
+                self._handle_failure(getattr(error, "reason", None),
+                                     str(error) or type(error).__name__)
+                return
+            known = {app_id for _, _, app_id in ranked}
+            for name, total_bytes, app_id, key in mapped:
+                if app_id in known:
+                    continue
+                known.add(app_id)
+                extras.append((name, key, total_bytes, app_id))
+            extras.sort(key=lambda choice: (choice[0], choice[1].encode("utf-8")))
+        choices = ranked + [(name, total, app_id)
+                            for name, _key, total, app_id in extras]
+        if self._app_id is not None and any(self._app_id == choice[2] for choice in choices):
+            subject = self._app_id
+        elif ranked:
+            subject = ranked[0][2]
+        elif extras:
+            subject = extras[0][3]
+        else:
+            subject = None
+        if subject != previous:
+            # A vanished/fallback subject changes the query key: the old
+            # delivery must not publish under the new subject, and the new one
+            # is owed exactly one deferred query.
+            if self._outstanding:
+                self.retire_deliveries()
+            else:
+                self._refresh_wanted = True
+        self.app_selector.setVisible(len(choices) > len(ranked))
         self.app_selector.blockSignals(True)
         try:
             self.app_selector.clear()
@@ -700,14 +945,19 @@ class FilesView(QWidget):
                 self.app_selector.addItem(
                     f"{name}  {format_bytes(total_bytes)}", app_id
                 )
-            if self._app_id is None and choices:
-                self._app_id = choices[0][2]
-            index = -1
-            if self._app_id is not None:
-                index = self.app_selector.findData(self._app_id)
+            index = -1 if subject is None else self.app_selector.findData(subject)
             self.app_selector.setCurrentIndex(index)
         finally:
             self.app_selector.blockSignals(False)
+        self._app_id = subject
+        self._choices_loaded = True
+        if not choices:
+            # A genuinely empty available union is a measured empty success.
+            self._refresh_wanted = False
+            self._render_no_applications()
+        self._update_updating_label()
+        if subject != previous:
+            self.subject_changed.emit(subject)
 
     # -- rendering --------------------------------------------------------
 
@@ -717,14 +967,14 @@ class FilesView(QWidget):
         if inner.unavailable_reason is not None:
             # The router raises for these; a result carrying one is still never
             # rendered as numbers.
-            self._set_unavailable(inner.unavailable_reason,
-                                  "file history is not available for this window")
+            self._handle_failure(inner.unavailable_reason,
+                                 "file history is not available for this window")
             return
         if coverage.served_interval is None:
             # An unavailable placeholder is not an accepted served scope: its
             # absent rows are unknown, not measured emptiness, so it must not
             # reach the model or any numeric footer line.
-            self._set_unavailable(
+            self._handle_failure(
                 coverage.unknown_owner_overflow.coverage.unavailable_reason,
                 "file history is not available for this window")
             return
@@ -733,6 +983,11 @@ class FilesView(QWidget):
         self.model.set_rows(result.table.rows, window)
         self._render_coverage(result, window)
         self._set_state(STATE_READY if inner.complete else STATE_INCOMPLETE)
+        if not self._scope_ready:
+            # The visible table is now current for its own scope, but the host
+            # still owes a replacement: keep the destination visible.
+            self._refresh_wanted = True
+        self._update_updating_label()
 
     def _render_coverage(self, result: FileViewResult, window: Window) -> None:
         coverage = result.coverage
@@ -811,6 +1066,7 @@ class FilesView(QWidget):
         self.last_result = None
         self.model.clear()
         self._set_state(STATE_READY)
+        self._update_updating_label()
 
     def _set_unavailable(self, reason: str | None, message: str) -> None:
         self.last_result = None
@@ -820,6 +1076,7 @@ class FilesView(QWidget):
         self._unavailable_reason = reason
         self._unavailable_message = message
         self._set_state(STATE_UNAVAILABLE)
+        self._update_updating_label()
 
     def _set_state(self, state: str) -> None:
         self._state = state
