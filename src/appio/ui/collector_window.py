@@ -16,22 +16,23 @@ verdict may refine the activation dimension. A verified answer on the GUI's
 current history connection is also a socket observation and supersedes a silent
 one-shot probe.
 
-The P2 :class:`~appio.ui.main_window.AppIoWindow` is embedded unchanged and is
-only rendered after :meth:`HistoryRouter.ready` is true for the exact window that
-was prepared; until then its numeric detail is hidden and a loading text is shown.
+The console host and its Overview and Files tabs persist before the first sample
+and throughout replacement preparations. Numeric frames are applied only after
+:meth:`HistoryRouter.ready` is true for their exact window; a replacement keeps
+the previous frame visible until the new frame is ready.
 """
 
 from __future__ import annotations
 
-from concurrent.futures import Future
-from dataclasses import replace
+from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass, replace
 import os
 from pathlib import Path
 import subprocess
 import sys
 import threading
 import time
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING, Callable, Literal
 
 from PyQt6.QtCore import QObject, Qt, QTimer, pyqtSignal
 from PyQt6.QtWidgets import (
@@ -42,7 +43,6 @@ from PyQt6.QtWidgets import (
     QMainWindow,
     QPushButton,
     QRadioButton,
-    QStackedWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -67,6 +67,9 @@ from ..setup_boundary import CommandResult
 from ..setup_client import SetupClient, SetupReply
 from .files_view import STATE_UNAVAILABLE as FILES_STATE_UNAVAILABLE
 from .files_view import FilesView
+
+if TYPE_CHECKING:
+    from .main_window import AppIoWindow
 
 __all__ = [
     "ACTIVATION_INACTIVE",
@@ -326,7 +329,7 @@ def display_state(facts: ServiceFacts, probe_state: str | None = None) -> str:
     """
 
     state = decide_owner(facts).state
-    if probe_state in ACTIVATION_STATES and facts.enabled is not False:
+    if probe_state is not None and probe_state in ACTIVATION_STATES and facts.enabled is not False:
         return probe_state
     return state
 
@@ -393,14 +396,57 @@ class SettingsDialog(QDialog):
 # --------------------------------------------------------------------------- #
 
 
+@dataclass(frozen=True)
+class ProbePayload:
+    facts: ServiceFacts | None
+    error: str | None
+    ticket: int
+    generation: int
+
+    def __post_init__(self) -> None:
+        if (self.facts is None) == (self.error is None):
+            raise ValueError("probe payload must contain exactly one outcome")
+        if self.facts is not None and not isinstance(self.facts, ServiceFacts):
+            raise ValueError("probe payload facts must be ServiceFacts")
+        if self.error is not None and (
+            not isinstance(self.error, str) or not self.error.strip()
+        ):
+            raise ValueError("probe payload error must be nonempty text")
+        if type(self.ticket) is not int or self.ticket <= 0:
+            raise ValueError("probe payload ticket must be a positive integer")
+        if type(self.generation) is not int or self.generation < 0:
+            raise ValueError("probe payload generation must be a nonnegative integer")
+
+
+@dataclass(frozen=True)
+class PrepareRetry:
+    window: Window
+    owner: Literal["clock", "explicit"]
+    since: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.window, Window):
+            raise ValueError("prepare retry window must be a Window")
+        if self.owner not in ("clock", "explicit"):
+            raise ValueError("prepare retry owner must be clock or explicit")
+        if type(self.since) is not int or self.since < 0:
+            raise ValueError("prepare retry timestamp must be a nonnegative integer")
+
+
 class _ReplyBridge(QObject):
     """Carries a completed helper future from a worker thread to the Qt thread."""
 
     delivered = pyqtSignal(object)
 
 
+class _ProbeBridge(QObject):
+    """Carries immutable probe outcomes to the Qt thread."""
+
+    delivered = pyqtSignal(object)
+
+
 class CollectorWindow(QMainWindow):
-    """The P3 shell: a status banner, one Settings switch, and navigation only."""
+    """The shell owns applied history frames and all Qt-side service decisions."""
 
     def __init__(
         self,
@@ -419,13 +465,24 @@ class CollectorWindow(QMainWindow):
         self._clock_ns = clock_ns or (lambda: time.clock_gettime_ns(time.CLOCK_BOOTTIME))
         self._pump = pump
         self._facts: ServiceFacts | None = None
+        self._facts_applied = 0
+        self._dropped_facts = 0
         self._probe_state: str | None = None
+        self._probe_ticket = 0
+        self._setup_generation = 0
+        self._probe_inflight: Future[ServiceFacts] | None = None
+        self._probe_successor: Future[ServiceFacts] | None = None
+        self._probe_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="appio-probe")
         self._busy = False
         self._operation: tuple[str, Callable[[SetupReply], None] | None] | None = None
         self._activation_choice: str | None = None
         self._unsupported_reason: str | None = None
-        self._view: "AppIoWindow | None" = None
-        self._prepared: Window | None = None
+        self._target: Window | None = None
+        self._displayed: Window | None = None
+        self._pending: Window | None = None
+        self._invalidated = False
+        self._prepare_retry: PrepareRetry | None = None
+        self._prepare_error: str | None = None
         self._closed = False
         self.state_text = COLLECTOR_STATE_UNAVAILABLE
 
@@ -437,7 +494,14 @@ class CollectorWindow(QMainWindow):
         self._build_ui()
 
         self._bridge = _ReplyBridge(self)
-        self._bridge.delivered.connect(self._on_reply)
+        # The packaged PyQt stub omits the supported connection-type argument.
+        self._bridge.delivered.connect(  # type: ignore[call-arg]
+            self._on_reply, Qt.ConnectionType.QueuedConnection
+        )
+        self._probe_bridge = _ProbeBridge(self)
+        self._probe_bridge.delivered.connect(  # type: ignore[call-arg]
+            self._apply_facts, Qt.ConnectionType.QueuedConnection
+        )
 
         self._poll_timer = QTimer(self)
         self._poll_timer.setInterval(100)
@@ -450,6 +514,8 @@ class CollectorWindow(QMainWindow):
     # -- construction -----------------------------------------------------
 
     def _build_ui(self) -> None:
+        from .main_window import AppIoWindow
+
         central = QWidget(self)
         outer = QVBoxLayout(central)
 
@@ -463,11 +529,8 @@ class CollectorWindow(QMainWindow):
         self.banner_open_settings = QPushButton("Open settings")
         self.banner_open_settings.setObjectName("banner_open_settings")
         self.banner_open_settings.setToolTip("Opens Settings at the System services switch.")
-        self.files_nav = QPushButton("Files")
-        self.files_nav.setObjectName("files_nav")
         banner_layout.addWidget(self.banner_status, 1)
         banner_layout.addWidget(self.banner_open_settings)
-        banner_layout.addWidget(self.files_nav)
         outer.addWidget(banner)
 
         self.error_label = QLabel("")
@@ -477,39 +540,14 @@ class CollectorWindow(QMainWindow):
         self.error_label.setVisible(False)
         outer.addWidget(self.error_label)
 
-        self.stack = QStackedWidget()
-        self.history_page = QWidget()
-        history_layout = QVBoxLayout(self.history_page)
-        self.history_state = QLabel("waiting for the first sample")
-        self.history_state.setObjectName("history_state")
-        self.history_state.setWordWrap(True)
-        history_layout.addWidget(self.history_state)
-        self._view_slot = QVBoxLayout()
-        history_layout.addLayout(self._view_slot, 1)
-        self.stack.addWidget(self.history_page)
-
-        self.files_page = QWidget()
-        files_layout = QVBoxLayout(self.files_page)
-        # The real Files surface. It consumes only the Files query contract and
-        # never selects, elevates, or writes anything.
-        self.files_view = FilesView(self.history)
-        self.files_view.setObjectName("files_view")
-        self.files_message = QLabel(FILES_UNAVAILABLE)
-        self.files_message.setObjectName("files_message")
-        self.files_message.setWordWrap(True)
-        self.files_message.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        self.files_message.setVisible(False)
-        self.files_open_settings = QPushButton("Open settings")
-        self.files_open_settings.setObjectName("files_open_settings")
-        self.files_open_settings.setToolTip(
-            "Opens Settings at the System services switch. Changes no state."
-        )
-        files_layout.addWidget(self.files_view, 1)
-        files_layout.addWidget(self.files_message)
-        files_layout.addWidget(self.files_open_settings)
-        self.stack.addWidget(self.files_page)
-        self.stack.setCurrentWidget(self.history_page)
-        outer.addWidget(self.stack, 1)
+        self._view = AppIoWindow(self.history, files_view=FilesView(self.history))
+        self._view.setObjectName("console_view")
+        self.files_view = self._view.files_view
+        self.files_message = self._view.files_message
+        self.files_open_settings = self._view.files_open_settings
+        self.history_state = self._view.history_state
+        self.files_view.state_changed.connect(self._render_files_message)
+        outer.addWidget(self._view, 1)
 
         self.setCentralWidget(central)
         self.resize(980, 620)
@@ -519,12 +557,9 @@ class CollectorWindow(QMainWindow):
         self.settings.switch.clicked.connect(self._on_switch_clicked)
         self.banner_open_settings.clicked.connect(self._open_settings_default)
         self.files_open_settings.clicked.connect(self._open_settings_default)
-        self.files_nav.clicked.connect(self.open_files_unavailable)
-        self.files_view.state_changed.connect(self._render_files_message)
         self._render_files_message()
 
     def _open_settings_default(self) -> None:
-        # QPushButton.clicked carries a checked flag; the deep link takes no argument.
         self.open_settings()
 
     # -- public navigation surface ----------------------------------------
@@ -533,9 +568,15 @@ class CollectorWindow(QMainWindow):
     def busy(self) -> bool:
         return self._busy
 
-    def open_settings(self, *, focus: str = "system_services") -> None:
-        """Focus the one settings row. Never invokes, reconciles or queries."""
+    @property
+    def facts_applied(self) -> int:
+        return self._facts_applied
 
+    @property
+    def _prepared(self) -> Window | None:
+        return self._displayed
+
+    def open_settings(self, *, focus: str = "system_services") -> None:
         if focus not in SettingsDialog.ROWS:
             raise ValueError("unknown settings row")
         self.settings.show()
@@ -544,21 +585,14 @@ class CollectorWindow(QMainWindow):
         self.settings.focus_row(focus)
 
     def open_files_unavailable(self) -> None:
-        """Compatibility navigation slot: select the Files page and query it.
+        """Compatibility navigation: select Files without issuing a query."""
 
-        The name is retained because the P3 banner already pointed at it. It now
-        shows the real Files surface and issues one contract query for the
-        current window; it invokes no helper and changes no collector state.
-        """
+        self._view.detail_tabs.setCurrentIndex(1)
+        self._render_files_message()
 
-        self.stack.setCurrentWidget(self.files_page)
-        self._sync_files(request=True)
-
-    # -- the Files page ---------------------------------------------------
+    # -- Files ownership --------------------------------------------------
 
     def _history_ready(self, window: Window | None) -> bool:
-        """The router's readiness gate, with a raised read treated as not ready."""
-
         if window is None:
             return False
         try:
@@ -567,21 +601,26 @@ class CollectorWindow(QMainWindow):
             return False
 
     def _files_status_text(self) -> str | None:
-        """The explicit page-level message beside the table, or ``None``."""
-
-        window = self._prepared
-        if window is None:
-            return "waiting for the first sample"
-        if not self._history_ready(window):
-            # A degraded file source is already a final fact while the process
-            # history is still loading: it is never rendered as a table.
-            status = self.history.file_source_status()
+        window = self._displayed or self._pending or self._target
+        if self._displayed is None:
+            try:
+                status = self.history.file_source_status()
+            except Exception as error:
+                if window is None:
+                    return "waiting for the first sample"
+                return f"{FILES_UNAVAILABLE}: {str(error) or type(error).__name__}"
             if not getattr(status, "available", False):
                 reason = getattr(status, "reason", None)
                 detail = getattr(status, "diagnostic", None) or "the file source is unavailable"
                 prefix = f"{reason}: " if reason else ""
                 return f"{FILES_UNAVAILABLE}: {prefix}{detail}"
+            if window is None:
+                return "waiting for the first sample"
             return f"loading history ({self.history.view_state})"
+        if self._pending is not None or self._prepare_retry is not None:
+            return None
+        if not self._history_ready(self._displayed):
+            return None
         if self.files_view.state == FILES_STATE_UNAVAILABLE:
             return f"{FILES_UNAVAILABLE}: {self.files_view.unavailable_text()}"
         return None
@@ -589,75 +628,240 @@ class CollectorWindow(QMainWindow):
     def _render_files_message(self, *_args) -> None:
         try:
             text = self._files_status_text()
-        except Exception as error:  # a state signal must never kill the window
+        except Exception as error:
             text = f"appio: {error}"
         self.files_message.setText(text or "")
         self.files_message.setVisible(text is not None)
 
-    def _sync_files(self, *, request: bool) -> None:
-        """Point the Files surface at the prepared window, or hide it honestly."""
-
-        window = self._prepared
-        ready = self._history_ready(window)
-        if ready:
-            # The same exact Window the Overview renders, never a widened one.
-            self.files_view.set_window(window)
-            if request:
-                self.files_view.request_refresh()
-        self.files_view.setVisible(ready)
+    def _sync_files(self, *, request: bool = False) -> None:
+        window = self._displayed
+        if (window is None or self._pending is not None or self._prepare_retry is not None
+                or not self._history_ready(window)):
+            self._render_files_message()
+            return
+        previous = self.files_view._window
+        self.files_view.set_window(window)
+        if request and previous == window:
+            self.files_view.request_refresh()
         self._render_files_message()
 
+    # -- timer and target state machine -----------------------------------
+
     def refresh(self) -> None:
-        """Probe (unprivileged), reconcile ownership, then render only proven data."""
+        """Pump, advance/apply stored history work, then submit one probe."""
 
         if self._closed:
             return
         try:
             if self._pump is not None:
-                self._pump()
-            facts = self.setup.refresh()
-            # Both probes belong to this GUI. A successful status round-trip on
-            # the current history connection is stronger evidence than a silent
-            # one-shot probe. IodClient clears verification on loss/reconnect,
-            # so a retained cursor cannot latch the answering label.
-            client = getattr(self.history, "client", None)
-            state = getattr(client, "state", None)
-            if state is not None and state.verified and state.answering:
-                facts = replace(facts, daemon_verified=True, answering=True,
-                                pending_activation=state.pending_activation)
-            # Reconciliation invalidates the router. With unchanged daemon
-            # ownership, let an in-flight read finish across refresh ticks;
-            # replacing it each tick can discard every completed generation.
-            keep_pending = (
-                facts == self._facts
-                and facts.daemon_verified and facts.answering
-                and self._prepared is not None
-                and self.history.view_state == "loading"
-            )
-            self._facts = facts
+                with self.files_view.transient_scope():
+                    self._pump()
+            self._tick_target()
+            applied = self.apply_ready_frame()
+            if (
+                not applied
+                and self._pending is None
+                and self._prepare_retry is None
+                and self._displayed is not None
+                and self._history_ready(self._displayed)
+            ):
+                self.files_view.flush_refresh()
             if not self._busy:
-                if not keep_pending:
-                    self.coordinator.reconcile(facts)
-                self.coordinator.tick_local()
-            self._render(facts)
-            if not self._busy:
-                self._render_history(keep_pending=keep_pending)
-        except Exception as error:  # a timer callback must never kill the window
-            self._show_error(f"appio: {error}")
+                self._submit_probe()
+        except Exception as error:
+            self._show_error(f"appio: {str(error) or type(error).__name__}")
 
-    def shutdown(self) -> None:
+    def _history_retired(self) -> bool:
+        return str(getattr(self.history, "view_state", "")).startswith("unavailable")
+
+    def _tick_target(self) -> None:
         if self._closed:
             return
-        self._closed = True
-        for timer in (self._timer, self._poll_timer):
-            timer.stop()
-        for dialog in (self.consent, self.choice, self.restart_confirmation, self.settings):
-            if dialog is not None:
-                dialog.close()
+        if self._pending is not None and self._history_retired():
+            self._pending = None
+        self._target = self._current_window()
+        retry = self._prepare_retry
+        if self._target is None:
+            if retry is not None and retry.owner == "explicit":
+                self.files_view.set_updating_scope(retry.window)
+                self.files_view.set_scope_ready(False)
+                self._invalidated = False
+                self._sync_files()
+                self._render_files_message()
+                return
+            if retry is not None:
+                self._clear_error()
+            self._displayed = None
+            self._pending = None
+            self._prepare_retry = None
+            self._prepare_error = None
+            self._invalidated = False
+            self.files_view.set_updating_scope(None)
+            self.files_view.set_scope_ready(True)
+            self.history_state.setText("waiting for the first sample")
+            self.history_state.setVisible(True)
+            self._view.show_overview_status("waiting for the first sample", keep_frame=False)
+            self._poll_timer.stop()
+            self._sync_files()
+            return
+        if retry is not None and retry.owner == "explicit":
+            self.files_view.set_updating_scope(retry.window)
+            self.files_view.set_scope_ready(False)
+            self._invalidated = self._history_retired() and self._displayed is not None
+            self._render_files_message()
+            return
+
+        retrying = retry is not None and retry.owner == "clock"
+        self.files_view.set_scope_ready(self._pending is None and not retrying)
+        self._invalidated = self._history_retired() and self._displayed is not None
+        if self._pending is not None:
+            self._show_pending_status()
+            self._arm_poll()
+            return
+        if self._displayed is None or self._invalidated or retrying or self._target != self._displayed:
+            prepare_window = self._target
+            self.files_view.set_updating_scope(prepare_window)
+            self.files_view.set_scope_ready(False)
+            self.files_view.request_refresh()
+            try:
+                with self.files_view.transient_scope(retire_on_exit=True):
+                    self.history.prepare(prepare_window)
+            except Exception as error:
+                if self.history.view_state != "loading":
+                    raise
+                self._pending = None
+                self._prepare_retry = PrepareRetry(
+                    prepare_window, "clock", self._clock_ns()
+                )
+                self._prepare_error = f"appio: {str(error) or type(error).__name__}"
+                self._show_error(self._prepare_error)
+                self._show_pending_status()
+                self._poll_timer.stop()
+                self._render_files_message()
+                return
+            self._prepare_retry = None
+            self._prepare_error = None
+            self._pending = prepare_window
+            self._clear_error()
+            self._show_pending_status()
+            self._arm_poll()
+        elif self._displayed is not None:
+            self.files_view.set_scope_ready(True)
+            self.files_view.set_updating_scope(None)
+            self._sync_files()
+            self.history_state.setText("")
+            self.history_state.setVisible(False)
+            self._poll_timer.stop()
+
+    def _show_pending_status(self) -> None:
+        if self._displayed is None:
+            self.history_state.setText(f"loading history ({self.history.view_state})")
+        else:
+            self.history_state.setText(f"updating ({self.history.view_state})")
+        self.history_state.setVisible(True)
+        self._render_files_message()
+
+    def _arm_poll(self) -> None:
+        if self._pending is not None and not self._poll_timer.isActive():
+            self._poll_timer.start()
+
+    def apply_ready_frame(self) -> bool:
+        if self._closed:
+            return False
+        if self._prepare_retry is not None and self._prepare_retry.owner == "explicit":
+            return False
+        if self._pending is None:
+            return False
+        if self._history_retired():
+            self._pending = None
+            self._invalidated = self._history_retired() and self._displayed is not None
+            return False
+        if self.history.ready(self._pending):
+            self._apply_frame()
+            return True
+        return False
+
+    def show_window(self, window: Window) -> None:
+        if self._closed:
+            return
+        self._prepare_retry = None
+        self._prepare_error = None
+        self.files_view.set_updating_scope(window)
+        self.files_view.set_scope_ready(False)
+        self.files_view.request_refresh()
         try:
-            self.coordinator.close()
-        finally:
-            self.history.close()
+            with self.files_view.transient_scope(retire_on_exit=True):
+                self.history.prepare(window)
+        except Exception as error:
+            if self.history.view_state != "loading":
+                raise
+            self._pending = None
+            self._prepare_retry = PrepareRetry(window, "explicit", self._clock_ns())
+            self._prepare_error = f"appio: {str(error) or type(error).__name__}"
+            self._show_error(self._prepare_error)
+            self._show_pending_status()
+            self._poll_timer.stop()
+            self._render_files_message()
+            raise
+        self._prepare_retry = None
+        self._prepare_error = None
+        self._pending = window
+        self._clear_error()
+        self._show_pending_status()
+        self._arm_poll()
+
+    def _apply_frame(self) -> None:
+        window = self._pending
+        if window is None:
+            return
+        self._displayed = window
+        self._pending = None
+        self._invalidated = False
+        self.files_view.retire_deliveries()
+        self.files_view.set_scope_ready(True)
+        self._show_ready(window)
+        self.files_view.flush_refresh()
+        self.files_view.set_updating_scope(None)
+        self._render_files_message()
+        self._poll_timer.stop()
+
+    def _poll_history(self) -> None:
+        if self._closed or self._pending is None:
+            self._poll_timer.stop()
+            return
+        try:
+            applied = self.apply_ready_frame()
+            if not applied and self._pending is None:
+                self._poll_timer.stop()
+        except Exception as error:
+            self._show_error(f"appio: {str(error) or type(error).__name__}")
+
+    def _show_ready(self, window: Window) -> None:
+        view = self._ensure_view()
+        view.set_window(window)
+        self.history_state.setText("")
+        self.history_state.setVisible(False)
+        self._sync_files(request=False)
+
+    def _ensure_view(self, window: Window | None = None) -> "AppIoWindow":
+        del window
+        if self._view is None:
+            from .main_window import AppIoWindow
+
+            self._view = AppIoWindow(self.history, files_view=self.files_view)
+        return self._view
+
+    def _hide_view(self) -> None:
+        if self._displayed is None:
+            self._view.show_overview_status("waiting for the first sample", keep_frame=False)
+
+    @property
+    def view(self) -> "AppIoWindow | None":
+        return self._view
+
+    @property
+    def history_visible(self) -> bool:
+        return self._displayed is not None
 
     # -- rendering --------------------------------------------------------
 
@@ -681,12 +885,9 @@ class CollectorWindow(QMainWindow):
         self.error_label.setVisible(False)
 
     def _current_window(self) -> Window | None:
-        # A daemon-owned GUI may have no local boot row at all: the GUI is a
-        # read-through client in that state.  Only the root-verified status
-        # cursor establishes which boot the first remote query may name.
         client = getattr(self.history, "client", None)
         state = getattr(client, "state", None)
-        if (state is not None and state.verified and state.answering):
+        if state is not None and state.verified and state.answering:
             cursor = state.cursor
             if cursor is None:
                 return None
@@ -705,78 +906,114 @@ class CollectorWindow(QMainWindow):
         end = (now // RAW_BUCKET_NS + 1) * RAW_BUCKET_NS
         return Window(kind="since_boot", boot_id=boot_id, end_mono_ns=end)
 
-    def _render_history(self, *, keep_pending: bool = False) -> None:
-        window = self._current_window()
-        if window is None:
-            self._prepared = None
-            self._hide_view()
-            self.history_state.setText("waiting for the first sample")
-            self.history_state.setVisible(True)
-            self._poll_timer.stop()
-            self._sync_files(request=False)
-            return
-        if not keep_pending or self._prepared != window:
-            self._prepared = window
-            self.history.prepare(window)
-        if self.history.ready(window):
-            self._show_ready(window)
-            return
-        self._hide_view()
-        self.history_state.setText(f"loading history ({self.history.view_state})")
-        self.history_state.setVisible(True)
-        # Poll readiness only while something is being prepared: no idle wakeups.
-        if not self._poll_timer.isActive():
-            self._poll_timer.start()
+    # -- probe worker and acceptance -------------------------------------
 
-    def _poll_history(self) -> None:
-        """Fast readiness poll; never prepares a new scope and never queries."""
+    def _submit_probe(self, *, replace_pending: bool = False) -> bool:
+        if self._closed or self._busy:
+            return False
+        previous = self._probe_inflight
+        if previous is not None and not replace_pending:
+            return False
+        previous_running = previous is not None and previous.running()
+        has_running_predecessor = previous_running or (
+            previous is not None and self._probe_successor is previous
+        )
+        self._probe_ticket += 1
+        ticket = self._probe_ticket
+        generation = self._setup_generation
+        if previous is not None and not previous.done() and not previous_running:
+            previous.cancel()
+        self._probe_successor = None
+        try:
+            future: Future[ServiceFacts] = self._probe_executor.submit(self.setup.refresh)
+        except Exception as error:
+            self._probe_inflight = None
+            self._probe_successor = None
+            self._show_error(f"appio: {str(error) or type(error).__name__}")
+            return False
+        self._probe_inflight = future
+        self._probe_successor = future if has_running_predecessor else None
+        def completed(done: Future[ServiceFacts]) -> None:
+            self._probe_completed(ticket, generation, done)
 
-        if self._closed or self._prepared is None or self._busy:
-            return
-        if self._view is not None and self._view.isVisible():
+        future.add_done_callback(completed)
+        return True
+
+    def _probe_completed(
+        self, ticket: int, generation: int, future: Future[ServiceFacts]
+    ) -> None:
+        if future.cancelled():
             return
         try:
-            if self.history.ready(self._prepared):
-                self._show_ready(self._prepared)
+            facts = future.result()
+            payload = ProbePayload(facts, None, ticket, generation)
+        except BaseException as error:
+            payload = ProbePayload(
+                None, str(error) or type(error).__name__, ticket, generation
+            )
+        try:
+            self._probe_bridge.delivered.emit(payload)
+        except RuntimeError:
+            if not self._closed:
+                raise
+
+    def _apply_facts(self, payload: ProbePayload) -> None:
+        if self._closed:
+            return
+        if (
+            payload.ticket != self._probe_ticket
+            or payload.generation != self._setup_generation
+            or self._busy
+        ):
+            self._dropped_facts += 1
+            if payload.ticket == self._probe_ticket:
+                self._probe_inflight = None
+                self._probe_successor = None
+            return
+        if payload.ticket == self._probe_ticket:
+            self._probe_inflight = None
+            self._probe_successor = None
+        if payload.error is not None:
+            self._show_error(f"appio: {payload.error}")
+            return
+        facts = payload.facts
+        assert facts is not None
+        client = getattr(self.history, "client", None)
+        state = getattr(client, "state", None)
+        if state is not None and state.verified and state.answering:
+            facts = replace(
+                facts, daemon_verified=True, answering=True,
+                pending_activation=state.pending_activation,
+            )
+        keep_pending = facts == self._facts and self._pending is not None
+        try:
+            with self.files_view.transient_scope():
+                if not keep_pending:
+                    self.coordinator.reconcile(facts)
+                self.coordinator.tick_local()
         except Exception as error:
-            self._show_error(f"appio: {error}")
-
-    def _show_ready(self, window: Window) -> None:
-        if self._view is None:
-            # The P2 view renders its own first frame through the same contracts.
-            self._view = self._ensure_view(window)
-        else:
-            self._view.set_window(window)
-        self.history_state.setText("")
-        self.history_state.setVisible(False)
-        self._view.setVisible(True)
-        self._sync_files(request=False)
-        self._poll_timer.stop()
-
-    def _ensure_view(self, window: Window) -> "AppIoWindow":
-        from .main_window import AppIoWindow
-
-        view = AppIoWindow(self.history, window.boot_id, window.end_mono_ns)
-        self._view_slot.addWidget(view)
-        return view
-
-    def _hide_view(self) -> None:
-        if self._view is not None:
-            self._view.setVisible(False)
-
-    @property
-    def view(self) -> "AppIoWindow | None":
-        return self._view
-
-    @property
-    def history_visible(self) -> bool:
-        return self._view is not None and self._view.isVisible()
+            self._show_error(f"appio: {str(error) or type(error).__name__}")
+            return
+        self._facts = facts
+        self._facts_applied += 1
+        self._render(facts)
+        try:
+            self._tick_target()
+            applied = self.apply_ready_frame()
+            if (
+                not applied
+                and self._pending is None
+                and self._prepare_retry is None
+                and self._displayed is not None
+                and self._history_ready(self._displayed)
+            ):
+                self.files_view.flush_refresh()
+        except Exception as error:
+            self._show_error(f"appio: {str(error) or type(error).__name__}")
 
     # -- the switch: probe first, consent, then one operation --------------
 
     def _on_switch_clicked(self) -> None:
-        # A click is a request, never a state. Restore the probed position first so
-        # no dismissal, failure or pending future can leave a lie on screen.
         if self._facts is not None:
             self._render(self._facts)
         if self._busy:
@@ -812,22 +1049,18 @@ class CollectorWindow(QMainWindow):
             self._start("status", self._after_status)
 
     def _quiesce_local(self) -> bool:
-        """Stop the local writer before enabling the daemon; claim nothing else.
-
-        A failed quiesce aborts the elevation: enabling a daemon while this process
-        still holds the writer lease would create two collectors for one boot.
-        """
-
         try:
-            self.coordinator.reconcile(QUIESCE_FACTS)
+            with self.files_view.transient_scope():
+                self.coordinator.reconcile(QUIESCE_FACTS)
         except Exception as error:
-            self._show_error(f"appio: {error}")
+            self._show_error(f"appio: {str(error) or type(error).__name__}")
             return False
         return True
 
     def _start(self, verb: str, on_success: Callable[[SetupReply], None] | None) -> None:
         if self._busy:
             return
+        self._setup_generation += 1
         self._busy = True
         self._operation = (verb, on_success)
         if self._facts is not None:
@@ -835,40 +1068,48 @@ class CollectorWindow(QMainWindow):
         try:
             future = self.setup.invoke(verb)
         except BaseException as error:
-            self._busy = False
-            self._operation = None
-            self._show_error(f"appio: {error}")
-            if self._facts is not None:
-                self._render(self._facts)
+            self._complete_start_failure(error)
             return
         future.add_done_callback(self._bridge.delivered.emit)
 
-    def _on_reply(self, future) -> None:
-        # Reached only through the queued bridge signal, so widgets are mutated on
-        # Qt's thread even when the helper future completes on a worker thread.
+    def _complete_start_failure(self, error: BaseException) -> None:
+        self._setup_generation += 1
+        self._operation = None
+        self._busy = False
+        self._show_error(f"appio: {str(error) or type(error).__name__}")
+        if self._facts is not None:
+            self._render(self._facts)
+        if not self._closed:
+            self._submit_probe(replace_pending=True)
+
+    def _on_reply(self, future: Future[SetupReply]) -> None:
+        if self._closed:
+            return
         operation, self._operation = self._operation, None
+        self._setup_generation += 1
         self._busy = False
         _verb, on_success = operation if operation is not None else ("", None)
         try:
             reply = future.result()
         except Exception as error:
             self._fail(str(error))
-            return
-        if self._apply_body(reply.body):
-            self._clear_error()
-        if reply.exit_code != 0:
-            self._fail(reply)
-            return
-        self._clear_error()
-        if on_success is not None:
-            on_success(reply)
         else:
-            self.refresh()
-        self._render(self._facts if self._facts is not None else QUIESCE_FACTS)
+            if self._apply_body(reply.body):
+                self._clear_error()
+            if reply.exit_code != 0:
+                self._fail(reply)
+            else:
+                self._clear_error()
+                try:
+                    if on_success is not None:
+                        on_success(reply)
+                except Exception as error:
+                    self._show_error(f"appio: {str(error) or type(error).__name__}")
+                self._render(self._facts if self._facts is not None else QUIESCE_FACTS)
+        if not self._closed and not self._busy:
+            self._submit_probe(replace_pending=True)
 
     def _apply_body(self, body: dict | None) -> bool:
-        """Take the root probe's accounting verdict; never its 'answering'."""
-
         if body is None:
             return False
         state = body.get("state")
@@ -890,14 +1131,9 @@ class CollectorWindow(QMainWindow):
             if isinstance(reason, str) and reason.startswith("unsupported:"):
                 self._unsupported_reason = reason
             if reply.exit_code == 127:
-                # pkexec could not find the helper at all: the switch cannot work.
                 self._unsupported_reason = "appio-setup is not available"
         else:
             self._show_error(f"appio: {failure}")
-        try:
-            self.refresh()
-        except Exception:
-            pass
         self._render(self._facts if self._facts is not None else QUIESCE_FACTS)
 
     # -- enable, choice and restart ---------------------------------------
@@ -919,7 +1155,6 @@ class CollectorWindow(QMainWindow):
         self.refresh()
 
     def _after_enable(self, reply: SetupReply) -> None:
-        self.refresh()
         if self._activation_choice == "restart":
             self.restart_confirmation = RestartConfirmationDialog(self)
             self.restart_confirmation.accepted.connect(self._restart_confirmed)
@@ -941,10 +1176,10 @@ class CollectorWindow(QMainWindow):
             )
         else:
             try:
-                self.coordinator.accept_export(exported)
+                with self.files_view.transient_scope():
+                    self.coordinator.accept_export(exported)
             except Exception as error:
                 self._show_error(f"appio: export import refused: {error}")
-        self.refresh()
 
     @staticmethod
     def _export_from_body(body: dict) -> ExportResult | None:
@@ -969,7 +1204,23 @@ class CollectorWindow(QMainWindow):
     # -- explicit status recheck ------------------------------------------
 
     def _after_status(self, reply: SetupReply) -> None:
-        self.refresh()
+        return None
+
+    def shutdown(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        for timer in (self._timer, self._poll_timer):
+            timer.stop()
+        for dialog in (self.consent, self.choice, self.restart_confirmation, self.settings):
+            if dialog is not None:
+                dialog.close()
+        self.files_view.retire_deliveries()
+        self._probe_executor.shutdown(wait=False, cancel_futures=True)
+        try:
+            self.coordinator.close()
+        finally:
+            self.history.close()
 
 
 # --------------------------------------------------------------------------- #

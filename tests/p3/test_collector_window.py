@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from concurrent.futures import Future
 import threading
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -99,6 +100,12 @@ class FakeHistory:
         self.file_status = FileAvailability(False, False, "file_source_unavailable", None)
         self.file_result: FileViewResult | None = None
         self.file_requests: list[tuple] = []
+        self.ranking_reads = 0
+        self.file_application_reads = 0
+        self.status_reads = 0
+        self.hold_file_requests = False
+        self.gaps = []
+        self.sources = []
 
     def prepare(self, window: Window) -> None:
         self.actions.append(("prepare", window))
@@ -114,12 +121,14 @@ class FakeHistory:
         self.view_state = "complete"
 
     def ranking(self, window: Window, metric: str):
+        self.ranking_reads += 1
         if not self.ready(window):
             raise RuntimeError("history is not ready for this window")
         self.ranking_calls.append(window)
         return list(self.rows)
 
     def file_source_status(self) -> FileAvailability:
+        self.status_reads += 1
         return self.file_status
 
     def request_file_view(self, app_id: int, window: Window, sort: str,
@@ -1411,3 +1420,1057 @@ def test_the_displayed_state_constants_are_the_owner_decision_vocabulary():
     assert decide_owner(SILENT).state == COLLECTOR_STATE_SILENT
     assert decide_owner(NEEDS_ACTIVATION).state == COLLECTOR_STATE_NEEDS_ACTIVATION
     assert cw.ACTIVATION_INACTIVE == "delegation present, accounting inactive"
+
+
+# --------------------------------------------------------------------------- #
+# Task 4: explicit shell ownership, queued probes and Files invalidation
+# --------------------------------------------------------------------------- #
+
+
+def test_probe_payload_rejects_malformed_combinations_and_counters():
+    """The queued probe boundary accepts exactly one immutable outcome."""
+
+    valid = cw.ProbePayload(OFF, None, 1, 0)
+    assert valid.facts == OFF
+    assert valid.error is None
+    assert valid.ticket == 1
+    assert valid.generation == 0
+    with pytest.raises(ValueError):
+        cw.ProbePayload(None, None, 1, 0)
+    with pytest.raises(ValueError):
+        cw.ProbePayload(OFF, "failure", 1, 0)
+    with pytest.raises(ValueError):
+        cw.ProbePayload(object(), None, 1, 0)
+    with pytest.raises(ValueError):
+        cw.ProbePayload(None, "  ", 1, 0)
+    with pytest.raises(ValueError):
+        cw.ProbePayload(None, "failure", True, 0)
+    with pytest.raises(ValueError):
+        cw.ProbePayload(None, "failure", 0, 0)
+    with pytest.raises(ValueError):
+        cw.ProbePayload(None, "failure", 1, True)
+    with pytest.raises(ValueError):
+        cw.ProbePayload(None, "failure", 1, -1)
+
+
+class ControlledCoordinator(FakeCoordinator):
+    def __init__(self):
+        super().__init__()
+        self.history = None
+        self.invalidate_on = None
+
+    def _invalidate_if(self, operation):
+        if self.invalidate_on == operation:
+            self.invalidate_on = None
+            self.history.invalidate()
+
+    def reconcile(self, facts):
+        result = super().reconcile(facts)
+        self._invalidate_if("reconcile")
+        return result
+
+    def tick_local(self):
+        super().tick_local()
+        self._invalidate_if("tick_local")
+
+    def accept_export(self, result):
+        super().accept_export(result)
+        self._invalidate_if("accept_export")
+
+
+class ControlledHistory(FakeHistory):
+    def __init__(self, *, ready=False, boot_id=BOOT):
+        super().__init__(ready=ready, boot_id=boot_id)
+        self.prepare_calls: list[Window] = []
+        self.prepare_failures: list[BaseException] = []
+        self.ready_windows: set[Window] = set()
+        self.ready_immediately = ready
+        self.file_futures: list[Future] = []
+        self.registry = SimpleNamespace(id_for=lambda key: 2 if key == "file:beta" else 3)
+        self.file_apps: list[tuple[str, str, int]] = []
+        self.local.file_applications = self._file_applications
+
+    def _file_applications(self, _window):
+        self.file_application_reads += 1
+        return list(self.file_apps)
+
+    def prepare(self, window: Window) -> None:
+        self.prepare_calls.append(window)
+        super().prepare(window)
+        self._ready = False
+        self.ready_windows.discard(window)
+        if self.ready_immediately and len(self.prepare_calls) == 1:
+            self.ready_windows.add(window)
+        if self.prepare_failures:
+            raise self.prepare_failures.pop(0)
+
+    def ready(self, window: Window) -> bool:
+        return window in self.ready_windows
+
+    def become_ready(self, window: Window) -> None:
+        self.prepared = window
+        self.ready_windows.add(window)
+        self.view_state = "ready"
+
+    def request_file_view(self, app_id, window, sort, direction, search):
+        self.file_requests.append((app_id, window, sort, direction, search))
+        future = Future()
+        self.file_futures.append(future)
+        if not self.hold_file_requests and self.file_result is not None:
+            future.set_result(self.file_result)
+        return future
+
+    def invalidate(self) -> None:
+        self.view_state = "unavailable: synthetic invalidation"
+        self.ready_windows.clear()
+        for future in self.file_futures:
+            if not future.done():
+                future.set_exception(WindowUnavailableError(
+                    "file_source_unavailable", "synthetic generation retired"
+                ))
+
+    def record_transport_gap(self, notice) -> None:
+        self.gaps.append(notice)
+        self.invalidate()
+
+    def add_source(self, service, *, collector_id, owner) -> None:
+        self.sources.append((service, collector_id, owner))
+        self.invalidate()
+
+
+class ControlledSetup(FakeSetup):
+    def __init__(self, facts=OFF, *, hold=False):
+        super().__init__(facts)
+        self.started = threading.Event()
+        self.release = threading.Event()
+        self.hold = hold
+        self.worker_ids: list[int] = []
+        self.completed = 0
+
+    def refresh(self) -> ServiceFacts:
+        self.refresh_calls += 1
+        self.worker_ids.append(threading.get_ident())
+        facts = self.facts
+        self.started.set()
+        if self.hold:
+            assert self.release.wait(5), "probe barrier was not released"
+        self.completed += 1
+        return facts
+
+
+def controlled_build(qtbot, *, facts=OFF, ready=False, setup=None, history=None, pump=None):
+    coordinator = ControlledCoordinator()
+    history = history or ControlledHistory(ready=ready)
+    coordinator.history = history
+    setup = setup or ControlledSetup(facts)
+    window = CollectorWindow(
+        coordinator, history, setup,
+        clock_ns=lambda: END - RAW_BUCKET_NS // 2,
+        pump=pump,
+        refresh_interval_ms=1000,
+    )
+    qtbot.addWidget(window)
+    qtbot.addWidget(window.settings)
+    window.show()
+    return window, coordinator, history, setup
+
+
+def settle_probe(qtbot, window, *, after):
+    qtbot.waitUntil(lambda: window.facts_applied > after, timeout=2000)
+
+
+def scope_window(end=END, *, boot=BOOT):
+    return Window(kind="since_boot", boot_id=boot, end_mono_ns=end)
+
+
+def apply_scope(window, history, target):
+    history.become_ready(target)
+    assert window.apply_ready_frame() is True
+    assert window._displayed == target
+
+
+def test_slow_probe_does_not_block_pump_or_pending_frame_application(qtbot):
+    setup = ControlledSetup(OFF, hold=True)
+    pumps = []
+    window, _, history, setup = controlled_build(
+        qtbot, setup=setup, pump=lambda: pumps.append(threading.get_ident())
+    )
+    try:
+        window.refresh()
+        assert setup.started.wait(1)
+        qtbot.wait(310)
+        assert setup.worker_ids == [setup.worker_ids[0]]
+        assert setup.worker_ids[0] != threading.get_ident()
+        started = time.monotonic()
+        window.refresh()
+        elapsed = time.monotonic() - started
+        assert elapsed < 0.1
+        assert len(pumps) == 2
+        assert len(history.prepare_calls) == 1
+        pending = window._pending
+        history.become_ready(pending)
+        assert window.apply_ready_frame() is True
+        assert window._displayed == pending
+        assert setup.completed == 0
+    finally:
+        setup.release.set()
+        window._timer.stop()
+        window._poll_timer.stop()
+
+
+def test_replacement_keeps_frame_and_eventually_displays_new_scope(qtbot):
+    window, _, history, _ = controlled_build(qtbot, ready=True)
+    window.refresh()
+    qtbot.waitUntil(lambda: window.history_visible, timeout=2000)
+    first = window._displayed
+    host = window.view
+    history.local.connection.boot_id = "boot-2"
+    window.refresh()
+    assert window._displayed == first
+    assert window._pending == scope_window(boot="boot-2")
+    assert window.view is host
+    assert window.history_visible
+    assert "updating" in window.history_state.text()
+    apply_scope(window, history, window._pending)
+    assert window._prepared == scope_window(boot="boot-2")
+
+
+def test_applied_scope_is_not_prepared_again_without_change_or_retirement(qtbot):
+    window, _, history, _ = controlled_build(qtbot, ready=True)
+    window.refresh()
+    qtbot.waitUntil(lambda: window.history_visible, timeout=2000)
+    count = len(history.prepare_calls)
+    for _ in range(3):
+        after = window.facts_applied
+        window.refresh()
+        settle_probe(qtbot, window, after=after)
+    assert len(history.prepare_calls) == count
+    history.view_state = "unavailable: test retirement"
+    after = window.facts_applied
+    window.refresh()
+    settle_probe(qtbot, window, after=after)
+    assert len(history.prepare_calls) == count + 1
+
+
+def test_unchanged_facts_skip_reconcile_while_preparation_is_pending(qtbot):
+    window, coordinator, history, _ = controlled_build(qtbot)
+    window.refresh()
+    qtbot.waitUntil(lambda: window.facts_applied == 1, timeout=2000)
+    assert window._pending is not None
+    reconciles = len(coordinator.reconciles)
+    after = window.facts_applied
+    window.refresh()
+    settle_probe(qtbot, window, after=after)
+    assert len(coordinator.reconciles) == reconciles
+    assert coordinator.ticks == 2
+
+
+def test_retired_pending_preparation_is_replaced_once(qtbot):
+    window, _, history, _ = controlled_build(qtbot)
+    window.refresh()
+    target = window._pending
+    assert target is not None
+    history.view_state = "unavailable: ownership changed"
+    window.refresh()
+    assert history.prepare_calls == [target, target]
+    window.refresh()
+    assert history.prepare_calls == [target, target]
+    apply_scope(window, history, target)
+    assert window._displayed == target
+
+
+@pytest.mark.parametrize("owner", ["clock", "explicit"])
+@pytest.mark.parametrize("boundary", ["transaction", "memory_source", "submit"])
+@pytest.mark.parametrize("resolution", ["retry", "no_target", "supersede"])
+def test_prepare_failure_after_loading_keeps_frame_closed_and_retries_on_later_tick(
+    real_files_shell, monkeypatch, owner, boundary, resolution
+):
+    import sqlite3
+    from appio.query import QueryService
+
+    shell = real_files_shell
+    window, history = shell.window, shell.history
+    snapshot = files_snapshot(shell.view)
+    displayed = window._displayed
+    target = shell.target
+    prepare = history.prepare
+    calls = []
+
+    def record(scope):
+        calls.append(scope)
+        return prepare(scope)
+
+    monkeypatch.setattr(history, "prepare", record)
+    history.invalidate()
+    memory = None
+    try:
+        with monkeypatch.context() as failure:
+            if boundary == "transaction":
+                shell.frames.db.execute("BEGIN")
+                message = "uncommitted transaction"
+            elif boundary == "memory_source":
+                memory = sqlite3.connect(":memory:")
+                history._sources["memory"] = (QueryService(memory), "gui")
+                message = "file-backed SQLite"
+            else:
+                def reject(*_args, **_kwargs):
+                    raise RuntimeError("synthetic submit refusal")
+                failure.setattr(history._executor, "submit", reject)
+                message = "synthetic submit refusal"
+            if owner == "clock":
+                window.refresh()
+            else:
+                with pytest.raises((ValueError, RuntimeError), match=message):
+                    window.show_window(target)
+            assert history.view_state == "loading"
+            assert window._pending is None
+            marker = window._prepare_retry
+            assert marker.owner == owner and marker.window == target
+            assert message in window._prepare_error
+            assert not shell.view._scope_ready
+            assert window._displayed == displayed
+            assert files_snapshot(shell.view) == snapshot
+            assert window.apply_ready_frame() is False
+            assert calls == [target]
+            if owner == "explicit":
+                window._tick_target()
+                assert calls == [target] and window._prepare_retry is marker
+            else:
+                # A repeated clock failure renews, rather than consumes, its marker.
+                window._tick_target()
+                assert calls == [target, target]
+                assert window._prepare_retry is not marker
+    finally:
+        if shell.frames.db.in_transaction:
+            shell.frames.db.rollback()
+        if memory is not None:
+            history._sources.pop("memory")
+            memory.close()
+    previous_calls = len(calls)
+    if resolution == "no_target":
+        with monkeypatch.context() as no_target:
+            no_target.setattr(window, "_current_window", lambda: None)
+            marker = window._prepare_retry
+            window._tick_target()
+            assert len(calls) == previous_calls
+            if owner == "explicit":
+                assert window._prepare_retry is marker
+                assert not shell.view._scope_ready
+                assert window._displayed == displayed
+            else:
+                assert window._prepare_retry is None and window._prepare_error is None
+                assert window.error_label.text() == ""
+                assert shell.view._scope_ready
+                assert window._displayed is None
+    if owner == "explicit":
+        if resolution == "supersede":
+            target = Window("since_boot", "boot-A",
+                end_mono_ns=target.end_mono_ns + RAW_BUCKET_NS)
+        window.show_window(target)
+    else:
+        window._tick_target()
+    assert len(calls) == previous_calls + 1
+    assert calls[-1] == target and window._pending == target
+    assert window._prepare_retry is None and window._prepare_error is None
+    assert window.error_label.text() == ""
+    history._local_future.result(timeout=5)
+    assert window.apply_ready_frame()
+    assert window._displayed == target
+
+
+def test_probe_spanning_setup_is_dropped_and_completion_probe_is_applied(qtbot):
+    window, coordinator, _, _ = controlled_build(qtbot)
+    window._probe_ticket = 2
+    window._probe_inflight = Future()
+    window._busy = True
+    before = window.facts_applied
+    window._apply_facts(cw.ProbePayload(OFF, None, 1, 0))
+    assert window.facts_applied == before
+    assert window._dropped_facts == 1
+    assert window._probe_inflight is not None
+    window._busy = False
+    window._apply_facts(cw.ProbePayload(SILENT, None, 2, 0))
+    assert window.facts_applied == before + 1
+    assert coordinator.reconciles[-1] == SILENT
+
+
+@pytest.mark.parametrize("outcome", ["facts", "error"])
+def test_old_probe_ticket_cannot_overwrite_or_release_replacement_probe(qtbot, outcome):
+    window, coordinator, history, _ = controlled_build(qtbot)
+    current = Future()
+    window._probe_ticket = 2
+    window._probe_inflight = window._probe_successor = current
+    window._facts = ON
+    window._render(ON)
+    window._show_error("appio: prior notice")
+    stale = (cw.ProbePayload(OFF, None, 1, 0) if outcome == "facts"
+             else cw.ProbePayload(None, "obsolete probe failure", 1, 0))
+
+    def state():
+        return (window._facts, window.state_text, window.error_label.text(),
+                window.facts_applied, window._displayed, window._pending,
+                tuple(coordinator.actions), tuple(history.prepare_calls))
+
+    before = state()
+    window._apply_facts(stale)
+    assert state() == before
+    assert window._probe_inflight is current and window._probe_successor is current
+    assert window._dropped_facts == 1
+    window._apply_facts(cw.ProbePayload(SILENT, None, 2, 0))
+    assert window._facts == SILENT
+    assert window._probe_inflight is None and window._probe_successor is None
+    accepted = state()
+    window._apply_facts(stale)
+    assert state() == accepted
+    assert window._dropped_facts == 2
+
+
+def test_probe_error_keeps_last_banner_and_frame(qtbot):
+    window, _, history, setup = controlled_build(qtbot, ready=True)
+    window.refresh()
+    qtbot.waitUntil(lambda: window.history_visible and window.facts_applied == 1,
+                    timeout=2000)
+    frame = window._displayed
+    state = window.state_text
+    window._probe_ticket += 1
+    ticket = window._probe_ticket
+    window._probe_inflight = Future()
+    window._apply_facts(cw.ProbePayload(None, "probe unavailable", ticket, 0))
+    assert window.state_text == state
+    assert window._displayed == frame
+    assert window.error_label.text() == "appio: probe unavailable"
+    assert window._probe_inflight is None
+    assert setup.completed == 1
+
+
+def test_files_compatibility_navigation_selects_tab_without_banner_button(qtbot):
+    window, _, history, _ = controlled_build(qtbot)
+    view = window.view
+    assert view is not None
+    assert not hasattr(window, "files_nav")
+    assert view.detail_tabs.count() == 2
+    assert view.files_view is window.files_view
+    assert view.detail_tabs.tabText(0) == "Overview"
+    assert view.detail_tabs.tabText(1) == "Files"
+    assert not hasattr(window, "stack")
+    assert not hasattr(window, "files_page")
+    before = len(history.file_requests)
+    window.open_files_unavailable()
+    assert view.detail_tabs.currentIndex() == 1
+    assert len(history.file_requests) == before
+
+
+def test_no_target_restores_admission_without_hiding_tabs(qtbot):
+    window, _, _, _ = controlled_build(qtbot, history=ControlledHistory(boot_id=None))
+    window.refresh()
+    assert window._target is None
+    assert window._displayed is None
+    assert window._pending is None
+    assert window.history_state.text() == "waiting for the first sample"
+    assert window.view.detail_tabs.count() == 2
+    assert window.files_view._scope_ready
+
+
+def test_files_source_failure_preserves_exact_message_and_link(qtbot):
+    window, _, history, _ = controlled_build(qtbot)
+    history.file_status = FileAvailability(
+        False, False, "file_source_unavailable", "bpf load failed: EPERM"
+    )
+    window.refresh()
+    window.open_files_unavailable()
+    assert (history.file_status.diagnostic, window._displayed, window._pending,
+            window._target, window._files_status_text()) == (
+                "bpf load failed: EPERM", None, scope_window(), scope_window(),
+                "file activity is unavailable: file_source_unavailable: bpf load failed: EPERM",
+            )
+    assert window.files_message.text() == (
+        "file activity is unavailable: file_source_unavailable: bpf load failed: EPERM"
+    )
+    assert window.files_open_settings.isVisible()
+    assert history.file_requests == []
+
+
+def test_explicit_show_window_driver_does_not_compute_clock_target(qtbot, monkeypatch):
+    from PyQt6.QtCore import QCoreApplication
+    from PyQt6.QtWidgets import QApplication
+
+    window, _, history, _ = controlled_build(qtbot)
+    explicit = Window(kind="range", start_mono_ns=2, end_mono_ns=END, boot_id=BOOT)
+    monkeypatch.setattr(window, "_current_window", lambda: pytest.fail("clock target computed"))
+    def forbid_events(*_args, **_kwargs):
+        pytest.fail("explicit scope driver pumped Qt events")
+    with monkeypatch.context() as no_events:
+        no_events.setattr(QCoreApplication, "processEvents", forbid_events)
+        no_events.setattr(QApplication, "processEvents", forbid_events)
+        window.show_window(explicit)
+        history.become_ready(explicit)
+        assert window.apply_ready_frame() is True
+    assert window._displayed == explicit
+
+
+def test_frame_apply_sets_displayed_before_files_sync(qtbot, monkeypatch):
+    window, _, history, _ = controlled_build(qtbot)
+    window.refresh()
+    target = window._pending
+    seen = []
+    original = window._sync_files
+
+    def observe(*, request=False):
+        seen.append(window._prepared)
+        return original(request=request)
+
+    monkeypatch.setattr(window, "_sync_files", observe)
+    apply_scope(window, history, target)
+    assert seen == [target]
+
+
+@pytest.mark.parametrize("completion", ["success", "nonzero", "future_error", "invoke_error"])
+def test_helper_completion_categories_advance_generation_before_busy_clears_and_reprobe(
+    qtbot, monkeypatch, completion
+):
+    setup = ControlledSetup(hold=True)
+    window, _, _, _ = controlled_build(qtbot, setup=setup)
+    window._timer.stop()
+    observed = []
+    original_submit = window._submit_probe
+
+    def observe_submit(*, replace_pending=False):
+        observed.append((window._setup_generation, window.busy, replace_pending))
+        return original_submit(replace_pending=replace_pending)
+
+    monkeypatch.setattr(window, "_submit_probe", observe_submit)
+    try:
+        if completion == "invoke_error":
+            def reject(_verb):
+                raise RuntimeError("invoke failed")
+            monkeypatch.setattr(setup, "invoke", reject)
+        window._start("status", None)
+        if completion != "invoke_error":
+            assert window._setup_generation == 1 and window.busy
+            future = setup.pending["status"][0]
+            if completion == "future_error":
+                future.set_exception(RuntimeError("helper future failed"))
+            elif completion == "nonzero":
+                future.set_result(SetupReply(1, "permission denied", None))
+            else:
+                future.set_result(ok("status"))
+            qtbot.waitUntil(lambda: bool(observed))
+        assert observed == [(2, False, True)]
+        assert window._setup_generation == 2
+        assert window._probe_ticket == 1
+    finally:
+        setup.release.set()
+        window._timer.stop()
+        window._poll_timer.stop()
+        window._probe_executor.shutdown(wait=False, cancel_futures=True)
+
+
+def populated_shell(qtbot, monkeypatch):
+    history = ControlledHistory()
+    history.rows = [app_total()]
+    history.file_status = FileAvailability(True, True)
+    history.file_result = file_view_result()
+    window, coordinator, _, setup = controlled_build(qtbot, history=history)
+    window._timer.stop()
+    window._poll_timer.stop()
+    monkeypatch.setattr(window, "_submit_probe", lambda **_kwargs: False)
+    window.show_window(scope_window())
+    apply_scope(window, history, scope_window())
+    qtbot.waitUntil(lambda: window.files_view.last_result is not None)
+    return window, coordinator, history, setup
+
+
+def files_snapshot(view):
+    return (view.model, view.table, view.last_result, tuple(view.model._cells),
+            tuple(label.text() for label in view._footer_labels()),
+            view._sort, view._direction, view.search(), view._app_id,
+            view.table.verticalScrollBar().value())
+
+
+def test_pending_scope_refuses_all_file_entry_points_then_flushes_once(qtbot, monkeypatch):
+    window, _, history, _ = populated_shell(qtbot, monkeypatch)
+    view = window.files_view
+    before = files_snapshot(view)
+    target = scope_window(END + RAW_BUCKET_NS)
+    window.show_window(target)
+    reads = (history.ranking_reads, history.file_application_reads, history.status_reads)
+    requests = len(history.file_requests)
+    view.set_window(target)
+    view.set_app_id(1)
+    view.request_refresh()
+    view.set_sort("bytes_w", "asc")
+    view.search_field.setText("alpha")
+    view._on_app_changed(view.app_selector.currentIndex())
+    view._on_direction_clicked()
+    view.flush_refresh()
+    assert (history.ranking_reads, history.file_application_reads, history.status_reads) == reads
+    assert len(history.file_requests) == requests
+    assert files_snapshot(view)[:5] == before[:5]
+    assert view._refresh_wanted
+    apply_scope(window, history, target)
+    assert len(history.file_requests) == requests + 1
+    view.flush_refresh()
+    assert len(history.file_requests) == requests + 1
+    assert history.file_requests[-1] == (1, target, "bytes_w", "desc", "alpha")
+
+
+def test_mixed_ranking_and_file_only_union_queries_file_only_subject(qtbot, monkeypatch):
+    from dataclasses import replace
+
+    window, _, history, _ = populated_shell(qtbot, monkeypatch)
+    view = window.files_view
+    history.file_apps = [("file:beta", "Beta", 10)]
+    history.file_result = replace(history.file_result,
+        table=replace(history.file_result.table, app_id=2),
+        coverage=replace(history.file_result.coverage, app_id=2))
+    window.show_window(scope_window())
+    apply_scope(window, history, scope_window())
+    assert [view.app_selector.itemData(i) for i in range(view.app_selector.count())] == [1, 2]
+    requests = len(history.file_requests)
+    view.app_selector.setCurrentIndex(1)
+    assert history.file_requests[-1][0] == history.registry.id_for("file:beta") == 2
+    assert len(history.file_requests) == requests + 1
+    assert window.view.selected_app_id() == 2
+    model = window.view._overview_model
+    assert all(kpi.text == "unavailable" for kpi in model.kpis)
+    assert model.app_id == 2
+
+
+def test_same_window_frame_refreshes_union_for_file_only_ranked_and_vanished_apps(qtbot, monkeypatch):
+    from dataclasses import replace
+
+    window, _, history, _ = populated_shell(qtbot, monkeypatch)
+    view = window.files_view
+    table = view.table
+    model = view.model
+    history.file_apps = [("file:beta", "Beta", 10)]
+    for ranked, extras, expected in [
+        ([app_total()], history.file_apps, [1, 2]),
+        ([app_total(), replace(app_total(), app_id=2, name="Beta")], [], [1, 2]),
+        ([app_total()], [], [1]),
+    ]:
+        history.rows, history.file_apps = ranked, extras
+        requests = len(history.file_requests)
+        window.show_window(scope_window())
+        apply_scope(window, history, scope_window())
+        assert [view.app_selector.itemData(i) for i in range(view.app_selector.count())] == expected
+        assert len(history.file_requests) == requests + 1
+        assert view.table is table and view.model is model
+        if 2 in expected:
+            view.set_app_id(2)
+    assert view._app_id == 1
+    assert window.view.selected_app_id() == 1
+
+
+def test_current_terminal_file_failure_clears_but_transient_failure_does_not(qtbot, monkeypatch):
+    window, _, history, _ = populated_shell(qtbot, monkeypatch)
+    view = window.files_view
+    before = files_snapshot(view)
+    with view.transient_scope():
+        view._handle_failure("file_source_unavailable", "retired")
+    assert files_snapshot(view) == before
+    assert view._refresh_wanted
+    view._handle_failure("not_retained", "current evidence expired")
+    assert view.model.rowCount() == 0
+    assert view.last_result is None
+    assert view.state == "unavailable"
+    assert "current evidence expired" in view.unavailable_text()
+
+
+def test_off_probe_during_enable_never_reacquires_local_writer(qtbot):
+    setup = ControlledSetup(OFF, hold=True)
+    window, coordinator, _, _ = controlled_build(qtbot, setup=setup)
+    window._timer.stop()
+    try:
+        assert window._submit_probe()
+        assert setup.started.wait(1)
+        old = window._probe_inflight
+        window._begin("enable")
+        assert coordinator.reconciles == [cw.QUIESCE_FACTS]
+        setup.facts = SILENT
+        setup.release.set()
+        old.result(timeout=2)
+        qtbot.waitUntil(lambda: window._dropped_facts == 1)
+        assert coordinator.reconciles == [cw.QUIESCE_FACTS]
+        setup.complete("install-delegation", ok("install-delegation"))
+        qtbot.waitUntil(lambda: window._probe_ticket == 2)
+        settle_probe(qtbot, window, after=0)
+        assert OFF not in coordinator.reconciles
+        assert coordinator.reconciles[-1] == SILENT
+    finally:
+        setup.release.set()
+        window._timer.stop()
+        window._poll_timer.stop()
+        window._probe_executor.shutdown(wait=False, cancel_futures=True)
+
+
+def test_repeated_setup_stages_replace_one_queued_successor_while_probe_runs(qtbot, monkeypatch):
+    setup = ControlledSetup(OFF, hold=True)
+    window, _, _, _ = controlled_build(qtbot, setup=setup)
+    window._timer.stop()
+    submissions = []
+    executor_submit = window._probe_executor.submit
+
+    def observe_submit(*args, **kwargs):
+        submissions.append((window._probe_ticket, window._probe_successor))
+        return executor_submit(*args, **kwargs)
+
+    monkeypatch.setattr(window._probe_executor, "submit", observe_submit)
+    try:
+        assert window._submit_probe()
+        assert setup.started.wait(1)
+        running = window._probe_inflight
+        window._start("status", None)
+        setup.complete("status", ok("status"))
+        qtbot.waitUntil(lambda: window._probe_ticket == 2)
+        first_successor = window._probe_inflight
+        assert not first_successor.running()
+        window._start("status", None)
+        setup.complete("status", ok("status"), index=1)
+        qtbot.waitUntil(lambda: window._probe_ticket == 3)
+        newest = window._probe_inflight
+        assert submissions[-2:] == [(2, None), (3, None)]
+        assert first_successor.cancelled()
+        assert window._probe_successor is newest
+        for _ in range(3):
+            assert window._submit_probe() is False
+        assert setup.refresh_calls == 1
+        setup.facts = SILENT
+        setup.release.set()
+        running.result(timeout=2)
+        newest.result(timeout=2)
+        # A settled Future still owns its slot until its queued payload applies.
+        assert window._submit_probe() is False
+        settle_probe(qtbot, window, after=0)
+        assert setup.refresh_calls == 2
+        assert window._facts == SILENT
+    finally:
+        setup.release.set()
+        window._timer.stop()
+        window._poll_timer.stop()
+        window._probe_executor.shutdown(wait=False, cancel_futures=True)
+
+
+def test_close_during_probe_drops_all_late_effects(qtbot, monkeypatch):
+    setup = ControlledSetup(OFF, hold=True)
+    window, coordinator, history, _ = controlled_build(qtbot, setup=setup)
+    window._timer.stop()
+    closed = []
+    monkeypatch.setattr(coordinator, "close", lambda: closed.append("coordinator"), raising=False)
+    monkeypatch.setattr(history, "close", lambda: closed.append("history"), raising=False)
+    try:
+        window._submit_probe()
+        assert setup.started.wait(1)
+        future = window._probe_inflight
+        before = (window.facts_applied, window._dropped_facts, window.state_text,
+                  window.error_label.text(), window._displayed, tuple(coordinator.actions))
+        started = time.monotonic()
+        window.shutdown()
+        assert time.monotonic() - started < 0.1
+        assert closed == ["coordinator", "history"]
+        window.shutdown()
+        assert closed == ["coordinator", "history"]
+        setup.release.set()
+        future.result(timeout=2)
+        qtbot.wait(30)
+        window._apply_facts(cw.ProbePayload(None, "late failure", 1, 0))
+        assert (window.facts_applied, window._dropped_facts, window.state_text,
+                window.error_label.text(), window._displayed, tuple(coordinator.actions)) == before
+    finally:
+        setup.release.set()
+
+
+@pytest.fixture
+def real_files_shell(qtbot, tmp_path, monkeypatch):
+    from dataclasses import replace
+    from appio.bpf_fileio import BpfFileSource, VectorLoader
+    from appio.contracts import FILE_HOUR_NS
+    from appio.file_runtime import FileRuntime
+    from appio.files import FileIdentityResolver
+    from appio.history_router import HistoryRouter
+    from appio.iodclient import AppRegistry
+    from appio.query import QueryService
+    from tests.p3.test_iodclient import Harness
+    from tests.p4.test_file_runtime import Frames, event
+
+    path = tmp_path / "real-files.db"
+    frames = Frames(path)
+    loader = VectorLoader()
+    runtime = FileRuntime(frames.db, source_factory=lambda: BpfFileSource(loader),
+                          identity_resolver=FileIdentityResolver(lambda _dev: "fs"))
+    assert runtime.start().available
+    loader.queue(0, events=[replace(event(inode=i + 1, amount=i + 10),
+        basename=f"alpha-{i:02}".encode(), name_len=8) for i in range(24)])
+    runtime.consume(*frames.tick(0))
+    runtime.consume(*frames.tick(FILE_HOUR_NS, amount=200))
+    harness = Harness()
+    history = HistoryRouter(QueryService(frames.db), harness.client, AppRegistry())
+    harness.client._on_gap = history.record_transport_gap
+    harness.client.pump()
+    window, coordinator, _, setup = controlled_build(qtbot, history=history)
+    window._timer.stop()
+    window._poll_timer.stop()
+    window._clock_ns = lambda: FILE_HOUR_NS - 1
+    monkeypatch.setattr(window, "_submit_probe", lambda **_kwargs: False)
+    target = Window("since_boot", "boot-A", end_mono_ns=FILE_HOUR_NS)
+    window.show_window(target)
+    history._local_future.result(timeout=5)
+    assert window.apply_ready_frame()
+    view = window.files_view
+    qtbot.waitUntil(lambda: view.last_result is not None, timeout=5000)
+    window.open_files_unavailable()
+    view.set_sort("bytes_r", "asc")
+    view.search_field.setText("alpha")
+    qtbot.waitUntil(lambda: not view._outstanding, timeout=5000)
+    assert view.model.rowCount() == 24
+    view.table.setFixedHeight(100)
+    qtbot.wait(10)
+    view.table.verticalScrollBar().setValue(view.table.verticalScrollBar().maximum())
+    assert view.table.verticalScrollBar().value() > 0
+    owner = cw.CollectorCoordinator(local_factory=lambda: pytest.fail("unexpected writer"),
+        client=harness.client, history=history, lease=cw.GuiLease(tmp_path / "owner.lock"),
+        clock=lambda: (FILE_HOUR_NS, 1000 * 10**9 + FILE_HOUR_NS))
+    shell = SimpleNamespace(window=window, coordinator=coordinator, history=history,
+        view=view, harness=harness, frames=frames, owner=owner, target=target, path=path)
+    try:
+        yield shell
+    finally:
+        window._timer.stop()
+        window._poll_timer.stop()
+        view.retire_deliveries()
+        window._probe_executor.shutdown(wait=False, cancel_futures=True)
+        owner.close()
+        history.close()
+        for peer in harness.servers:
+            peer.close()
+        frames.db.close()
+
+
+class HeldFileDelivery:
+    """Hold a real file worker, capture only its bridge, replay real handler."""
+
+    def __init__(self, shell, monkeypatch):
+        self.shell = shell
+        self.release = threading.Event()
+        self.started = threading.Event()
+        self.delivered = threading.Event()
+        self.payloads = []
+        self.transient_at_settlement = []
+        history, view = shell.history, shell.view
+        read = history._read_local_files
+
+        def held(*args):
+            self.started.set()
+            assert self.release.wait(5), "file worker not released"
+            return read(*args)
+
+        def capture(generation, future):
+            self.transient_at_settlement.append(view._transient)
+            self.payloads.append((generation, future))
+            self.delivered.set()
+
+        monkeypatch.setattr(history, "_read_local_files", held)
+        monkeypatch.setattr(view, "_deliver", capture)
+        view.request_refresh()
+        assert self.started.wait(1)
+        self.future = next(iter(history._file_jobs))
+        self.generation = view._generation
+        self.history_generation = history._generation
+        self.requests = len(view.requests)
+        self.snapshot = files_snapshot(view)
+
+    def win_cancellation(self, monkeypatch, *, synchronous=False):
+        history, view = self.shell.history, self.shell.view
+        cancel = history._cancel_file_requests
+
+        def after_generation_bump():
+            assert history._generation > self.history_generation
+            self.release.set()
+            assert self.delivered.wait(2), "worker did not settle before cancellation"
+            if synchronous:
+                view._on_delivered(self.payloads[0])
+            cancel()
+
+        monkeypatch.setattr(history, "_cancel_file_requests", after_generation_bump)
+
+    def replay(self):
+        assert self.delivered.wait(2)
+        self.shell.view._on_delivered(self.payloads[0])
+
+
+def invalidate_shell(shell, route, monkeypatch, *, defer_tick=True):
+    window, history, coordinator = shell.window, shell.history, shell.coordinator
+    if defer_tick and route not in ("clock_prepare", "explicit_prepare"):
+        monkeypatch.setattr(window, "_tick_target", lambda: None)
+    if route in ("pump", "healthy_pump"):
+        if route == "pump":
+            from appio.ipc_models import StreamCursor
+            from tests.p3.test_iodclient import gap_frame
+            shell.harness.send(gap_frame(previous=None,
+                current=StreamCursor("boot-A", shell.frames.epoch, 1), start=0, end=1))
+            shell.harness.eof()
+        window._pump = shell.harness.client.pump
+        window.refresh()
+    elif route in ("reconcile", "tick_local", "healthy_tick"):
+        if route != "healthy_tick":
+            coordinator.invalidate_on = route
+        window._probe_ticket += 1
+        window._apply_facts(cw.ProbePayload(OFF, None, window._probe_ticket,
+                                          window._setup_generation))
+    elif route == "quiesce":
+        coordinator.invalidate_on = "reconcile"
+        assert window._quiesce_local()
+    elif route == "import":
+        monkeypatch.setattr(coordinator, "accept_export", shell.owner.accept_export)
+        frames = shell.frames
+        window._after_disable(ok("disable", {"export_path": str(shell.path),
+            "export_cutoff": {"boot_id": frames.boot_id, "iod_epoch": frames.epoch,
+                              "seq": frames.seq,
+                              "cutoff_mono_ns": frames.state.checkpoint_mono_ns}}))
+        assert len(shell.owner._exports) == 1, window.error_label.text()
+        assert len(history._sources) == 2
+    elif route == "clock_prepare":
+        shell.target = Window("since_boot", "boot-A",
+            end_mono_ns=shell.target.end_mono_ns + RAW_BUCKET_NS)
+        window._clock_ns = lambda: shell.target.end_mono_ns - 1
+        window._tick_target()
+    elif route == "explicit_prepare":
+        window.show_window(shell.target)
+    else:
+        raise AssertionError(route)
+
+
+def apply_replacement(shell):
+    window, history, view = shell.window, shell.history, shell.view
+    if window._pending is None:
+        # Call the class driver because the default-invalidator tests defer the
+        # instance driver until after their pre-next-tick delivery observation.
+        CollectorWindow._tick_target(window)
+    assert window._pending == shell.target
+    history._local_future.result(timeout=5)
+    assert window.apply_ready_frame()
+    assert not view._transient and view._scope_ready
+
+
+def test_pump_transport_gap_preserves_files_through_replacement(real_files_shell, monkeypatch):
+    shell = real_files_shell
+    held = HeldFileDelivery(shell, monkeypatch)
+    try:
+        held.win_cancellation(monkeypatch, synchronous=True)
+        invalidate_shell(shell, "pump", monkeypatch)
+        assert shell.history.transport_issues
+        assert files_snapshot(shell.view) == held.snapshot
+        assert len(shell.view.requests) == held.requests
+        apply_replacement(shell)
+        assert len(shell.view.requests) == held.requests + 1
+    finally:
+        held.release.set()
+
+
+def test_disable_export_import_preserves_files_through_add_source(real_files_shell, monkeypatch):
+    shell = real_files_shell
+    held = HeldFileDelivery(shell, monkeypatch)
+    try:
+        held.win_cancellation(monkeypatch, synchronous=True)
+        invalidate_shell(shell, "import", monkeypatch)
+        assert files_snapshot(shell.view) == held.snapshot
+        assert len(shell.view.requests) == held.requests
+        apply_replacement(shell)
+        assert len(shell.view.requests) == held.requests + 1
+    finally:
+        held.release.set()
+
+
+@pytest.mark.parametrize("route", ["pump", "reconcile", "tick_local", "quiesce", "import",
+                                    "clock_prepare", "explicit_prepare"])
+def test_worker_wins_cancellation_delivery_is_transient_while_pending(
+    real_files_shell, monkeypatch, route
+):
+    shell = real_files_shell
+    held = HeldFileDelivery(shell, monkeypatch)
+    try:
+        held.win_cancellation(monkeypatch, synchronous=True)
+        invalidate_shell(shell, route, monkeypatch)
+        assert held.transient_at_settlement == [True]
+        assert files_snapshot(shell.view) == held.snapshot
+        assert shell.view.refresh_wanted()
+        assert len(shell.view.requests) == held.requests
+        apply_replacement(shell)
+        assert files_snapshot(shell.view) == held.snapshot
+        assert len(shell.view.requests) == held.requests + 1
+    finally:
+        held.release.set()
+
+
+@pytest.mark.parametrize("route", ["pump", "reconcile", "tick_local", "quiesce", "import",
+    "clock_prepare", "explicit_prepare", "healthy_pump", "healthy_tick"])
+def test_transient_scope_exit_retires_worker_delivery_before_next_target_tick(
+    real_files_shell, monkeypatch, route
+):
+    shell = real_files_shell
+    held = HeldFileDelivery(shell, monkeypatch)
+    try:
+        if route.startswith("healthy"):
+            invalidate_shell(shell, route, monkeypatch)
+            assert shell.view._generation == held.generation
+            assert not shell.view.refresh_wanted()
+            assert shell.view._outstanding
+            assert len(shell.view.requests) == held.requests
+            held.release.set()
+            held.replay()
+            assert not shell.view._outstanding
+            assert len(shell.view.requests) == held.requests
+            return
+        held.win_cancellation(monkeypatch)
+        invalidate_shell(shell, route, monkeypatch)
+        assert not shell.view._transient
+        if route not in ("clock_prepare", "explicit_prepare"):
+            assert shell.view._scope_ready  # SR-1: readiness has not closed yet.
+            assert shell.window._pending is None
+        assert shell.view._generation > held.generation
+        held.replay()
+        assert files_snapshot(shell.view) == held.snapshot
+        assert shell.view.refresh_wanted()
+        assert len(shell.view.requests) == held.requests
+        apply_replacement(shell)
+        assert files_snapshot(shell.view) == held.snapshot
+        assert len(shell.view.requests) == held.requests + 1
+    finally:
+        held.release.set()
+
+
+def test_late_retired_file_delivery_after_ready_is_dropped_and_requeried_once(
+    real_files_shell, monkeypatch
+):
+    shell = real_files_shell
+    held = HeldFileDelivery(shell, monkeypatch)
+    try:
+        held.win_cancellation(monkeypatch)
+        invalidate_shell(shell, "explicit_prepare", monkeypatch)
+        # Delivery carrying the pre-apply Files generation must already be
+        # retired when readiness is restored, even if delivered reentrantly.
+        failure = Future()
+        failure.set_exception(WindowUnavailableError("file_source_unavailable", "old scope"))
+        before_apply = shell.view._generation
+        restore = shell.view.set_scope_ready
+
+        def reentrant_ready(ready):
+            restore(ready)
+            if ready:
+                shell.view._on_delivered((before_apply, failure))
+
+        monkeypatch.setattr(shell.view, "set_scope_ready", reentrant_ready)
+        apply_replacement(shell)
+        assert files_snapshot(shell.view) == held.snapshot
+        assert len(shell.view.requests) == held.requests + 1
+        newest = shell.view.last_request
+        assert shell.view._outstanding
+        held.replay()
+        assert shell.view._outstanding
+        assert shell.view.last_request is newest
+        assert not shell.view.refresh_wanted()
+        assert files_snapshot(shell.view) == held.snapshot
+        shell.view.flush_refresh()
+        assert len(shell.view.requests) == held.requests + 1
+    finally:
+        held.release.set()
