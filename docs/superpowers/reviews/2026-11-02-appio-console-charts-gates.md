@@ -2,15 +2,19 @@
 
 **Provenance:** `run_id=pm-20261101-175829-4410c030`; `lane=none`; `attempt=1`; task 5 of
 `docs/superpowers/plans/2026-11-02-appio-console-charts-replan.md`. Every statement below
-was read from this worktree or from a command run in the recorded environment. Items that
-could not be produced because a gate is red are listed as deferred, not as passed.
+was read from this worktree or from a command run in the recorded environment. No plan
+Task 5 gate item remains deferred: the mutation sweep, the offscreen grab inspection and
+the baseline-to-final protected-boundary diff were produced afterwards and are recorded
+below with their observed results, including one observed visual limitation that is not
+claimed as a pass. Items that cannot be produced are listed as deferred, not as passed.
 
 **Status: UNBLOCKED — all reported gates green.** The one upstream production defect
 (`src/appio/ui/collector_window.py`, owner Task 4) is fixed in
 `fix(ui): keep helper failures visible across clock ticks` (parent `9d1484f`); the two
 legacy denial assertions and the full suite now pass, and the six-file typecheck gate
 still passes. Sections below record the pre-fix observation and the post-fix re-run
-separately; historical exit codes are not rewritten.
+separately; historical exit codes are not rewritten. The three gate items this receipt
+previously deferred are now produced in “Gates produced in this receipt”.
 
 ## Toolchain (observed)
 
@@ -31,7 +35,8 @@ Environment for every command below:
 | Item | Value |
 | --- | --- |
 | Planning baseline | `0eb173eb28dcba81df33e9261dbaa25d778422c0` |
-| HEAD at this receipt | `53a2c4c5fab9723bf583838cce167286f835dbf5` (`fix(ui): close the shell deterministically and pin frame ownership`) |
+| HEAD at the first receipt | `53a2c4c5fab9723bf583838cce167286f835dbf5` (`fix(ui): close the shell deterministically and pin frame ownership`) |
+| Parent revision for the deferred gates and review fixes | `9c5f0648aba336d1d6f07d16f877899f5834c1da` (`fix(ui): keep helper failures visible across clock ticks`) |
 | Files changed by this task | `tests/p3/test_collector_window.py`, `tests/p3/acceptance_harness.py`, `tests/p3/test_p3_adversarial.py`, `tests/p3/test_history_overlap_entry.py`, `tests/acceptance/test_no_later_scope.py`, this file |
 | Production/contract files changed by this task | none (`git status` lists only the files above) |
 
@@ -40,7 +45,9 @@ Environment for every command below:
 `test_fixture_tick_sqlite_socket_client_router_and_window_match`) drive
 `open_gui`/`advance`/`query`/`render` only, and those are the migrated harness sites.
 Contract/query/router/storage/schema/registry/helper-command sources in this task's diff
-are byte-unchanged.
+are byte-unchanged. The mutation sweep and the grab inspection ran on `9c5f064` plus the
+uncommitted review fixes to `tests/p3/test_collector_window.py` (the only working-tree
+change at that time); the disposable copies came from that same tree.
 
 ## Commands and results
 
@@ -294,23 +301,206 @@ inside `_tick_target` (`:691`), `show_window`'s explicit retry success (`:813`),
 (`:1045`) and `_on_reply` (`:1102`, `:1106`) keep their prior behaviour, as do the
 clock-owned marker retry, its renewal and the no-target error reset.
 
-## Deferred (not produced by this receipt)
+## Review-finding corrections (observed)
 
-These plan Task 5 gate items were still **not** produced; they are not claimed:
+### MR-1 — changed ownership prepares one replacement
 
-- Race-mechanism mutation sweep in disposable copies (quiesce wrapper, export wrapper,
-  conditional exit retirement, prepare force flag, retire-before-ready ordering,
-  unconditional-exit control) with restored controls.
-- Offscreen grab inspection of populated/empty/unavailable/pending console and chart
-  fixtures.
-- Baseline-to-final protected-boundary diff review (only the working-tree check above was
-  done: this task changed no production, configuration or contract file).
+`test_pending_history_changed_ownership_reprepares_once` now uses `controlled_build`, so it
+owns a `ControlledCoordinator`. It stops both timers, applies the initial ON probe, then
+sets `coordinator.invalidate_on = "reconcile"` before the second `refresh_and_settle`.
+The changed-ownership reconcile therefore invalidates the router generation exactly as a
+live sample or transport invalidation does, and spec §4.4 replaces the retained pending
+preparation once. The case now asserts `len(history.prepare_calls) == 2`,
+`len(history.actions) == 2` and `window._pending == original_window`, and still asserts
+`history.prepared == original_window`, `len(coordinator.reconciles) == 2`,
+`coordinator.ticks == 2`, `coordinator.reconciles[-1] == OFF` and the displayed OFF state.
+The old `len(history.actions) == 1` wording was not simply restored: the plain
+`FakeCoordinator.reconcile` never invalidates and §4.4 forbids a re-prepare there.
+
+Falsification in `/tmp/mr12-probe` (a disposable copy): with the seam set and only the old
+`len(history.actions) == 1` assertion restored, the selected test failed with
+`AssertionError: assert 2 == 1` at that assertion (two `prepare` entries for the same
+window). The corrected test passes, and `tests/p3/test_collector_window.py` reports 170
+passed.
+
+### MR-2 — quiesce ordering proven after initial facts land
+
+`test_enable_quiesces_local_collection_before_the_first_elevation` now starts with an
+unheld `ControlledSetup(OFF)`, applies the first probe, and asserts `facts_applied == 1`
+and the OFF state before clearing `setup.started`, setting `hold = True` and taking the
+spanning probe. The quiesce-before-invoke order, `decide_owner` verdict, exact invoke
+event and spanning-probe drop assertions are unchanged; after release it waits for
+`_dropped_facts == 1` and asserts `facts_applied == 1` (the spanning facts are dropped and
+the initial applied fact stands) before completing the helper.
+
+Falsification in the same disposable copy: removing the initial settle and keeping the
+new assertion failed with `assert 0 == 1` on `window.facts_applied`, i.e. the old fixture
+never applied initial facts. The corrected test passes.
+
+## Gates produced in this receipt (observed)
+
+### Race-mechanism mutation sweep in disposable copies
+
+Setup, run once for the whole sweep:
+
+```
+$ rm -rf /tmp/appio-gates-sweep /tmp/appio-gates-sweep-pristine
+$ rsync -a --exclude .git --exclude __pycache__ --exclude '*.pyc' <checkout>/ /tmp/appio-gates-sweep/
+$ mkdir /tmp/appio-gates-sweep-pristine
+$ cp /tmp/appio-gates-sweep/src/appio/ui/files_view.py \
+     /tmp/appio-gates-sweep/src/appio/ui/collector_window.py /tmp/appio-gates-sweep-pristine/
+$ cd /tmp/appio-gates-sweep
+$ . /tmp/appio-console-charts-pm-20261101-175829-4410c030-venv/bin/activate
+$ export QT_QPA_PLATFORM=offscreen PYTEST_QT_API=pyqt6
+$ python -m pytest -q \
+    tests/p3/test_collector_window.py::test_worker_wins_cancellation_delivery_is_transient_while_pending \
+    tests/p3/test_collector_window.py::test_transient_scope_exit_retires_worker_delivery_before_next_target_tick \
+    tests/p3/test_collector_window.py::test_late_retired_file_delivery_after_ready_is_dropped_and_requeried_once
+17 passed in 5.76s
+```
+
+Each mutation below was applied only in `/tmp/appio-gates-sweep`; the checkout stayed
+untouched. Every run collected and executed the named test (no import/collection error)
+and failed at the listed assertion line. After each mutation both production files were
+restored from `/tmp/appio-gates-sweep-pristine` and the same selector had to pass again.
+
+Barrier/order observed: `HeldFileDelivery` replaces `HistoryRouter._read_local_files` with
+a worker held on a `threading.Event` and captures only the real `_deliver` payload;
+`win_cancellation` hooks `_cancel_file_requests` to release that worker, wait for the
+captured bridge payload and then cancel while the invalidating call is still running.
+Default-exit routes (`pump`, `reconcile`, `tick_local`, `quiesce`, `import`) run through
+`invalidate_shell`; prepare routes run through `_tick_target`/`show_window`, which close
+Files admission before `prepare()` and pass `retire_on_exit=True` because `prepare()`
+leaves `view_state == "loading"`. The last test re-enters `set_scope_ready(True)` with a
+pre-apply generation payload, which is exactly the ordering hazard.
+
+| Mutation (disposable copy only) | Selector | Observed failure (killing assertion) |
+| --- | --- | --- |
+| Remove the `transient_scope()` wrapper around `_quiesce_local`'s `reconcile(QUIESCE_FACTS)` | `...[quiesce]` | `assert held.transient_at_settlement == [True]` → `[False]` |
+| Remove the `transient_scope()` wrapper around `_after_disable`'s `accept_export` | `...[import]` | `assert held.transient_at_settlement == [True]` → `[False]` |
+| Conditional exit retirement removed (`if retire_on_exit or self._history_view_unavailable():` → `if retire_on_exit:`) | `...test_transient_scope_exit_retires_worker_delivery_before_next_target_tick[reconcile]` | `assert shell.view._generation > held.generation` → `6 > 6` |
+| Prepare force flag removed (`transient_scope(retire_on_exit=True)` → `transient_scope()` at both prepare callers) | `...[clock_prepare]` | `assert shell.view._generation > held.generation` → `5 > 5` |
+| Retire-before-ready order swapped (`retire_deliveries()` moved after `set_scope_ready(True)`/`_show_ready`) | `test_late_retired_file_delivery_after_ready_is_dropped_and_requeried_once` | `assert files_snapshot(shell.view) == held.snapshot`; `last_result` became `None` while the retained result had rows |
+| Exit retirement made unconditional (`if True:`) | `...test_transient_scope_exit_retires_worker_delivery_before_next_target_tick[healthy_pump]` | `assert shell.view._generation == held.generation` → `8 == 6` |
+
+Restored controls: after both files were restored byte-for-byte
+(`diff -q` against the pristine copies) the full 17-test selector passed again in 5.12 s.
+
+### Offscreen grab inspection
+
+Fixtures were generated offscreen by `/tmp/appio-grabs/make_grabs.py` against the same
+tree (`QApplication` with `QT_QPA_PLATFORM=offscreen`); PNGs and the generator stayed
+outside the checkout in `/tmp/appio-grabs/`. Chart smoke grabs are 320 x 170
+(`SeriesChart`, `DualSeriesChart`, `DeviceLane`, `DonutChart`, `ShareBars`) and the console
+grabs are 1180 px wide (`Overview`/`Files`); the wide `ShareBars` grab is 1100 x 240.
+
+| Grab | Controlled fixture | Observed |
+| --- | --- | --- |
+| `charts_series.png` | 7-of-8 task buckets, hole at bucket 3 | `TOTAL · read above, write below`; blue above/orange below with a visible unfilled bucket span |
+| `charts_dual.png` | same series plus totals 6 MiB/3 MiB | same caption and gap support; gutter `r 6 MiB · w 3 MiB` |
+| `charts_lane.png` | device 8:0 points, hole at bucket 3 | lane caption `8:0` and the same visible gap |
+| `charts_donut.png` | task shares 6 MiB read / 3 MiB write | `READ vs WRITE`, sectors, `6 MiB read`, `3 MiB write`, `66.7% / 33.3%` |
+| `charts_bars.png` | rows 4/2/1/0.5 MiB | `ATTRIBUTED SHARE BY DISK`, four proportional bars, rows 8:0, 8:16, 8:32, 8:48 |
+| `console_populated_overview.png` | 4 ranked apps (9/6/3/1.5 MiB); subject 4 MiB read + 2 MiB write; four device rows; series 7-of-8 buckets; share coverage incomplete, 2 gaps | ranking bars for all four apps; five KPIs `TOTAL 6 MiB`, `READ 4 MiB`, `WRITE 2 MiB`, `PEAK unavailable`, `DEVICE 6.3 MiB`; dual TOTAL with the visible gap; three device lanes `8:0`, `8:16`, `8:32` with raw-token captions and byte gutters `r 3 MiB · w 1 MiB`, `r 768 KiB · w 512 KiB`, `r 512 KiB · w 256 KiB`; `and 1 more`; donut `66.7% / 33.3%`; all four share rows; residual strip `Residual: attributed exceeds task accounting by 384 KiB - difference between accounting points`; coverage `coverage: incomplete; device attribution: available; tier: raw; gaps: 2; suspends: False`; both persistent tabs |
+| `console_share_bars_wide.png` | same share model at 1100 px | full signed equation: `Residual: attributed exceeds task accounting by 384 KiB - difference between accounting points; 6.3 MiB attributed + (-384 KiB) residual = 6 MiB total` |
+| `console_populated_files.png` | two retained file rows for the selected subject | seven ratified columns, both rows (`alpha-report.bin`, `alpha-cache.tmp`), footer quantities and both persistent tabs |
+| `console_empty_overview.png` | available but zero task I/O and an empty series | KPIs `0 B` (device `0 B`, `PEAK unavailable`); `no samples in this window` and no zero line; donut `0 B read`, `0 B write`, `0.0% / 0.0%`, `no task I/O in this window`; no share rows; `Residual: 0 B`; `coverage: complete` |
+| `console_unavailable_overview.png` | ranking raises `daemon is not answering on the socket` | five `unavailable` KPIs; all three chart panels say `unavailable: daemon is not answering on the socket`; `Residual: unavailable`; `coverage: unavailable`; no numeric zeroes |
+| `console_pending_overview.png` | populated frame retained, `history_state` set to `updating (loading)`, Files admission closed | the full retained populated frame plus the explicit `updating (loading)` line above the KPIs |
+| `console_pending_files.png` | same pending scope | retained rows/footer, disabled search/direction/refresh controls, `updating to since_boot` |
+
+Observed visual limitation (recorded, not claimed as a pass): in the 1180 px console the
+`ShareBars` reconciliation annotation is drawn as one painter text line and is horizontally
+clipped at the panel edge (`difference b…`). The complete signed equation is visible in
+the 1100 px standalone grab of the same model (table above), and the short signed residual
+strip plus both coverage lines are fully readable at the console width. The chart smoke
+fixtures set points without totals, so their `SeriesChart`/`DeviceLane` gutters read
+`r 0 B · w 0 B`; the console lanes use the share totals and show the values above.
+
+### Baseline-to-final protected-boundary diff
+
+Commands, run in the checkout:
+
+```
+$ BASE=0eb173eb28dcba81df33e9261dbaa25d778422c0
+$ git diff --name-status $BASE
+A  docs/superpowers/plans/2026-11-02-appio-console-charts-replan.execution-graph.dot
+A  docs/superpowers/plans/2026-11-02-appio-console-charts-replan.execution-graph.yaml
+A  docs/superpowers/plans/2026-11-02-appio-console-charts-replan.md
+A  docs/superpowers/reviews/2026-11-02-appio-console-charts-gates.md
+A  src/appio/ui/charts.py
+M  src/appio/ui/collector_window.py
+M  src/appio/ui/files_view.py
+M  src/appio/ui/main_window.py
+A  src/appio/ui/render_model.py
+A  src/appio/ui/theme.py
+M  tests/acceptance/test_no_later_scope.py
+M  tests/p3/acceptance_harness.py
+M  tests/p3/test_collector_window.py
+M  tests/p3/test_history_overlap_entry.py
+M  tests/p3/test_p3_adversarial.py
+M  tests/p4/test_files_view.py
+A  tests/test_charts.py
+M  tests/test_ui.py
+$ git diff --quiet $BASE -- $(git ls-tree -r --name-only $BASE \
+    | grep -v -E '^(src/appio/ui/(collector_window|files_view|main_window)\.py|src/appio/ui/(charts|render_model|theme)\.py|tests/|docs/)')
+$ echo $?
+0
+```
+
+The only changed implementation paths are the six UI files the spec §3/§9.7 inventory
+lists; every other baseline path is byte-identical, including
+`contracts.py`, `query.py`, `history_router.py`, `store.py`, `file_store.py`,
+`schema.py`, `migrations.py`, `ipc_models.py`, `ipc_protocol.py`, `iodclient.py`,
+`iod.py`, `iod_history.py`, `bpf_fileio.py`, `collector_owner.py`, `setup_client.py`,
+`setup_boundary.py`, `setup_delegation.py`, `setup_files.py`, `setup_service.py`,
+`file_runtime.py`, `activation.py`, `ownership.py`, `identity.py`, `pyproject.toml`,
+`packaging/` and `appio_iod/` (the `git diff --quiet` gate above exits 0; the packaging
+and runtime-dependency diff is 0 lines). `git status` during the sweep listed only the
+uncommitted review fix in `tests/p3/test_collector_window.py`.
+
+Helper/consent boundary checked against the same baseline by AST extraction:
+`consent_text` is byte-identical, the exact `('_start', verb)` literal vector is identical
+(`disable`, `enable`, `install-delegation`, `restart-user-manager`, `status`; nothing
+added or removed), `CONSENT_COMMAND_PREFIX` is unchanged and `setup_client.py` is
+byte-identical. The only consent-adjacent docstring change is the module docstring
+describing the persistent two-tab console; no user-visible consent or command text moved.
+A scan of added `src/appio/ui` lines found no hour-of-day intensity strip, autostart,
+retention/cadence control, tray widget, or enabled launch/range control; the only `tray`
+match is the existing docstring phrase `contains no tray, daemon or privilege flow`.
+
+### Gate re-run after the review fixes
+
+Run in the working tree that contained the two test corrections (uncommitted at run time):
+
+```
+$ python -m pytest -q
+2639 passed, 2 skipped in 128.38s (0:02:08)
+$ python -m pytest -q tests/p3/test_collector_window.py
+170 passed in 17.11s
+$ python -m mypy --follow-imports=skip --ignore-missing-imports \
+    src/appio/ui/render_model.py src/appio/ui/charts.py src/appio/ui/theme.py \
+    src/appio/ui/main_window.py src/appio/ui/files_view.py src/appio/ui/collector_window.py
+Success: no issues found in 6 source files
+$ echo $?
+0
+```
 
 ## Verdict
 
-- Six-file mypy gate: **PASS** (exit 0, re-run after the fix).
-- Full `python -m pytest`: **PASS** (exit 0, re-run after the fix) — 2639 passed, 2 skipped.
-  Both former failures (`test_helper_denial_and_absence_preserve_gui_ownership[126]` and
-  `[127]`) pass, and `tests/p3/test_collector_window.py` still has 170 passing tests.
-- The Task 4 defect recorded above is **fixed**; the Task 5 gate items listed as deferred
-  remain deferred and are not claimed.
+- Six-file mypy gate: **PASS** (exit 0, re-run after the fix and after the review
+  corrections).
+- Full `python -m pytest`: **PASS** (exit 0, re-run after the fix and after the review
+  corrections) — 2639 passed, 2 skipped. Both former failures
+  (`test_helper_denial_and_absence_preserve_gui_ownership[126]` and `[127]`) pass, and
+  `tests/p3/test_collector_window.py` still has 170 passing tests.
+- Mutation sweep: **produced** — six separate mutations each killed by its named
+  preservation/request-count assertion, with byte-restored controls passing again.
+- Offscreen grabs: **produced and inspected** — populated, empty, unavailable, pending,
+  populated Files, chart smoke and the wide share panel; one annotation-clipping limitation
+  is recorded above and not claimed as a pass.
+- Protected-boundary diff: **produced** — the non-UI implementation tree is byte-identical
+  to `0eb173e`; only the six listed UI implementation files, this task's test sites and
+  these docs changed, helper/consent text and argv are unchanged, no excluded feature was
+  added, and there is no packaging/runtime dependency diff.
+- The Task 4 defect recorded above is **fixed**; no plan Task 5 gate item remains deferred.

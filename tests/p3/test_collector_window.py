@@ -859,10 +859,17 @@ def test_a_missing_helper_reports_one_hundred_twenty_seven(qtbot):
 
 
 def test_enable_quiesces_local_collection_before_the_first_elevation(qtbot):
-    setup = ControlledSetup(OFF, hold=True)
+    setup = ControlledSetup(OFF)
     window, coordinator, history, setup = build(qtbot, setup=setup)
     try:
+        # Initial facts land before any elevation: the ordering below is proven
+        # on an already-collected window, not only on a cold start.
+        refresh_and_settle(qtbot, window)
+        assert window.facts_applied == 1
+        assert window.state_text == COLLECTOR_STATE_OFF
         # A probe spanning the helper start belongs to the pre-helper generation.
+        setup.started.clear()
+        setup.hold = True
         window.refresh()
         assert setup.started.wait(2), "the spanning probe must have reached its worker"
         events = setup.events
@@ -881,7 +888,8 @@ def test_enable_quiesces_local_collection_before_the_first_elevation(qtbot):
         # generation, so its result is dropped instead of applied.
         setup.release.set()
         qtbot.waitUntil(lambda: window._dropped_facts == 1, timeout=2000)
-        assert window.facts_applied == 0
+        # The spanning probe's facts never land; the initial applied fact stands.
+        assert window.facts_applied == 1
         complete_and_settle(qtbot, window, setup, "install-delegation",
                             SetupReply(1, "enable:daemon_not_answering", None))
     finally:
@@ -1196,8 +1204,7 @@ def test_pending_history_invalidation_reprepares_once(qtbot):
 
 
 def test_pending_history_changed_ownership_reprepares_once(qtbot):
-    window, coordinator, history, setup = build(
-        qtbot, facts=ON, history=ControlledHistory())
+    window, coordinator, history, setup = controlled_build(qtbot, facts=ON)
     window._timer.stop()
     window._poll_timer.stop()
     refresh_and_settle(qtbot, window)
@@ -1208,11 +1215,15 @@ def test_pending_history_changed_ownership_reprepares_once(qtbot):
     assert window.state_text == COLLECTOR_STATE_ON_ANSWERING
 
     setup.facts = OFF
+    # Changed ownership is reconciled as the new facts are applied, and that
+    # reconcile invalidates the router generation: the retained preparation is
+    # replaced exactly once while the requested scope is unchanged.
+    coordinator.invalidate_on = "reconcile"
     refresh_and_settle(qtbot, window)
-    # Changed ownership replaces the applied facts; the requested scope did
-    # not change, so the retained preparation is still the only one.
     assert history.prepared == original_window
-    assert len(history.actions) == 1
+    assert len(history.prepare_calls) == 2
+    assert len(history.actions) == 2
+    assert window._pending == original_window
     assert len(coordinator.reconciles) == 2
     assert coordinator.ticks == 2
     assert coordinator.reconciles[-1] == OFF
