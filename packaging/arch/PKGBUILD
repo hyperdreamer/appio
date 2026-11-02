@@ -2,7 +2,7 @@
 # Local/dev package: the source tarball is exported from this checkout by
 # packaging/arch/build-package.sh, which also verifies the digest below.
 pkgname=appio
-pkgver=0.1.1
+pkgver=0.1.2
 pkgrel=1
 pkgdesc='Application I/O monitor: system-wide collector, IPC protocol and Qt viewer'
 arch=('x86_64')
