@@ -602,20 +602,18 @@ class CollectorWindow(QMainWindow):
 
     def _files_status_text(self) -> str | None:
         window = self._displayed or self._pending or self._target
+        if window is None:
+            return "waiting for the first sample"
         if self._displayed is None:
             try:
                 status = self.history.file_source_status()
             except Exception as error:
-                if window is None:
-                    return "waiting for the first sample"
                 return f"{FILES_UNAVAILABLE}: {str(error) or type(error).__name__}"
             if not getattr(status, "available", False):
                 reason = getattr(status, "reason", None)
                 detail = getattr(status, "diagnostic", None) or "the file source is unavailable"
                 prefix = f"{reason}: " if reason else ""
                 return f"{FILES_UNAVAILABLE}: {prefix}{detail}"
-            if window is None:
-                return "waiting for the first sample"
             return f"loading history ({self.history.view_state})"
         if self._pending is not None or self._prepare_retry is not None:
             return None
@@ -748,7 +746,9 @@ class CollectorWindow(QMainWindow):
         elif self._displayed is not None:
             self.files_view.set_scope_ready(True)
             self.files_view.set_updating_scope(None)
-            self._sync_files()
+            if self._history_ready(self._displayed):
+                self.files_view.flush_refresh()
+            self._render_files_message()
             self.history_state.setText("")
             self.history_state.setVisible(False)
             self._poll_timer.stop()
@@ -1058,7 +1058,7 @@ class CollectorWindow(QMainWindow):
         return True
 
     def _start(self, verb: str, on_success: Callable[[SetupReply], None] | None) -> None:
-        if self._busy:
+        if self._closed or self._busy:
             return
         self._setup_generation += 1
         self._busy = True
@@ -1206,6 +1206,10 @@ class CollectorWindow(QMainWindow):
     def _after_status(self, reply: SetupReply) -> None:
         return None
 
+    def closeEvent(self, event) -> None:  # noqa: N802 - Qt override
+        self.shutdown()
+        super().closeEvent(event)
+
     def shutdown(self) -> None:
         if self._closed:
             return
@@ -1216,6 +1220,7 @@ class CollectorWindow(QMainWindow):
             if dialog is not None:
                 dialog.close()
         self.files_view.retire_deliveries()
+        self.files_view.close()
         self._probe_executor.shutdown(wait=False, cancel_futures=True)
         try:
             self.coordinator.close()

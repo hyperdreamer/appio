@@ -143,6 +143,9 @@ class FakeHistory:
             done.set_result(self.file_result)
         return done
 
+    def close(self) -> None:
+        """The in-memory fake has no external resources to release."""
+
     def disk_share(self, app_id: int, window: Window) -> DiskShare:
         row = next(row for row in self.rows if row.app_id == app_id)
         # No device attribution in this fake: None is rendered as unavailable.
@@ -173,6 +176,9 @@ class FakeCoordinator:
         self.ticks += 1
         self.actions.append(("tick_local",))
         self.events.append(("tick_local",))
+
+    def close(self) -> None:
+        """The fake coordinator owns no writer or lease."""
 
     def accept_export(self, result: ExportResult) -> None:
         self.exports.append(result)
@@ -2474,3 +2480,610 @@ def test_late_retired_file_delivery_after_ready_is_dropped_and_requeried_once(
         assert len(shell.view.requests) == held.requests + 1
     finally:
         held.release.set()
+
+
+# Task 4 review regressions. Each M-number names the review ledger mutation
+# independently falsified by that test; all entry points use the real shell.
+
+
+def test_task4_m006_closed_target_tick_is_inert(qtbot, monkeypatch):
+    window, _, history, _ = controlled_build(qtbot)
+    window.show_window(scope_window())
+    window.close()
+    before = (window._displayed, window._pending, tuple(history.prepare_calls))
+    clocks = []
+    monkeypatch.setattr(window, "_current_window", lambda: clocks.append(True) or None)
+    window._tick_target()
+    assert clocks == []
+    assert (window._displayed, window._pending, tuple(history.prepare_calls)) == before
+
+
+def test_task4_m017_closed_apply_refuses_ready_pending_frame(qtbot):
+    window, _, history, _ = controlled_build(qtbot)
+    target = scope_window()
+    window.show_window(target)
+    history.become_ready(target)
+    window.close()
+    assert window.apply_ready_frame() is False
+    assert window._displayed is None and window._pending == target
+
+
+def test_task4_m021_closed_explicit_request_is_inert(qtbot):
+    window, _, history, _ = controlled_build(qtbot)
+    window.close()
+    before = (window._displayed, window._pending, tuple(history.prepare_calls))
+    window.show_window(scope_window())
+    assert (window._displayed, window._pending, tuple(history.prepare_calls)) == before
+
+
+def test_task4_m031_closed_refresh_never_pumps(qtbot):
+    pumps = []
+    window, _, history, _ = controlled_build(qtbot, pump=lambda: pumps.append(True))
+    window.close()
+    window.refresh()
+    assert pumps == []
+    assert history.prepare_calls == []
+    assert window._probe_ticket == 0
+
+
+def test_task4_m078_close_enters_shutdown_and_stops_both_timers(qtbot, monkeypatch):
+    window, coordinator, history, _ = controlled_build(qtbot)
+    closed = []
+    monkeypatch.setattr(coordinator, "close", lambda: closed.append("coordinator"))
+    monkeypatch.setattr(history, "close", lambda: closed.append("history"))
+    window.show_window(scope_window())
+    assert window._timer.isActive() and window._poll_timer.isActive()
+    try:
+        assert window.close()
+        assert window._closed
+        assert not window._timer.isActive() and not window._poll_timer.isActive()
+        window.shutdown()
+        assert closed == ["coordinator", "history"]
+    finally:
+        window._timer.stop()
+        window._poll_timer.stop()
+
+
+def test_task4_m081_close_cancels_queued_probe_without_waiting(qtbot):
+    setup = ControlledSetup(OFF, hold=True)
+    window, _, _, _ = controlled_build(qtbot, setup=setup)
+    window._timer.stop()
+    try:
+        assert window._submit_probe()
+        assert setup.started.wait(1)
+        running = window._probe_inflight
+        assert window._submit_probe(replace_pending=True)
+        successor = window._probe_inflight
+        assert successor is window._probe_successor and not successor.running()
+        started = time.monotonic()
+        window.close()
+        assert time.monotonic() - started < 0.1
+        assert successor.cancelled()
+        setup.release.set()
+        running.result(timeout=2)
+        assert setup.refresh_calls == 1
+        qtbot.waitUntil(lambda: window._probe_executor._threads.isdisjoint(threading.enumerate()))
+        assert window.facts_applied == 0 and window._dropped_facts == 0
+    finally:
+        setup.release.set()
+        window.shutdown()
+
+
+def test_task4_closed_shell_refuses_helpers(qtbot):
+    window, _, _, setup = controlled_build(qtbot)
+    window.shutdown()
+    generation = window._setup_generation
+    window._start("status", None)
+    assert setup.calls == []
+    assert window._setup_generation == generation and not window.busy
+
+
+def test_task4_m079_shutdown_retires_then_closes_files_before_resources(qtbot, monkeypatch):
+    window, coordinator, history, _ = populated_shell(qtbot, monkeypatch)
+    view = window.files_view
+    events = []
+    retire = view.retire_deliveries
+    close = view.close
+
+    def retire_files():
+        events.append("retire")
+        retire()
+
+    def close_files():
+        events.append("files")
+        return close()
+
+    def close_history():
+        assert view._closed
+        events.append("history")
+
+    monkeypatch.setattr(view, "retire_deliveries", retire_files)
+    monkeypatch.setattr(view, "close", close_files)
+    monkeypatch.setattr(coordinator, "close", lambda: events.append("coordinator"))
+    monkeypatch.setattr(history, "close", close_history)
+    window.shutdown()
+    assert events == ["retire", "files", "coordinator", "history"]
+    reads = (history.ranking_reads, history.file_application_reads, history.status_reads)
+    requests = len(history.file_requests)
+    view.request_refresh()
+    view.flush_refresh()
+    view.set_window(scope_window())
+    assert len(history.file_requests) == requests
+    assert (history.ranking_reads, history.file_application_reads, history.status_reads) == reads
+    window.shutdown()
+    assert events == ["retire", "files", "coordinator", "history"]
+
+
+def test_task4_stable_target_flushes_without_reloading_union(qtbot, monkeypatch):
+    window, _, history, _ = populated_shell(qtbot, monkeypatch)
+    reads = (history.ranking_reads, history.file_application_reads, history.status_reads)
+    requests = len(history.file_requests)
+    prepares = tuple(history.prepare_calls)
+    for _ in range(2):
+        window._tick_target()
+    assert (history.ranking_reads, history.file_application_reads, history.status_reads) == reads
+    assert len(history.file_requests) == requests
+    assert tuple(history.prepare_calls) == prepares
+    view = window.files_view
+    view.set_scope_ready(False)
+    view.request_refresh()
+    assert view.refresh_wanted()
+    window._tick_target()
+    assert len(history.file_requests) == requests + 1
+    assert not view.refresh_wanted()
+    assert (history.ranking_reads, history.file_application_reads) == reads[:2]
+    window._tick_target()
+    assert len(history.file_requests) == requests + 1
+    assert tuple(history.prepare_calls) == prepares
+
+
+@pytest.mark.parametrize("source", ["unavailable", "available", "raises"])
+def test_task4_no_scope_files_message_waits_for_first_sample(qtbot, monkeypatch, source):
+    history = ControlledHistory(boot_id=None)
+    if source == "available":
+        history.file_status = FileAvailability(True, True)
+    window, _, _, _ = controlled_build(qtbot, history=history)
+    window._timer.stop()
+    reads = history.status_reads
+    if source == "raises":
+        def fail_status():
+            raise RuntimeError("status unavailable")
+        monkeypatch.setattr(history, "file_source_status", fail_status)
+    window._tick_target()
+    assert window._target is window._pending is window._displayed is None
+    assert window._files_status_text() == "waiting for the first sample"
+    assert window.files_message.text() == "waiting for the first sample"
+    assert history.status_reads == reads
+
+
+def test_task4_m008_advancing_target_keeps_nonretired_pending_scope(qtbot, monkeypatch):
+    window, _, history, _ = controlled_build(qtbot)
+    window._timer.stop()
+    pending, target = scope_window(), scope_window(END + RAW_BUCKET_NS)
+    window.show_window(pending)
+    monkeypatch.setattr(window, "_current_window", lambda: target)
+    calls = tuple(history.prepare_calls)
+    window._tick_target()
+    assert window._target == target and window._pending == pending
+    assert tuple(history.prepare_calls) == calls
+    assert window._displayed is None
+
+
+def test_task4_m012_explicit_retry_survives_nonempty_clock_target(qtbot, monkeypatch):
+    window, _, history, _ = controlled_build(qtbot)
+    window._timer.stop()
+    history.prepare_failures.append(RuntimeError("explicit failure"))
+    with pytest.raises(RuntimeError, match="explicit failure"):
+        window.show_window(scope_window())
+    marker = window._prepare_retry
+    calls = tuple(history.prepare_calls)
+    monkeypatch.setattr(window, "_current_window", lambda: scope_window(END + RAW_BUCKET_NS))
+    window._tick_target()
+    assert window._prepare_retry is marker and marker.owner == "explicit"
+    assert window._pending is None and not window.files_view._scope_ready
+    assert tuple(history.prepare_calls) == calls
+
+
+def test_task4_m016_validation_error_before_loading_propagates(qtbot, monkeypatch):
+    window, _, history, _ = controlled_build(qtbot)
+    window._timer.stop()
+    history.view_state = "ready"
+
+    def invalid(_window):
+        raise ValueError("invalid window")
+
+    monkeypatch.setattr(history, "prepare", invalid)
+    with pytest.raises(ValueError, match="invalid window"):
+        window._tick_target()
+    assert window._prepare_retry is None and window._prepare_error is None
+
+
+def test_task4_m019_apply_discards_retired_pending_work(qtbot):
+    window, _, history, _ = controlled_build(qtbot)
+    window._timer.stop()
+    window.show_window(scope_window())
+    history.invalidate()
+    assert window.apply_ready_frame() is False
+    assert window._pending is None and window._displayed is None
+
+
+def test_task4_m022_explicit_scope_leaves_stored_clock_target(qtbot):
+    window, _, _, _ = controlled_build(qtbot)
+    window._timer.stop()
+    window._target = scope_window()
+    window.show_window(scope_window(END + RAW_BUCKET_NS))
+    assert window._target == scope_window()
+    assert window._pending == scope_window(END + RAW_BUCKET_NS)
+
+
+def test_task4_m098_target_preparation_never_renders_ready(qtbot, monkeypatch):
+    window, _, history, _ = controlled_build(qtbot)
+    window._timer.stop()
+    renders = []
+    monkeypatch.setattr(window, "_show_ready", lambda target: renders.append(target))
+    window._tick_target()
+    assert renders == []
+    assert window._displayed is None and window._pending == scope_window()
+    assert history.prepare_calls == [scope_window()]
+
+
+def test_task4_m100_explicit_request_clears_retry_before_prepare(qtbot, monkeypatch):
+    window, _, history, _ = controlled_build(qtbot)
+    window._timer.stop()
+    history.prepare_failures.append(RuntimeError("prepare failed"))
+    with pytest.raises(RuntimeError, match="prepare failed"):
+        window.show_window(scope_window())
+    assert window._prepare_retry is not None and window._prepare_error is not None
+    observed = []
+    prepare = history.prepare
+
+    def checked(target):
+        observed.append((window._prepare_retry, window._prepare_error))
+        prepare(target)
+
+    monkeypatch.setattr(history, "prepare", checked)
+    window.show_window(scope_window(END + RAW_BUCKET_NS))
+    assert observed == [(None, None)]
+    assert window._pending == scope_window(END + RAW_BUCKET_NS)
+
+
+def test_task4_m029_frame_application_stops_readiness_poll(qtbot):
+    window, _, history, _ = controlled_build(qtbot)
+    window._timer.stop()
+    window.show_window(scope_window())
+    history.become_ready(scope_window())
+    assert window._poll_timer.isActive()
+    assert window.apply_ready_frame()
+    assert not window._poll_timer.isActive()
+
+
+def test_task4_m030_poll_never_ticks_clock_target(qtbot, monkeypatch):
+    window, _, _, _ = controlled_build(qtbot)
+    window._timer.stop()
+    window.show_window(scope_window())
+    ticks = []
+    monkeypatch.setattr(window, "_tick_target", lambda: ticks.append(True))
+    window._poll_history()
+    assert ticks == []
+    assert window._pending == scope_window() and window._displayed is None
+
+
+def test_task4_m034_refresh_pumps_then_ticks_then_applies_then_probes(qtbot, monkeypatch):
+    events = []
+    window, _, _, _ = controlled_build(qtbot, pump=lambda: events.append("pump"))
+    window._timer.stop()
+    monkeypatch.setattr(window, "_tick_target", lambda: events.append("tick"))
+    monkeypatch.setattr(window, "apply_ready_frame", lambda: events.append("apply") or False)
+    monkeypatch.setattr(window, "_submit_probe", lambda: events.append("probe") or False)
+    window.refresh()
+    assert events == ["pump", "tick", "apply", "probe"]
+
+
+def task4_deferred_same_scope(qtbot, monkeypatch):
+    window, coordinator, history, setup = populated_shell(qtbot, monkeypatch)
+    # Isolate each caller's no-apply flush from the target driver's own flush.
+    monkeypatch.setattr(window, "_tick_target", lambda: None)
+    view = window.files_view
+    view.set_scope_ready(False)
+    view.request_refresh()
+    view.set_scope_ready(True)
+    assert view.refresh_wanted()
+    return window, coordinator, history, setup
+
+
+def test_task4_m035_refresh_flushes_deferred_files_without_new_frame(qtbot, monkeypatch):
+    window, _, history, _ = task4_deferred_same_scope(qtbot, monkeypatch)
+    requests = len(history.file_requests)
+    window.refresh()
+    assert len(history.file_requests) == requests + 1
+    assert not window.files_view.refresh_wanted()
+    window.refresh()
+    assert len(history.file_requests) == requests + 1
+
+
+def test_task4_m036_refresh_contains_operational_errors(qtbot, monkeypatch):
+    window, _, history, _ = populated_shell(qtbot, monkeypatch)
+    displayed = window._displayed
+    snapshot = files_snapshot(window.files_view)
+
+    def fail():
+        raise RuntimeError("pump failed")
+
+    monkeypatch.setattr(window, "_pump", fail)
+    window.refresh()
+    assert window.error_label.text() == "appio: pump failed"
+    assert window._displayed == displayed and files_snapshot(window.files_view) == snapshot
+    assert history.prepare_calls == [displayed]
+
+
+def test_task4_m045_facts_flush_deferred_files_without_new_frame(qtbot, monkeypatch):
+    window, _, history, _ = task4_deferred_same_scope(qtbot, monkeypatch)
+    requests = len(history.file_requests)
+    window._probe_ticket = 1
+    window._apply_facts(cw.ProbePayload(OFF, None, 1, 0))
+    assert len(history.file_requests) == requests + 1
+    assert not window.files_view.refresh_wanted()
+    window._probe_ticket = 2
+    window._apply_facts(cw.ProbePayload(OFF, None, 2, 0))
+    assert len(history.file_requests) == requests + 1
+
+
+def test_task4_m097_poll_applies_replacement_while_old_frame_visible(qtbot, monkeypatch):
+    window, _, history, _ = populated_shell(qtbot, monkeypatch)
+    first = window._displayed
+    target = scope_window(END + RAW_BUCKET_NS)
+    window.show_window(target)
+    assert window._displayed == first and window.history_visible
+    history.become_ready(target)
+    window._poll_history()
+    assert window._displayed == target and window._pending is None
+    assert not window._poll_timer.isActive()
+
+
+def task4_rejected_probe(qtbot, *, busy, generation):
+    window, coordinator, history, _ = controlled_build(qtbot)
+    window._timer.stop()
+    window._probe_ticket = 7
+    window._setup_generation = 9
+    window._busy = busy
+    window._probe_inflight = window._probe_successor = Future()
+    before = (window.facts_applied, window._facts, window.state_text,
+              tuple(coordinator.actions), tuple(history.prepare_calls))
+    window._apply_facts(cw.ProbePayload(OFF, None, 7, generation))
+    assert (window.facts_applied, window._facts, window.state_text,
+            tuple(coordinator.actions), tuple(history.prepare_calls)) == before
+    assert window._dropped_facts == 1
+    assert window._probe_inflight is None and window._probe_successor is None
+
+
+def test_task4_m065_generation_rejection_with_current_ticket_and_idle_shell(qtbot):
+    task4_rejected_probe(qtbot, busy=False, generation=8)
+
+
+def test_task4_m066_busy_rejection_with_current_ticket_and_generation(qtbot):
+    task4_rejected_probe(qtbot, busy=True, generation=9)
+
+
+def task4_completion_edges(qtbot, monkeypatch, *, synchronous):
+    window, _, _, _ = controlled_build(qtbot)
+    window._timer.stop()
+    window._busy = True
+    window._setup_generation = 3
+    window._operation = ("status", None)
+    events = []
+    original = cw.CollectorWindow.__setattr__
+
+    def record(self, name, value):
+        if self is window and name in ("_busy", "_setup_generation"):
+            events.append((name, value))
+        return original(self, name, value)
+
+    monkeypatch.setattr(cw.CollectorWindow, "__setattr__", record)
+    monkeypatch.setattr(window, "_submit_probe", lambda **_kwargs: False)
+    if synchronous:
+        window._complete_start_failure(RuntimeError("helper failed"))
+    else:
+        future = Future()
+        future.set_exception(RuntimeError("helper failed"))
+        window._on_reply(future)
+    assert events == [("_setup_generation", 4), ("_busy", False)]
+
+
+def test_task4_m073_reply_advances_generation_before_clearing_busy(qtbot, monkeypatch):
+    task4_completion_edges(qtbot, monkeypatch, synchronous=False)
+
+
+def test_task4_m074_invoke_failure_advances_generation_before_clearing_busy(qtbot, monkeypatch):
+    task4_completion_edges(qtbot, monkeypatch, synchronous=True)
+
+
+def test_task4_m061_already_complete_probe_waits_for_queued_delivery(qtbot, monkeypatch):
+    window, coordinator, _, _ = controlled_build(qtbot)
+    window._timer.stop()
+
+    def submit(*_args, **_kwargs):
+        future = Future()
+        future.set_result(OFF)
+        return future
+
+    monkeypatch.setattr(window._probe_executor, "submit", submit)
+    assert window._submit_probe()
+    assert window.facts_applied == 0 and coordinator.actions == []
+    assert window._probe_inflight is not None and window._probe_inflight.done()
+    assert window._submit_probe() is False
+    qtbot.waitUntil(lambda: window.facts_applied == 1)
+    assert window._probe_inflight is None
+
+
+def task4_connection_promotion(qtbot, *, verified):
+    from dataclasses import replace
+
+    window, coordinator, history, _ = controlled_build(qtbot)
+    window._timer.stop()
+    facts = replace(OFF, enabled=True, daemon_verified=False,
+                    answering=False, pending_activation=False)
+    history.client = SimpleNamespace(state=SimpleNamespace(
+        verified=verified, answering=True, pending_activation=True, cursor=None))
+    expected = (replace(facts, daemon_verified=True, answering=True, pending_activation=True)
+                if verified else facts)
+    window._probe_ticket = 1
+    window._apply_facts(cw.ProbePayload(facts, None, 1, 0))
+    assert window._facts == expected
+    assert coordinator.reconciles == [expected]
+    assert window.facts_applied == 1
+
+
+def test_task4_m037_unverified_answer_cannot_promote_probe(qtbot):
+    task4_connection_promotion(qtbot, verified=False)
+
+
+def test_task4_m038_verified_answer_promotes_silent_probe(qtbot):
+    task4_connection_promotion(qtbot, verified=True)
+
+
+def test_task4_m039_connection_promotion_preserves_pending_activation(qtbot):
+    task4_connection_promotion(qtbot, verified=True)
+
+
+def test_task4_m044_reconcile_failure_preserves_facts_banner_and_frame(qtbot, monkeypatch):
+    window, coordinator, _, _ = populated_shell(qtbot, monkeypatch)
+    window._facts = ON
+    window._render(ON)
+    before = (window.facts_applied, window._facts, window.state_text, window._displayed)
+    snapshot = files_snapshot(window.files_view)
+
+    def fail(_facts):
+        raise RuntimeError("reconcile failed")
+
+    monkeypatch.setattr(coordinator, "reconcile", fail)
+    window._probe_ticket = 1
+    window._apply_facts(cw.ProbePayload(OFF, None, 1, 0))
+    assert (window.facts_applied, window._facts, window.state_text, window._displayed) == before
+    assert files_snapshot(window.files_view) == snapshot
+    assert window.error_label.text() == "appio: reconcile failed"
+
+
+def test_task4_m099_unchanged_pending_facts_skip_reconcile_outside_loading(qtbot):
+    window, coordinator, history, _ = controlled_build(qtbot)
+    window._timer.stop()
+    window.show_window(scope_window())
+    history.view_state = "ready"
+    window._facts = OFF
+    window._probe_ticket = 1
+    window._apply_facts(cw.ProbePayload(OFF, None, 1, 0))
+    assert coordinator.reconciles == [] and coordinator.ticks == 1
+    assert window._pending == scope_window()
+    assert window.facts_applied == 1
+
+
+def test_task4_m057_busy_shell_without_slot_refuses_probe_submit(qtbot, monkeypatch):
+    window, _, _, _ = controlled_build(qtbot)
+    window._timer.stop()
+    submissions = []
+    monkeypatch.setattr(window._probe_executor, "submit",
+                        lambda *_args, **_kwargs: submissions.append(True) or Future())
+    window._busy = True
+    assert window._probe_inflight is None
+    assert window._submit_probe() is False
+    assert submissions == [] and window._probe_ticket == 0
+
+
+def test_task4_m059_executor_submission_failure_is_visible_and_releases_slot(qtbot, monkeypatch):
+    window, _, _, _ = controlled_build(qtbot)
+    window._timer.stop()
+
+    def fail(*_args, **_kwargs):
+        raise RuntimeError("submit failed")
+
+    monkeypatch.setattr(window._probe_executor, "submit", fail)
+    assert window._submit_probe() is False
+    assert window.error_label.text() == "appio: submit failed"
+    assert window._probe_inflight is None and window._probe_successor is None
+
+
+def test_task4_m062_blank_probe_exception_uses_class_name(qtbot):
+    window, _, _, _ = controlled_build(qtbot)
+    window._timer.stop()
+    window._probe_ticket = 1
+    future = Future()
+    future.set_exception(RuntimeError())
+    window._probe_completed(1, 0, future)
+    qtbot.waitUntil(lambda: window.error_label.text() == "appio: RuntimeError")
+    assert window.facts_applied == 0
+
+
+def test_task4_m070_error_payload_never_counts_as_applied_facts(qtbot):
+    window, coordinator, _, _ = controlled_build(qtbot)
+    window._timer.stop()
+    window._probe_ticket = 1
+    window._probe_inflight = window._probe_successor = Future()
+    window._apply_facts(cw.ProbePayload(None, "probe failed", 1, 0))
+    assert window.facts_applied == 0 and coordinator.actions == []
+    assert window._probe_inflight is None and window._probe_successor is None
+    assert window.error_label.text() == "appio: probe failed"
+
+
+def test_task4_m004_prepare_retry_is_immutable():
+    from dataclasses import FrozenInstanceError
+
+    retry = cw.PrepareRetry(scope_window(), "clock", 1)
+    with pytest.raises(FrozenInstanceError):
+        retry.since = 2
+
+
+def test_task4_m005_clock_retry_captures_current_timestamp(qtbot, monkeypatch):
+    window, _, history, _ = controlled_build(qtbot)
+    window._timer.stop()
+    monkeypatch.setattr(window, "_clock_ns", lambda: 1234567)
+    history.prepare_failures.append(RuntimeError("clock failure"))
+    window._tick_target()
+    assert window._prepare_retry.since == 1234567
+    assert window._prepare_retry.owner == "clock"
+
+
+def test_task4_m050_probe_payload_is_immutable():
+    from dataclasses import FrozenInstanceError
+
+    payload = cw.ProbePayload(OFF, None, 1, 0)
+    with pytest.raises(FrozenInstanceError):
+        payload.ticket = 2
+
+
+def test_task4_m101_prepared_observation_is_getter_only(qtbot):
+    window, _, _, _ = controlled_build(qtbot)
+    window._timer.stop()
+    with pytest.raises(AttributeError):
+        window._prepared = scope_window()
+    assert window._displayed is None
+
+
+def test_task4_m102_facts_applied_observation_is_getter_only(qtbot):
+    window, _, _, _ = controlled_build(qtbot)
+    window._timer.stop()
+    with pytest.raises(AttributeError):
+        window.facts_applied = 12
+    assert window.facts_applied == 0
+
+
+def test_task4_m089_invalid_file_result_preserves_inner_failure_reason(qtbot, monkeypatch):
+    from dataclasses import replace
+
+    window, _, history, _ = populated_shell(qtbot, monkeypatch)
+    result = history.file_result
+    inner = replace(result.coverage.coverage, complete=False, unavailable_reason="not_retained")
+    result = replace(result, coverage=replace(result.coverage, coverage=inner))
+    classified = []
+    handle = window.files_view._handle_failure
+
+    def classify(reason, message):
+        classified.append((reason, message))
+        handle(reason, message)
+
+    monkeypatch.setattr(window.files_view, "_handle_failure", classify)
+    window.files_view._publish(result)
+    assert classified == [("not_retained", "file history is not available for this window")]
+    assert window.files_view.last_result is None
+    assert window.files_view.model.rowCount() == 0
+    assert window.files_view.unavailable_text() == (
+        "not_retained: file history is not available for this window"
+    )
