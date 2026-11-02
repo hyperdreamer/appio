@@ -1,0 +1,36 @@
+{
+  digraph appio_console_charts {
+    graph [rankdir="LR", label="appio console charts — execution graph", labelloc="t"];
+    node [shape="box", style="rounded"];
+    "T-001" [label="T-001\nplan task 1\nstandard"];
+    "T-002" [label="T-002\nplan task 2\nadvanced"];
+    "T-003" [label="T-003\nplan task 3\nstandard"];
+    "T-004" [label="T-004\nplan task 4\nadvanced"];
+    "T-005" [label="T-005\nplan task 5\nstandard"];
+    "T-006" [label="T-006\nplan task 6\nadvanced"];
+    "T-007" [label="T-007\nplan task 7\ncapable"];
+    "T-008" [label="T-008\nplan task 8\ncapable"];
+    "T-009" [label="T-009\nplan task 9\ncapable"];
+    "T-010" [label="T-010\nplan task 10\nadvanced"];
+    "T-011" [label="T-011\nplan task 11\ncapable"];
+    "T-012" [label="T-012\nplan task 12\nfast"];
+    "T-013" [label="T-013\nplan task 13\nstandard"];
+    "T-001" -> "T-002" [label="sequence"];
+    "T-002" -> "T-003" [label="sequence"];
+    "T-003" -> "T-004" [label="sequence"];
+    "T-001" -> "T-004" [label="depends"];
+    "T-004" -> "T-005" [label="sequence"];
+    "T-005" -> "T-006" [label="sequence"];
+    "T-001" -> "T-006" [label="depends"];
+    "T-003" -> "T-006" [label="depends"];
+    "T-006" -> "T-007" [label="sequence"];
+    "T-007" -> "T-008" [label="sequence"];
+    "T-008" -> "T-009" [label="sequence"];
+    "T-009" -> "T-010" [label="sequence"];
+    "T-010" -> "T-011" [label="sequence"];
+    "T-011" -> "T-012" [label="sequence"];
+    "T-006" -> "T-012" [label="depends"];
+    "T-012" -> "T-013" [label="sequence"];
+    "T-001" -> "T-013" [label="depends"];
+  }
+}

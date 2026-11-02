@@ -1,0 +1,244 @@
+# appio calm-redraw, tabs and charts execution manifest — derived from the plan and signed documents.
+# One lane: the plan's Depends-on edges chain through shared files (tests/test_ui.py,
+# src/appio/ui/collector_window.py, tests/p3/test_collector_window.py), so a sequential lane is
+# the only partition whose ownership is statically disjoint.
+schema_version: 1
+epoch: 1
+source_plan:
+  path: "docs/superpowers/plans/2026-11-01-appio-console-charts.md"
+  sha256: "764d0bcfde3b75067a45dae6e10d8f1dad420b29b7a18028a06ef72406ec3d8d"
+  tasks: 13
+source_documents:
+  - path: "docs/superpowers/specs/2026-11-01-appio-console-charts-spec.md"
+    sha256: "cf7c3140cab5734cc4badc9d643a9eee7dd3341f03a68b3762be8f90a054aae2"
+  - path: "docs/superpowers/specs/2026-11-01-appio-console-charts-design.md"
+    sha256: "acd2e9f81096b24bcc3a7d05eb3130945bd8da837fe9c38835ca29516512ef6d"
+derivation:
+  lane_from: "one lane; plan Depends-on edges chain through shared files"
+  depends_on_from: "plan Depends on numbers plus same-lane predecessor edges"
+  ownership_from: "plan Files allowlists, line suffixes stripped"
+  validation_from: "plan named test files per task; the gate task runs the full suite and mypy"
+tasks:
+  - id: T-001
+    plan_task: 1
+    title: "Implement pure render models and the process-query fixture"
+    implementer_tier: "standard"
+    lane: main
+    sequence: 1
+    depends_on: []
+    owns:
+      - "src/appio/ui/render_model.py"
+      - "tests/test_ui.py"
+    resources: []
+    validation:
+      - argv: [python, -m, pytest, -q, tests/test_ui.py]
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+          QT_QPA_PLATFORM: "offscreen"
+          PYTEST_QT_API: "pyqt6"
+  - id: T-002
+    plan_task: 2
+    title: "Implement the palette and lossless time-chart geometry"
+    implementer_tier: "advanced"
+    lane: main
+    sequence: 2
+    depends_on: ["T-001"]
+    owns:
+      - "src/appio/ui/charts.py"
+      - "src/appio/ui/theme.py"
+      - "tests/test_charts.py"
+      - "tests/test_ui.py"
+    resources: []
+    validation:
+      - argv: [python, -m, pytest, -q, tests/test_charts.py, tests/test_ui.py]
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+          QT_QPA_PLATFORM: "offscreen"
+          PYTEST_QT_API: "pyqt6"
+  - id: T-003
+    plan_task: 3
+    title: "Add task composition and device-share painting"
+    implementer_tier: "standard"
+    lane: main
+    sequence: 3
+    depends_on: ["T-002"]
+    owns:
+      - "src/appio/ui/charts.py"
+      - "tests/test_charts.py"
+    resources: []
+    validation:
+      - argv: [python, -m, pytest, -q, tests/test_charts.py]
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+          QT_QPA_PLATFORM: "offscreen"
+          PYTEST_QT_API: "pyqt6"
+  - id: T-004
+    plan_task: 4
+    title: "Make Files admission and delivery retirement preserve the displayed result"
+    implementer_tier: "advanced"
+    lane: main
+    sequence: 4
+    depends_on: ["T-001", "T-003"]
+    owns:
+      - "src/appio/ui/files_view.py"
+      - "tests/p4/test_files_view.py"
+    resources: []
+    validation:
+      - argv: [python, -m, pytest, -q, tests/p4/test_files_view.py]
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+          QT_QPA_PLATFORM: "offscreen"
+          PYTEST_QT_API: "pyqt6"
+  - id: T-005
+    plan_task: 5
+    title: "Refresh the ranked and file-only application union on every applied frame"
+    implementer_tier: "standard"
+    lane: main
+    sequence: 5
+    depends_on: ["T-004"]
+    owns:
+      - "src/appio/ui/files_view.py"
+      - "tests/p4/test_files_view.py"
+    resources: []
+    validation:
+      - argv: [python, -m, pytest, -q, tests/p4/test_files_view.py]
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+          QT_QPA_PLATFORM: "offscreen"
+          PYTEST_QT_API: "pyqt6"
+  - id: T-006
+    plan_task: 6
+    title: "Build the persistent two-tab console and diff measured frames"
+    implementer_tier: "advanced"
+    lane: main
+    sequence: 6
+    depends_on: ["T-001", "T-003", "T-005"]
+    owns:
+      - "src/appio/ui/main_window.py"
+      - "tests/test_ui.py"
+    resources: []
+    validation:
+      - argv: [python, -m, pytest, -q, tests/test_ui.py]
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+          QT_QPA_PLATFORM: "offscreen"
+          PYTEST_QT_API: "pyqt6"
+  - id: T-007
+    plan_task: 7
+    title: "Separate requested scopes from displayed frames in the shell"
+    implementer_tier: "capable"
+    lane: main
+    sequence: 7
+    depends_on: ["T-006"]
+    owns:
+      - "src/appio/ui/collector_window.py"
+      - "tests/p3/test_collector_window.py"
+    resources: []
+    validation:
+      - argv: [python, -m, pytest, -q, tests/p3/test_collector_window.py]
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+          QT_QPA_PLATFORM: "offscreen"
+          PYTEST_QT_API: "pyqt6"
+  - id: T-008
+    plan_task: 8
+    title: "Move service probes off Qt and arbitrate setup generations"
+    implementer_tier: "capable"
+    lane: main
+    sequence: 8
+    depends_on: ["T-007"]
+    owns:
+      - "src/appio/ui/collector_window.py"
+      - "tests/p3/test_collector_window.py"
+    resources: []
+    validation:
+      - argv: [python, -m, pytest, -q, tests/p3/test_collector_window.py]
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+          QT_QPA_PLATFORM: "offscreen"
+          PYTEST_QT_API: "pyqt6"
+  - id: T-009
+    plan_task: 9
+    title: "Prove Files preservation across every live invalidation schedule"
+    implementer_tier: "capable"
+    lane: main
+    sequence: 9
+    depends_on: ["T-008"]
+    owns:
+      - "src/appio/ui/collector_window.py"
+      - "tests/p3/test_collector_window.py"
+    resources: []
+    validation:
+      - argv: [python, -m, pytest, -q, tests/p3/test_collector_window.py]
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+          QT_QPA_PLATFORM: "offscreen"
+          PYTEST_QT_API: "pyqt6"
+  - id: T-010
+    plan_task: 10
+    title: "Migrate every existing collector-window test to applied-fact and frame semantics"
+    implementer_tier: "advanced"
+    lane: main
+    sequence: 10
+    depends_on: ["T-009"]
+    owns:
+      - "tests/p3/test_collector_window.py"
+    resources: []
+    validation:
+      - argv: [python, -m, pytest, -q, tests/p3/test_collector_window.py]
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+          QT_QPA_PLATFORM: "offscreen"
+          PYTEST_QT_API: "pyqt6"
+  - id: T-011
+    plan_task: 11
+    title: "Migrate acceptance drivers and preserve one daemon owner thread"
+    implementer_tier: "capable"
+    lane: main
+    sequence: 11
+    depends_on: ["T-010"]
+    owns:
+      - "tests/p3/acceptance_harness.py"
+      - "tests/p3/test_history_overlap_entry.py"
+      - "tests/p3/test_p3_acceptance.py"
+      - "tests/p3/test_p3_adversarial.py"
+    resources: []
+    validation:
+      - argv: [python, -m, pytest, -q, tests/p3/acceptance_harness.py, tests/p3/test_history_overlap_entry.py, tests/p3/test_p3_acceptance.py, tests/p3/test_p3_adversarial.py]
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+          QT_QPA_PLATFORM: "offscreen"
+          PYTEST_QT_API: "pyqt6"
+  - id: T-012
+    plan_task: 12
+    title: "Narrow the later-scope guard to permit only the approved tab surface"
+    implementer_tier: "fast"
+    lane: main
+    sequence: 12
+    depends_on: ["T-006", "T-011"]
+    owns:
+      - "tests/acceptance/test_no_later_scope.py"
+    resources: []
+    validation:
+      - argv: [python, -m, pytest, -q, tests/acceptance/test_no_later_scope.py]
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+          QT_QPA_PLATFORM: "offscreen"
+          PYTEST_QT_API: "pyqt6"
+  - id: T-013
+    plan_task: 13
+    title: "Run complete implementation gates and record reviewable evidence"
+    implementer_tier: "standard"
+    lane: main
+    sequence: 13
+    depends_on: ["T-001", "T-012"]
+    owns:
+      - "docs/superpowers/reviews/2026-11-01-appio-console-charts-gates.md"
+    resources: []
+    validation:
+      - argv: [python, -m, pytest, -q, tests]
+      - argv: [python, -m, mypy, src/appio/ui/render_model.py, src/appio/ui/charts.py, src/appio/ui/theme.py, src/appio/ui/main_window.py, src/appio/ui/files_view.py, src/appio/ui/collector_window.py]
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+          QT_QPA_PLATFORM: "offscreen"
+          PYTEST_QT_API: "pyqt6"
