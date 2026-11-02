@@ -737,10 +737,14 @@ class CollectorWindow(QMainWindow):
                 self._poll_timer.stop()
                 self._render_files_message()
                 return
+            resolved_error = self._prepare_error
             self._prepare_retry = None
             self._prepare_error = None
             self._pending = prepare_window
-            self._clear_error()
+            # Clear only the preparation error this tick resolved; a helper or
+            # probe failure that is still on screen must stay visible.
+            if resolved_error is not None and self.error_label.text() == resolved_error:
+                self._clear_error()
             self._show_pending_status()
             self._arm_poll()
         elif self._displayed is not None:

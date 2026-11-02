@@ -5,9 +5,12 @@
 was read from this worktree or from a command run in the recorded environment. Items that
 could not be produced because a gate is red are listed as deferred, not as passed.
 
-**Status: BLOCKED — not implementation-ready.** One upstream production defect
-(`src/appio/ui/collector_window.py`, owner Task 4) keeps two legacy denial assertions red.
-The six-file typecheck gate passes.
+**Status: UNBLOCKED — all reported gates green.** The one upstream production defect
+(`src/appio/ui/collector_window.py`, owner Task 4) is fixed in
+`fix(ui): keep helper failures visible across clock ticks` (parent `9d1484f`); the two
+legacy denial assertions and the full suite now pass, and the six-file typecheck gate
+still passes. Sections below record the pre-fix observation and the post-fix re-run
+separately; historical exit codes are not rewritten.
 
 ## Toolchain (observed)
 
@@ -76,6 +79,25 @@ $ python -m mypy --follow-imports=skip --ignore-missing-imports \
     src/appio/ui/main_window.py src/appio/ui/files_view.py src/appio/ui/collector_window.py
 Success: no issues found in 6 source files
 ```
+
+### Post-fix re-run (after the Task 4 fix) — exit 0
+
+Same environment, same command text as the failing runs above; only
+`src/appio/ui/collector_window.py::_tick_target` changed.
+
+```
+$ python -m pytest -q tests/p3/test_p3_adversarial.py
+32 passed in 7.18s
+
+$ python -m pytest -q tests/p3/test_collector_window.py
+170 passed in 15.37s
+
+$ python -m pytest -q
+2639 passed, 2 skipped in 133.87s (0:02:13)
+```
+
+The six-file typecheck was re-run unchanged and still reports
+`Success: no issues found in 6 source files` (exit 0).
 
 ## 59-test inventory against the signed specification
 
@@ -248,9 +270,33 @@ edit production, so no fix was made here. The scoped clear above keeps Task 4's 
 `test_prepare_failure_after_loading_keeps_frame_closed_and_retries_on_later_tick` green,
 which is the constraint the fix must satisfy.
 
-## Deferred because the gate is red
+**Resolution (observed).** The unscoped `_clear_error()` is gone from the successful-prepare
+path. `_tick_target` now captures the preparation error it is about to resolve and clears
+the label only when that error is still the text on screen:
 
-These plan Task 5 gate items were **not** produced; they are not claimed:
+```python
+resolved_error = self._prepare_error
+self._prepare_retry = None
+self._prepare_error = None
+self._pending = prepare_window
+# Clear only the preparation error this tick resolved; a helper or
+# probe failure that is still on screen must stay visible.
+if resolved_error is not None and self.error_label.text() == resolved_error:
+    self._clear_error()
+```
+
+This matches spec §4.2 (the normative `_tick_target` resets only `_prepare_retry` and
+`_prepare_error`; the label is not cleared by a tick) and spec §8, where both the
+"Preparation raises" and "Probe raises" rows keep the error surface shown while the last
+frame is retained. Baseline `0187c64` likewise cleared the label only in `_begin` and
+`_on_reply`. No other `_clear_error()` call site changed: the no-target clock-marker reset
+inside `_tick_target` (`:691`), `show_window`'s explicit retry success (`:813`), `_begin`
+(`:1045`) and `_on_reply` (`:1102`, `:1106`) keep their prior behaviour, as do the
+clock-owned marker retry, its renewal and the no-target error reset.
+
+## Deferred (not produced by this receipt)
+
+These plan Task 5 gate items were still **not** produced; they are not claimed:
 
 - Race-mechanism mutation sweep in disposable copies (quiesce wrapper, export wrapper,
   conditional exit retirement, prepare force flag, retire-before-ready ordering,
@@ -262,8 +308,9 @@ These plan Task 5 gate items were **not** produced; they are not claimed:
 
 ## Verdict
 
-- Six-file mypy gate: **PASS** (exit 0).
-- Full `python -m pytest`: **FAIL** (exit 1) — 2 failed, 2637 passed, 2 skipped, and both
-  failures are the Task 4 defect recorded above.
-- Task 5 is **blocked** on Task 4 remediation; this receipt must be reissued after that fix
-  and a fresh full-suite run. Not implementation-ready.
+- Six-file mypy gate: **PASS** (exit 0, re-run after the fix).
+- Full `python -m pytest`: **PASS** (exit 0, re-run after the fix) — 2639 passed, 2 skipped.
+  Both former failures (`test_helper_denial_and_absence_preserve_gui_ownership[126]` and
+  `[127]`) pass, and `tests/p3/test_collector_window.py` still has 170 passing tests.
+- The Task 4 defect recorded above is **fixed**; the Task 5 gate items listed as deferred
+  remain deferred and are not claimed.
