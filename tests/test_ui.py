@@ -7,8 +7,10 @@ window that reached past the contract would fail at import or at call time.
 
 from __future__ import annotations
 
+from concurrent.futures import Future
 import inspect
 import math
+from types import SimpleNamespace
 
 import pytest
 
@@ -20,6 +22,7 @@ from pytestqt.qt_compat import qt_api
 if qt_api.pytest_qt_api != "pyqt6":
     qt_api.set_qt_api("pyqt6")
 
+from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
     QAbstractButton,
     QLabel,
@@ -39,6 +42,7 @@ from appio.contracts import (
     Series,
     SeriesPoint,
     Window,
+    WindowUnavailableError,
 )
 from appio.ui import formatting
 from appio.ui.formatting import (
@@ -49,6 +53,7 @@ from appio.ui.formatting import (
     format_residual,
 )
 from appio.ui.charts import ChartColumn, ChartSegment
+from appio.ui.files_view import FilesView
 from appio.ui.main_window import AppIoWindow
 from appio.ui.render_model import (
     DeviceLaneModel,
@@ -198,6 +203,16 @@ class FakeQueryService:
             raise self.ranking_error
         return list(self._totals)
 
+    def set_totals(self, totals: list[AppTotal]) -> None:
+        """Replace the ranking the next refresh will read."""
+
+        self._totals = list(totals)
+
+    def set_series(self, app_id: int, series: Series) -> None:
+        """Configure one subject's exact series result."""
+
+        self._series[app_id] = series
+
     def disk_share(self, app_id: int, window: Window) -> DiskShare:
         self.disk_share_calls.append((app_id, window))
         if self.share_error is not None:
@@ -231,6 +246,7 @@ def build(
     shares: dict[int, DiskShare] | None = None,
     *,
     series: dict[int, Series] | None = None,
+    files_view: FilesView | None = None,
 ) -> tuple[AppIoWindow, FakeQueryService]:
     if shares is None:
         shares = {
@@ -238,7 +254,7 @@ def build(
             for row in totals
         }
     service = FakeQueryService(totals, shares, series=series)
-    window = AppIoWindow(service, BOOT, END)
+    window = AppIoWindow(service, BOOT, END, files_view=files_view)
     qtbot.addWidget(window)
     window.show()
     return window, service
@@ -490,10 +506,31 @@ def test_window_consumes_only_query_contracts(qtbot) -> None:
 
 
 def test_no_files_tab_tray_daemon_or_privileged_action(qtbot) -> None:
+    """Exactly the approved two-tab host, one Files surface, no stray controls."""
+
     totals = [app_total(1, "unit:/alpha.service", "Alpha", 100)]
     window, _ = build(qtbot, totals)
 
-    assert window.findChildren(QTabWidget) == []
+    tabs = window.detail_tabs
+    assert window.findChildren(QTabWidget) == [tabs]
+    assert tabs.objectName() == "detail_tabs"
+    assert tabs.count() == 2
+    assert [tabs.tabText(index) for index in range(tabs.count())] == [
+        "Overview",
+        "Files",
+    ]
+
+    # Exactly one Files surface, inside the shared console and not Overview.
+    files_surfaces = window.findChildren(FilesView)
+    assert len(files_surfaces) == 1
+    assert files_surfaces[0] is window.files_view
+    files_page = tabs.widget(1)
+    assert files_page is not None
+    assert files_page is files_surfaces[0] or files_page.isAncestorOf(files_surfaces[0])
+    assert not tabs.widget(0).isAncestorOf(files_surfaces[0])
+    assert window.files_message.objectName() == "files_message"
+    assert window.files_open_settings.objectName() == "files_open_settings"
+
     assert window.findChildren(QSystemTrayIcon) == []
 
     verbs = ("files", "tray", "daemon", "setup", "polkit", "pkexec", "privilege")
@@ -501,6 +538,8 @@ def test_no_files_tab_tray_daemon_or_privileged_action(qtbot) -> None:
         text = button.text().casefold()
         for verb in verbs:
             assert verb not in text, (button.objectName(), text)
+
+    assert [action.text() for action in window.actions()] == []
 
 
 def test_format_bytes_is_deterministic_and_signed() -> None:
@@ -1193,3 +1232,621 @@ def test_render_dataclasses_reject_invalid_values_and_availability_conflicts() -
     ):
         with pytest.raises(ValueError):
             ChartSegment(side, run_index, polygon)  # type: ignore[arg-type]
+
+
+# --------------------------------------------------------------------------
+# 8. The persistent two-tab console (design 7.3, spec §9.4).
+# --------------------------------------------------------------------------
+
+SHARE_ROLE = int(Qt.ItemDataRole.UserRole) + 1
+KPI_NAMES = ("total_value", "read_value", "write_value", "peak_value", "device_value")
+UNAVAILABLE_RESIDUAL = "Residual: unavailable - difference between accounting points"
+
+
+class _LocalChoices:
+    """The structural ``history.local`` seam: retained file applications."""
+
+    def __init__(self, history: FakeFilesHistory) -> None:
+        self.history = history
+
+    def file_applications(self, window: Window):
+        self.history.choice_calls.append(window)
+        return tuple(self.history.local_applications)
+
+
+class _RegistryIds:
+    """The structural ``history.registry`` seam: stable application ids."""
+
+    def __init__(self, ids: dict[str, int]) -> None:
+        self.ids = dict(ids)
+
+    def id_for(self, key: str) -> int:
+        return self.ids[key]
+
+
+class FakeFilesHistory:
+    """The shipped Files query surface, as a structural fake.
+
+    It answers only ``ranking``, ``file_source_status`` and
+    ``request_file_view`` (plus the optional ``local``/``registry`` choice
+    seams), so an injected ``FilesView`` can build its union with no database,
+    socket or producer behind it. Every request stays pending until a test
+    settles it, which keeps the retirement generation checks observable.
+    """
+
+    def __init__(
+        self,
+        *,
+        ranking_rows: tuple[AppTotal, ...] = (),
+        local_applications: tuple[tuple[str, str, int], ...] = (),
+        registry_ids: dict[str, int] | None = None,
+    ) -> None:
+        self.ranking_rows = ranking_rows
+        self.local_applications = local_applications
+        self.ranking_calls: list[tuple[Window, str]] = []
+        self.choice_calls: list[Window] = []
+        self.requests: list[tuple[object, ...]] = []
+        self.pending: list[Future] = []
+        self.view_state = "ready"
+        if local_applications or registry_ids is not None:
+            self.local = _LocalChoices(self)
+            self.registry = _RegistryIds(registry_ids or {})
+
+    def ranking(self, window: Window, metric: str) -> list[AppTotal]:
+        self.ranking_calls.append((window, metric))
+        return list(self.ranking_rows)
+
+    def file_source_status(self):
+        return SimpleNamespace(available=True, reason=None, diagnostic=None)
+
+    def file_source_diagnostic(self) -> str | None:
+        return None
+
+    def ready(self, window: Window) -> bool:
+        return True
+
+    def request_file_view(self, app_id: int, window: Window, sort: str,
+                          direction: str, search: str | None) -> Future:
+        self.requests.append((app_id, window, sort, direction, search))
+        future: Future = Future()
+        self.pending.append(future)
+        return future
+
+
+def kpi_texts(window: AppIoWindow) -> list[str]:
+    return [label(window, name).text() for name in KPI_NAMES]
+
+
+def test_identical_refresh_preserves_item_identity_and_current_row(qtbot) -> None:
+    totals = [
+        app_total(1, "unit:/alpha.service", "Alpha", 300),
+        app_total(2, "unit:/beta.service", "Beta", 200),
+        app_total(3, "unit:/gamma.service", "Gamma", 100),
+    ]
+    window, service = build(qtbot, totals)
+    widget = listing(window)
+    widget.setCurrentRow(1)
+    assert window.selected_app_id() == 2
+    items = [widget.item(index) for index in range(widget.count())]
+    assert len(items) == 3
+
+    cleared: list[int] = []
+    resets: list[int] = []
+    selection_writes: list[int] = []
+    selection_signals: list[tuple[object, object]] = []
+    widget.clear = lambda: cleared.append(1)  # type: ignore[method-assign]
+    widget.reset = lambda: resets.append(1)  # type: ignore[method-assign]
+    widget.setCurrentRow = lambda row: selection_writes.append(row)  # type: ignore[method-assign]
+    widget.currentItemChanged.connect(
+        lambda current, previous: selection_signals.append((current, previous))
+    )
+
+    ranking_before = len(service.ranking_calls)
+    series_before = len(service.series_calls)
+    share_before = len(service.disk_share_calls)
+    window.refresh()
+
+    assert all(widget.item(index) is items[index] for index in range(len(items)))
+    assert widget.count() == len(items)
+    assert widget.currentRow() == 1
+    assert widget.currentItem() is items[1]
+    assert window.selected_app_id() == 2
+    assert cleared == []
+    assert resets == []
+    assert selection_writes == []
+    assert selection_signals == []
+    # The one refresh re-read the ranking and the unchanged subject once each.
+    assert len(service.ranking_calls) == ranking_before + 1
+    assert len(service.series_calls) == series_before + 1
+    assert len(service.disk_share_calls) == share_before + 1
+
+
+def test_changed_shares_with_identical_labels_repaint_without_rebuild(qtbot) -> None:
+    totals = [
+        app_total(1, "unit:/alpha.service", "Alpha", 1500),
+        app_total(2, "unit:/beta.service", "Beta", 500),
+        app_total(3, "unit:/zero.service", "Zero", 0),
+    ]
+    window, service = build(qtbot, totals)
+    widget = listing(window)
+    items = [widget.item(index) for index in range(widget.count())]
+    labels = [item.text() for item in items]
+    # The rounding trap: a leader moving 1500 -> 1530 keeps every label.
+    assert format_bytes(1500) == format_bytes(1530)
+    assert labels == [
+        f"Alpha  {format_bytes(1500)}",
+        f"Beta  {format_bytes(500)}",
+        f"Zero  {format_bytes(0)}",
+    ]
+    assert [item.data(SHARE_ROLE) for item in items] == [1.0, 500 / 1500, 0.0]
+
+    cleared: list[int] = []
+    widget.clear = lambda: cleared.append(1)  # type: ignore[method-assign]
+    widget.repaint_requests.clear()
+
+    service.set_totals(
+        [
+            app_total(1, "unit:/alpha.service", "Alpha", 1530),
+            app_total(2, "unit:/beta.service", "Beta", 500),
+            app_total(3, "unit:/zero.service", "Zero", 0),
+        ]
+    )
+    window.refresh()
+
+    assert all(widget.item(index) is items[index] for index in range(len(items)))
+    assert [item.text() for item in items] == labels
+    assert cleared == []
+    assert [item.data(SHARE_ROLE) for item in items] == [1.0, 500 / 1530, 0.0]
+    # Only the subordinate share changed: exactly that row is repainted.
+    repainted = list(widget.repaint_requests)
+    assert widget.visualItemRect(items[1]) in repainted
+    assert widget.visualItemRect(items[0]) not in repainted
+    assert widget.visualItemRect(items[2]) not in repainted
+
+
+def test_changed_order_restores_subject_and_scroll(qtbot) -> None:
+    totals = [
+        app_total(app_id, f"unit:/app{app_id}.service", f"App{app_id}", 10_000 - app_id)
+        for app_id in range(1, 41)
+    ]
+    window, service = build(qtbot, totals)
+    window.resize(900, 420)
+    widget = listing(window)
+    bar = widget.verticalScrollBar()
+    qtbot.waitUntil(lambda: bar.maximum() > 0, timeout=1000)
+
+    widget.setCurrentRow(12)
+    subject = window.selected_app_id()
+    assert subject == 13
+    bar.setValue(9)
+    assert bar.value() == 9
+
+    ranking_before = len(service.ranking_calls)
+    series_before = len(service.series_calls)
+    share_before = len(service.disk_share_calls)
+    service.set_totals(
+        [
+            app_total(app_id, f"unit:/app{app_id}.service", f"App{app_id}", app_id * 100)
+            for app_id in range(1, 41)
+        ]
+    )
+    window.refresh()
+
+    assert window.selected_app_id() == subject
+    ids = [row.app_id for row in window._ranking_model.rows]
+    # The order really changed: App13 moved from index 12 to index 27.
+    assert ids == list(range(40, 0, -1))
+    assert ids.index(subject) == 27
+    assert ids.index(subject) != 12
+    assert widget.item(0).text().startswith("App40")
+    assert widget.currentRow() == 27
+    assert widget.currentItem() is widget.item(27)
+    assert bar.value() == 9
+    # The subject survived the rebuild, so no feedback selection re-queried it.
+    assert len(service.ranking_calls) == ranking_before + 1
+    assert len(service.series_calls) == series_before + 1
+    assert len(service.disk_share_calls) == share_before + 1
+
+
+def test_detail_tabs_are_exactly_overview_then_files(qtbot) -> None:
+    service = FakeQueryService([], {})
+    window = AppIoWindow(service)
+    qtbot.addWidget(window)
+    window.show()
+
+    tabs = window.detail_tabs
+    assert window.findChildren(QTabWidget) == [tabs]
+    assert tabs.objectName() == "detail_tabs"
+    assert [tabs.tabText(index) for index in range(tabs.count())] == [
+        "Overview",
+        "Files",
+    ]
+    assert len(window.findChildren(FilesView)) == 1
+    assert window.findChildren(FilesView)[0] is window.files_view
+
+    # Empty construction queries nothing and leaves both scopes unset.
+    assert service.ranking_calls == []
+    assert window._active_window is None
+    assert window._since_boot is None
+    since_boot = window.findChild(QAbstractButton, "scope_since_boot")
+    assert since_boot is not None and not since_boot.isEnabled()
+    assert window.has_frame is False
+
+    # The scope handlers are safe before any supplied window.
+    window.refresh()
+    window._on_since_boot_clicked()
+    window._on_range_clicked()
+    assert service.ranking_calls == []
+    assert window.has_frame is False
+
+    # A supplied standalone window still renders the initial since-boot frame.
+    standalone, _service = build(qtbot, [app_total(1, "unit:/a.service", "A", 100)])
+    assert [
+        standalone.detail_tabs.tabText(index)
+        for index in range(standalone.detail_tabs.count())
+    ] == ["Overview", "Files"]
+    assert standalone.has_frame is True
+    # A process-only fake has no file capabilities: the Files tab says so
+    # explicitly instead of inventing an empty table.
+    assert standalone.files_view.state == "unavailable"
+    assert standalone.files_view.unavailable_text() == "the file source is unavailable"
+    assert standalone.files_view.model.rowCount() == 0
+
+
+def test_two_tab_switches_preserve_subject_without_scope_or_query_calls(qtbot) -> None:
+    totals = [
+        app_total(1, "unit:/alpha.service", "Alpha", 300),
+        app_total(2, "unit:/beta.service", "Beta", 200),
+    ]
+    window, service = build(qtbot, totals)
+    widget = listing(window)
+    widget.setCurrentRow(1)
+    subject = window.selected_app_id()
+    row = widget.currentRow()
+    assert subject == 2
+
+    scope_calls: list[Window] = []
+    original_set_window = window.set_window
+
+    def spy_set_window(window_arg: Window) -> None:
+        scope_calls.append(window_arg)
+        original_set_window(window_arg)
+
+    window.set_window = spy_set_window  # type: ignore[method-assign]
+    files_scope_calls: list[Window] = []
+    original_files_window = window.files_view.set_window
+
+    def spy_files_window(window_arg: Window) -> None:
+        files_scope_calls.append(window_arg)
+        original_files_window(window_arg)
+
+    window.files_view.set_window = spy_files_window  # type: ignore[method-assign]
+    files_requests: list[object] = []
+    original_request = window.files_view.request_refresh
+
+    def spy_request() -> None:
+        files_requests.append(1)
+        original_request()
+
+    window.files_view.request_refresh = spy_request  # type: ignore[method-assign]
+
+    ranking_before = len(service.ranking_calls)
+    series_before = len(service.series_calls)
+    share_before = len(service.disk_share_calls)
+
+    window.detail_tabs.setCurrentIndex(1)
+    qtbot.waitUntil(lambda: window.detail_tabs.currentIndex() == 1, timeout=1000)
+    window.detail_tabs.setCurrentIndex(0)
+    window.detail_tabs.setCurrentIndex(1)
+
+    assert window.detail_tabs.currentIndex() == 1
+    assert window.selected_app_id() == subject
+    assert widget.currentRow() == row
+    assert scope_calls == []
+    assert files_scope_calls == []
+    assert files_requests == []
+    assert len(service.ranking_calls) == ranking_before
+    assert len(service.series_calls) == series_before
+    assert len(service.disk_share_calls) == share_before
+    # The console owns no preparation/collector path a tab switch could drive.
+    assert not hasattr(window, "prepare")
+    assert not hasattr(window, "_start")
+
+
+def test_files_selector_visibility_depends_on_union_extras(qtbot) -> None:
+    alpha = app_total(1, "unit:/alpha.service", "Alpha", 300)
+    beta = app_total(2, "unit:/beta.service", "Beta", 100)
+    file_key = "unit:retained-only.service"
+
+    # Ranked A plus file-only B: the selector has to offer both.
+    mixed_files = FakeFilesHistory(
+        ranking_rows=(alpha,),
+        local_applications=((file_key, "Retained only", 40),),
+        registry_ids={file_key: 99},
+    )
+    mixed, _ = build(qtbot, [alpha, beta], files_view=FilesView(mixed_files))
+    selector = mixed.files_view.app_selector
+    assert mixed.selected_app_id() == 1
+    assert not selector.isHidden()
+    assert [selector.itemData(index) for index in range(selector.count())] == [1, 99]
+    assert selector.itemText(1).startswith("Retained only")
+    assert mixed_files.choice_calls == [
+        Window(kind="since_boot", boot_id=BOOT, end_mono_ns=END)
+    ]
+
+    # A fully ranked file population hides the selector again.
+    ranked_files = FakeFilesHistory(
+        ranking_rows=(alpha, beta),
+        local_applications=((file_key, "Retained only", 40),),
+        registry_ids={file_key: 2},
+    )
+    ranked, _ = build(qtbot, [alpha, beta], files_view=FilesView(ranked_files))
+    hidden = ranked.files_view.app_selector
+    assert hidden.isHidden()
+    assert [hidden.itemData(index) for index in range(hidden.count())] == [1, 2]
+
+
+def test_file_only_selection_clears_highlight_preserves_scroll_and_explains_overview(
+    qtbot,
+) -> None:
+    totals = [
+        app_total(app_id, f"unit:/app{app_id}.service", f"App{app_id}", 10_000 - app_id)
+        for app_id in range(1, 41)
+    ]
+    file_key = "unit:retained-only.service"
+    files = FakeFilesHistory(
+        ranking_rows=tuple(totals),
+        local_applications=((file_key, "Retained only", 40),),
+        registry_ids={file_key: 99},
+    )
+    window, service = build(qtbot, totals, files_view=FilesView(files))
+    widget = listing(window)
+    bar = widget.verticalScrollBar()
+    qtbot.waitUntil(lambda: bar.maximum() > 0, timeout=1000)
+    widget.setCurrentRow(2)
+    assert window.selected_app_id() == 3
+    # Scroll the selected row out of view: clearing the highlight later would
+    # otherwise snap the list back to its current index.
+    bar.setValue(bar.maximum())
+    scrolled = bar.value()
+    assert scrolled > 0
+
+    series_before = len(service.series_calls)
+    share_before = len(service.disk_share_calls)
+    selector = window.files_view.app_selector
+    selector.setCurrentIndex(selector.findData(99))
+
+    assert window.selected_app_id() == 99
+    assert widget.currentRow() == -1
+    assert widget.currentItem() is None
+    assert widget.selectedItems() == []
+    assert bar.value() == scrolled
+    assert kpi_texts(window) == ["unavailable"] * 5
+    assert label(window, "detail_state").text() == "not in the process ranking"
+    assert window._total_chart.is_available() is False
+    assert window._total_chart.segments() == ()
+    # A file-only subject has no share/series query of its own, and the
+    # selector's own query for B was issued exactly once.
+    assert len(service.series_calls) == series_before
+    assert len(service.disk_share_calls) == share_before
+    assert [request[0] for request in files.requests].count(99) == 1
+
+
+def test_unavailable_series_is_not_rendered_as_zero(qtbot) -> None:
+    totals = [app_total(1, "unit:/alpha.service", "Alpha", 200, peak_bps=None)]
+    share = disk_share(1, task_total=200)
+    window, service = build(qtbot, totals, {1: share})
+    service.series_error = WindowUnavailableError("unsupported_window", "series refused")
+    window.refresh()
+
+    chart = window._total_chart
+    assert chart.is_available() is False
+    assert chart.unavailable_reason() == "series refused"
+    assert chart.columns() == ()
+    assert chart.segments() == ()
+    message = chart.findChild(QLabel, "chart_message")
+    assert message is not None
+    assert message.text() == "unavailable: series refused"
+
+    assert kpi_texts(window) == [
+        format_bytes(200),
+        format_bytes(100),
+        format_bytes(100),
+        "unavailable",
+        format_bytes(share.device_total_bytes),
+    ]
+    assert label(window, "peak_value").text() == "unavailable"
+    assert "0" not in label(window, "peak_value").text()
+    # The residual strip keeps its signed short form; the accountability
+    # equation itself is the attribution panel's annotation (spec 7).
+    assert label(window, "residual_value").text() == (
+        "Residual: 0 B - difference between accounting points"
+    )
+    assert window._overview_model is not None
+    assert window._overview_model.reconciliation is not None
+    assert "attributed + (0 B) residual =" in window._overview_model.reconciliation
+
+
+def test_ranking_error_marks_all_overview_dependencies_unavailable(qtbot) -> None:
+    totals = [app_total(1, "unit:/alpha.service", "Alpha", 300)]
+    window, service = build(qtbot, totals)
+    series_before = len(service.series_calls)
+    share_before = len(service.disk_share_calls)
+
+    reason = "window is unavailable"
+    service.ranking_error = WindowUnavailableError("unsupported_window", reason)
+    window.refresh()
+
+    assert listing(window).count() == 0
+    assert window.selected_app_id() is None
+    assert kpi_texts(window) == ["unavailable"] * 5
+    assert window._total_chart.unavailable_reason() == reason
+    assert window._total_chart.columns() == ()
+    assert window._total_chart.segments() == ()
+    assert [lane.unavailable_reason() for lane in window._device_lanes] == [reason] * 3
+    assert window._donut.unavailable_reason() == reason
+    assert window._donut.shares() is None
+    assert window._share_bars.unavailable_reason() == reason
+    assert window._share_bars.fractions() == ()
+    assert label(window, "detail_state").text() == reason
+    assert label(window, "coverage_label").text() == "coverage: unavailable"
+    assert label(window, "residual_value").text() == UNAVAILABLE_RESIDUAL
+    # A failed ranking is not a partial success: no subject result was read.
+    assert len(service.series_calls) == series_before
+    assert len(service.disk_share_calls) == share_before
+    assert window.has_frame is True
+
+
+def test_share_error_keeps_task_lane_and_marks_dependent_values_unavailable(qtbot) -> None:
+    task, devices = series_points()
+    series = Series(1, SINCE_BOOT, "raw", task, devices, (), coverage())
+    totals = [app_total(1, "unit:/alpha.service", "Alpha", 200, peak_bps=100)]
+    share = disk_share(1, task_total=200)
+    window, service = build(qtbot, totals, {1: share}, series={1: series})
+
+    service.share_error = WindowUnavailableError("not_retained", "disk split refused")
+    window.refresh()
+
+    assert kpi_texts(window) == [
+        "unavailable",
+        "unavailable",
+        "unavailable",
+        format_peak(100),
+        "unavailable",
+    ]
+    # The task lane is independently successful and still draws.
+    assert window._total_chart.is_available() is True
+    assert window._total_chart.segments() != ()
+    # The donut fails with the query's reason; it is never a fallback zero.
+    assert window._donut.shares() is None
+    assert window._donut.unavailable_reason() == "disk split refused"
+    assert window._share_bars.unavailable_reason() == "disk split refused"
+    assert window._share_bars.fractions() == ()
+    assert "; share: disk split refused" in label(window, "detail_state").text()
+
+
+def test_series_failure_and_empty_series_are_distinct(qtbot) -> None:
+    totals = [app_total(1, "unit:/alpha.service", "Alpha", 200, peak_bps=0)]
+    share = disk_share(1, task_total=200)
+    window, service = build(qtbot, totals, {1: share})
+
+    service.series_error = WindowUnavailableError("not_retained", "series refused")
+    window.refresh()
+    chart = window._total_chart
+    assert chart.is_available() is False
+    assert chart.unavailable_reason() == "series refused"
+    assert chart.segments() == ()
+    assert kpi_texts(window) == [
+        format_bytes(200),
+        format_bytes(100),
+        format_bytes(100),
+        "0 B/s",
+        format_bytes(share.device_total_bytes),
+    ]
+
+    # An empty successful series is available, shapes nothing and is not zero.
+    service.series_error = None
+    service.set_series(
+        1, Series(1, SINCE_BOOT, "raw", (), (), (), coverage())
+    )
+    window.refresh()
+    assert chart.is_available() is True
+    assert chart.unavailable_reason() is None
+    assert chart.columns() == ()
+    assert chart.segments() == ()
+    message = chart.findChild(QLabel, "chart_message")
+    assert message is not None and message.text() == "no samples in this window"
+    assert kpi_texts(window) == [
+        format_bytes(200),
+        format_bytes(100),
+        format_bytes(100),
+        "0 B/s",
+        format_bytes(share.device_total_bytes),
+    ]
+
+
+def test_device_unavailable_keeps_task_composition(qtbot) -> None:
+    task, devices = series_points()
+    series = Series(1, SINCE_BOOT, "raw", task, devices, (), coverage())
+    totals = [app_total(1, "unit:/alpha.service", "Alpha", 200, peak_bps=100)]
+    incomplete = coverage(
+        complete=False, device_state="incomplete", unavailable_reason="not_retained"
+    )
+    share = disk_share(1, task_total=200, residual_total=None, cov=incomplete)
+    window, _ = build(qtbot, totals, {1: share}, series={1: series})
+
+    # The task donut and the task lane survive their own valid inputs.
+    assert window._donut.unavailable_reason() is None
+    assert window._donut.shares() == (0.5, 0.5)
+    assert window._total_chart.is_available() is True
+    assert window._total_chart.segments() != ()
+    # Device attribution is withheld, never rendered as a zero.
+    assert label(window, "device_value").text() == "unavailable"
+    assert window._share_bars.fractions() == ()
+    assert window._share_bars.unavailable_reason() == "not_retained"
+    assert window._device_reason.text() == "device attribution unavailable: not_retained"
+    assert label(window, "residual_value").text() == UNAVAILABLE_RESIDUAL
+    assert window._overview_model is not None
+    assert window._overview_model.reconciliation is None
+    assert all(lane.isVisible() is False for lane in window._device_lanes)
+
+
+def test_empty_ranking_has_no_shapes_or_zero_kpis(qtbot) -> None:
+    empty, service = build(qtbot, [])
+    assert listing(empty).count() == 0
+    assert empty.selected_app_id() is None
+    assert kpi_texts(empty) == ["unavailable"] * 5
+    assert label(empty, "detail_state").text() == (
+        "window: since_boot; no applications observed"
+    )
+    assert empty._total_chart.is_available() is False
+    assert empty._total_chart.columns() == ()
+    assert empty._total_chart.segments() == ()
+    assert all(lane.segments() == () for lane in empty._device_lanes)
+    assert empty._donut.shares() is None
+    assert empty._share_bars.fractions() == ()
+    assert empty.has_frame is True
+    assert service.series_calls == []
+    assert service.disk_share_calls == []
+
+    # Emptying both populations clears the prior shared and Files subjects, and
+    # a late old-subject delivery cannot publish over the measured emptiness.
+    alpha = app_total(1, "unit:/alpha.service", "Alpha", 300)
+    files = FakeFilesHistory(ranking_rows=(alpha,))
+    window, service = build(
+        qtbot, [alpha], files_view=FilesView(files)
+    )
+    widget = listing(window)
+    assert window.selected_app_id() == 1
+    assert widget.currentRow() == 0
+    assert files.requests and files.requests[0][0] == 1
+    stale = files.pending[-1]
+    stale_generation = window.files_view._generation
+    assert window.files_view._outstanding is True
+
+    service.set_totals([])
+    files.ranking_rows = ()
+    window.set_window(SINCE_BOOT)
+
+    assert window.selected_app_id() is None
+    assert widget.count() == 0
+    assert widget.currentRow() == -1
+    assert window.files_view.state == "ready"
+    assert window.files_view.model.rowCount() == 0
+    assert window.files_view.footer_state.text() == (
+        "coverage: not applicable; no applications observed in this window"
+    )
+    assert window.files_view._generation > stale_generation
+
+    stale.set_exception(
+        WindowUnavailableError(
+            "file_source_unavailable", "File history generation retired."
+        )
+    )
+    qtbot.waitUntil(lambda: stale.done(), timeout=1000)
+    assert window.selected_app_id() is None
+    assert window.files_view.model.rowCount() == 0
+    assert window.files_view.state == "ready"
+    assert window.files_view.footer_state.text() == (
+        "coverage: not applicable; no applications observed in this window"
+    )
