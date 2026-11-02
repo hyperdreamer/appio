@@ -1,0 +1,12 @@
+{
+  digraph appio_console_charts_epoch2 {
+    "T-001" [label="T-001\nPure render models, palette and chart widgets"];
+    "T-002" [label="T-002\nFiles admission, retirement and the ranked/file-only union"];
+    "T-003" [label="T-003\nThe two-tab console, subject and frame diffing"];
+    "T-004" [label="T-004\nShell frame state machine and probe worker"];
+    "T-005" [label="T-005\nMigrate the remaining tests and run the gates"];
+    "T-001" -> "T-002";
+    "T-002" -> "T-003";
+    "T-003" -> "T-004";
+    "T-004" -> "T-005";
+}

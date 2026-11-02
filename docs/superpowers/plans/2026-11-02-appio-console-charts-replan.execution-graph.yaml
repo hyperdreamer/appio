@@ -1,0 +1,50 @@
+schema_version: 1
+epoch: 2
+source_plan:
+  path: "docs/superpowers/plans/2026-11-02-appio-console-charts-replan.md"
+  sha256: "16b42e5f7fa4b9ffb4d32977a2a86882afe00628f4d49fc0d5dae675910fda53"
+  tasks: 5
+derivation:
+  lane_from: "one parent-dispatched lane; the PM session dispatches implementer and reviewer per task"
+  ownership_from: "plan Files allowlists"
+tasks:
+  - id: T-001
+    plan_task: 1
+    title: "Pure render models, palette and chart widgets"
+    implementer_tier: "capable"
+    lane: main
+    sequence: 1
+    depends_on: []
+    owns:
+  - id: T-002
+    plan_task: 2
+    title: "Files admission, retirement and the ranked/file-only union"
+    implementer_tier: "advanced"
+    lane: main
+    sequence: 2
+    depends_on: ["T-001"]
+    owns:
+  - id: T-003
+    plan_task: 3
+    title: "The two-tab console, subject and frame diffing"
+    implementer_tier: "advanced"
+    lane: main
+    sequence: 3
+    depends_on: ["T-002"]
+    owns:
+  - id: T-004
+    plan_task: 4
+    title: "Shell frame state machine and probe worker"
+    implementer_tier: "frontier"
+    lane: main
+    sequence: 4
+    depends_on: ["T-003"]
+    owns:
+  - id: T-005
+    plan_task: 5
+    title: "Migrate the remaining tests and run the gates"
+    implementer_tier: "capable"
+    lane: main
+    sequence: 5
+    depends_on: ["T-004"]
+    owns:
