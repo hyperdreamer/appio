@@ -22,11 +22,21 @@ from pytestqt.qt_compat import qt_api
 if qt_api.pytest_qt_api != "pyqt6":
     qt_api.set_qt_api("pyqt6")
 
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import QRect, Qt
+from PyQt6.QtGui import (
+    QColor,
+    QImage,
+    QPainter,
+    QStandardItem,
+    QStandardItemModel,
+)
 from PyQt6.QtWidgets import (
     QAbstractButton,
     QLabel,
     QListWidget,
+    QStyle,
+    QStyledItemDelegate,
+    QStyleOptionViewItem,
     QSystemTrayIcon,
     QTabWidget,
 )
@@ -54,8 +64,9 @@ from appio.ui.formatting import (
 )
 from appio.ui.charts import ChartColumn, ChartSegment
 from appio.ui.files_view import FilesView
-from appio.ui.main_window import AppIoWindow
+from appio.ui.main_window import AppIoWindow, RankingDelegate
 from appio.ui.render_model import (
+    MAX_DEVICE_LANES,
     DeviceLaneModel,
     Kpi,
     OverviewModel,
@@ -65,6 +76,7 @@ from appio.ui.render_model import (
     build_ranking,
     scope_text,
 )
+from appio.ui.theme import BAR_HEIGHT, READ_COLOR, TRACK_COLOR
 
 BOOT = "11111111-2222-4333-8444-555555555555"
 END = 7_200_000_000_000
@@ -212,6 +224,11 @@ class FakeQueryService:
         """Configure one subject's exact series result."""
 
         self._series[app_id] = series
+
+    def set_share(self, app_id: int, share: DiskShare) -> None:
+        """Replace one subject's disk-share result."""
+
+        self._shares[app_id] = share
 
     def disk_share(self, app_id: int, window: Window) -> DiskShare:
         self.disk_share_calls.append((app_id, window))
@@ -1850,3 +1867,356 @@ def test_empty_ranking_has_no_shapes_or_zero_kpis(qtbot) -> None:
     assert window.files_view.footer_state.text() == (
         "coverage: not applicable; no applications observed in this window"
     )
+
+
+# --------------------------------------------------------------------------
+# 9. Follow-up pins for the console window/diffing rules (review CR-1..CR-9).
+# --------------------------------------------------------------------------
+
+
+def device_share(
+    entries: tuple[tuple[str, str, int], ...],
+    *,
+    window: Window | None = None,
+    app_id: int = 1,
+    cov: Coverage | None = None,
+) -> DiskShare:
+    """A DiskShare whose device rows are exactly ``(boot_id, dev, total)``."""
+
+    rows = tuple(
+        DeviceShareRow(boot, dev, total // 2, total - total // 2, total)
+        for boot, dev, total in entries
+    )
+    device_total = sum(total for _boot, _dev, total in entries)
+    task_read = device_total // 2
+    return DiskShare(
+        app_id,
+        window or SINCE_BOOT,
+        task_read,
+        device_total - task_read,
+        device_total,
+        rows,
+        task_read,
+        device_total - task_read,
+        device_total,
+        0,
+        0,
+        0,
+        cov or coverage(),
+    )
+
+
+def device_points_for(
+    devs: tuple[str, ...], *, start: int = 1_000_000_000, bucket_secs: int = 10
+) -> tuple[DeviceSeriesPoint, ...]:
+    """One ordered device bucket per token so lanes have drawable samples."""
+
+    return tuple(
+        DeviceSeriesPoint(start, bucket_secs, dev, 512, 256) for dev in devs
+    )
+
+
+def test_same_order_refresh_updates_changed_labels_in_place(qtbot) -> None:
+    totals = [
+        app_total(1, "unit:/alpha.service", "Alpha", 300),
+        app_total(2, "unit:/beta.service", "Beta", 200),
+        app_total(3, "unit:/gamma.service", "Gamma", 100),
+    ]
+    window, service = build(qtbot, totals)
+    widget = listing(window)
+    widget.setCurrentRow(1)
+    items = [widget.item(index) for index in range(widget.count())]
+    assert window.selected_app_id() == 2
+    cleared: list[int] = []
+    widget.clear = lambda: cleared.append(1)  # type: ignore[method-assign]
+    text_writes: list[tuple[int, str]] = []
+    for index, item in enumerate(items):
+        original = item.setText
+
+        def spy(text: str, index: int = index, original=original) -> None:
+            text_writes.append((index, text))
+            original(text)
+
+        item.setText = spy  # type: ignore[method-assign]
+
+    # The ID order is unchanged, so the diff branch must run and carry the
+    # renamed label into the existing item object (spec 3.3).
+    service.set_totals(
+        [
+            app_total(1, "unit:/alpha.service", "Alpha renamed", 300),
+            app_total(2, "unit:/beta.service", "Beta", 200),
+            app_total(3, "unit:/gamma.service", "Gamma", 100),
+        ]
+    )
+    window.refresh()
+
+    expected = [
+        f"Alpha renamed  {format_bytes(300)}",
+        f"Beta  {format_bytes(200)}",
+        f"Gamma  {format_bytes(100)}",
+    ]
+    assert [item.text() for item in items] == expected
+    assert all(widget.item(index) is items[index] for index in range(len(items)))
+    # Only the changed row's text is written; an unchanged row is untouched.
+    assert text_writes == [(0, expected[0])]
+    assert cleared == []
+    assert widget.currentRow() == 1
+    assert window.selected_app_id() == 2
+
+
+def test_ranking_selection_requests_files_once_for_new_subject(qtbot) -> None:
+    alpha = app_total(1, "unit:/alpha.service", "Alpha", 300)
+    beta = app_total(2, "unit:/beta.service", "Beta", 200)
+    files = FakeFilesHistory(ranking_rows=(alpha, beta))
+    window, service = build(qtbot, [alpha, beta], files_view=FilesView(files))
+    widget = listing(window)
+    assert window.selected_app_id() == 1
+    assert [request[0] for request in files.requests] == [1]
+    ranking_before = len(service.ranking_calls)
+
+    widget.setCurrentRow(1)
+
+    assert window.selected_app_id() == 2
+    # A user's ranking selection passes request_files=True, so Files follows
+    # the subject with exactly one query (spec 3.3, `_set_subject`).
+    assert [request[0] for request in files.requests] == [1, 2]
+    assert window.files_view.app_selector.currentData() == 2
+    assert len(service.ranking_calls) == ranking_before
+
+
+def test_refresh_retains_file_only_subject(qtbot) -> None:
+    alpha = app_total(1, "unit:/alpha.service", "Alpha", 300)
+    beta = app_total(2, "unit:/beta.service", "Beta", 100)
+    file_key = "unit:retained-only.service"
+    files = FakeFilesHistory(
+        ranking_rows=(alpha, beta),
+        local_applications=((file_key, "Retained only", 40),),
+        registry_ids={file_key: 99},
+    )
+    window, _ = build(qtbot, [alpha, beta], files_view=FilesView(files))
+    selector = window.files_view.app_selector
+    selector.setCurrentIndex(selector.findData(99))
+    assert window.selected_app_id() == 99
+    assert listing(window).currentRow() == -1
+    requests_before = len(files.requests)
+
+    window.refresh()
+
+    # A valid file-only subject survives a process redraw (spec 5.3 rule 5).
+    assert window.selected_app_id() == 99
+    assert listing(window).currentRow() == -1
+    assert kpi_texts(window) == ["unavailable"] * 5
+    assert label(window, "detail_state").text() == "not in the process ranking"
+    assert len(files.requests) == requests_before
+
+
+def test_applied_frame_issues_at_most_one_files_query(qtbot) -> None:
+    alpha = app_total(1, "unit:/alpha.service", "Alpha", 300)
+    beta = app_total(2, "unit:/beta.service", "Beta", 200)
+    files = FakeFilesHistory(ranking_rows=(alpha, beta))
+    window, service = build(qtbot, [alpha, beta], files_view=FilesView(files))
+    assert [request[0] for request in files.requests] == [1]
+
+    # A changed scope: adoption satisfies the frame's one query (spec 5.2).
+    range_window = Window(
+        kind="range", boot_id=BOOT, start_mono_ns=0, end_mono_ns=MAX_RANGE_NS
+    )
+    service.set_share(1, disk_share(1, window=range_window, task_total=300))
+    before = len(files.requests)
+    window.set_window(range_window)
+    assert [request[0] for request in files.requests[before:]] == [1]
+
+    # An unchanged scope whose delivery was retired: the flush issues the one
+    # request the frame needs, and nothing issues a second (spec 5.2 step 4).
+    window.files_view.retire_deliveries()
+    assert window.files_view.refresh_wanted() is True
+    before = len(files.requests)
+    window.set_window(range_window)
+    assert [request[0] for request in files.requests[before:]] == [1]
+
+
+def test_repeated_process_redraws_issue_no_files_query(qtbot) -> None:
+    alpha = app_total(1, "unit:/alpha.service", "Alpha", 300)
+    beta = app_total(2, "unit:/beta.service", "Beta", 200)
+    files = FakeFilesHistory(ranking_rows=(alpha, beta))
+    window, service = build(qtbot, [alpha, beta], files_view=FilesView(files))
+    before = len(files.requests)
+    ranking_before = len(service.ranking_calls)
+
+    for _ in range(3):
+        window.refresh()
+
+    assert len(service.ranking_calls) == ranking_before + 3
+    # Repeated process redraws re-read the ranking and the subject only.
+    assert len(files.requests) == before
+    assert window.files_view.refresh_wanted() is False
+
+
+def test_device_lanes_and_more_caption_follow_the_model(qtbot) -> None:
+    devs = ("8:0", "8:16", "8:32", "8:48", "8:64")
+    entries = tuple(
+        (BOOT, dev, total) for dev, total in zip(devs, (500, 400, 300, 200, 100))
+    )
+    task, _devices = series_points()
+    series = Series(1, SINCE_BOOT, "raw", task, device_points_for(devs), (), coverage())
+    alpha = app_total(1, "unit:/alpha.service", "Alpha", 1500)
+    window, service = build(
+        qtbot, [alpha], {1: device_share(entries)}, series={1: series}
+    )
+    lanes = window._device_lanes
+    more = label(window, "more_devices")
+    assert len(lanes) == MAX_DEVICE_LANES
+
+    # Active lanes are shown and captioned with their own raw tokens; the
+    # remaining devices are counted, never silently dropped.
+    assert [lane._caption for lane in lanes] == ["8:0", "8:16", "8:32"]
+    assert [lane.isVisible() for lane in lanes] == [True, True, True]
+    assert more.text() == "and 2 more"
+    assert more.isHidden() is False
+
+    # A later tick re-captions the reused lanes; a stale caption is a defect.
+    service.set_share(
+        1,
+        device_share(
+            tuple(
+                (BOOT, dev, total)
+                for dev, total in zip(devs, (100, 200, 50, 500, 400))
+            )
+        ),
+    )
+    window.refresh()
+    assert [lane._caption for lane in lanes] == ["8:48", "8:64", "8:16"]
+    assert more.text() == "and 2 more"
+
+    # Fewer active devices: the spare lane hides and the count disappears.
+    service.set_share(1, device_share(((BOOT, "8:0", 100), (BOOT, "8:16", 200))))
+    window.refresh()
+    assert [lane._caption for lane in lanes[:2]] == ["8:16", "8:0"]
+    assert lanes[2].isVisible() is False
+    assert more.isHidden() is True
+
+
+def test_attribution_panel_keeps_rows_and_boot_qualifies_lifetime_labels(
+    qtbot,
+) -> None:
+    lifetime = Window(kind="lifetime")
+    entries = (
+        ("boot-a", "8:0", 500),
+        ("boot-b", "8:0", 400),
+        ("boot-a", "8:16", 300),
+        ("boot-b", "8:16", 200),
+        ("boot-a", "8:32", 100),
+    )
+    alpha = app_total(1, "unit:/alpha.service", "Alpha", 1500)
+    window, service = build(qtbot, [alpha], {})
+    service.set_share(1, device_share(entries, window=lifetime))
+    window.set_window(lifetime)
+
+    rows = [row_label for row_label, _fraction in window._share_bars.fractions()]
+    # Every share row is kept (the three-lane cap is for time lanes only) and
+    # repeated timeless tokens stay distinct across boots (spec 6.4).
+    assert rows == [
+        "8:0 [boot-a]",
+        "8:0 [boot-b]",
+        "8:16 [boot-a]",
+        "8:16 [boot-b]",
+        "8:32 [boot-a]",
+    ]
+
+    # A single-boot scope keeps the raw token without a boot qualifier.
+    service.set_share(1, device_share(((BOOT, "8:0", 500), (BOOT, "8:16", 300))))
+    window.set_window(SINCE_BOOT)
+    rows = [row_label for row_label, _fraction in window._share_bars.fractions()]
+    assert rows == ["8:0", "8:16"]
+
+
+def test_later_ticks_update_coverage_device_strip_and_reconciliation(qtbot) -> None:
+    alpha = app_total(1, "unit:/alpha.service", "Alpha", 200)
+    window, service = build(
+        qtbot, [alpha], {1: disk_share(1, task_total=200, residual_total=0)}
+    )
+    bars = window._share_bars
+    first = bars._reconciliation
+    assert first is not None
+    assert "200 B attributed + (0 B) residual = 200 B total" in first
+    assert "gaps: 0" in label(window, "coverage_label").text()
+
+    # Same attributed rows, a different residual: the annotation changes even
+    # though the row tuple did not (spec 3.3 `_apply_overview`).
+    service.set_share(1, disk_share(1, task_total=220, residual_total=20))
+    window.refresh()
+    assert window._overview_model is not None
+    assert bars._reconciliation == window._overview_model.reconciliation
+    assert bars._reconciliation != first
+    assert "+20 B" in bars._reconciliation
+    assert "220 B total" in bars._reconciliation
+
+    # Coverage is not frozen at the first frame.
+    service.set_share(
+        1,
+        disk_share(
+            1, task_total=220, residual_total=20, cov=coverage(gap_intervals=2)
+        ),
+    )
+    window.refresh()
+    assert "gaps: 2" in label(window, "coverage_label").text()
+
+    # The device strip appears on the later tick that loses attribution.
+    unavailable = coverage(
+        complete=False, device_state="incomplete", unavailable_reason="not_retained"
+    )
+    service.set_share(
+        1, disk_share(1, task_total=220, residual_total=None, cov=unavailable)
+    )
+    window.refresh()
+    reason = label(window, "device_reason")
+    assert reason.text() == "device attribution unavailable: not_retained"
+    assert reason.isVisible() is True
+
+
+def test_ranking_delegate_draws_bar_and_reserves_its_height(qtbot) -> None:
+    view = QListWidget()
+    qtbot.addWidget(view)
+    model = QStandardItemModel()
+    model.appendRow(QStandardItem(f"Alpha  {format_bytes(300)}"))
+    index = model.index(0, 0)
+
+    delegate = RankingDelegate(view)
+    option = QStyleOptionViewItem()
+    option.rect = QRect(0, 0, 200, 40)
+    option.state = QStyle.StateFlag.State_Enabled
+    option.widget = view
+    option.font = view.font()
+
+    def painted(share: float) -> QImage:
+        model.setData(index, share, SHARE_ROLE)
+        image = QImage(200, 40, QImage.Format.Format_RGB32)
+        image.fill(QColor("#ffffff"))
+        painter = QPainter(image)
+        try:
+            delegate.paint(painter, option, index)
+        finally:
+            painter.end()
+        return image
+
+    def pixels_of(image: QImage, colour: QColor) -> int:
+        target = colour.rgb() & 0xFFFFFF
+        return sum(
+            1
+            for y in range(image.height())
+            for x in range(image.width())
+            if (image.pixel(x, y) & 0xFFFFFF) == target
+        )
+
+    full = painted(1.0)
+    empty = painted(0.0)
+    # The inline fill comes from SHARE_ROLE; a zero share paints only track.
+    assert pixels_of(full, READ_COLOR) > 0
+    assert pixels_of(empty, READ_COLOR) == 0
+    assert pixels_of(empty, TRACK_COLOR) > 0
+
+    # sizeHint reserves one bar row under the text (spec 3.3).
+    base = QStyledItemDelegate().sizeHint(option, index)
+    hinted = delegate.sizeHint(option, index)
+    assert hinted.width() == base.width()
+    assert hinted.height() >= base.height() + BAR_HEIGHT
