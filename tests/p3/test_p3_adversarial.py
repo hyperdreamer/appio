@@ -395,8 +395,12 @@ def test_helper_denial_and_absence_preserve_gui_ownership(tmp_path, qapp, qtbot,
             result.set_result(CommandResult(status, "", "denied or unavailable"))
             return result
         gui.window.setup = SetupClient(launch=launch, probe=lambda: h.facts(gui.client), expected_uid=1000)
+        after = gui.window.facts_applied
         gui.window._begin("enable")
         qtbot.waitUntil(lambda: not gui.window.busy)
+        # Enabling quiesced local collection; the helper completion only submits
+        # a fresh probe, so ownership returns when that probe's facts are applied.
+        qtbot.waitUntil(lambda: gui.window.facts_applied > after)
         assert calls == [HELPER_ARGV + ("install-delegation",)]
         assert not h.enabled
         assert gui.coordinator._local is not None

@@ -15,9 +15,22 @@ from test_p1_p2 import collected, fixture_io, show_chromium
 def test_window_has_no_later_plan_widgets_actions_or_flows(collected, qtbot):
     window = show_chromium(qtbot, collected)
     assert window.findChildren(QSystemTrayIcon) == []
-    assert window.findChildren(QTabWidget) == []
+    # The approved one detail host: two tabs, Overview and Files.
+    tabs = window.findChildren(QTabWidget)
+    assert len(tabs) == 1
+    assert tabs[0].objectName() == "detail_tabs"
+    assert tabs[0].count() == 2
+    assert [tabs[0].tabText(index) for index in range(tabs[0].count())] == [
+        "Overview", "Files"
+    ]
+    # Exactly one real Files surface, and it lives in the Files tab.
+    surfaces = [widget for widget in window.findChildren(QWidget)
+                if widget.objectName() == "files_view"]
+    assert len(surfaces) == 1
+    files_tab = tabs[0].widget(1)
+    assert files_tab is surfaces[0] or files_tab.isAncestorOf(surfaces[0])
     assert window.findChildren(QMenu) == []
-    forbidden = ("daemon", "socket", "bpf", "polkit", "privilege", "setup", "tray", "files")
+    forbidden = ("daemon", "socket", "bpf", "polkit", "privilege", "setup", "tray")
     for widget in window.findChildren(QWidget):
         assert not any(word in widget.objectName().lower() for word in forbidden), widget.objectName()
     for control in window.findChildren(QAbstractButton):

@@ -7,6 +7,7 @@ No host process/cgroup sampling, manager, user bus, pkexec or network is used.
 from __future__ import annotations
 
 import builtins
+from collections.abc import Callable
 from concurrent.futures import Future
 from contextlib import ExitStack
 from dataclasses import dataclass, replace
@@ -24,6 +25,8 @@ import stat
 import time
 from types import SimpleNamespace
 from unittest.mock import patch
+
+from PyQt6.QtWidgets import QApplication
 
 from appio.activation import choose_activation, probe_accounting, probe_file_path
 from appio.collector_owner import CollectorCoordinator, GuiLease, ServiceFacts
@@ -380,11 +383,21 @@ class P3Harness:
             for gui in self.guis:
                 gui.client.pump()
 
-    def until(self, condition, *, seconds=5):
+    def until(self, condition: Callable[[], bool], *, seconds: float = 5,
+              process_events: bool = True) -> None:
+        """Wait for one external condition, never driving the window itself.
+
+        The transport is pumped so the real daemon/client/socket path keeps
+        running; Qt delivery is only drained when the caller asks for it. This
+        helper never refreshes a window and never computes a target.
+        """
+
         deadline = time.monotonic() + seconds
         while not condition():
             assert time.monotonic() < deadline, "acceptance transport/history did not settle"
             self.pump(2)
+            if process_events:
+                QApplication.processEvents()
             time.sleep(0.001)  # yield to the real read-only history worker
 
     def facts(self, client):
@@ -455,10 +468,40 @@ class P3Harness:
         self.settle(gui)
 
     def settle(self, gui=None):
+        """Drive one applied fact, then the frame it makes current.
+
+        Phase 1 submits probes and waits for at least one *new* applied fact, so
+        a prior target or ``busy=False`` can never stand in for delivery. Phase 2
+        keeps driving until the applied frame matches the target (or there is no
+        target), stopping the readiness poll afterwards.
+        """
+
         gui = gui or self.gui
-        scope = gui.history._window
-        if scope is not None and gui.history._local_generation != -1:
-            self.until(lambda: gui.history.ready(scope))
+        window = gui.window
+        after = window.facts_applied
+
+        def applied():
+            window.refresh()
+            return window.facts_applied > after
+
+        self.until(applied)
+
+        def displayed():
+            if window._pending is not None:
+                # Readiness polling is what the shell's own 100 ms timer does;
+                # submitting another probe here would retire the preparation the
+                # frame is waiting for on every loop turn.
+                window.apply_ready_frame()
+            else:
+                window.refresh()
+            return window._target is None or (
+                window._pending is None
+                and window._prepare_retry is None
+                and window._displayed == window._target
+            )
+
+        self.until(displayed)
+        window._poll_timer.stop()
 
     def import_history(self, *, gui=None):
         """Use the helper's real export as schema-v1 ownership evidence.
@@ -552,19 +595,30 @@ class P3Harness:
     def query(self, window: Window, *, gui=None):
         gui = gui or self.gui
         gui.history.prepare(window)
-        self.until(lambda: gui.history.ready(window))
+        # No window refresh, queued fact application, readiness apply or target
+        # calculation may happen inside this wait.
+        self.until(lambda: gui.history.ready(window), process_events=False)
         return gui.history.ranking(window, "total_bytes")
 
     def render(self, window, *, gui=None):
         gui = gui or self.gui
-        self.query(window, gui=gui)
+        shell = gui.window
         # The shell constructs the unchanged P2 view with a since-boot selector.
         # Make that exact selector ready, then exercise its public set_window.
         since = Window("since_boot", window.boot_id, end_mono_ns=window.end_mono_ns)
-        self.query(since, gui=gui)
-        gui.window._show_ready(since)
-        self.query(window, gui=gui)
-        gui.window.view.set_window(window)
+
+        def displayed(target):
+            def check():
+                shell.apply_ready_frame()
+                return shell._displayed == target
+
+            return check
+
+        # Event-free application loops: transport pump and stored readiness only.
+        shell.show_window(since)
+        self.until(displayed(since), process_events=False)
+        shell.show_window(window)
+        self.until(displayed(window), process_events=False)
 
     def wire(self, message, *, response_type=None):
         """One actual AF_UNIX exchange, including invalid/adversarial requests."""

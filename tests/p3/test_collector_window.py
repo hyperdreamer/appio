@@ -187,19 +187,38 @@ class FakeCoordinator:
 
 
 class FakeSetup:
-    """A setup client that records calls and hands the test the completion."""
+    """A setup client that records calls and hands the test the completion.
+
+    ``refresh()`` now runs on the shell's probe worker, so the configured facts
+    and the call counter are shared controls protected by a lock. Widget state
+    is only ever mutated by the delivery that lands back on the Qt thread.
+    """
 
     def __init__(self, facts: ServiceFacts = OFF, events=None):
-        self.facts = facts
+        self._facts = facts
+        self._facts_lock = threading.Lock()
         self.events = events if events is not None else []
         self.calls: list[str] = []
         self.pending: dict[str, list[Future]] = {}
         self.refresh_calls = 0
 
+    @property
+    def facts(self) -> ServiceFacts:
+        with self._facts_lock:
+            return self._facts
+
+    @facts.setter
+    def facts(self, value: ServiceFacts) -> None:
+        with self._facts_lock:
+            self._facts = value
+
     def refresh(self) -> ServiceFacts:
-        self.refresh_calls += 1
+        with self._facts_lock:
+            self.refresh_calls += 1
+            facts = self._facts
+        # Worker observation only: no widget, coordinator or router mutation.
         self.events.append(("probe",))
-        return self.facts
+        return facts
 
     def invoke(self, verb: str) -> Future:
         self.calls.append(verb)
@@ -273,10 +292,17 @@ def app_total(app_id: int = 1) -> AppTotal:
                     None, None, None, file_coverage())
 
 
-def build(qtbot, *, facts=OFF, ready=False, setup=None, events=None):
+def build(qtbot, *, facts=OFF, ready=False, setup=None, events=None, history=None):
+    """Compose the fake shell without driving any probe.
+
+    The periodic timer is stopped so every legacy driver site owns its probe
+    submissions explicitly and the counts stay deterministic; the liveness
+    test that needs periodic refreshes starts the timer itself.
+    """
+
     events = events if events is not None else []
     coordinator = FakeCoordinator(events)
-    history = FakeHistory(ready=ready, events=events)
+    history = history if history is not None else FakeHistory(ready=ready, events=events)
     setup = setup if setup is not None else FakeSetup(facts, events)
     setup.events = events
     window = CollectorWindow(coordinator, history, setup,
@@ -284,7 +310,30 @@ def build(qtbot, *, facts=OFF, ready=False, setup=None, events=None):
     qtbot.addWidget(window)
     qtbot.addWidget(window.settings)
     window.show()
+    window._timer.stop()
     return window, coordinator, history, setup
+
+
+def refresh_and_settle(qtbot, window):
+    """Drive one probe from submission to its applied fact.
+
+    The probe runs on the shell's worker executor now, so a driver site that
+    used to read the state right after ``refresh()`` waits for ``facts_applied``
+    to advance instead. Exactly one fact lands, so per-cycle counts stay honest.
+    """
+
+    after = window.facts_applied
+    window.refresh()
+    settle_probe(qtbot, window, after=after)
+    assert window.facts_applied == after + 1, "one refresh must apply one probe"
+
+
+def complete_and_settle(qtbot, window, setup, verb, reply, index=0):
+    """Complete one helper reply and await the fresh probe it triggers."""
+
+    after = window.facts_applied
+    setup.complete(verb, reply, index)
+    settle_probe(qtbot, window, after=after)
 
 
 def test_verified_status_round_trip_clears_silent_header_while_window_open(qtbot):
@@ -294,16 +343,16 @@ def test_verified_status_round_trip_clears_silent_header_while_window_open(qtbot
     harness = Harness()
     history.client = harness.client
     window._pump = harness.client.pump
-    window._timer.setInterval(10)
     try:
-        window.refresh()
+        refresh_and_settle(qtbot, window)
         assert window.state_text == COLLECTOR_STATE_SILENT
         harness.one_request("status")
         # A real, correlated, validated response on the GUI's own connection.
         # The separate one-shot service probe remains silent throughout.
         harness.status()
-        qtbot.waitUntil(lambda: window.state_text == COLLECTOR_STATE_ON_ANSWERING,
-                        timeout=1000)
+        # The next probe observes this window's own verified round-trip.
+        refresh_and_settle(qtbot, window)
+        assert window.state_text == COLLECTOR_STATE_ON_ANSWERING
         assert window.banner_status.text() == COLLECTOR_STATE_ON_ANSWERING
         assert window.settings.status_label.text() == COLLECTOR_STATE_ON_ANSWERING
         assert coordinator.reconciles[-1].daemon_verified
@@ -312,8 +361,8 @@ def test_verified_status_round_trip_clears_silent_header_while_window_open(qtbot
         # Disconnect clears current verification; a retained cursor/status must
         # not keep the successful label latched forever.
         harness.eof()
-        qtbot.waitUntil(lambda: window.state_text == COLLECTOR_STATE_SILENT,
-                        timeout=1000)
+        refresh_and_settle(qtbot, window)
+        assert window.state_text == COLLECTOR_STATE_SILENT
     finally:
         window._timer.stop()
         harness.client.close()
@@ -339,7 +388,7 @@ def test_probe_only_truth_stays_answering_for_three_refreshes_after_EOF(qtbot):
     window._pump = harness.client.pump
     try:
         harness.handshake()
-        window.refresh()
+        refresh_and_settle(qtbot, window)
         assert harness.client.state.verified and harness.client.state.answering
         assert window.state_text == COLLECTOR_STATE_ON_ANSWERING
         assert len(harness.servers) == 1
@@ -353,7 +402,7 @@ def test_probe_only_truth_stays_answering_for_three_refreshes_after_EOF(qtbot):
         ticks_before = coordinator.ticks
         for tick in range(1, 4):
             setup.facts = ON
-            window.refresh()
+            refresh_and_settle(qtbot, window)
             # The loop really ran the probe and really completed a refresh tick.
             assert setup.refresh_calls == probes_before + tick
             assert coordinator.ticks == ticks_before + tick
@@ -394,7 +443,7 @@ def test_label_recovers_after_silent_refresh_and_connection_reverification(qtbot
     window._pump = harness.client.pump
     try:
         harness.handshake()
-        window.refresh()
+        refresh_and_settle(qtbot, window)
         assert window.state_text == COLLECTOR_STATE_ON_ANSWERING
         assert harness.client.state.verified and harness.client.state.answering
         assert len(harness.servers) == 1
@@ -403,7 +452,7 @@ def test_label_recovers_after_silent_refresh_and_connection_reverification(qtbot
         harness.client.pump()
         probes_before = setup.refresh_calls
         setup.facts = SILENT
-        window.refresh()
+        refresh_and_settle(qtbot, window)
         # Observable intermediate demotion: one silent probe is enough to
         # withdraw the answering claim while the stream is gone.
         assert setup.refresh_calls == probes_before + 1
@@ -419,7 +468,7 @@ def test_label_recovers_after_silent_refresh_and_connection_reverification(qtbot
         # window's stream is still unverified -- so the label alone is not the
         # recovery evidence the next assertions require.
         setup.facts = ON
-        window.refresh()
+        refresh_and_settle(qtbot, window)
         assert setup.refresh_calls == probes_before + 2
         assert window.state_text == COLLECTOR_STATE_ON_ANSWERING
         assert not harness.client.state.verified
@@ -436,7 +485,7 @@ def test_label_recovers_after_silent_refresh_and_connection_reverification(qtbot
         harness.client.pump()
         assert harness.client.state.verified and harness.client.state.answering
 
-        window.refresh()
+        refresh_and_settle(qtbot, window)
         assert window.state_text == COLLECTOR_STATE_ON_ANSWERING
         assert window.settings.status_label.text() == COLLECTOR_STATE_ON_ANSWERING
         # Recovered in place: no restart, no replacement window or label.
@@ -462,7 +511,7 @@ def test_current_link_status_requires_verification_and_preserves_activation(
     history.client = SimpleNamespace(state=SimpleNamespace(
         verified=verified, answering=answering, pending_activation=pending, cursor=None,
     ))
-    window.refresh()
+    refresh_and_settle(qtbot, window)
     assert window.state_text == expected
     window._timer.stop()
 
@@ -485,6 +534,8 @@ def assert_no_state_change(coordinator: FakeCoordinator, history: FakeHistory,
 
 def test_banner_and_files_deep_links_focus_settings_without_changing_state(qtbot):
     window, coordinator, history, setup = build(qtbot)
+    view = window.view
+    assert view is not None
     assert_no_state_change(coordinator, history, setup)
 
     click(window.banner_open_settings)
@@ -494,13 +545,16 @@ def test_banner_and_files_deep_links_focus_settings_without_changing_state(qtbot
     assert_no_state_change(coordinator, history, setup)
 
     window.open_files_unavailable()
-    assert window.files_page.isVisible()
-    assert window.stack.currentWidget() is window.files_page
+    # Deep links navigate the one persistent tab host; they never prepare or
+    # query an application scope.
+    assert view.detail_tabs.currentIndex() == 1
     # No window has been prepared yet, so the page says so instead of showing a
     # zero table; the deep link is still the only action offered.
     assert window.files_message.isVisible()
     assert "waiting for the first sample" in window.files_message.text()
-    assert window.files_view.isVisible() is False
+    assert window.files_view.state == "idle"
+    assert window.files_view.model.rowCount() == 0
+    assert window.files_view.last_result is None
     assert history.file_requests == []
     click(window.files_open_settings)
     assert window.settings.focused_row == "system_services"
@@ -513,21 +567,24 @@ def test_opening_files_shows_the_real_table_and_changes_only_query_state(qtbot):
     history.rows = [app_total()]
     history.file_status = FileAvailability(True, True)
     history.file_result = file_view_result()
-    window.refresh()
+    refresh_and_settle(qtbot, window)
     qtbot.waitUntil(lambda: window.history_visible is True, timeout=2000)
-    # The page is prepared by the same exact Window the Overview renders.
+    # The Files surface is prepared by the same exact Window the Overview
+    # renders, and adopted by the visible tab.
     assert history.file_requests[-1][1] == history.prepared
-    assert window.files_view.isVisibleTo(window.files_page)
+    assert window.view.detail_tabs.currentIndex() == 0
     assert window.files_view.model.rowCount() == 1
     before_actions = list(coordinator.actions)
     before_calls = list(setup.calls)
     issued = len(history.file_requests)
+    assert issued >= 1, "canonical adoption queries the shared scope"
 
     window.open_files_unavailable()
-    assert window.stack.currentWidget() is window.files_page
+    assert window.view.detail_tabs.currentIndex() == 1
     assert window.files_view.isVisible() and window.files_view.table.isVisible()
     assert window.files_message.isVisible() is False
-    assert len(history.file_requests) == issued + 1
+    # Tab navigation issues no second query: adoption already owned it.
+    assert len(history.file_requests) == issued
     assert coordinator.actions == before_actions
     assert setup.calls == before_calls
     assert window.settings.switch.isChecked() is False
@@ -538,17 +595,21 @@ def test_a_degraded_file_source_is_reported_while_history_is_still_loading(qtbot
     history.file_status = FileAvailability(
         False, False, "file_source_unavailable", "bpf load failed: EPERM"
     )
-    window.refresh()
+    refresh_and_settle(qtbot, window)
     assert window.history_visible is False
     before_actions = list(coordinator.actions)
     before_calls = list(setup.calls)
 
     window.open_files_unavailable()
-    assert window.stack.currentWidget() is window.files_page
+    assert window.view.detail_tabs.currentIndex() == 1
     assert window.files_message.isVisible()
     assert FILES_UNAVAILABLE in window.files_message.text()
     assert "bpf load failed: EPERM" in window.files_message.text()
-    assert window.files_view.isVisible() is False
+    # The unavailable table never appears: the view holds no rows and no
+    # settled result while the source is degraded and history is still loading.
+    assert window.files_view.state == "idle"
+    assert window.files_view.model.rowCount() == 0
+    assert window.files_view.last_result is None
     assert history.file_requests == []
     assert coordinator.actions == before_actions
     assert setup.calls == before_calls
@@ -559,13 +620,13 @@ def test_files_page_keeps_an_explicit_unavailable_message_and_settings_link(qtbo
     history.file_status = FileAvailability(
         False, False, "file_source_unavailable", "bpf load failed: EPERM"
     )
-    window.refresh()
+    refresh_and_settle(qtbot, window)
     qtbot.waitUntil(lambda: window.history_visible is True, timeout=2000)
     before_actions = list(coordinator.actions)
     before_calls = list(setup.calls)
 
     window.open_files_unavailable()
-    assert window.stack.currentWidget() is window.files_page
+    assert window.view.detail_tabs.currentIndex() == 1
     assert history.file_requests == [], "an unavailable source is never queried"
     assert window.files_view.state == "unavailable"
     assert window.files_view.model.rowCount() == 0
@@ -581,16 +642,20 @@ def test_files_page_keeps_an_explicit_unavailable_message_and_settings_link(qtbo
 
 def test_the_files_surface_never_appears_inside_the_overview_window(qtbot):
     window, coordinator, history, setup = build(qtbot, ready=True)
-    window.refresh()
+    refresh_and_settle(qtbot, window)
     qtbot.waitUntil(lambda: window.history_visible is True, timeout=2000)
     assert window.view is not None
-    assert window.view.findChildren(QTableView) == []
-    assert window.stack.currentWidget() is window.history_page
-    # The Files surface lives on its own page, never inside the Overview's page
-    # or the P1/P2 AppIoWindow the acceptance guard inspects.
-    assert not window.view.isAncestorOf(window.files_view)
-    assert not window.history_page.isAncestorOf(window.files_view)
-    assert window.files_view.parent() is window.files_page
+    overview = window.view.detail_tabs.widget(0)
+    files_tab = window.view.detail_tabs.widget(1)
+    assert overview is not None and files_tab is not None
+    # The Overview tab owns no table; the single real Files surface lives in
+    # the shared console's Files tab, never inside the Overview frame.
+    assert overview.findChildren(QTableView) == []
+    assert not overview.isAncestorOf(window.files_view)
+    assert files_tab.isAncestorOf(window.files_view)
+    assert window.findChildren(QTableView) == [window.files_view.table]
+    # Exactly one detail tab host: the persistent two-tab console.
+    assert window.findChildren(QTabWidget) == [window.view.detail_tabs]
 
 
 def test_open_settings_rejects_an_unknown_focus_row(qtbot):
@@ -608,10 +673,10 @@ def test_the_switch_is_the_only_root_control_and_sits_inside_settings(qtbot):
     assert window.settings.isAncestorOf(switches[0])
     assert isinstance(switches[0], QCheckBox)
     assert window.settings.switch is switches[0]
-    # No tray, no menu, no second screen with a copy of the switch.
+    # No tray, no menu, no second screen with a copy of the switch. The detail
+    # host is a tab widget now; that is the console, not a privilege surface.
     assert window.findChildren(QSystemTrayIcon) == []
     assert window.findChildren(QMenu) == []
-    assert window.findChildren(QTabWidget) == []
     assert window.findChildren(QTableWidget) == []
     assert [button.text() for button in window.findChildren(QAbstractButton)].count(
         "System services (root)") == 1
@@ -624,7 +689,7 @@ def test_the_switch_is_the_only_root_control_and_sits_inside_settings(qtbot):
 
 def test_the_switch_never_shows_the_click_before_the_probe(qtbot):
     window, coordinator, history, setup = build(qtbot)
-    window.refresh()
+    refresh_and_settle(qtbot, window)
     assert window.settings.switch.isChecked() is False
 
     click(window.settings.switch)
@@ -644,7 +709,7 @@ def test_the_switch_never_shows_the_click_before_the_probe(qtbot):
 )
 def test_the_four_honest_states_render_distinctly(qtbot, facts, state):
     window, coordinator, history, setup = build(qtbot, facts=facts)
-    window.refresh()
+    refresh_and_settle(qtbot, window)
     assert window.state_text == state
     assert window.banner_status.text() == state
     assert window.settings.status_label.text() == state
@@ -659,17 +724,19 @@ def test_the_four_states_are_pairwise_distinct():
 
 def test_the_gui_probe_not_the_helper_body_decides_whether_the_daemon_answers(qtbot):
     window, coordinator, history, setup = build(qtbot)
-    window.refresh()
+    refresh_and_settle(qtbot, window)
     click(window.settings.switch)
     window.consent.accept()
-    setup.complete("install-delegation", ok("install-delegation",
-                                            {"answering": True, "pending_activation": True}))
+    complete_and_settle(qtbot, window, setup, "install-delegation", ok(
+        "install-delegation", {"answering": True, "pending_activation": True}))
+    assert window.choice is not None and window.choice.isVisible()
     window.choice.choose("reboot")
     # The helper claims answering; this session\'s own probe cannot reach the socket.
     setup.facts = SILENT
     probes_before = setup.refresh_calls
-    setup.complete("enable", ok("enable", {"answering": True, "pending_activation": True,
-                                           "state": "on, answering"}))
+    complete_and_settle(qtbot, window, setup, "enable", ok(
+        "enable", {"answering": True, "pending_activation": True,
+                   "state": "on, answering"}))
     # The unprivileged probe ran after the helper replied, and its silence wins.
     assert setup.refresh_calls > probes_before
     assert window.state_text == COLLECTOR_STATE_SILENT
@@ -682,14 +749,14 @@ def test_the_gui_probe_not_the_helper_body_decides_whether_the_daemon_answers(qt
 
 def test_an_unknown_probe_disables_the_switch_instead_of_claiming_off(qtbot):
     window, coordinator, history, setup = build(qtbot, facts=UNKNOWN)
-    window.refresh()
+    refresh_and_settle(qtbot, window)
     assert window.settings.switch.isEnabled() is False
     assert window.state_text == "unavailable"
 
 
 def test_pending_activation_stays_visible_across_a_restart(qtbot):
     window, coordinator, history, setup = build(qtbot, facts=NEEDS_ACTIVATION)
-    window.refresh()
+    refresh_and_settle(qtbot, window)
     assert window.state_text == COLLECTOR_STATE_NEEDS_ACTIVATION
     assert window.settings.switch.isChecked() is True
 
@@ -701,7 +768,7 @@ def test_pending_activation_stays_visible_across_a_restart(qtbot):
 
 def test_consent_lists_the_exact_commands_before_any_elevation(qtbot):
     window, coordinator, history, setup = build(qtbot)
-    window.refresh()
+    refresh_and_settle(qtbot, window)
     before = coordinator.actions[:]
     click(window.settings.switch)
     text = window.consent.body_text()
@@ -718,7 +785,7 @@ def test_consent_lists_the_exact_commands_before_any_elevation(qtbot):
 
 def test_cancelled_consent_changes_nothing(qtbot):
     window, coordinator, history, setup = build(qtbot)
-    window.refresh()
+    refresh_and_settle(qtbot, window)
     before = coordinator.actions[:]
     click(window.settings.switch)
     window.consent.reject()
@@ -739,10 +806,10 @@ def test_cancelled_consent_changes_nothing(qtbot):
 def test_a_failed_dismissal_reverts_the_switch_and_shows_the_exit_code(
         qtbot, reply, code, line, retryable):
     window, coordinator, history, setup = build(qtbot)
-    window.refresh()
+    refresh_and_settle(qtbot, window)
     click(window.settings.switch)
     window.consent.accept()
-    setup.complete("install-delegation", reply)
+    complete_and_settle(qtbot, window, setup, "install-delegation", reply)
     assert window.settings.switch.isChecked() is False
     assert window.settings.switch.isEnabled() is retryable
     assert f"exit {code}" in window.error_label.text()
@@ -751,35 +818,36 @@ def test_a_failed_dismissal_reverts_the_switch_and_shows_the_exit_code(
 
 def test_a_dismissal_after_a_previous_success_reverts_to_the_probed_on_state(qtbot):
     window, coordinator, history, setup = build(qtbot, facts=ON)
-    window.refresh()
+    refresh_and_settle(qtbot, window)
     assert window.settings.switch.isChecked() is True
     click(window.settings.switch)
     window.consent.accept()
-    setup.complete("disable", SetupReply(126, "Authentication dismissed", None))
+    complete_and_settle(qtbot, window, setup, "disable",
+                        SetupReply(126, "Authentication dismissed", None))
     assert window.settings.switch.isChecked() is True
     assert "exit 126" in window.error_label.text()
 
 
 def test_a_container_host_reason_disables_the_switch_and_is_shown_verbatim(qtbot):
     window, coordinator, history, setup = build(qtbot)
-    window.refresh()
+    refresh_and_settle(qtbot, window)
     click(window.settings.switch)
     window.consent.accept()
-    setup.complete("install-delegation",
-                   SetupReply(1, "unsupported:container_host",
-                              {"version": 1, "verb": "install-delegation", "uid": 1000,
-                               "state": "unknown", "error": "unsupported:container_host"}))
+    complete_and_settle(qtbot, window, setup, "install-delegation",
+                        SetupReply(1, "unsupported:container_host",
+                                   {"version": 1, "verb": "install-delegation", "uid": 1000,
+                                    "state": "unknown", "error": "unsupported:container_host"}))
     assert "unsupported:container_host" in window.error_label.text()
     assert window.settings.switch.isEnabled() is False
 
 
 def test_a_missing_helper_reports_one_hundred_twenty_seven(qtbot):
     window, coordinator, history, setup = build(qtbot)
-    window.refresh()
+    refresh_and_settle(qtbot, window)
     click(window.settings.switch)
     window.consent.accept()
-    setup.complete("install-delegation",
-                   SetupReply(127, "appio-setup is not installed", None))
+    complete_and_settle(qtbot, window, setup, "install-delegation",
+                        SetupReply(127, "appio-setup is not installed", None))
     assert "exit 127" in window.error_label.text()
     assert "appio-setup is not installed" in window.error_label.text()
     assert window.settings.switch.isEnabled() is False
@@ -791,25 +859,38 @@ def test_a_missing_helper_reports_one_hundred_twenty_seven(qtbot):
 
 
 def test_enable_quiesces_local_collection_before_the_first_elevation(qtbot):
-    window, coordinator, history, setup = build(qtbot)
-    window.refresh()
-    events = setup.events
-    events.clear()
-    click(window.settings.switch)
-    window.consent.accept()
-    first_invoke = next(index for index, event in enumerate(events) if event[0] == "invoke")
-    assert first_invoke > 0, "the local writer is quiesced before elevating"
-    quiesce = next(event[1] for event in events[:first_invoke] if event[0] == "reconcile")
-    from appio.collector_owner import decide_owner
-    assert decide_owner(quiesce).may_collect_local is False
-    assert decide_owner(quiesce).owner == "unknown"
-    assert decide_owner(quiesce).state == COLLECTOR_STATE_UNAVAILABLE
-    assert events[first_invoke] == ("invoke", "install-delegation")
+    setup = ControlledSetup(OFF, hold=True)
+    window, coordinator, history, setup = build(qtbot, setup=setup)
+    try:
+        # A probe spanning the helper start belongs to the pre-helper generation.
+        window.refresh()
+        assert setup.started.wait(2), "the spanning probe must have reached its worker"
+        events = setup.events
+        events.clear()
+        click(window.settings.switch)
+        window.consent.accept()
+        first_invoke = next(index for index, event in enumerate(events) if event[0] == "invoke")
+        assert first_invoke > 0, "the local writer is quiesced before elevating"
+        quiesce = next(event[1] for event in events[:first_invoke] if event[0] == "reconcile")
+        from appio.collector_owner import decide_owner
+        assert decide_owner(quiesce).may_collect_local is False
+        assert decide_owner(quiesce).owner == "unknown"
+        assert decide_owner(quiesce).state == COLLECTOR_STATE_UNAVAILABLE
+        assert events[first_invoke] == ("invoke", "install-delegation")
+        # Release the spanning probe: the helper start advanced the setup
+        # generation, so its result is dropped instead of applied.
+        setup.release.set()
+        qtbot.waitUntil(lambda: window._dropped_facts == 1, timeout=2000)
+        assert window.facts_applied == 0
+        complete_and_settle(qtbot, window, setup, "install-delegation",
+                            SetupReply(1, "enable:daemon_not_answering", None))
+    finally:
+        setup.release.set()
 
 
 def test_a_failed_quiesce_aborts_the_elevation(qtbot):
     window, coordinator, history, setup = build(qtbot)
-    window.refresh()
+    refresh_and_settle(qtbot, window)
     real = coordinator.reconcile
 
     def reconcile(facts):
@@ -827,19 +908,21 @@ def test_a_failed_quiesce_aborts_the_elevation(qtbot):
 
 def test_restart_choice_warns_and_needs_a_distinct_confirmation(qtbot):
     window, coordinator, history, setup = build(qtbot)
-    window.refresh()
+    refresh_and_settle(qtbot, window)
     click(window.settings.switch)
     window.consent.accept()
     assert setup.calls == ["install-delegation"]
-    setup.complete("install-delegation", ok("install-delegation", {"enabled": False}))
+    complete_and_settle(qtbot, window, setup, "install-delegation",
+                        ok("install-delegation", {"enabled": False}))
     assert window.choice is not None and window.choice.isVisible()
     assert cw.RESTART_CHOICE_WARNING in window.choice.body_text()
     assert cw.CHOICE_RESTART_LABEL in window.choice.body_text()
 
     window.choice.choose("restart")
     assert setup.calls == ["install-delegation", "enable"]
-    setup.complete("enable", ok("enable", {"pending_activation": True,
-                                           "state": COLLECTOR_STATE_NEEDS_ACTIVATION}))
+    complete_and_settle(qtbot, window, setup, "enable", ok(
+        "enable", {"pending_activation": True,
+                   "state": COLLECTOR_STATE_NEEDS_ACTIVATION}))
     # Distinct, second confirmation: no restart command yet, and it ends the session.
     assert setup.calls == ["install-delegation", "enable"]
     assert window.restart_confirmation is not None
@@ -851,29 +934,36 @@ def test_restart_choice_warns_and_needs_a_distinct_confirmation(qtbot):
 
 def test_reboot_choice_never_runs_restart_or_reboot(qtbot):
     window, coordinator, history, setup = build(qtbot)
-    window.refresh()
+    refresh_and_settle(qtbot, window)
     click(window.settings.switch)
     window.consent.accept()
-    setup.complete("install-delegation", ok("install-delegation", {"enabled": False}))
+    complete_and_settle(qtbot, window, setup, "install-delegation",
+                        ok("install-delegation", {"enabled": False}))
+    assert window.choice is not None and window.choice.isVisible()
     window.choice.choose("reboot")
     setup.facts = NEEDS_ACTIVATION
-    setup.complete("enable", ok("enable", {"pending_activation": True,
-                                           "state": COLLECTOR_STATE_NEEDS_ACTIVATION}))
+    complete_and_settle(qtbot, window, setup, "enable", ok(
+        "enable", {"pending_activation": True,
+                   "state": COLLECTOR_STATE_NEEDS_ACTIVATION}))
     assert setup.calls == ["install-delegation", "enable"]
     assert window.restart_confirmation is None
     for verb in setup.calls:
         assert verb not in {"restart-user-manager", "reboot", "restart"}
-    window.refresh()
+    refresh_and_settle(qtbot, window)
     assert window.state_text == COLLECTOR_STATE_NEEDS_ACTIVATION
 
 
 def test_a_dismissed_choice_leaves_the_switch_on_the_probe(qtbot):
     window, coordinator, history, setup = build(qtbot)
-    window.refresh()
+    refresh_and_settle(qtbot, window)
     click(window.settings.switch)
     window.consent.accept()
-    setup.complete("install-delegation", ok("install-delegation", {"enabled": False}))
+    complete_and_settle(qtbot, window, setup, "install-delegation",
+                        ok("install-delegation", {"enabled": False}))
+    assert window.choice is not None and window.choice.isVisible()
+    after = window.facts_applied
     window.choice.reject()
+    settle_probe(qtbot, window, after=after)
     assert setup.calls == ["install-delegation"]
     assert window.settings.switch.isChecked() is False
 
@@ -885,7 +975,7 @@ def test_a_dismissed_choice_leaves_the_switch_on_the_probe(qtbot):
 
 def test_disable_requires_its_own_consent_and_imports_verified_metadata(qtbot):
     window, coordinator, history, setup = build(qtbot, facts=ON)
-    window.refresh()
+    refresh_and_settle(qtbot, window)
     click(window.settings.switch)
     text = window.consent.body_text()
     assert "/usr/bin/pkexec /usr/bin/appio-setup disable" in text
@@ -894,7 +984,7 @@ def test_disable_requires_its_own_consent_and_imports_verified_metadata(qtbot):
     assert setup.calls == ["disable"]
 
     setup.facts = OFF
-    setup.complete("disable", ok("disable", {
+    complete_and_settle(qtbot, window, setup, "disable", ok("disable", {
         "enabled": False,
         "export_path": "/home/u/.local/share/appio/iod-export-1.db",
         "export_cutoff": {"boot_id": BOOT, "iod_epoch": 3, "seq": 9, "cutoff_mono_ns": 4 * RAW_BUCKET_NS},
@@ -909,10 +999,11 @@ def test_disable_requires_its_own_consent_and_imports_verified_metadata(qtbot):
 
 def test_disable_without_verified_export_metadata_imports_nothing(qtbot):
     window, coordinator, history, setup = build(qtbot, facts=ON)
-    window.refresh()
+    refresh_and_settle(qtbot, window)
     click(window.settings.switch)
     window.consent.accept()
-    setup.complete("disable", ok("disable", {"enabled": False, "export_path": None}))
+    complete_and_settle(qtbot, window, setup, "disable",
+                        ok("disable", {"enabled": False, "export_path": None}))
     assert coordinator.exports == []
     assert window.settings.switch.isChecked() is True, "the probe still says enabled"
     assert "export" in window.error_label.text().lower()
@@ -925,14 +1016,15 @@ def test_disable_without_verified_export_metadata_imports_nothing(qtbot):
 
 def test_an_explicit_recheck_invokes_status_and_shows_the_probe_verdict(qtbot):
     window, coordinator, history, setup = build(qtbot, facts=NEEDS_ACTIVATION)
-    window.refresh()
+    refresh_and_settle(qtbot, window)
     click(window.settings.recheck)
     text = window.consent.body_text()
     assert "/usr/bin/pkexec /usr/bin/appio-setup status" in text
     assert setup.calls == []
     window.consent.accept()
     assert setup.calls == ["status"]
-    setup.complete("status", ok("status", {"state": ACTIVATION_INACTIVE}))
+    complete_and_settle(qtbot, window, setup, "status",
+                        ok("status", {"state": ACTIVATION_INACTIVE}))
     assert window.state_text == ACTIVATION_INACTIVE
     assert window.banner_status.text() == ACTIVATION_INACTIVE
 
@@ -940,7 +1032,7 @@ def test_an_explicit_recheck_invokes_status_and_shows_the_probe_verdict(qtbot):
 def test_periodic_refresh_never_invokes_the_helper(qtbot):
     window, coordinator, history, setup = build(qtbot, facts=ON)
     for _ in range(3):
-        window.refresh()
+        refresh_and_settle(qtbot, window)
     assert setup.calls == []
     assert setup.refresh_calls == 3
     assert coordinator.ticks == 3
@@ -953,7 +1045,7 @@ def test_periodic_refresh_never_invokes_the_helper(qtbot):
 
 def test_a_pending_operation_rejects_a_second_one_across_a_qt_heartbeat(qtbot):
     window, coordinator, history, setup = build(qtbot)
-    window.refresh()
+    refresh_and_settle(qtbot, window)
     click(window.settings.switch)
     window.consent.accept()
     assert setup.calls == ["install-delegation"]
@@ -967,7 +1059,8 @@ def test_a_pending_operation_rejects_a_second_one_across_a_qt_heartbeat(qtbot):
     assert setup.calls == ["install-delegation"]
     assert window.settings.switch.isChecked() is False
 
-    setup.complete("install-delegation", ok("install-delegation", {"enabled": False}))
+    complete_and_settle(qtbot, window, setup, "install-delegation",
+                        ok("install-delegation", {"enabled": False}))
     assert window.busy is False
     assert window.settings.switch.isEnabled() is True
 
@@ -993,14 +1086,17 @@ def test_a_reply_completed_on_a_worker_thread_updates_only_on_the_qt_thread(qtbo
     qtbot.addWidget(window)
     qtbot.addWidget(window.settings)
     window.show()
-    window.refresh()
+    window._timer.stop()
+    refresh_and_settle(qtbot, window)
     click(window.settings.switch)
     window.consent.accept()
+    after = window.facts_applied
     thread = threading.Thread(target=setup.complete,
                               args=("install-delegation", ok("install-delegation", {"enabled": False})))
     thread.start()
     thread.join()
     qtbot.waitUntil(lambda: window.busy is False, timeout=2000)
+    settle_probe(qtbot, window, after=after)
     assert window.choice is not None and window.choice.isVisible()
     # Every reply, including one completed on a worker, mutated widgets on Qt's thread.
     assert window.reply_threads and set(window.reply_threads) == {threading.get_ident()}
@@ -1014,70 +1110,145 @@ def test_a_reply_completed_on_a_worker_thread_updates_only_on_the_qt_thread(qtbo
 def test_history_is_prepared_before_rendering_and_stale_detail_is_hidden(qtbot):
     window, coordinator, history, setup = build(qtbot, ready=False)
     window.refresh()
+    requested = Window(kind="since_boot", boot_id=BOOT, end_mono_ns=END)
+    # The requested scope is pending/target; the displayed alias only exists
+    # after the frame is applied.
+    assert window._pending == requested
+    assert window._target == requested
+    assert window._prepared is None
     assert [action[0] for action in history.actions] == ["prepare"]
-    assert history.prepared == Window(kind="since_boot", boot_id=BOOT, end_mono_ns=END)
+    assert history.prepared == requested
     assert window.history_visible is False
     assert "loading" in window.history_state.text()
     assert history.ranking_calls == []
 
     history.become_ready()
     qtbot.waitUntil(lambda: window.history_visible is True, timeout=2000)
+    assert window._prepared == requested
     # Two read-only consumers rank the same prepared window: the Files app
     # selector and the Overview list. Neither widens the scope.
     assert history.ranking_calls
     assert set(history.ranking_calls) == {history.prepared}
 
 
-@pytest.mark.parametrize("change", ["time", "boot", "owner", "invalidated", "ready", "local"])
-def test_pending_history_yields_to_new_scope_ownership_or_invalidation(qtbot, change):
-    window, coordinator, history, setup = build(qtbot, facts=OFF if change == "local" else ON)
+@pytest.mark.parametrize("change", ["time", "boot"])
+def test_pending_history_retains_a_until_applied_before_b(qtbot, change):
+    window, coordinator, history, setup = build(
+        qtbot, facts=ON, history=ControlledHistory())
     window._timer.stop()
     window._poll_timer.stop()
-    window.refresh()
+    refresh_and_settle(qtbot, window)
     original_window = history.prepared
+    assert window._pending == original_window
+    assert window._displayed is None
+    assert len(history.actions) == 1
+
+    # Advance the requested scope without retiring the pending preparation.
     if change == "time":
         window._clock_ns = lambda: END + RAW_BUCKET_NS // 2
-    elif change == "boot":
+        advanced = Window(kind="since_boot", boot_id=BOOT, end_mono_ns=END + RAW_BUCKET_NS)
+    else:
         history.local.connection.boot_id = "next-boot"
-    elif change == "owner":
-        setup.facts = OFF
-    elif change == "invalidated":
-        history.view_state = "unavailable"
-    elif change == "ready":
-        history.become_ready()
+        advanced = Window(kind="since_boot", boot_id="next-boot", end_mono_ns=END)
 
     window.refresh()
+    # Target advance is not retirement: A stays pending and is prepared once.
+    assert window._target == advanced
+    assert window._pending == original_window
+    assert len(history.actions) == 1
+    assert coordinator.ticks == 1
+
+    # A is still the only ready scope, so it becomes the displayed frame...
+    history.become_ready(original_window)
+    assert window.apply_ready_frame() is True
+    assert window._displayed == original_window
+    assert window._prepared == original_window
+    # ... and only the later tick prepares and applies B.
+    refresh_and_settle(qtbot, window)
+    assert history.prepared == advanced
     assert len(history.actions) == 2
+    history.become_ready(advanced)
+    assert window.apply_ready_frame() is True
+    assert window._displayed == advanced
+
+
+def test_pending_history_invalidation_reprepares_once(qtbot):
+    window, coordinator, history, setup = build(
+        qtbot, facts=ON, history=ControlledHistory())
+    window._timer.stop()
+    window._poll_timer.stop()
+    refresh_and_settle(qtbot, window)
+    original_window = history.prepared
+    assert window._pending == original_window
+    assert len(history.actions) == 1
+
+    history.view_state = "unavailable"
+    refresh_and_settle(qtbot, window)
+    # Retirement drops the stale pending preparation and replaces it once.
+    assert len(history.actions) == 2
+    assert history.prepared == original_window
+    assert window._pending == original_window
+
+    history.become_ready(original_window)
+    assert window.apply_ready_frame() is True
+    assert window._displayed == original_window
+    assert window._prepared == original_window
+
+
+def test_pending_history_changed_ownership_reprepares_once(qtbot):
+    window, coordinator, history, setup = build(
+        qtbot, facts=ON, history=ControlledHistory())
+    window._timer.stop()
+    window._poll_timer.stop()
+    refresh_and_settle(qtbot, window)
+    original_window = history.prepared
+    assert len(history.actions) == 1
+    assert len(coordinator.reconciles) == 1
+    assert coordinator.ticks == 1
+    assert window.state_text == COLLECTOR_STATE_ON_ANSWERING
+
+    setup.facts = OFF
+    refresh_and_settle(qtbot, window)
+    # Changed ownership replaces the applied facts; the requested scope did
+    # not change, so the retained preparation is still the only one.
+    assert history.prepared == original_window
+    assert len(history.actions) == 1
+    assert len(coordinator.reconciles) == 2
     assert coordinator.ticks == 2
-    if change == "time":
-        assert history.prepared.end_mono_ns == END + RAW_BUCKET_NS
-    elif change == "boot":
-        assert history.prepared.boot_id == "next-boot"
-    else:
-        assert history.prepared == original_window
-        assert len(coordinator.reconciles) == 2
-    if change == "owner":
-        assert coordinator.reconciles[-1] == OFF
-        assert window.state_text == COLLECTOR_STATE_OFF
+    assert coordinator.reconciles[-1] == OFF
+    assert window.state_text == COLLECTOR_STATE_OFF
 
 
 def test_no_boot_row_yet_waits_instead_of_querying_an_empty_scope(qtbot):
     window, coordinator, history, setup = build(qtbot)
     history.local = SimpleNamespace(connection=FakeConnection(None))
-    window.refresh()
+    refresh_and_settle(qtbot, window)
     assert history.actions == []
     assert window.history_visible is False
     assert window.history_state.text() == "waiting for the first sample"
 
 
 def test_a_refresh_failure_is_reported_instead_of_crashing_the_timer(qtbot):
-    window, coordinator, history, setup = build(qtbot)
+    window, coordinator, history, setup = build(qtbot, facts=ON, ready=True)
+    refresh_and_settle(qtbot, window)
+    qtbot.waitUntil(lambda: window.history_visible is True, timeout=2000)
+    displayed, state = window._displayed, window.state_text
+    calls = []
 
     def explode(facts):
+        calls.append(facts)
         raise RuntimeError("collector transition/tick is already in progress")
 
     coordinator.reconcile = explode
+    # Await the error delivery from the fact application, not a synchronous
+    # callback; the prior facts/frame stay visible and the callback survives.
     window.refresh()
+    qtbot.waitUntil(lambda: "already in progress" in window.error_label.text(), timeout=2000)
+    assert len(calls) == 1
+    assert window._displayed == displayed
+    assert window.state_text == state
+    window.refresh()
+    qtbot.waitUntil(lambda: len(calls) == 2, timeout=2000)
     assert "already in progress" in window.error_label.text()
 
 
@@ -1151,12 +1322,18 @@ def test_real_history_router_gates_rendering_until_ready(qtbot, tmp_path):
     qtbot.addWidget(window)
     qtbot.addWidget(window.settings)
     window.show()
+    window._timer.stop()
     try:
         window.refresh()
-        assert window._prepared == Window(kind="since_boot", boot_id=BOOT, end_mono_ns=END)
+        requested = Window(kind="since_boot", boot_id=BOOT, end_mono_ns=END)
+        # The requested scope is pending; no displayed alias exists yet.
+        assert window._pending == requested
+        assert window._target == requested
+        assert window._prepared is None
         if not window.history_visible:
             assert "loading" in window.history_state.text()
         qtbot.waitUntil(lambda: window.history_visible is True, timeout=5000)
+        assert window._prepared == requested
         assert history.ready(window._prepared)
         assert window.history_state.text() == ""
     finally:
@@ -1390,6 +1567,9 @@ def test_window_keeps_in_flight_history_for_the_same_scope(qtbot, tmp_path, monk
         assert window.state_text == COLLECTOR_STATE_ON_ANSWERING
         assert observed["pumps"] > 1 and observed["probes"] > 1
         assert observed["ranking_settled"] > 0
+        # At least two distinct probes were accepted and applied in place; the
+        # periodic driver owns probe submission now, not a synchronous refresh.
+        qtbot.waitUntil(lambda: window.facts_applied >= 2, timeout=2000)
         assert [(row.app_key, row.total_bytes) for row in history.ranking(
             window._prepared, "total_bytes",
         )] == [("exe:/usr/bin/shared", 40)]

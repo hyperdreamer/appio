@@ -1,10 +1,10 @@
 """Ownership exclusion must survive a live daemon reply in the shipped GUI."""
-from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 import json
 import shutil
 import sqlite3
 import stat
+import threading
 import time
 from types import SimpleNamespace
 
@@ -46,9 +46,10 @@ def test_live_incomplete_reply_cannot_resurrect_export_overlap_in_production_ent
     daemon = Daemon(paths, clock=clock, filesystem=FakeFilesystem(), selector=PollSelector(),
                     peer_reader=lambda sock: Peer(77, 1000, 987),
                     group_lookup=lambda uid: frozenset({987}) if uid == 1000 else frozenset())
-    executor = ThreadPoolExecutor(max_workers=1)
     raw_client, raw_status = iodclient.IodClient, ui._read_daemon_status
     holder, local_opens = {}, []
+    owner_threads: list[int] = []
+    probe_threads: list[int] = []
     try:
         daemon.start()
         for step in range(1, 6):
@@ -69,13 +70,11 @@ def test_live_incomplete_reply_cannot_resurrect_export_overlap_in_production_ent
                                 checkpoint.last_seq, checkpoint.checkpoint_mono_ns)
 
         def status_reader():
-            future = executor.submit(raw_status)
-            deadline = time.monotonic() + 5
-            while not future.done():
-                assert time.monotonic() < deadline, "daemon status did not settle"
-                daemon.step()
-                time.sleep(0.001)
-            return future.result()
+            # The shell's probe worker owns the blocking read. It performs no
+            # daemon ownership work: every daemon step stays on the test owner
+            # thread that also drives the live client and the shell.
+            probe_threads.append(threading.get_ident())
+            return raw_status()
 
         def command(argv):
             assert argv == ui.UNIT_SHOW_ARGV
@@ -105,23 +104,56 @@ def test_live_incomplete_reply_cannot_resurrect_export_overlap_in_production_ent
                           if type(widget) is ui.CollectorWindow and not widget._closed)
             window._timer.stop()
 
+            def step_daemon():
+                """One owner-thread daemon mutation plus the live client pump."""
+                owner_threads.append(threading.get_ident())
+                daemon.step()
+                holder["client"].pump()
+
+            def drive():
+                step_daemon()
+                application.processEvents()
+
             def settle():
+                after = window.facts_applied
                 deadline = time.monotonic() + 10
-                while not (window.history_visible and window.history.ready(window._prepared)):
+
+                def current():
+                    return (window.facts_applied > after
+                            and window._pending is None
+                            and window._prepare_retry is None
+                            and window._displayed is not None
+                            and window._displayed == window._target
+                            and window.history.ready(window._displayed))
+
+                while not current():
+                    drive()
+                    window.refresh()
                     assert time.monotonic() < deadline, (
                         window.history_state.text(), window.error_label.text())
-                    daemon.step()
-                    holder["client"].pump()
-                    application.processEvents()
-                    window._poll_history()
-                    time.sleep(0.001)
                 window._poll_timer.stop()
+
+            def finish_probe():
+                # Let the worker callable finish so nothing outlives the owner
+                # thread, but deliver nothing: a late fact would reconcile and
+                # retire the frame this test just asserted.
+                deadline = time.monotonic() + 10
+                while True:
+                    outstanding = [future for future in
+                                   (window._probe_inflight, window._probe_successor)
+                                   if future is not None]
+                    if all(future.done() or future.cancelled() for future in outstanding):
+                        return
+                    step_daemon()
+                    time.sleep(0.001)
+                    assert time.monotonic() < deadline, "probe did not finish"
 
             settle()
             # Use the production export validator/coordinator, not add_source.
             window.coordinator.accept_export(exported)
             window.refresh()
             settle()
+            finish_probe()
             history, scope = window.history, window._prepared
             assert holder["client"].state.verified and holder["client"].state.answering
             assert not local_opens
@@ -139,8 +171,7 @@ def test_live_incomplete_reply_cannot_resurrect_export_overlap_in_production_ent
             deadline = time.monotonic() + 5
             while not reply.done():
                 assert time.monotonic() < deadline, "live ranking did not answer"
-                daemon.step()
-                holder["client"].pump()
+                step_daemon()
                 time.sleep(0.001)
             response = reply.result()
             remote_row, = response["result"]
@@ -166,6 +197,11 @@ def test_live_incomplete_reply_cannot_resurrect_export_overlap_in_production_ent
             assert not row.coverage.complete and not share.coverage.complete
             assert labels["total_value"] == labels["read_value"] == labels["write_value"] == "0 B"
             assert "coverage: incomplete" in labels["coverage_label"]
+            # One owner thread stepped the daemon; the blocking status read ran
+            # on the shell's probe worker, never on that owner thread.
+            assert owner_threads and set(owner_threads) == {threading.get_ident()}
+            assert probe_threads
+            assert set(probe_threads).isdisjoint({threading.get_ident()})
             return 0
 
         monkeypatch.setattr(ui, "SOCKET_PATH", paths.socket)
@@ -180,6 +216,5 @@ def test_live_incomplete_reply_cannot_resurrect_export_overlap_in_production_ent
         assert ui.run_interactive(SimpleNamespace(db=tmp_path / "gui.db", proc_root=proc,
                                                  cgroup_root=cgroup, interval=1.0)) == 0
     finally:
-        executor.shutdown(wait=True)
         daemon.stop()
         daemon.selector.close()
