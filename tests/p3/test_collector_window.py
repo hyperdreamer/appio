@@ -552,6 +552,7 @@ def test_banner_and_files_deep_links_focus_settings_without_changing_state(qtbot
     # zero table; the deep link is still the only action offered.
     assert window.files_message.isVisible()
     assert "waiting for the first sample" in window.files_message.text()
+    assert window.files_view.isVisible() is False
     assert window.files_view.state == "idle"
     assert window.files_view.model.rowCount() == 0
     assert window.files_view.last_result is None
@@ -607,6 +608,7 @@ def test_a_degraded_file_source_is_reported_while_history_is_still_loading(qtbot
     assert "bpf load failed: EPERM" in window.files_message.text()
     # The unavailable table never appears: the view holds no rows and no
     # settled result while the source is degraded and history is still loading.
+    assert window.files_view.isVisible() is False
     assert window.files_view.state == "idle"
     assert window.files_view.model.rowCount() == 0
     assert window.files_view.last_result is None
@@ -3192,15 +3194,90 @@ def test_task4_m059_executor_submission_failure_is_visible_and_releases_slot(qtb
     assert window._probe_inflight is None and window._probe_successor is None
 
 
-def test_task4_m062_blank_probe_exception_uses_class_name(qtbot):
-    window, _, _, _ = controlled_build(qtbot)
+@pytest.mark.parametrize("message", ["", "   ", "\t\n  "])
+def test_task4_m062_blank_probe_exception_uses_class_name(qtbot, message):
+    window, coordinator, _, setup = controlled_build(qtbot)
     window._timer.stop()
-    window._probe_ticket = 1
-    future = Future()
-    future.set_exception(RuntimeError())
-    window._probe_completed(1, 0, future)
+    original_refresh = setup.refresh
+
+    def fail():
+        raise RuntimeError(message)
+
+    setup.refresh = fail
+    assert window._submit_probe() is True
     qtbot.waitUntil(lambda: window.error_label.text() == "appio: RuntimeError")
     assert window.facts_applied == 0
+    assert coordinator.actions == []
+    assert window._probe_inflight is None and window._probe_successor is None
+
+    # The real worker/done-callback/queued-delivery path must release the slot
+    # so the next ordinary automatic refresh can recover, without replacement.
+    setup.refresh = original_refresh
+    refresh_and_settle(qtbot, window)
+    assert window.facts_applied == 1
+
+
+def test_populated_shell_fits_620_pixels_and_all_content_is_scrollable(qtbot, monkeypatch):
+    from PyQt6.QtWidgets import QScrollArea
+    from appio.contracts import DeviceSeriesPoint, DeviceShareRow, Series, SeriesPoint
+
+    history = FakeHistory(ready=True)
+    history.rows = [app_total()]
+    history.file_status = FileAvailability(True, True)
+    history.file_result = file_view_result()
+    devs = ("8:0", "8:16", "8:32", "8:48")
+
+    def share(app_id, window):
+        return DiskShare(
+            app_id, window, 150, 150, 300,
+            tuple(DeviceShareRow(BOOT, dev, 25, 25, 50) for dev in devs),
+            100, 100, 200, 50, 50, 100, file_coverage(),
+        )
+
+    def series(app_id, window):
+        return Series(
+            app_id, window, "raw",
+            (SeriesPoint(0, 10, None, 150, 150, None, None, None, False),),
+            tuple(DeviceSeriesPoint(0, 10, dev, 25, 25) for dev in devs),
+            (), file_coverage(),
+        )
+
+    monkeypatch.setattr(history, "disk_share", share)
+    monkeypatch.setattr(history, "series", series, raising=False)
+    window, _, _, _ = build(qtbot, ready=True, history=history)
+    refresh_and_settle(qtbot, window)
+    window.resize(980, 620)
+    qtbot.waitUntil(lambda: len([lane for lane in window.view._device_lanes
+                                  if lane.isVisible()]) == 3)
+    qtbot.wait(0)  # Drain Qt's queued layout requests, not a wall-clock delay.
+    assert window.height() <= 620
+    assert window.minimumSizeHint().height() <= 620
+    scroll = window.findChild(QScrollArea, "console_scroll")
+    assert scroll is not None
+    assert scroll.widgetResizable() and scroll.widget() is window.view
+    bar = scroll.verticalScrollBar()
+    assert bar.maximum() > 0
+
+    # Reaching the bottom must expose the full last Overview annotation, not
+    # just leave a scroll bar beside clipped content.
+    bar.setValue(bar.maximum())
+    detail = window.view._detail_state
+    visible = scroll.viewport().rect()
+    assert visible.contains(detail.mapTo(scroll.viewport(), detail.rect().topLeft()))
+    assert visible.contains(detail.mapTo(scroll.viewport(), detail.rect().bottomRight()))
+    bar.setValue(0)
+    assert visible.contains(window.view._total_chart.mapTo(
+        scroll.viewport(), window.view._total_chart.rect().topLeft()
+    ))
+
+    window.open_files_unavailable()
+    qtbot.wait(0)
+    assert window.height() <= 620
+    bar.setValue(bar.maximum())
+    link = window.files_open_settings
+    assert visible.contains(link.mapTo(scroll.viewport(), link.rect().topLeft()))
+    assert visible.contains(link.mapTo(scroll.viewport(), link.rect().bottomRight()))
+    assert window.files_view.isVisible()
 
 
 def test_task4_m070_error_payload_never_counts_as_applied_facts(qtbot):

@@ -20,7 +20,8 @@ from pytestqt.qt_compat import qt_api
 if qt_api.pytest_qt_api != "pyqt6":
     qt_api.set_qt_api("pyqt6")
 
-from PyQt6.QtGui import QImage, QPixmap
+from PyQt6.QtCore import QPointF, Qt
+from PyQt6.QtGui import QImage, QPainter, QPixmap
 from PyQt6.QtWidgets import QLabel
 
 from appio.contracts import DeviceSeriesPoint, SeriesPoint
@@ -883,6 +884,76 @@ def test_donut_shares_and_device_bar_fractions_use_their_defined_denominators(qt
         bars.set_rows((("8:0", True),))
     with pytest.raises(ValueError):
         bars.set_reconciliation("")
+
+
+@pytest.mark.parametrize("row_count", [4, 8])
+@pytest.mark.parametrize("width", [300, 327])
+def test_share_panel_sizes_for_every_painted_row_and_wrapped_annotation(
+    qtbot, monkeypatch, row_count, width
+) -> None:
+    bars = ShareBars()
+    qtbot.addWidget(bars)
+    bars.resize(width, 160)
+    rows = tuple((f"8:{index * 16}", (row_count - index) * 1024)
+                 for index in range(row_count))
+    bars.set_rows(rows)
+    text = "Σ disks 36 KiB + residual (-4 KiB) = 32 KiB total"
+    bars.set_reconciliation(text)
+    bars.show()
+    qtbot.wait(0)
+    assert bars.sizeHint().height() > 160
+    assert bars.height() >= bars.heightForWidth(bars.width())
+
+    # Watch every row actually painted and verify its full text/bar support,
+    # rather than treating fractions() or a non-null grab as visibility proof.
+    baselines = {}
+    original = QPainter.drawText
+
+    def record(painter, *args):
+        if len(args) == 2 and isinstance(args[0], QPointF):
+            baselines[args[1]] = args[0].y()
+        return original(painter, *args)
+
+    monkeypatch.setattr(QPainter, "drawText", record)
+    bars.grab()
+    metrics = bars.fontMetrics()
+    for label, _ in rows:
+        y = baselines[label]
+        assert y - metrics.ascent() >= 0
+        assert y + max(metrics.descent(), 3 + theme.BAR_HEIGHT) < bars.height()
+
+    annotation = bars.findChild(QLabel, "share_reconciliation")
+    assert annotation is not None and annotation.isVisible()
+    assert annotation.text() == text and annotation.wordWrap()
+    assert annotation.y() > max(baselines[label] for label, _ in rows)
+    assert bars.rect().contains(annotation.geometry())
+    needed = annotation.fontMetrics().boundingRect(
+        annotation.contentsRect(), int(Qt.TextFlag.TextWordWrap), text
+    )
+    assert needed.height() <= annotation.height()
+    assert needed.width() <= annotation.width()
+
+
+def test_empty_share_rows_still_paint_defined_reconciliation(qtbot) -> None:
+    bars = ShareBars()
+    qtbot.addWidget(bars)
+    bars.resize(500, 150)
+    bars.set_rows(())
+    bars.show()
+    before = bars.grab().toImage()
+    text = "Σ disks 0 B + residual (6 MiB) = 6 MiB total"
+    bars.set_reconciliation(text)
+    after = bars.grab().toImage()
+    assert bars.fractions() == ()
+    assert before != after, "defined empty-device reconciliation must be painted"
+    annotation = bars.findChild(QLabel, "share_reconciliation")
+    assert annotation is not None and annotation.isVisible()
+    assert annotation.text() == text
+    assert bars.rect().contains(annotation.geometry())
+
+    bars.set_unavailable("disk split refused")
+    assert annotation.isVisible() is False
+    assert annotation.text() == ""
 
 
 def test_each_chart_grabs_nonempty_pixmap_and_renders_reason_text(

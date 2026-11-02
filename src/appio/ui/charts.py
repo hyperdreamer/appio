@@ -16,7 +16,7 @@ import math
 from dataclasses import dataclass
 from typing import Literal, Sequence
 
-from PyQt6.QtCore import QPointF, QRectF, Qt
+from PyQt6.QtCore import QPointF, QRectF, QSize, Qt
 from PyQt6.QtGui import (
     QBrush,
     QColor,
@@ -27,7 +27,7 @@ from PyQt6.QtGui import (
     QPolygonF,
     QResizeEvent,
 )
-from PyQt6.QtWidgets import QLabel, QWidget
+from PyQt6.QtWidgets import QLabel, QSizePolicy, QWidget
 
 from appio.contracts import DeviceSeriesPoint, SeriesPoint
 from appio.ui import theme
@@ -346,8 +346,9 @@ class SeriesChart(QWidget):
         self._runs: tuple[tuple[int, ...], ...] = ()
         self._available = True
         self._reason: str | None = None
-        self._read_total = 0
-        self._write_total = 0
+        # Share totals and time-series samples have independent availability.
+        # None is unavailable; (0, 0) is an explicitly measured zero.
+        self._totals: tuple[int, int] | None = None
         self._columns: tuple[ChartColumn, ...] = ()
         self._segments: tuple[ChartSegment, ...] = ()
         self._plot: tuple[float, float, float, float] = (0.0, 0.0, 0.0, 0.0)
@@ -387,8 +388,7 @@ class SeriesChart(QWidget):
         self._runs = ()
         self._available = False
         self._reason = reason
-        self._read_total = 0
-        self._write_total = 0
+        self._totals = None
         self._columns = ()
         self._segments = ()
         self._sync_message()
@@ -605,7 +605,20 @@ class SeriesChart(QWidget):
                 self._caption,
             )
             left, top, right, bottom = self._plot
-            if not self._available or not self._samples or not self._columns:
+            if not self._available:
+                return
+            painter.setPen(theme.MUTED_COLOR)
+            gutter = (
+                "r unavailable · w unavailable" if self._totals is None else
+                f"r {_format_bytes(self._totals[0])} · "
+                f"w {_format_bytes(self._totals[1])}"
+            )
+            painter.drawText(
+                QRectF(right + theme.PLOT_MARGIN, top,
+                       float(theme.GUTTER_WIDTH - theme.PLOT_MARGIN), bottom - top),
+                int(Qt.TextFlag.TextWordWrap), gutter,
+            )
+            if not self._samples or not self._columns:
                 return
             centre = (top + bottom) / 2.0
             painter.setPen(QPen(theme.BORDER_COLOR, theme.AXIS_PEN_WIDTH))
@@ -617,14 +630,6 @@ class SeriesChart(QWidget):
                 painter.drawPolygon(
                     QPolygonF([QPointF(x, y) for x, y in segment.polygon])
                 )
-            painter.setPen(theme.MUTED_COLOR)
-            gutter = (
-                f"r {_format_bytes(self._read_total)} · "
-                f"w {_format_bytes(self._write_total)}"
-            )
-            painter.drawText(
-                QPointF(right + theme.PLOT_MARGIN, top + metrics.ascent()), gutter
-            )
         finally:
             painter.end()
 
@@ -645,8 +650,16 @@ class DualSeriesChart(SeriesChart):
     def set_totals(self, read_bytes: int, write_bytes: int) -> None:
         """Set the exact gutter totals independently of the plotted samples."""
 
-        self._read_total = _require_int(read_bytes, "read_bytes", minimum=0)
-        self._write_total = _require_int(write_bytes, "write_bytes", minimum=0)
+        self._totals = (
+            _require_int(read_bytes, "read_bytes", minimum=0),
+            _require_int(write_bytes, "write_bytes", minimum=0),
+        )
+        self.update()
+
+    def set_totals_unavailable(self) -> None:
+        """Withhold the gutter without discarding independently valid samples."""
+
+        self._totals = None
         self.update()
 
 
@@ -819,8 +832,18 @@ class ShareBars(QWidget):
         )
         self._message.hide()
 
+        self._reconciliation_label = QLabel("", self)
+        self._reconciliation_label.setObjectName("share_reconciliation")
+        self._reconciliation_label.setTextFormat(Qt.TextFormat.PlainText)
+        self._reconciliation_label.setWordWrap(True)
+        self._reconciliation_label.setForegroundRole(QPalette.ColorRole.PlaceholderText)
+        self._reconciliation_label.hide()
+        policy = QSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
+        policy.setHeightForWidth(True)
+        self.setSizePolicy(policy)
         self.resize(280, 150)
         self._sync_message()
+        self._place_content()
 
     def set_rows(self, rows: Sequence[tuple[str, int]]) -> None:
         parsed: list[tuple[str, int]] = []
@@ -834,19 +857,24 @@ class ShareBars(QWidget):
         self._available = True
         self._reason = None
         self._sync_message()
+        self._place_content()
         self.update()
 
     def set_reconciliation(self, text: str | None) -> None:
         self._reconciliation = _require_optional_text(text, "reconciliation")
+        self._reconciliation_label.setText(self._reconciliation or "")
+        self._place_content()
         self.update()
 
     def set_unavailable(self, reason: str) -> None:
         reason = _require_text(reason, "reason")
         self._rows = ()
         self._reconciliation = None
+        self._reconciliation_label.clear()
         self._available = False
         self._reason = reason
         self._sync_message()
+        self._place_content()
         self.update()
 
     def fractions(self) -> tuple[tuple[str, float], ...]:
@@ -870,11 +898,46 @@ class ShareBars(QWidget):
         self._message.setText(text)
         self._message.setVisible(bool(text))
 
-    def _place_message(self) -> None:
+    def _row_height(self) -> int:
+        return max(theme.BAR_HEIGHT + self.fontMetrics().height() + 4, 14)
+
+    def _annotation_top(self) -> int:
+        metrics = self.fontMetrics()
+        return (theme.PLOT_MARGIN + metrics.ascent() + metrics.height()
+                + len(self._rows) * self._row_height())
+
+    def heightForWidth(self, width: int) -> int:
+        annotation_height = 0
+        if self._available and self._reconciliation is not None:
+            annotation_height = self._reconciliation_label.heightForWidth(
+                max(1, width - 2 * theme.PLOT_MARGIN)
+            )
+        return max(150, self._annotation_top() + annotation_height + theme.PLOT_MARGIN)
+
+    def sizeHint(self) -> QSize:
+        return QSize(280, self.heightForWidth(280))
+
+    def minimumSizeHint(self) -> QSize:
+        return QSize(
+            self.fontMetrics().horizontalAdvance(_SHARE_CAPTION) + 2 * theme.PLOT_MARGIN,
+            self.heightForWidth(self.width()),
+        )
+
+    def _place_content(self) -> None:
+        margin = theme.PLOT_MARGIN
+        annotation = self._reconciliation_label
+        width = max(1, self.width() - 2 * margin)
+        annotation.setGeometry(margin, self._annotation_top(), width,
+                               max(0, annotation.heightForWidth(width)))
+        annotation.setVisible(self._available and self._reconciliation is not None)
+        # Layout minima must follow the current row count and wrapped text, so
+        # a parent either allocates the full panel or exposes a scroll path.
+        self.setMinimumHeight(self.heightForWidth(self.width()))
+        self.updateGeometry()
         self._message.setGeometry(0, 0, self.width(), self.height())
 
     def resizeEvent(self, event: QResizeEvent) -> None:  # type: ignore[override]
-        self._place_message()
+        self._place_content()
         super().resizeEvent(event)
         self.update()
 
@@ -892,10 +955,10 @@ class ShareBars(QWidget):
                 QPointF(float(theme.PLOT_MARGIN), float(theme.PLOT_MARGIN + metrics.ascent())),
                 _SHARE_CAPTION,
             )
-            if not self._available or not self._rows:
+            if not self._available:
                 return
             fractions = self.fractions()
-            row_height = max(theme.BAR_HEIGHT + metrics.height() + 4, 14)
+            row_height = self._row_height()
             y = float(theme.PLOT_MARGIN + metrics.ascent() + metrics.height())
             bar_area = max(1.0, self.width() - 2.0 * theme.PLOT_MARGIN)
             for (label, _total), (_, fraction) in zip(self._rows, fractions):
@@ -917,12 +980,6 @@ class ShareBars(QWidget):
                     )
                 )
                 y += row_height
-            if self._reconciliation is not None:
-                painter.setPen(theme.MUTED_COLOR)
-                painter.drawText(
-                    QPointF(float(theme.PLOT_MARGIN), y + metrics.ascent()),
-                    self._reconciliation,
-                )
         finally:
             painter.end()
 

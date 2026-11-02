@@ -1742,6 +1742,56 @@ def test_share_error_keeps_task_lane_and_marks_dependent_values_unavailable(qtbo
     assert "; share: disk split refused" in label(window, "detail_state").text()
 
 
+@pytest.mark.parametrize("fresh", [False, True])
+def test_total_gutter_is_unavailable_on_share_failure_then_recovers(
+    qtbot, monkeypatch, fresh
+) -> None:
+    task, devices = series_points()
+    series = Series(1, SINCE_BOOT, "raw", task, devices, (), coverage())
+    total = app_total(1, "unit:/alpha.service", "Alpha", 200)
+    service = FakeQueryService([total], {1: disk_share(1, task_total=200)},
+                               series={1: series})
+    failure = WindowUnavailableError("not_retained", "disk split refused")
+    if fresh:
+        service.share_error = failure
+    window = AppIoWindow(service, BOOT, END)
+    qtbot.addWidget(window)
+    window.show()
+    if not fresh:
+        service.share_error = failure
+        window.refresh()
+
+    # Observe the actual painted gutter, not just a new availability flag.
+    drawn = []
+    original = QPainter.drawText
+
+    def record(painter, *args):
+        if args and isinstance(args[-1], str):
+            drawn.append(args[-1])
+        return original(painter, *args)
+
+    monkeypatch.setattr(QPainter, "drawText", record)
+    chart = window._total_chart
+    chart.grab()
+    assert "r unavailable · w unavailable" in drawn
+    assert "r 0 B · w 0 B" not in drawn
+    assert "r 100 B · w 100 B" not in drawn
+    assert chart.is_available() is True and chart.segments()
+
+    # Measured zero is different from unavailable, and a later nonzero total
+    # comes from the exact share result rather than retained series samples.
+    service.share_error = None
+    for measured, expected in [(0, "r 0 B · w 0 B"),
+                               (600, "r 300 B · w 300 B")]:
+        service.set_share(1, disk_share(1, task_total=measured))
+        window.refresh()
+        drawn.clear()
+        chart.grab()
+        assert expected in drawn
+        assert "r unavailable · w unavailable" not in drawn
+        assert chart.is_available() is True and chart.segments()
+
+
 def test_series_failure_and_empty_series_are_distinct(qtbot) -> None:
     totals = [app_total(1, "unit:/alpha.service", "Alpha", 200, peak_bps=0)]
     share = disk_share(1, task_total=200)
@@ -2138,7 +2188,7 @@ def test_later_ticks_update_coverage_device_strip_and_reconciliation(qtbot) -> N
     bars = window._share_bars
     first = bars._reconciliation
     assert first is not None
-    assert "200 B attributed + (0 B) residual = 200 B total" in first
+    assert first == "Σ disks 200 B + residual (0 B) = 200 B total"
     assert "gaps: 0" in label(window, "coverage_label").text()
 
     # Same attributed rows, a different residual: the annotation changes even
@@ -2146,9 +2196,9 @@ def test_later_ticks_update_coverage_device_strip_and_reconciliation(qtbot) -> N
     service.set_share(1, disk_share(1, task_total=220, residual_total=20))
     window.refresh()
     assert window._overview_model is not None
-    assert bars._reconciliation == window._overview_model.reconciliation
+    assert bars._reconciliation == "Σ disks 200 B + residual (20 B) = 220 B total"
     assert bars._reconciliation != first
-    assert "+20 B" in bars._reconciliation
+    assert "(20 B)" in bars._reconciliation
     assert "220 B total" in bars._reconciliation
 
     # Coverage is not frozen at the first frame.
@@ -2172,6 +2222,27 @@ def test_later_ticks_update_coverage_device_strip_and_reconciliation(qtbot) -> N
     reason = label(window, "device_reason")
     assert reason.text() == "device attribution unavailable: not_retained"
     assert reason.isVisible() is True
+
+
+@pytest.mark.parametrize("residual", [200, 0, -20, None])
+def test_share_panel_uses_its_own_exact_signed_equation(qtbot, residual) -> None:
+    total = app_total(1, "unit:/alpha.service", "Alpha", 200)
+    share = disk_share(1, task_total=200, residual_total=residual)
+    window, _ = build(qtbot, [total], {1: share})
+    expected = None if residual is None else (
+        f"Σ disks {format_bytes(share.device_total_bytes)} + residual "
+        f"({format_bytes(residual)}) = 200 B total"
+    )
+    assert window._share_bars._reconciliation == expected
+    if residual == 200:
+        assert window._share_bars.fractions() == ()
+        annotation = window._share_bars.findChild(QLabel, "share_reconciliation")
+        assert annotation is not None and annotation.isVisible()
+        assert annotation.text() == expected
+    if residual is not None:
+        # Preserve the separate render-model / residual-strip contract.
+        assert window._overview_model.reconciliation.startswith("Residual:")
+        assert label(window, "residual_value").text().startswith("Residual:")
 
 
 def test_ranking_delegate_draws_bar_and_reserves_its_height(qtbot) -> None:

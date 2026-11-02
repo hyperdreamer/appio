@@ -171,6 +171,20 @@ def _share_unavailable_reason(model: OverviewModel) -> str:
     return share.coverage.unavailable_reason or share.coverage.device_state
 
 
+def _share_reconciliation_text(model: OverviewModel) -> str | None:
+    """The panel's compact §7 equation, not the residual-strip annotation."""
+
+    share = model.share
+    if (share is None or not _device_available(share)
+            or share.residual_total is None):
+        return None
+    return (
+        f"Σ disks {format_bytes(share.device_total_bytes)} + residual "
+        f"({format_bytes(share.residual_total)}) = "
+        f"{format_bytes(share.task_total_bytes)} total"
+    )
+
+
 def _share_rows(model: OverviewModel) -> tuple[tuple[str, int], ...] | None:
     """Every attributed share row, in contract order, or ``None`` if withheld."""
 
@@ -488,6 +502,7 @@ class AppIoWindow(QMainWindow):
         page = QWidget()
         layout = QVBoxLayout(page)
         layout.addWidget(self.files_view, 1)
+        self.files_view.setVisible(False)
 
         self.files_message = QLabel("")
         self.files_message.setObjectName("files_message")
@@ -608,6 +623,7 @@ class AppIoWindow(QMainWindow):
             return
         self._has_frame = False
         self._overview_body.setVisible(False)
+        self.files_view.setVisible(False)
 
     # -- Files scope ownership --------------------------------------------
 
@@ -621,6 +637,7 @@ class AppIoWindow(QMainWindow):
         if subject is not None:
             self.files_view.set_app_id(subject, request=False)
         self.files_view.set_window(window)
+        self.files_view.setVisible(True)
         # Adoption already issued its one query when the scope changed; the
         # flush is only needed for the unchanged-scope deferred request.
         self.files_view.flush_refresh()
@@ -902,6 +919,8 @@ class AppIoWindow(QMainWindow):
                     self._total_chart.set_task_points(model.task_points)
                 if totals is not None:
                     self._total_chart.set_totals(*totals)
+                else:
+                    self._total_chart.set_totals_unavailable()
 
         lanes_changed = (
             previous is None
@@ -961,14 +980,18 @@ class AppIoWindow(QMainWindow):
 
         rows = _share_rows(model)
         old_rows = _share_rows(previous) if previous is not None else None
+        reconciliation = _share_reconciliation_text(model)
+        old_reconciliation = (
+            _share_reconciliation_text(previous) if previous is not None else None
+        )
         if previous is None or rows != old_rows:
             if rows is None:
                 self._share_bars.set_unavailable(_share_unavailable_reason(model))
             else:
                 self._share_bars.set_rows(rows)
-                self._share_bars.set_reconciliation(model.reconciliation)
-        elif previous is not None and previous.reconciliation != model.reconciliation:
-            self._share_bars.set_reconciliation(model.reconciliation)
+                self._share_bars.set_reconciliation(reconciliation)
+        elif old_reconciliation != reconciliation:
+            self._share_bars.set_reconciliation(reconciliation)
 
     def _render_unavailable(self, reason: str) -> None:
         """Install one unavailable state: no list, no subject, five KPIs."""

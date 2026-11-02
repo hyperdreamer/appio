@@ -43,6 +43,7 @@ from PyQt6.QtWidgets import (
     QMainWindow,
     QPushButton,
     QRadioButton,
+    QScrollArea,
     QVBoxLayout,
     QWidget,
 )
@@ -547,7 +548,14 @@ class CollectorWindow(QMainWindow):
         self.files_open_settings = self._view.files_open_settings
         self.history_state = self._view.history_state
         self.files_view.state_changed.connect(self._render_files_message)
-        outer.addWidget(self._view, 1)
+        # The persistent console can be taller than a small desktop. Preserve
+        # each panel's useful minimum size, but scroll instead of growing the
+        # top-level shell beyond its requested 620-pixel height.
+        console_scroll = QScrollArea(central)
+        console_scroll.setObjectName("console_scroll")
+        console_scroll.setWidgetResizable(True)
+        console_scroll.setWidget(self._view)
+        outer.addWidget(console_scroll, 1)
 
         self.setCentralWidget(central)
         self.resize(980, 620)
@@ -630,6 +638,10 @@ class CollectorWindow(QMainWindow):
             text = f"appio: {error}"
         self.files_message.setText(text or "")
         self.files_message.setVisible(text is not None)
+        # A caption does not make an idle table unavailable: before the first
+        # applied frame there is no numeric Files surface to show. Pending
+        # replacement windows retain the previously displayed table.
+        self.files_view.setVisible(self._displayed is not None)
 
     def _sync_files(self, *, request: bool = False) -> None:
         window = self._displayed
@@ -953,7 +965,7 @@ class CollectorWindow(QMainWindow):
             payload = ProbePayload(facts, None, ticket, generation)
         except BaseException as error:
             payload = ProbePayload(
-                None, str(error) or type(error).__name__, ticket, generation
+                None, str(error).strip() or type(error).__name__, ticket, generation
             )
         try:
             self._probe_bridge.delivered.emit(payload)
