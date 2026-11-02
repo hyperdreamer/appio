@@ -578,6 +578,249 @@ def test_coverage_counts_do_not_invent_chart_breaks(qtbot) -> None:
     assert [column.starts_run for column in contiguous.columns()] == [True] + [False] * 5
 
 
+def test_downsampled_column_rate_divides_by_observed_durations_across_hole(
+    qtbot,
+) -> None:
+    chart = make_chart(DualSeriesChart, qtbot, width=200, height=180)
+    budget = width_of(chart.plot_rect())
+    assert budget == 40
+
+    # Every retained bucket is identical, so every honestly downsampled column
+    # has the same rate and must reach its own full half-height.
+    full = [
+        task_point(BASE_NS + index * BUCKET_NS, read_bytes=1024, write_bytes=512)
+        for index in range(3 * budget)
+    ]
+    # Drop the middle bucket of the first column: its neighbours keep their
+    # bytes and share one pixel column across a real one-bucket hole. That
+    # column's envelope is three buckets wide, but its contributors were only
+    # ever observed for two of them.
+    points = tuple(full[:1] + full[2:])
+    chart.set_task_points(points)
+
+    columns = chart.columns()
+    assert len(columns) == budget
+    mixed = columns[0]
+    assert mixed.starts_run is True
+    assert mixed.end_mono_ns - mixed.start_mono_ns == 3 * BUCKET_NS
+    assert (
+        sum(
+            1
+            for point in points
+            if mixed.start_mono_ns <= point.bucket_start_mono_ns < mixed.end_mono_ns
+        )
+        == 2
+    )
+    assert (mixed.read_bytes, mixed.write_bytes) == (2048, 1024)
+
+    plot = chart.plot_rect()
+    _, top, _, bottom = plot
+    centre = (top + bottom) / 2.0
+    tolerance = 1e-6
+    segments = chart.segments()
+    assert_closed_finite_polygons(segments)
+    assert_inside_plot(segments, plot)
+
+    # Averaging over the summed observed durations keeps the isolated bucket
+    # before the hole at the full rate. Dividing by the envelope would leave
+    # the first run - the one built only from that mixed column - two thirds
+    # tall, at a height strictly between the centre line and the plot edge.
+    for segment in segments:
+        ys = [y for _, y in segment.polygon]
+        if segment.side == "read":
+            assert min(ys) == pytest.approx(top, abs=tolerance), segment
+            assert all(
+                min(abs(y - top), abs(y - centre)) <= tolerance for y in ys
+            ), segment
+        else:
+            assert max(ys) == pytest.approx(bottom, abs=tolerance), segment
+            assert all(
+                min(abs(y - bottom), abs(y - centre)) <= tolerance for y in ys
+            ), segment
+
+
+def test_downsampling_bins_points_by_the_full_time_extent(qtbot) -> None:
+    chart = make_chart(DualSeriesChart, qtbot, width=200, height=180)
+    budget = width_of(chart.plot_rect())
+    assert budget == 40
+
+    count = 127
+    assert count > budget
+    points = tuple(
+        task_point(
+            BASE_NS + index * BUCKET_NS,
+            read_bytes=index + 1,
+            write_bytes=3 * (index + 1),
+        )
+        for index in range(count)
+    )
+    chart.set_task_points(points)
+
+    # Section 6.2: bin = min(W - 1, ((start - first_start) * W) //
+    # (last_end - first_start)). With 127 buckets over 40 columns the exact
+    # read prefix below follows from including the final bucket's end in the
+    # denominator; a start-only denominator shifts 26 of the 40 columns.
+    expected_read = [
+        10, 18, 27, 36, 45, 74, 66, 75, 84, 93,
+        102, 150, 123, 132, 141, 150, 159, 226, 180, 189,
+        198, 207, 290, 228, 237, 246, 255, 264, 366, 285,
+        294, 303, 312, 321, 442, 342, 351, 360, 369, 378,
+    ]
+    expected_write = [3 * value for value in expected_read]
+
+    columns = chart.columns()
+    assert len(columns) == budget
+    assert [column.read_bytes for column in columns] == expected_read
+    assert [column.write_bytes for column in columns] == expected_write
+    # Every point contributes to exactly one column.
+    assert sum(expected_read) == count * (count + 1) // 2
+
+
+def test_empty_bins_emit_no_zero_byte_columns(qtbot) -> None:
+    chart = make_chart(DualSeriesChart, qtbot, width=200, height=180)
+    plot = chart.plot_rect()
+    budget = width_of(plot)
+    assert budget == 40
+
+    # Twenty-five contiguous buckets, a long recorded gap, then twenty-five
+    # more. The gap is unmeasured time, not a run of measured-zero buckets.
+    slots = [*range(25), *range(250, 275)]
+    points = tuple(
+        task_point(
+            BASE_NS + slot * BUCKET_NS,
+            read_bytes=slot + 1,
+            write_bytes=2 * (slot + 1),
+        )
+        for slot in slots
+    )
+    assert len(points) > budget
+    chart.set_task_points(points)
+
+    columns = chart.columns()
+    # Only bins 0..3 and 36..39 hold retained buckets; the other 32 bins are
+    # holes and must not become synthetic columns.
+    assert len(columns) == 8
+    assert len(columns) <= budget
+    assert [column.read_bytes for column in columns] == [
+        28,
+        77,
+        126,
+        94,
+        1265,
+        1813,
+        1862,
+        1635,
+    ]
+    assert [column.write_bytes for column in columns] == [
+        56,
+        154,
+        252,
+        188,
+        2530,
+        3626,
+        3724,
+        3270,
+    ]
+    assert all(column.read_bytes > 0 and column.write_bytes > 0 for column in columns)
+    assert sum(column.read_bytes for column in columns) == sum(
+        point.read_bytes for point in points
+    )
+    # The unmeasured gap stays a gap between columns; nothing fills it.
+    assert [column.starts_run for column in columns] == (
+        [True] + [False] * 3 + [True] + [False] * 3
+    )
+    assert columns[4].start_mono_ns - columns[3].end_mono_ns == 225 * BUCKET_NS
+
+
+def test_device_points_map_rbytes_to_read_and_wbytes_to_write(qtbot) -> None:
+    lane = make_chart(DeviceLane, qtbot)
+    lane.set_device("8:0")
+    device = (
+        device_point(BASE_NS, rbytes=7000, wbytes=11),
+        device_point(BASE_NS + BUCKET_NS, rbytes=500, wbytes=90000),
+        device_point(BASE_NS + 2 * BUCKET_NS, rbytes=0, wbytes=0),
+    )
+    lane.set_device_points(device)
+
+    columns = lane.columns()
+    assert len(columns) == len(device)
+    assert [column.read_bytes for column in columns] == [7000, 500, 0]
+    assert [column.write_bytes for column in columns] == [11, 90000, 0]
+    assert sum(column.read_bytes for column in columns) == 7500
+    assert sum(column.write_bytes for column in columns) == 90011
+
+
+def test_setters_reject_wrong_point_types_unordered_points_and_invalid_totals(
+    qtbot,
+) -> None:
+    task, device = chart_points(4)
+
+    class DuckSeriesPoint:
+        """Structurally plausible, but not a contract SeriesPoint."""
+
+        bucket_start_mono_ns = BASE_NS
+        bucket_secs = BUCKET_SECS
+        read_bytes = 1
+        write_bytes = 1
+        peak_read_bps = None
+        peak_write_bps = None
+        spans_suspend = False
+
+    class DuckDevicePoint:
+        """Structurally plausible, but not a contract DeviceSeriesPoint."""
+
+        bucket_start_mono_ns = BASE_NS
+        bucket_secs = BUCKET_SECS
+        dev = "8:0"
+        rbytes = 1
+        wbytes = 1
+
+    chart = make_chart(SeriesChart, qtbot)
+    chart.set_task_points(task)
+    assert len(chart.columns()) == len(task)
+    for wrong in (DuckSeriesPoint(), device[0], object()):
+        with pytest.raises(ValueError):
+            chart.set_task_points((wrong,))  # type: ignore[arg-type]
+    # Equal starts are non-increasing; an overlong bucket overlaps its successor.
+    with pytest.raises(ValueError):
+        chart.set_task_points((task[0], task[0]))
+    with pytest.raises(ValueError):
+        chart.set_task_points((task[1], task[0]))
+    with pytest.raises(ValueError):
+        chart.set_task_points(
+            (task_point(BASE_NS, bucket_secs=20), task_point(BASE_NS + BUCKET_NS))
+        )
+
+    lane = make_chart(DeviceLane, qtbot)
+    lane.set_device_points(device)
+    assert len(lane.columns()) == len(device)
+    for wrong in (DuckDevicePoint(), task[0], object()):
+        with pytest.raises(ValueError):
+            lane.set_device_points((wrong,))  # type: ignore[arg-type]
+    with pytest.raises(ValueError):
+        lane.set_device_points((device[0], device[0]))
+    with pytest.raises(ValueError):
+        lane.set_device_points((device[1], device[0]))
+    with pytest.raises(ValueError):
+        lane.set_device_points(
+            (
+                DeviceSeriesPoint(BASE_NS, 20, "8:0", 1, 1),
+                DeviceSeriesPoint(BASE_NS + BUCKET_NS, 10, "8:0", 1, 1),
+            )
+        )
+
+    dual = make_chart(DualSeriesChart, qtbot)
+    dual.set_totals(0, 0)  # measured zero is a value
+    with pytest.raises(ValueError):
+        dual.set_totals(-1, 0)
+    with pytest.raises(ValueError):
+        dual.set_totals(0, -1)
+
+    with pytest.raises(ValueError):
+        lane.set_device("")
+    lane.set_device("8:1")
+
+
 # --------------------------------------------------------------------------
 # Composition widgets
 # --------------------------------------------------------------------------

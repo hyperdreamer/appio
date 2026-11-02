@@ -732,6 +732,50 @@ def test_build_overview_limits_device_lanes_and_counts_more() -> None:
     assert all(lane.dev != "8:9" for lane in model.device_lanes)
 
 
+def test_build_overview_requires_available_device_coverage_in_series_and_share() -> None:
+    task, devices = series_points()
+    total = app_total(1, "unit:/alpha.service", "Alpha", 200, peak_bps=100)
+    share = disk_share(1, window=SINCE_BOOT, task_total=200)
+    assert share.coverage.device_state == "available"
+
+    available = Series(1, SINCE_BOOT, "raw", task, devices, (), coverage())
+    model = build_overview(1, SINCE_BOOT, total, available, share)
+    assert [lane.dev for lane in model.device_lanes] == ["8:0"]
+
+    # Section 2.2: lanes need available attribution in *both* successful
+    # coverages. An attributed share cannot make an unattributed series
+    # drawable, even when that series still carries device points.
+    unattributed = Series(
+        1,
+        SINCE_BOOT,
+        "raw",
+        task,
+        devices,
+        (),
+        coverage(complete=False, device_state="incomplete"),
+    )
+    model = build_overview(1, SINCE_BOOT, total, unattributed, share)
+    assert model.device_lanes == ()
+    assert model.more_devices == 0
+    # Only the lanes are withheld: the task points and the share's DEVICE
+    # total stay independently measured.
+    assert model.task_points == task
+    assert model.kpis[4].text == format_bytes(share.device_total_bytes)
+
+    # The converse: an attributed series cannot rescue an unattributed share,
+    # whose undefined device total also fails the lane condition.
+    incomplete_share = disk_share(
+        1,
+        window=SINCE_BOOT,
+        task_total=200,
+        residual_total=None,
+        cov=coverage(complete=False, device_state="incomplete"),
+    )
+    model = build_overview(1, SINCE_BOOT, total, available, incomplete_share)
+    assert model.device_lanes == ()
+    assert model.more_devices == 0
+
+
 def test_build_overview_reconciles_only_available_device_attribution() -> None:
     task, devices = series_points()
     series = Series(1, SINCE_BOOT, "raw", task, devices, (), coverage())
