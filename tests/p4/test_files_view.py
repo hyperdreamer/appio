@@ -55,6 +55,11 @@ BOOT = "11111111-2222-4333-8444-555555555555"
 END = 7_200_000_000_000
 WINDOW = Window(kind="since_boot", boot_id=BOOT, end_mono_ns=END)
 NEXT_WINDOW = Window(kind="since_boot", boot_id=BOOT, end_mono_ns=2 * END)
+#: A destination with a different *kind*, so a footer label cannot accidentally
+#: agree with the displayed scope when a pending scope is not adopted.
+RANGE_WINDOW = Window(
+    kind="range", boot_id=BOOT, start_mono_ns=3_600_000_000_000, end_mono_ns=END
+)
 
 HOOKS = (
     "vfs_read",
@@ -1632,3 +1637,295 @@ def test_empty_choice_union_retires_subject_and_notifies_once(qtbot):
     assert changes == [1, None]
     view.flush_refresh()
     assert len(router.requests) == requests
+
+
+# --------------------------------------------------------------------------- #
+# Closed views, footer destination, flush gates, choice failures and no-op
+# entry points (spec 5.1-5.4 rules that had no failing witness)
+# --------------------------------------------------------------------------- #
+
+
+def test_a_closed_view_ignores_deliveries_and_schedules_no_replacement(qtbot):
+    view, router = published_view(qtbot, rows=(file_row(basename="kept.txt"),))
+    router.defer = True
+    outstanding = deferred_request(view, router)
+    before = preserved(view)
+    requests = len(router.requests)
+
+    view.close()
+    assert view._closed is True
+
+    # A success that drains after close neither publishes, clears nor mutates
+    # any Qt state, and the closed view has not released its slot (spec 5.4).
+    outstanding.set_result(file_view((file_row(basename="late.txt"),)))
+    assert preserved(view) == before
+    assert view._outstanding is True
+    assert len(router.requests) == requests
+
+    # Retiring that slot must not ask for a replacement on a closed view.
+    view.retire_deliveries()
+    assert view.refresh_wanted() is False
+    assert view._outstanding is False
+
+    # A flag raised after close is never consumed and never reaches the router.
+    view.set_scope_ready(False)
+    view.set_sort("writes", "asc")
+    assert view.refresh_wanted() is True
+    view.set_scope_ready(True)
+    ready_calls = len(router.ready_calls)
+    view.flush_refresh()
+    assert view.refresh_wanted() is True
+    assert len(router.ready_calls) == ready_calls
+    assert len(router.requests) == requests
+
+    # The single failure boundary is closed too: no clear, label change or
+    # unavailable state is allowed once the view is closed.
+    state = view.state
+    view._handle_failure("file_source_unavailable", "late failure")
+    assert view.state == state
+    assert preserved(view) == before
+
+
+def test_set_updating_scope_names_the_destination_without_adopting_it(qtbot):
+    view, router = published_view(qtbot, rows=(file_row(basename="kept.txt"),))
+    before = preserved(view)
+    requests = len(router.requests)
+    ranks = len(router.ranking_calls)
+
+    view.set_scope_ready(False)
+    view.set_sort("reads", "asc")  # deferred: a destination is pending
+    view.set_updating_scope(RANGE_WINDOW)
+
+    # Only the footer destination changes: the displayed scope is not adopted,
+    # no deferred frame is recorded and nothing is retained or queried.
+    assert view._window is WINDOW
+    assert view._deferred_window is None
+    assert view.files_updating.text() == f"updating to {RANGE_WINDOW.kind}"
+    assert view.files_updating.isVisible() is True
+    assert preserved(view) == before
+    assert len(router.requests) == requests
+    assert len(router.ranking_calls) == ranks
+
+    # With no explicit destination the label falls back to the displayed kind.
+    view.set_updating_scope(None)
+    assert view.files_updating.text() == f"updating to {WINDOW.kind}"
+    assert view._window is WINDOW
+
+    # The admitted attempt still targets the displayed scope, never the label.
+    view.set_scope_ready(True)
+    view.flush_refresh()
+    assert router.requests[-1][1] == WINDOW
+
+
+def test_flush_refresh_retains_the_flag_when_the_attempt_is_not_admissible(qtbot):
+    view, router = published_view(qtbot, rows=(file_row(basename="kept.txt"),))
+    requests = len(router.requests)
+
+    # Nothing was deferred: a flush reads the source and issues nothing.
+    ready_calls = len(router.ready_calls)
+    view.flush_refresh()
+    assert view.refresh_wanted() is False
+    assert len(router.ready_calls) == ready_calls
+    assert len(router.requests) == requests
+
+    # Admission closed: the flag survives and readiness is never consulted.
+    view.set_scope_ready(False)
+    view.set_sort("reads", "asc")
+    view.flush_refresh()
+    assert view.refresh_wanted() is True
+    assert len(router.ready_calls) == ready_calls
+    assert len(router.requests) == requests
+
+    # Admission restored but the source is not ready: still no attempt.
+    view.set_scope_ready(True)
+    router.ready_scope = False
+    view.flush_refresh()
+    assert view.refresh_wanted() is True
+    assert router.ready_calls[-1] == WINDOW
+    assert len(router.requests) == requests
+
+    # A ready source admits exactly one attempt and consumes the flag then.
+    router.ready_scope = True
+    view.flush_refresh()
+    assert len(router.requests) == requests + 1
+    assert view.refresh_wanted() is False
+
+
+def test_flush_refresh_without_a_window_or_subject_keeps_the_deferred_flag(qtbot):
+    # No window has been adopted yet: the flag waits for one and is not lost.
+    router = FakeRouter(ranking_rows=APPS)
+    view = build(qtbot, router)
+    view.set_scope_ready(False)
+    view.set_sort("reads", "asc")
+    view.set_scope_ready(True)
+    view.flush_refresh()
+    assert view._window is None
+    assert view.refresh_wanted() is True
+    assert router.requests == []
+    assert router.ready_calls == []
+
+    # A window whose available union is genuinely empty has no subject.
+    router = FakeRouter(ranking_rows=())
+    view = build(qtbot, router)
+    view.set_window(WINDOW)
+    assert view._window == WINDOW and view._app_id is None
+    view.set_scope_ready(False)
+    view.set_sort("reads", "asc")
+    view.set_scope_ready(True)
+    view.flush_refresh()
+    assert view.refresh_wanted() is True
+    assert router.requests == []
+    assert router.ready_calls == []
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "fragment"),
+    (
+        ({"ranking_error": RuntimeError("ranking broke")}, "ranking broke"),
+        (
+            {
+                # A usable ranking would otherwise make the failure look like a
+                # success for the file-only population it could not read.
+                "ranking_rows": APPS,
+                "local_applications": (("unit:retained.service", "retained", 512),),
+                "registry_ids": {"unit:retained.service": 41},
+                "choice_error": OSError("local state unreadable"),
+            },
+            "local state unreadable",
+        ),
+    ),
+    ids=("ranking", "file-only"),
+)
+def test_a_choice_read_failure_is_terminal_unavailable_not_an_empty_success(
+    qtbot, kwargs, fragment
+):
+    router = FakeRouter(**kwargs)
+    view = build(qtbot, router)
+    view.set_window(WINDOW)
+
+    assert view.state == "unavailable"
+    assert fragment in view.state_label.text()
+    assert view.model.rowCount() == 0
+    assert view.app_selector.count() == 0
+    assert router.requests == []
+    assert not any(character.isdigit() for character in footer_text(view))
+
+
+def test_a_choice_read_failure_inside_a_transient_scope_defers_one_refresh(qtbot):
+    router = FakeRouter(
+        ranking_rows=APPS, result=file_view((file_row(basename="kept.txt"),))
+    )
+    view = build(qtbot, router)
+    view.set_window(WINDOW)
+    before = preserved(view)
+
+    router.ranking_error = RuntimeError("ranking broke")
+    with view.transient_scope():
+        view.set_window(WINDOW)
+
+    # Same classification boundary as a failed delivery: preserve and defer.
+    assert preserved(view) == before
+    assert view.state == "ready"
+    assert view.refresh_wanted() is True
+    requests = len(router.requests)
+    router.ranking_error = None
+    view.flush_refresh()
+    assert len(router.requests) == requests + 1
+    assert view.refresh_wanted() is False
+
+
+def test_subject_changed_is_emitted_only_when_the_subject_actually_changes(qtbot):
+    router = FakeRouter(
+        ranking_rows=APPS,
+        local_applications=(),
+        registry_ids={"unit:extra.service": 41},
+    )
+    view = build(qtbot, router)
+    changes: list = []
+    view.subject_changed.connect(changes.append)
+    view.set_window(WINDOW)
+    assert changes == [1]
+    requests = len(router.requests)
+
+    # Same Window and same union: the subject did not change, so no signal.
+    view.set_window(WINDOW)
+    view.set_window(WINDOW)
+    assert changes == [1]
+    assert len(router.requests) == requests
+
+    # Same Window and a grown union that keeps the current subject: still no
+    # signal and still no table query.
+    router.local_applications = (("unit:extra.service", "extra", 5),)
+    view.set_window(WINDOW)
+    assert view.app_selector.count() == 3
+    assert view.app_selector.currentData() == 1
+    assert changes == [1]
+    assert len(router.requests) == requests
+
+
+def test_a_success_while_pending_keeps_the_destination_and_owes_a_refresh(qtbot):
+    view, router = published_view(qtbot, rows=(file_row(basename="kept.txt"),))
+    router.defer = True
+    outstanding = deferred_request(view, router)
+    view.set_updating_scope(RANGE_WINDOW)  # the host names the pending scope
+    view.set_scope_ready(False)
+    assert view.refresh_wanted() is False
+
+    outstanding.set_result(file_view((file_row(basename="published.txt"),)))
+
+    # The valid success updates only its own still-displayed scope ...
+    assert [row[0] for row in texts(view)] == ["published.txt"]
+    assert view.last_result is not None
+    assert view._window is WINDOW
+    # ... and neither adopts the destination nor consumes the owed refresh.
+    assert view.refresh_wanted() is True
+    assert view.files_updating.text() == f"updating to {RANGE_WINDOW.kind}"
+    assert view.files_updating.isVisible() is True
+
+    # The owed refresh is a real deferred attempt, not a lost flag.
+    requests = len(router.requests)
+    view.set_scope_ready(True)
+    view.flush_refresh()
+    assert len(router.requests) == requests + 1
+    assert router.requests[-1][1] == WINDOW
+    assert view.refresh_wanted() is False
+
+
+def test_setting_the_same_app_id_is_a_no_op(qtbot):
+    view, router = published_view(qtbot, rows=(file_row(basename="kept.txt"),))
+    before = preserved(view)
+    requests = len(router.requests)
+
+    view.set_app_id(1)
+    view.set_app_id(1)
+    assert len(router.requests) == requests
+    assert preserved(view) == before
+    assert view._app_id == 1
+    assert view.refresh_wanted() is False
+
+    # ``request=False`` only synchronises; a same-ID call still changes nothing
+    # and defers no refresh for the frame owner (spec 5.2).
+    view.set_app_id(1, request=False)
+    assert len(router.requests) == requests
+    assert view.refresh_wanted() is False
+    assert preserved(view) == before
+
+
+def test_scope_classification_flags_reject_non_boolean_values(qtbot):
+    router = FakeRouter(ranking_rows=APPS)
+    view = build(qtbot, router)
+    view.set_window(WINDOW)
+
+    for value in (1, 0, "true", None, object()):
+        with pytest.raises(ValueError):
+            view.set_transient_scope(value)
+        with pytest.raises(ValueError):
+            view.set_scope_ready(value)
+
+    # The real booleans remain accepted and idempotent.
+    view.set_transient_scope(True)
+    view.set_transient_scope(False)
+    view.set_scope_ready(False)
+    view.set_scope_ready(True)
+    assert view._transient is False
+    assert view._scope_ready is True
