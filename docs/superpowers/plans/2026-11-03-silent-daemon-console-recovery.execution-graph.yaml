@@ -1,0 +1,358 @@
+schema_version: 1
+epoch: 1
+source_plan:
+  path: docs/superpowers/plans/2026-11-03-silent-daemon-console-recovery.md
+  sha256: ceda4be65c66c848120e8b97e86d38d9d2c749e131cae23566fd6c159c86c6b1
+  tasks: 7
+derivation:
+  lane_from: one sequential recovery lane; the plan declares no parallel lanes
+  ownership_from: plan Files allowlists
+  test_environment:
+    python: /data/home/henry-arch/.local/state/pi/project-manager/worktrees/ff4052076ce484e2c2a11776fd034304240f1c4457b5db14d60e70059561fa4a/pm-run-20261103-152922-b67facc0/venv/bin/python
+    env:
+      QT_QPA_PLATFORM: offscreen
+      PYTEST_QT_API: pyqt6
+      PYTHONDONTWRITEBYTECODE: '1'
+lanes:
+- id: recovery
+  task_ids:
+  - T-001
+  - T-002
+  - T-003
+  - T-004
+  - T-005
+  - T-006
+  - T-007
+  owns:
+  - src/appio/collector_owner.py
+  - src/appio/history_router.py
+  - src/appio/ui/collector_window.py
+  - src/appio/ui/files_view.py
+  - src/appio/ui/main_window.py
+  - src/appio/ui/render_model.py
+  - tests/p3/test_collector_owner.py
+  - tests/p3/test_collector_window.py
+  - tests/p4/test_file_history_router.py
+  - tests/test_ui.py
+interfaces:
+  produces:
+  - id: tick_local
+    signature: CollectorCoordinator.tick_local(self) -> bool
+    sha256: b663437a01b4c35272816417cf7c679dabf0eff41048102f5a85fe534e2faf5f
+  - id: history_key
+    signature: HistoryKey = tuple[OwnerKind, bool, bool, bool]
+    sha256: d723cca1ab497bf4c9867f64ba01a1e218956cab37ab7a4d647e8adba4603233
+  - id: daemon_error
+    signature: 'DaemonAnswerError(kind: Literal["remote_error","unavailable","rejected","transport","internal"],
+      reason: str)'
+    sha256: 5cb7370a841e98329cd6724c9ac6ae01fd839dd436c28a72828c418509089415
+  - id: local_in_flight
+    signature: HistoryRouter.local_read_in_flight -> bool
+    sha256: 9dc4375ec1f5bcb78a4d0a472550e376a2b73e0da061e53a801ec524c643572c
+  - id: coverage_diagnostic
+    signature: 'OverviewModel.coverage_diagnostic: str | None'
+    sha256: c8eb60630e0682752d54b8983241a0decaa2df06c5f300e33f1e94c5e40d5009
+  - id: build_overview
+    signature: 'build_overview(..., *, coverage_diagnostic: str | None = None) -> OverviewModel'
+    sha256: 172c2317ed5eb8ee7a0b65be748ef1ad5715e86a765691391493fba68cf046ab
+  - id: set_stalled
+    signature: 'FilesView.set_stalled(self, stalled: bool, text: str) -> None'
+    sha256: ea8b52085ccf9dbd21972b26d3ca5690b9929a8e15ceba1141542b2fb3f26e57
+  - id: silence_cause
+    signature: 'silence_cause(facts: ServiceFacts, client_state: ClientState | None) -> str | None'
+    sha256: f8e9b57a85e491e5c592a98344064ee92534445a37a94a70f47ec4481f96788d
+  consumes:
+  - id: tick_local
+    sha256: b663437a01b4c35272816417cf7c679dabf0eff41048102f5a85fe534e2faf5f
+  - id: history_key
+    sha256: d723cca1ab497bf4c9867f64ba01a1e218956cab37ab7a4d647e8adba4603233
+  - id: daemon_error
+    sha256: 5cb7370a841e98329cd6724c9ac6ae01fd839dd436c28a72828c418509089415
+  - id: local_in_flight
+    sha256: 9dc4375ec1f5bcb78a4d0a472550e376a2b73e0da061e53a801ec524c643572c
+  - id: coverage_diagnostic
+    sha256: c8eb60630e0682752d54b8983241a0decaa2df06c5f300e33f1e94c5e40d5009
+  - id: build_overview
+    sha256: 172c2317ed5eb8ee7a0b65be748ef1ad5715e86a765691391493fba68cf046ab
+  - id: set_stalled
+    sha256: ea8b52085ccf9dbd21972b26d3ca5690b9929a8e15ceba1141542b2fb3f26e57
+  - id: silence_cause
+    sha256: f8e9b57a85e491e5c592a98344064ee92534445a37a94a70f47ec4481f96788d
+produces:
+- id: tick_local
+  signature: CollectorCoordinator.tick_local(self) -> bool
+  sha256: b663437a01b4c35272816417cf7c679dabf0eff41048102f5a85fe534e2faf5f
+- id: history_key
+  signature: HistoryKey = tuple[OwnerKind, bool, bool, bool]
+  sha256: d723cca1ab497bf4c9867f64ba01a1e218956cab37ab7a4d647e8adba4603233
+- id: daemon_error
+  signature: 'DaemonAnswerError(kind: Literal["remote_error","unavailable","rejected","transport","internal"],
+    reason: str)'
+  sha256: 5cb7370a841e98329cd6724c9ac6ae01fd839dd436c28a72828c418509089415
+- id: local_in_flight
+  signature: HistoryRouter.local_read_in_flight -> bool
+  sha256: 9dc4375ec1f5bcb78a4d0a472550e376a2b73e0da061e53a801ec524c643572c
+- id: coverage_diagnostic
+  signature: 'OverviewModel.coverage_diagnostic: str | None'
+  sha256: c8eb60630e0682752d54b8983241a0decaa2df06c5f300e33f1e94c5e40d5009
+- id: build_overview
+  signature: 'build_overview(..., *, coverage_diagnostic: str | None = None) -> OverviewModel'
+  sha256: 172c2317ed5eb8ee7a0b65be748ef1ad5715e86a765691391493fba68cf046ab
+- id: set_stalled
+  signature: 'FilesView.set_stalled(self, stalled: bool, text: str) -> None'
+  sha256: ea8b52085ccf9dbd21972b26d3ca5690b9929a8e15ceba1141542b2fb3f26e57
+- id: silence_cause
+  signature: 'silence_cause(facts: ServiceFacts, client_state: ClientState | None) -> str | None'
+  sha256: f8e9b57a85e491e5c592a98344064ee92534445a37a94a70f47ec4481f96788d
+consumes:
+- id: tick_local
+  sha256: b663437a01b4c35272816417cf7c679dabf0eff41048102f5a85fe534e2faf5f
+- id: history_key
+  sha256: d723cca1ab497bf4c9867f64ba01a1e218956cab37ab7a4d647e8adba4603233
+- id: daemon_error
+  sha256: 5cb7370a841e98329cd6724c9ac6ae01fd839dd436c28a72828c418509089415
+- id: local_in_flight
+  sha256: 9dc4375ec1f5bcb78a4d0a472550e376a2b73e0da061e53a801ec524c643572c
+- id: coverage_diagnostic
+  sha256: c8eb60630e0682752d54b8983241a0decaa2df06c5f300e33f1e94c5e40d5009
+- id: build_overview
+  sha256: 172c2317ed5eb8ee7a0b65be748ef1ad5715e86a765691391493fba68cf046ab
+- id: set_stalled
+  sha256: ea8b52085ccf9dbd21972b26d3ca5690b9929a8e15ceba1141542b2fb3f26e57
+- id: silence_cause
+  sha256: f8e9b57a85e491e5c592a98344064ee92534445a37a94a70f47ec4481f96788d
+tasks:
+- id: T-001
+  plan_task: 1
+  title: Key coordinator history by selected source
+  implementer_tier: standard
+  lane: recovery
+  sequence: 1
+  depends_on: []
+  owns:
+  - src/appio/collector_owner.py
+  - tests/p3/test_collector_owner.py
+  - tests/p3/test_collector_window.py
+  resources: []
+  produces:
+  - id: history_key
+    sha256: d723cca1ab497bf4c9867f64ba01a1e218956cab37ab7a4d647e8adba4603233
+  - id: tick_local
+    sha256: b663437a01b4c35272816417cf7c679dabf0eff41048102f5a85fe534e2faf5f
+  consumes: []
+  validation:
+  - argv:
+    - /data/home/henry-arch/.local/state/pi/project-manager/worktrees/ff4052076ce484e2c2a11776fd034304240f1c4457b5db14d60e70059561fa4a/pm-run-20261103-152922-b67facc0/venv/bin/python
+    - -m
+    - pytest
+    - -q
+    - tests/p3/test_collector_owner.py
+    - tests/p3/test_collector_window.py
+    cwd: .
+    timeout_seconds: 1800
+    env:
+      QT_QPA_PLATFORM: offscreen
+      PYTEST_QT_API: pyqt6
+      PYTHONDONTWRITEBYTECODE: '1'
+- id: T-002
+  plan_task: 2
+  title: Separate daemon-answer errors from retention
+  implementer_tier: standard
+  lane: recovery
+  sequence: 2
+  depends_on:
+  - T-001
+  owns:
+  - src/appio/history_router.py
+  - tests/p4/test_file_history_router.py
+  resources: []
+  produces:
+  - id: daemon_error
+    sha256: 5cb7370a841e98329cd6724c9ac6ae01fd839dd436c28a72828c418509089415
+  - id: local_in_flight
+    sha256: 9dc4375ec1f5bcb78a4d0a472550e376a2b73e0da061e53a801ec524c643572c
+  consumes: []
+  validation:
+  - argv:
+    - /data/home/henry-arch/.local/state/pi/project-manager/worktrees/ff4052076ce484e2c2a11776fd034304240f1c4457b5db14d60e70059561fa4a/pm-run-20261103-152922-b67facc0/venv/bin/python
+    - -m
+    - pytest
+    - -q
+    - tests/p4/test_file_history_router.py
+    cwd: .
+    timeout_seconds: 1800
+    env:
+      QT_QPA_PLATFORM: offscreen
+      PYTEST_QT_API: pyqt6
+      PYTHONDONTWRITEBYTECODE: '1'
+- id: T-003
+  plan_task: 3
+  title: Compose typed diagnostics in Overview
+  implementer_tier: standard
+  lane: recovery
+  sequence: 3
+  depends_on:
+  - T-002
+  owns:
+  - src/appio/ui/render_model.py
+  - src/appio/ui/main_window.py
+  - tests/test_ui.py
+  resources: []
+  produces:
+  - id: coverage_diagnostic
+    sha256: c8eb60630e0682752d54b8983241a0decaa2df06c5f300e33f1e94c5e40d5009
+  - id: build_overview
+    sha256: 172c2317ed5eb8ee7a0b65be748ef1ad5715e86a765691391493fba68cf046ab
+  consumes:
+  - id: daemon_error
+    sha256: 5cb7370a841e98329cd6724c9ac6ae01fd839dd436c28a72828c418509089415
+  validation:
+  - argv:
+    - /data/home/henry-arch/.local/state/pi/project-manager/worktrees/ff4052076ce484e2c2a11776fd034304240f1c4457b5db14d60e70059561fa4a/pm-run-20261103-152922-b67facc0/venv/bin/python
+    - -m
+    - pytest
+    - -q
+    - tests/test_ui.py
+    cwd: .
+    timeout_seconds: 1800
+    env:
+      QT_QPA_PLATFORM: offscreen
+      PYTEST_QT_API: pyqt6
+      PYTHONDONTWRITEBYTECODE: '1'
+- id: T-004
+  plan_task: 4
+  title: Add observed systemd causes beneath the state banner
+  implementer_tier: advanced
+  lane: recovery
+  sequence: 4
+  depends_on:
+  - T-003
+  owns:
+  - src/appio/ui/collector_window.py
+  - src/appio/collector_owner.py
+  - tests/p3/test_collector_window.py
+  - tests/test_ui.py
+  resources: []
+  produces:
+  - id: silence_cause
+    sha256: f8e9b57a85e491e5c592a98344064ee92534445a37a94a70f47ec4481f96788d
+  consumes: []
+  validation:
+  - argv:
+    - /data/home/henry-arch/.local/state/pi/project-manager/worktrees/ff4052076ce484e2c2a11776fd034304240f1c4457b5db14d60e70059561fa4a/pm-run-20261103-152922-b67facc0/venv/bin/python
+    - -m
+    - pytest
+    - -q
+    - tests/p3/test_collector_window.py
+    - tests/test_ui.py
+    cwd: .
+    timeout_seconds: 1800
+    env:
+      QT_QPA_PLATFORM: offscreen
+      PYTEST_QT_API: pyqt6
+      PYTHONDONTWRITEBYTECODE: '1'
+- id: T-005
+  plan_task: 5
+  title: Add a caption-only Files stall override
+  implementer_tier: standard
+  lane: recovery
+  sequence: 5
+  depends_on:
+  - T-004
+  owns:
+  - src/appio/ui/files_view.py
+  - tests/test_ui.py
+  resources: []
+  produces:
+  - id: set_stalled
+    sha256: ea8b52085ccf9dbd21972b26d3ca5690b9929a8e15ceba1141542b2fb3f26e57
+  consumes: []
+  validation:
+  - argv:
+    - /data/home/henry-arch/.local/state/pi/project-manager/worktrees/ff4052076ce484e2c2a11776fd034304240f1c4457b5db14d60e70059561fa4a/pm-run-20261103-152922-b67facc0/venv/bin/python
+    - -m
+    - pytest
+    - -q
+    - tests/test_ui.py
+    cwd: .
+    timeout_seconds: 1800
+    env:
+      QT_QPA_PLATFORM: offscreen
+      PYTEST_QT_API: pyqt6
+      PYTHONDONTWRITEBYTECODE: '1'
+- id: T-006
+  plan_task: 6
+  title: Coalesce local sample invalidation until apply
+  implementer_tier: advanced
+  lane: recovery
+  sequence: 6
+  depends_on:
+  - T-005
+  owns:
+  - src/appio/ui/collector_window.py
+  - tests/p3/test_collector_window.py
+  resources: []
+  produces: []
+  consumes:
+  - id: tick_local
+    sha256: b663437a01b4c35272816417cf7c679dabf0eff41048102f5a85fe534e2faf5f
+  validation:
+  - argv:
+    - /data/home/henry-arch/.local/state/pi/project-manager/worktrees/ff4052076ce484e2c2a11776fd034304240f1c4457b5db14d60e70059561fa4a/pm-run-20261103-152922-b67facc0/venv/bin/python
+    - -m
+    - pytest
+    - -q
+    - tests/p3/test_collector_window.py
+    cwd: .
+    timeout_seconds: 1800
+    env:
+      QT_QPA_PLATFORM: offscreen
+      PYTEST_QT_API: pyqt6
+      PYTHONDONTWRITEBYTECODE: '1'
+- id: T-007
+  plan_task: 7
+  title: Gate stalled reads and rate-limit retries
+  implementer_tier: advanced
+  lane: recovery
+  sequence: 7
+  depends_on:
+  - T-006
+  owns:
+  - src/appio/ui/collector_window.py
+  - src/appio/ui/files_view.py
+  - tests/p3/test_collector_window.py
+  - tests/p4/test_file_history_router.py
+  resources: []
+  produces: []
+  consumes:
+  - id: local_in_flight
+    sha256: 9dc4375ec1f5bcb78a4d0a472550e376a2b73e0da061e53a801ec524c643572c
+  - id: coverage_diagnostic
+    sha256: c8eb60630e0682752d54b8983241a0decaa2df06c5f300e33f1e94c5e40d5009
+  - id: set_stalled
+    sha256: ea8b52085ccf9dbd21972b26d3ca5690b9929a8e15ceba1141542b2fb3f26e57
+  validation:
+  - argv:
+    - /data/home/henry-arch/.local/state/pi/project-manager/worktrees/ff4052076ce484e2c2a11776fd034304240f1c4457b5db14d60e70059561fa4a/pm-run-20261103-152922-b67facc0/venv/bin/python
+    - -m
+    - pytest
+    - -q
+    - tests/p3/test_collector_window.py
+    - tests/p4/test_file_history_router.py
+    cwd: .
+    timeout_seconds: 1800
+    env:
+      QT_QPA_PLATFORM: offscreen
+      PYTEST_QT_API: pyqt6
+      PYTHONDONTWRITEBYTECODE: '1'
+  - argv:
+    - /data/home/henry-arch/.local/state/pi/project-manager/worktrees/ff4052076ce484e2c2a11776fd034304240f1c4457b5db14d60e70059561fa4a/pm-run-20261103-152922-b67facc0/venv/bin/python
+    - -m
+    - pytest
+    - -q
+    cwd: .
+    timeout_seconds: 1800
+    env:
+      QT_QPA_PLATFORM: offscreen
+      PYTEST_QT_API: pyqt6
+      PYTHONDONTWRITEBYTECODE: '1'
