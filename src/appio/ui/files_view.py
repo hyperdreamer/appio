@@ -346,6 +346,7 @@ class FilesView(QWidget):
         self._outstanding = False
         self._updating_scope: Window | None = None
         self._deferred_window: Window | None = None
+        self._stalled_caption: str | None = None
         #: True when the last `_load_choices()` call read a usable union.
         self._choices_loaded = False
 
@@ -560,6 +561,24 @@ class FilesView(QWidget):
             header.setSectionsClickable(ready)
         self._update_updating_label()
 
+    def set_stalled(self, stalled: bool, text: str) -> None:
+        """Override only the Files updating caption while history is stalled."""
+
+        if type(stalled) is not bool:
+            raise ValueError("stalled must be a bool")
+        if not isinstance(text, str):
+            raise ValueError("text must be a string")
+        if stalled and not text:
+            raise ValueError("stalled caption must not be empty")
+        if stalled:
+            self._stalled_caption = text
+            self.files_updating.setText(text)
+            self.files_updating.setVisible(True)
+        else:
+            self._stalled_caption = None
+            self._update_updating_label()
+        self.files_updating.repaint()
+
     def set_updating_scope(self, window: Window | None) -> None:
         """Name the pending destination in the footer; never adopt it here."""
 
@@ -757,6 +776,10 @@ class FilesView(QWidget):
         return str(getattr(self._history, "view_state", "")).startswith("unavailable")
 
     def _update_updating_label(self) -> None:
+        if self._stalled_caption is not None:
+            self.files_updating.setText(self._stalled_caption)
+            self.files_updating.setVisible(True)
+            return
         # A refresh that was deferred, or a replacement that is pending over a
         # displayed result, names its destination.  A first admitted request is
         # still an initial load and keeps the existing loading text (spec 5.1).
