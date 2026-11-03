@@ -1462,11 +1462,12 @@ def parse_unit_facts(
     if not required.issubset(rows) or not set(rows).issubset(allowed):
         return None, "unknown", None, None, None
     raw_restarts = rows.get("NRestarts")
-    restarts = (
-        int(raw_restarts)
-        if raw_restarts is not None and raw_restarts.isascii() and raw_restarts.isdecimal()
-        else None
-    )
+    restarts = None
+    if raw_restarts is not None and raw_restarts.isascii() and raw_restarts.isdecimal():
+        try:
+            restarts = int(raw_restarts)
+        except (TypeError, ValueError, OverflowError):
+            restarts = None
     return (
         _ENABLED_STATES.get(rows["UnitFileState"]),
         _ACTIVE_STATES.get(rows["ActiveState"], "unknown"),

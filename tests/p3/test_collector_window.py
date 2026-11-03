@@ -1831,6 +1831,21 @@ def test_a_malformed_or_failed_unit_query_is_unknown_not_off():
         status_reader=lambda: None) == ServiceFacts(None, "unknown", False, False, None)
 
 
+def test_unconvertible_restart_count_preserves_unit_and_daemon_status():
+    response = (
+        "UnitFileState=enabled\nActiveState=active\nNRestarts="
+        + "0" * 4301
+        + "\n"
+    )
+    assert cw.parse_unit_facts(response) == (True, "active", None, None, None)
+
+    facts = cw.production_probe(
+        command=lambda argv: CommandResult(0, response, ""),
+        status_reader=lambda: {"answering": True, "pending_activation": False},
+    )
+    assert facts == ServiceFacts(True, "active", True, True, False, None, None, None)
+
+
 def test_parse_unit_facts_accepts_optional_systemd_properties():
     assert cw.UNIT_SHOW_ARGV == (
         "/usr/bin/systemctl", "show", "appio-iod.service",
