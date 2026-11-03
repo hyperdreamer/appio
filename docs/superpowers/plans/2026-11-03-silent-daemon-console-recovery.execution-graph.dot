@@ -1,0 +1,20 @@
+digraph execution {
+  rankdir=TB;
+  node [shape=box, style=rounded];
+  subgraph cluster_recovery {
+    label="recovery";
+    "T-001" [label="Task 1: Key coordinator history by selected source\nStandard"];
+    "T-002" [label="Task 2: Separate daemon-answer errors from retention\nStandard"];
+    "T-003" [label="Task 3: Compose typed diagnostics in Overview\nStandard"];
+    "T-004" [label="Task 4: Add observed systemd causes beneath the state banner\nAdvanced"];
+    "T-005" [label="Task 5: Add a caption-only Files stall override\nStandard"];
+    "T-006" [label="Task 6: Coalesce local sample invalidation until apply\nAdvanced"];
+    "T-007" [label="Task 7: Gate stalled reads and rate-limit retries\nAdvanced"];
+  }
+  "T-001" -> "T-002";
+  "T-002" -> "T-003";
+  "T-003" -> "T-004";
+  "T-004" -> "T-005";
+  "T-005" -> "T-006";
+  "T-006" -> "T-007";
+}

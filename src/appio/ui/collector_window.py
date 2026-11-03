@@ -57,9 +57,10 @@ from ..activation import (
     STATE_NOT_DELEGATED,
 )
 from ..collector_owner import CollectorCoordinator, GuiLease, ServiceFacts, decide_owner
-from ..contracts import RAW_BUCKET_NS, Window
+from ..contracts import RAW_BUCKET_NS, Window, WindowUnavailableError
 from ..history_export import ExportResult
 from ..history_router import HistoryRouter
+from ..iodclient import ClientState
 from ..ipc_models import validate_server_message
 from ..ipc_protocol import FrameDecoder, MAX_OUTBOUND, ProtocolError, encode_frame
 from ..ipc_security import read_peer, require_root_server
@@ -92,6 +93,7 @@ __all__ = [
     "parse_unit_facts",
     "production_probe",
     "run_interactive",
+    "silence_cause",
 ]
 
 #: The four honest service states the switch may display. They are the exact
@@ -116,11 +118,12 @@ UNIT_SHOW_ARGV = (
     "/usr/bin/systemctl",
     "show",
     "appio-iod.service",
-    "--property=UnitFileState,ActiveState",
+    "--property=UnitFileState,ActiveState,SubState,Result,NRestarts",
     "--no-pager",
 )
 HELPER_TIMEOUT_SECONDS = 120.0
 STATUS_TIMEOUT_SECONDS = 2.0
+PENDING_BUDGET_NS: int = 30 * 10**9
 MAX_HELPER_OUTPUT = 64 * 1024
 CONSENT_COMMAND_PREFIX = "/usr/bin/pkexec /usr/bin/appio-setup"
 
@@ -335,6 +338,68 @@ def display_state(facts: ServiceFacts, probe_state: str | None = None) -> str:
     return state
 
 
+_SOCKET_CAUSES: dict[str, str] = {
+    "daemon_absent": "socket: nothing listening at /run/appio/iod.sock",
+    "connect_failed": "socket: connect failed",
+    "path_unverifiable": "socket: socket path could not be verified",
+    "peer_unreadable": "socket: peer credentials unreadable",
+    "daemon_not_answering": "socket: connected, no answer within 5 s",
+    "connection_lost": "socket: connection lost",
+    "transport_lost": "socket: transport closed by the daemon",
+}
+_PEER_REJECTION_CAUSES = frozenset({
+    "appio_group_missing", "peercred_unsupported", "socket_not_connected",
+    "peercred_unavailable", "invalid_peercred", "server_uid_nonzero",
+    "directory_missing", "directory_metadata_invalid", "directory_not_directory",
+    "directory_owner", "directory_group", "directory_mode", "socket_missing",
+    "socket_metadata_invalid", "path_symlink", "socket_not_socket", "socket_owner",
+    "socket_group", "socket_mode",
+})
+
+
+def silence_cause(facts: ServiceFacts, client_state: ClientState | None) -> str | None:
+    """Describe only observed socket or systemd causes for a silent owner state."""
+
+    owner_state = decide_owner(facts).state
+    enabled_failure = owner_state == COLLECTOR_STATE_OFF and facts.enabled is True and (
+        facts.sub_state == "failed"
+        or facts.result is not None and facts.result not in ("success", "none")
+    )
+    if owner_state != COLLECTOR_STATE_SILENT and not enabled_failure:
+        return None
+
+    socket_clause = None
+    if client_state is not None:
+        last_error = client_state.last_error
+        if last_error is None and client_state.verified is True and client_state.answering is False:
+            socket_clause = "daemon status reports not answering"
+        elif isinstance(last_error, str):
+            socket_clause = _SOCKET_CAUSES.get(last_error)
+            if socket_clause is None and last_error in _PEER_REJECTION_CAUSES:
+                socket_clause = f"socket: {last_error}"
+
+    clauses: list[str] = []
+    if enabled_failure:
+        if facts.result is not None and facts.result not in ("success", "none"):
+            clauses.append(f"enabled but not running: failed: {facts.result}")
+        else:
+            clauses.append("enabled but not running: failed")
+    if owner_state == COLLECTOR_STATE_SILENT and socket_clause is not None:
+        clauses.append(socket_clause)
+    elif enabled_failure and socket_clause is not None:
+        clauses.append(socket_clause)
+
+    if facts.restarts is not None and facts.restarts > 0:
+        clauses.append(f"{facts.restarts} restarts")
+    if (facts.result is not None and facts.result not in ("success", "none")
+            and not enabled_failure):
+        clauses.append(f"failed: {facts.result}")
+    if facts.sub_state == "auto-restart":
+        clauses.append("restarting")
+
+    return "; ".join(clauses) or None
+
+
 # --------------------------------------------------------------------------- #
 # Settings: the one place that owns the switch
 # --------------------------------------------------------------------------- #
@@ -481,6 +546,12 @@ class CollectorWindow(QMainWindow):
         self._target: Window | None = None
         self._displayed: Window | None = None
         self._pending: Window | None = None
+        self._pending_since: int | None = None
+        self._stalled = False
+        self._retry_after: int | None = None
+        self._deferred_target: Window | None = None
+        self._deferred_origin: Literal["clock", "explicit"] | None = None
+        self._refresh_after_apply = False
         self._invalidated = False
         self._prepare_retry: PrepareRetry | None = None
         self._prepare_error: str | None = None
@@ -524,13 +595,28 @@ class CollectorWindow(QMainWindow):
         banner.setObjectName("status_banner")
         banner_layout = QHBoxLayout(banner)
         banner_layout.setContentsMargins(0, 0, 0, 0)
+        status_column = QWidget(banner)
+        status_layout = QVBoxLayout(status_column)
+        status_layout.setContentsMargins(0, 0, 0, 0)
         self.banner_status = QLabel(COLLECTOR_STATE_UNAVAILABLE)
         self.banner_status.setObjectName("banner_status")
         self.banner_status.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.banner_detail = QLabel("")
+        self.banner_detail.setObjectName("banner_detail")
+        self.banner_detail.setWordWrap(True)
+        self.banner_detail.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.banner_detail.setVisible(False)
+        status_layout.addWidget(self.banner_status)
+        status_layout.addWidget(self.banner_detail)
+        # Propagate word-wrapped label height through the nested banner widgets.
+        for widget in (status_column, banner):
+            size_policy = widget.sizePolicy()
+            size_policy.setHeightForWidth(True)
+            widget.setSizePolicy(size_policy)
         self.banner_open_settings = QPushButton("Open settings")
         self.banner_open_settings.setObjectName("banner_open_settings")
         self.banner_open_settings.setToolTip("Opens Settings at the System services switch.")
-        banner_layout.addWidget(self.banner_status, 1)
+        banner_layout.addWidget(status_column, 1)
         banner_layout.addWidget(self.banner_open_settings)
         outer.addWidget(banner)
 
@@ -678,88 +764,79 @@ class CollectorWindow(QMainWindow):
                 self.files_view.flush_refresh()
             if not self._busy:
                 self._submit_probe()
+        except WindowUnavailableError as error:
+            self._show_error(str(error) or type(error).__name__)
         except Exception as error:
             self._show_error(f"appio: {str(error) or type(error).__name__}")
 
     def _history_retired(self) -> bool:
         return str(getattr(self.history, "view_state", "")).startswith("unavailable")
 
-    def _tick_target(self) -> None:
+    def _tick_target(self, *, now: int | None = None) -> None:
         if self._closed:
             return
-        if self._pending is not None and self._history_retired():
-            self._pending = None
-        self._target = self._current_window()
+        now = self._clock_ns() if now is None else now
+        self._target = self._current_window(now)
         retry = self._prepare_retry
-        if self._target is None:
-            if retry is not None and retry.owner == "explicit":
-                self.files_view.set_updating_scope(retry.window)
-                self.files_view.set_scope_ready(False)
-                self._invalidated = False
-                self._sync_files()
-                self._render_files_message()
+
+        if self._pending is not None:
+            if self._history_retired():
+                self._retire_pending(now)
                 return
+            if (
+                self._pending_since is not None
+                and now - self._pending_since >= PENDING_BUDGET_NS
+            ):
+                self._stalled = True
+            self._invalidated = False
+            self._show_pending_status(now)
+            self._arm_poll()
+            return
+
+        if retry is not None and retry.owner == "explicit":
+            self.files_view.set_updating_scope(retry.window)
+            self.files_view.set_scope_ready(False)
+            self._invalidated = self._history_retired() and self._displayed is not None
+            self._show_pending_status(now)
+            self._render_files_message()
+            return
+
+        wanted = self._deferred_target or self._target
+        origin = (
+            self._deferred_origin or "clock"
+            if self._deferred_target is not None
+            else "clock"
+        )
+        self._invalidated = self._history_retired() and self._displayed is not None
+        if wanted is None:
             if retry is not None:
+                self._prepare_retry = None
+                self._prepare_error = None
                 self._clear_error()
             self._displayed = None
-            self._pending = None
-            self._prepare_retry = None
-            self._prepare_error = None
+            self._pending_since = None
             self._invalidated = False
             self.files_view.set_updating_scope(None)
             self.files_view.set_scope_ready(True)
             self.history_state.setText("waiting for the first sample")
             self.history_state.setVisible(True)
             self._view.show_overview_status("waiting for the first sample", keep_frame=False)
+            self.files_view.set_stalled(False, "")
             self._poll_timer.stop()
             self._sync_files()
             return
-        if retry is not None and retry.owner == "explicit":
-            self.files_view.set_updating_scope(retry.window)
-            self.files_view.set_scope_ready(False)
-            self._invalidated = self._history_retired() and self._displayed is not None
-            self._render_files_message()
-            return
 
-        retrying = retry is not None and retry.owner == "clock"
-        self.files_view.set_scope_ready(self._pending is None and not retrying)
-        self._invalidated = self._history_retired() and self._displayed is not None
-        if self._pending is not None:
-            self._show_pending_status()
-            self._arm_poll()
-            return
-        if self._displayed is None or self._invalidated or retrying or self._target != self._displayed:
-            prepare_window = self._target
-            self.files_view.set_updating_scope(prepare_window)
-            self.files_view.set_scope_ready(False)
-            self.files_view.request_refresh()
-            try:
-                with self.files_view.transient_scope(retire_on_exit=True):
-                    self.history.prepare(prepare_window)
-            except Exception as error:
-                if self.history.view_state != "loading":
-                    raise
-                self._pending = None
-                self._prepare_retry = PrepareRetry(
-                    prepare_window, "clock", self._clock_ns()
-                )
-                self._prepare_error = f"appio: {str(error) or type(error).__name__}"
-                self._show_error(self._prepare_error)
-                self._show_pending_status()
-                self._poll_timer.stop()
-                self._render_files_message()
-                return
-            resolved_error = self._prepare_error
-            self._prepare_retry = None
-            self._prepare_error = None
-            self._pending = prepare_window
-            # Clear only the preparation error this tick resolved; a helper or
-            # probe failure that is still on screen must stay visible.
-            if resolved_error is not None and self.error_label.text() == resolved_error:
-                self._clear_error()
-            self._show_pending_status()
-            self._arm_poll()
-        elif self._displayed is not None:
+        retrying_clock = retry is not None and retry.owner == "clock"
+        needs_prepare = (
+            self._displayed is None
+            or self._invalidated
+            or retrying_clock
+            or self._deferred_target is not None
+            or self._stalled
+            or self._retry_after is not None
+            or wanted != self._displayed
+        )
+        if not needs_prepare:
             self.files_view.set_scope_ready(True)
             self.files_view.set_updating_scope(None)
             if self._history_ready(self._displayed):
@@ -767,64 +844,165 @@ class CollectorWindow(QMainWindow):
             self._render_files_message()
             self.history_state.setText("")
             self.history_state.setVisible(False)
+            self.files_view.set_stalled(False, "")
+            self._poll_timer.stop()
+            return
+
+        self.files_view.set_updating_scope(wanted)
+        self.files_view.set_scope_ready(False)
+        self.files_view.request_refresh()
+        if not self._submit_prepare(wanted, origin, now=now):
+            self._show_pending_status(now)
             self._poll_timer.stop()
 
-    def _show_pending_status(self) -> None:
+    def _retire_pending(self, now: int) -> None:
+        if self._pending is None:
+            return
+        wanted = self._deferred_target or self._target
+        if wanted is not None:
+            if self._deferred_target is None:
+                self._deferred_origin = "clock"
+            self._deferred_target = wanted
+        self._pending = None
+        self._pending_since = None
+        self._retry_after = now + PENDING_BUDGET_NS
+        self._invalidated = self._displayed is not None
+        self._poll_timer.stop()
+        self._show_pending_status(now)
+
+    def _show_pending_status(self, now: int | None = None) -> None:
+        now = self._clock_ns() if now is None else now
+        view_state = str(self.history.view_state)
         if self._displayed is None:
-            self.history_state.setText(f"loading history ({self.history.view_state})")
+            text = f"loading history ({view_state})"
         else:
-            self.history_state.setText(f"updating ({self.history.view_state})")
+            text = f"updating ({view_state})"
+
+        stall_eligible = self._stalled or self._retry_after is not None
+        local_read_in_flight = getattr(self.history, "local_read_in_flight", False)
+        if stall_eligible and local_read_in_flight is True:
+            text = (
+                f"history read has not completed ({view_state}); "
+                "the reader is still busy"
+            )
+        elif self._retry_after is not None and now < self._retry_after:
+            remaining = self._retry_after - now
+            seconds = (remaining + 1_000_000_000 - 1) // 1_000_000_000
+            text = (
+                f"history read has not completed ({view_state}); "
+                f"retrying in {seconds} s"
+            )
+
+        self.history_state.setText(text)
         self.history_state.setVisible(True)
+        if stall_eligible and text.startswith("history read has not completed"):
+            self.files_view.set_stalled(True, text)
+        else:
+            self.files_view.set_stalled(False, "")
         self._render_files_message()
 
     def _arm_poll(self) -> None:
         if self._pending is not None and not self._poll_timer.isActive():
             self._poll_timer.start()
 
-    def apply_ready_frame(self) -> bool:
+    def _submit_prepare(
+        self, wanted: Window, origin: Literal["clock", "explicit"], *, now: int | None = None
+    ) -> bool:
+        if self._closed:
+            return False
+        now = self._clock_ns() if now is None else now
+        if (
+            self._pending is not None
+            or getattr(self.history, "local_read_in_flight", False) is not False
+            or (self._retry_after is not None and now < self._retry_after)
+            or wanted is None
+        ):
+            return False
+
+        retry_error = self._prepare_error
+        self._prepare_retry = None
+        self._prepare_error = None
+        try:
+            with self.files_view.transient_scope(retire_on_exit=True):
+                self.history.prepare(wanted)
+        except WindowUnavailableError as error:
+            self._pending = None
+            self._pending_since = None
+            self._prepare_retry = None
+            self._prepare_error = None
+            self._show_error(str(error) or type(error).__name__)
+            self._show_pending_status(now)
+            self._poll_timer.stop()
+            self._render_files_message()
+            raise
+        except Exception as error:
+            self._pending = None
+            self._pending_since = None
+            self._prepare_retry = PrepareRetry(wanted, origin, now)
+            self._prepare_error = f"appio: {str(error) or type(error).__name__}"
+            self._show_error(self._prepare_error)
+            self._show_pending_status(now)
+            self._poll_timer.stop()
+            self._render_files_message()
+            if origin == "explicit":
+                raise
+            return False
+
+        self._pending = wanted
+        self._pending_since = now
+        self._stalled = False
+        self._retry_after = None
+        self._prepare_retry = None
+        self._prepare_error = None
+        if retry_error is not None and self.error_label.text() == retry_error:
+            self._clear_error()
+        self._show_pending_status(now)
+        self._arm_poll()
+        return True
+
+    def apply_ready_frame(self, *, now: int | None = None) -> bool:
         if self._closed:
             return False
         if self._prepare_retry is not None and self._prepare_retry.owner == "explicit":
             return False
+        now = self._clock_ns() if now is None else now
+        if self._pending is None and self._deferred_target is not None:
+            self._tick_target(now=now)
+            if self._pending is None:
+                return False
         if self._pending is None:
             return False
         if self._history_retired():
-            self._pending = None
-            self._invalidated = self._history_retired() and self._displayed is not None
+            self._retire_pending(now)
             return False
+        if self._pending_since is not None and now - self._pending_since >= PENDING_BUDGET_NS:
+            self._stalled = True
         if self.history.ready(self._pending):
             self._apply_frame()
             return True
+        self._show_pending_status(now)
         return False
 
     def show_window(self, window: Window) -> None:
         if self._closed:
             return
-        self._prepare_retry = None
-        self._prepare_error = None
+        now = self._clock_ns()
+        retry = self._prepare_retry
+        self._deferred_target = window
+        self._deferred_origin = "explicit"
+        if retry is not None and (retry.owner != "explicit" or retry.window != window):
+            self._prepare_retry = None
+            self._prepare_error = None
+            if self.error_label.text().startswith("appio: "):
+                self._clear_error()
+
         self.files_view.set_updating_scope(window)
         self.files_view.set_scope_ready(False)
         self.files_view.request_refresh()
-        try:
-            with self.files_view.transient_scope(retire_on_exit=True):
-                self.history.prepare(window)
-        except Exception as error:
-            if self.history.view_state != "loading":
-                raise
-            self._pending = None
-            self._prepare_retry = PrepareRetry(window, "explicit", self._clock_ns())
-            self._prepare_error = f"appio: {str(error) or type(error).__name__}"
-            self._show_error(self._prepare_error)
-            self._show_pending_status()
-            self._poll_timer.stop()
+        accepted = self._submit_prepare(window, "explicit", now=now)
+        if not accepted:
+            self._show_pending_status(now)
             self._render_files_message()
-            raise
-        self._prepare_retry = None
-        self._prepare_error = None
-        self._pending = window
-        self._clear_error()
-        self._show_pending_status()
-        self._arm_poll()
 
     def _apply_frame(self) -> None:
         window = self._pending
@@ -832,6 +1010,12 @@ class CollectorWindow(QMainWindow):
             return
         self._displayed = window
         self._pending = None
+        self._pending_since = None
+        self._stalled = False
+        self._retry_after = None
+        if self._deferred_target == window:
+            self._deferred_target = None
+            self._deferred_origin = None
         self._invalidated = False
         self.files_view.retire_deliveries()
         self.files_view.set_scope_ready(True)
@@ -839,16 +1023,24 @@ class CollectorWindow(QMainWindow):
         self.files_view.flush_refresh()
         self.files_view.set_updating_scope(None)
         self._render_files_message()
+        self.files_view.set_stalled(False, "")
+        if self._refresh_after_apply:
+            with self.files_view.transient_scope():
+                self._refresh_after_apply = False
+                self.history.invalidate()
         self._poll_timer.stop()
 
     def _poll_history(self) -> None:
         if self._closed or self._pending is None:
             self._poll_timer.stop()
             return
+        now = self._clock_ns()
         try:
-            applied = self.apply_ready_frame()
+            applied = self.apply_ready_frame(now=now)
             if not applied and self._pending is None:
                 self._poll_timer.stop()
+        except WindowUnavailableError as error:
+            self._show_error(str(error) or type(error).__name__)
         except Exception as error:
             self._show_error(f"appio: {str(error) or type(error).__name__}")
 
@@ -885,6 +1077,10 @@ class CollectorWindow(QMainWindow):
         state = display_state(facts, self._probe_state)
         self.state_text = state
         self.banner_status.setText(state)
+        client_state = getattr(getattr(self.history, "client", None), "state", None)
+        cause = silence_cause(facts, client_state)
+        self.banner_detail.setText("" if cause is None else cause)
+        self.banner_detail.setVisible(cause is not None)
         self.settings.status_label.setText(state)
         self.settings.show_switch(
             facts.enabled,
@@ -900,7 +1096,7 @@ class CollectorWindow(QMainWindow):
         self.error_label.setText("")
         self.error_label.setVisible(False)
 
-    def _current_window(self) -> Window | None:
+    def _current_window(self, now_ns: int | None = None) -> Window | None:
         client = getattr(self.history, "client", None)
         state = getattr(client, "state", None)
         if state is not None and state.verified and state.answering:
@@ -918,7 +1114,7 @@ class CollectorWindow(QMainWindow):
             if row is None or not row[0]:
                 return None
             boot_id = str(row[0])
-        now = self._clock_ns()
+        now = self._clock_ns() if now_ns is None else now_ns
         end = (now // RAW_BUCKET_NS + 1) * RAW_BUCKET_NS
         return Window(kind="since_boot", boot_id=boot_id, end_mono_ns=end)
 
@@ -1006,7 +1202,12 @@ class CollectorWindow(QMainWindow):
             with self.files_view.transient_scope():
                 if not keep_pending:
                     self.coordinator.reconcile(facts)
-                self.coordinator.tick_local()
+                committed = self.coordinator.tick_local()
+                if committed:
+                    if self._pending is None:
+                        self.history.invalidate()
+                    elif not self._history_retired():
+                        self._refresh_after_apply = True
         except Exception as error:
             self._show_error(f"appio: {str(error) or type(error).__name__}")
             return
@@ -1024,6 +1225,8 @@ class CollectorWindow(QMainWindow):
                 and self._history_ready(self._displayed)
             ):
                 self.files_view.flush_refresh()
+        except WindowUnavailableError as error:
+            self._show_error(str(error) or type(error).__name__)
         except Exception as error:
             self._show_error(f"appio: {str(error) or type(error).__name__}")
 
@@ -1249,23 +1452,38 @@ class CollectorWindow(QMainWindow):
 # --------------------------------------------------------------------------- #
 
 
-def parse_unit_facts(stdout: str) -> tuple[bool | None, str]:
-    """Map ``systemctl show`` output to (enabled, active) without inventing either."""
+def parse_unit_facts(
+    stdout: str,
+) -> tuple[bool | None, str, str | None, str | None, int | None]:
+    """Map required service fields and optional observed failure details."""
 
     if not isinstance(stdout, str):
-        return None, "unknown"
+        return None, "unknown", None, None, None
     rows: dict[str, str] = {}
     for line in stdout.splitlines():
         if not line.strip():
             continue  # systemctl may end its output with a blank line
         key, separator, value = line.partition("=")
         if not separator or key in rows:
-            return None, "unknown"
+            return None, "unknown", None, None, None
         rows[key] = value.strip()
-    if set(rows) != {"UnitFileState", "ActiveState"}:
-        return None, "unknown"
-    return _ENABLED_STATES.get(rows["UnitFileState"]), _ACTIVE_STATES.get(
-        rows["ActiveState"], "unknown"
+    required = {"UnitFileState", "ActiveState"}
+    allowed = required | {"SubState", "Result", "NRestarts"}
+    if not required.issubset(rows) or not set(rows).issubset(allowed):
+        return None, "unknown", None, None, None
+    raw_restarts = rows.get("NRestarts")
+    restarts = None
+    if raw_restarts is not None and raw_restarts.isascii() and raw_restarts.isdecimal():
+        try:
+            restarts = int(raw_restarts)
+        except (TypeError, ValueError, OverflowError):
+            restarts = None
+    return (
+        _ENABLED_STATES.get(rows["UnitFileState"]),
+        _ACTIVE_STATES.get(rows["ActiveState"], "unknown"),
+        rows.get("SubState") or None,
+        rows.get("Result") or None,
+        restarts,
     )
 
 
@@ -1312,12 +1530,14 @@ def production_probe(
     read_status = status_reader or _read_daemon_status
     enabled: bool | None = None
     active = "unknown"
+    sub_state = result = None
+    restarts = None
     try:
-        result = run(UNIT_SHOW_ARGV)
+        command_result = run(UNIT_SHOW_ARGV)
     except (OSError, subprocess.SubprocessError):
-        result = None
-    if isinstance(result, CommandResult) and result.returncode == 0:
-        enabled, active = parse_unit_facts(result.stdout)
+        command_result = None
+    if isinstance(command_result, CommandResult) and command_result.returncode == 0:
+        enabled, active, sub_state, result, restarts = parse_unit_facts(command_result.stdout)
     status: object = None
     try:
         status = read_status()
@@ -1326,8 +1546,9 @@ def production_probe(
     if isinstance(status, dict) and status.get("answering") is True:
         pending = status.get("pending_activation")
         return ServiceFacts(enabled, active, True, True,
-                            pending if type(pending) is bool else None)
-    return ServiceFacts(enabled, active, False, False, None)
+                            pending if type(pending) is bool else None,
+                            sub_state, result, restarts)
+    return ServiceFacts(enabled, active, False, False, None, sub_state, result, restarts)
 
 
 # --------------------------------------------------------------------------- #

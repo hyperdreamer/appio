@@ -8,6 +8,7 @@ window that reached past the contract would fail at import or at call time.
 from __future__ import annotations
 
 from concurrent.futures import Future
+from dataclasses import replace
 import inspect
 import math
 from types import SimpleNamespace
@@ -64,7 +65,7 @@ from appio.ui.formatting import (
 )
 from appio.ui.charts import ChartColumn, ChartSegment
 from appio.ui.files_view import FilesView
-from appio.ui.main_window import AppIoWindow, RankingDelegate
+from appio.ui.main_window import AppIoWindow, RankingDelegate, _device_unavailable_text
 from appio.ui.render_model import (
     MAX_DEVICE_LANES,
     DeviceLaneModel,
@@ -72,6 +73,8 @@ from appio.ui.render_model import (
     OverviewModel,
     RankingModel,
     RankingRow,
+    SHARE_UNAVAILABLE_REASON,
+    _coverage_text,
     build_overview,
     build_ranking,
     scope_text,
@@ -736,6 +739,177 @@ def test_build_overview_has_five_ordered_kpis_and_none_peak_is_unavailable() -> 
     assert differing.coverage_line.startswith("coverage: complete;")
 
 
+def test_coverage_diagnostic_composes_with_contract_reason(qtbot) -> None:
+    base = (
+        "coverage: complete; device attribution: available; tier: raw; "
+        "gaps: 0; suspends: False"
+    )
+    diagnostic = "daemon reported an error (bad_query)"
+    data_coverage = coverage(
+        complete=False,
+        device_state="incomplete",
+        gap_intervals=3,
+        unavailable_reason="not_retained",
+    )
+    data_prefix = (
+        "coverage: incomplete; device attribution: incomplete; tier: raw; "
+        "gaps: 3; suspends: False"
+    )
+    assert _coverage_text(coverage()) == base
+    assert _coverage_text(data_coverage) == f"{data_prefix}; reason: not_retained"
+    assert _coverage_text(coverage(), diagnostic) == f"{base}; reason: {diagnostic}"
+    assert _coverage_text(data_coverage, diagnostic) == (
+        f"{data_prefix}; reason: not_retained; {diagnostic}"
+    )
+
+    total = replace(
+        app_total(1, "unit:/alpha.service", "Alpha", 200),
+        coverage=data_coverage,
+    )
+    series = Series(1, SINCE_BOOT, "raw", (), (), (), data_coverage)
+    normal = build_overview(
+        1, SINCE_BOOT, total, series, None, coverage_diagnostic=diagnostic
+    )
+    assert normal.coverage_diagnostic == diagnostic
+    assert normal.coverage_line == f"{data_prefix}; reason: not_retained; {diagnostic}"
+    assert build_overview(1, SINCE_BOOT, total, series, None).coverage_diagnostic is None
+
+    file_only = build_overview(
+        1, SINCE_BOOT, None, None, None, coverage_diagnostic=diagnostic
+    )
+    assert file_only.coverage_line == f"coverage: unavailable; reason: {diagnostic}"
+    refused = build_overview(
+        1,
+        SINCE_BOOT,
+        None,
+        None,
+        None,
+        ranking_error="window unavailable",
+        coverage_diagnostic=diagnostic,
+    )
+    assert refused.coverage_line == f"coverage: unavailable; reason: {diagnostic}"
+
+    whitespace = build_overview(
+        1, SINCE_BOOT, None, None, None, coverage_diagnostic="  "
+    )
+    assert whitespace.coverage_diagnostic == "  "
+    for invalid in ("", 17, "\ud800"):
+        with pytest.raises(ValueError):
+            build_overview(
+                1, SINCE_BOOT, None, None, None, coverage_diagnostic=invalid
+            )
+        with pytest.raises(ValueError):
+            replace(file_only, coverage_diagnostic=invalid)
+
+    alpha = app_total(1, "unit:/alpha.service", "Alpha", 200)
+    file_key = "unit:retained-only.service"
+    files = FakeFilesHistory(
+        ranking_rows=(alpha,),
+        local_applications=((file_key, "Retained only", 40),),
+        registry_ids={file_key: 99},
+    )
+    window, service = build(qtbot, [alpha], files_view=FilesView(files))
+    assert window._overview_model.coverage_diagnostic is None
+    service.daemon_answer_error = SimpleNamespace(kind="remote_error", reason="bad_query")
+
+    window.refresh()
+    assert window._overview_model.coverage_diagnostic == diagnostic
+    assert label(window, "coverage_label").text().endswith(f"; reason: {diagnostic}")
+
+    selector = window.files_view.app_selector
+    selector.setCurrentIndex(selector.findData(99))
+    file_model = window._overview_model
+    assert file_model.coverage_diagnostic == diagnostic
+    assert file_model.coverage_line == f"coverage: unavailable; reason: {diagnostic}"
+
+    selector.setCurrentIndex(selector.findData(1))
+    mismatched = Series(
+        1,
+        Window(kind="since_boot", boot_id=BOOT, end_mono_ns=END + 1),
+        "raw",
+        (),
+        (),
+        (),
+        coverage(),
+    )
+    service.set_series(1, mismatched)
+    window.refresh()
+    refusal_model = window._overview_model
+    assert refusal_model.coverage_diagnostic == diagnostic
+    assert label(window, "coverage_label").text().endswith(f"; reason: {diagnostic}")
+
+
+def test_each_diagnostic_kind_matches_coverage_and_device_wording(qtbot) -> None:
+    cases = (
+        ("remote_error", "bad_query", "daemon reported an error (bad_query)"),
+        ("unavailable", "no_daemon", "no answering daemon (no_daemon)"),
+        ("rejected", "too_many_requests", "history query failed (too_many_requests)"),
+        ("transport", "connection_lost", "connection lost before the answer (connection_lost)"),
+        ("internal", "database failure", "history query failed (database failure)"),
+    )
+    data = coverage(
+        complete=False,
+        device_state="incomplete",
+        unavailable_reason="not_retained",
+    )
+    total = app_total(1, "unit:/alpha.service", "Alpha", 200)
+    share = disk_share(1, task_total=200, residual_total=None, cov=data)
+    window, service = build(qtbot, [total], {1: share})
+
+    for kind, reason, clause in cases:
+        service.daemon_answer_error = SimpleNamespace(kind=kind, reason=reason)
+        window.refresh()
+        assert label(window, "coverage_label").text().endswith(
+            f"; reason: not_retained; {clause}"
+        )
+        assert label(window, "device_reason").text() == (
+            f"device attribution unavailable: not_retained; {clause}"
+        )
+
+    absent = build_overview(
+        1, SINCE_BOOT, None, None, None, coverage_diagnostic=cases[2][2]
+    )
+    assert _device_unavailable_text(absent) == (
+        "device attribution unavailable: not in the process ranking; "
+        "history query failed (too_many_requests)"
+    )
+    split_unavailable = replace(absent, share_unavailable=SHARE_UNAVAILABLE_REASON)
+    assert _device_unavailable_text(split_unavailable) == (
+        f"device attribution unavailable: {SHARE_UNAVAILABLE_REASON}; "
+        "history query failed (too_many_requests)"
+    )
+    no_share_reason = replace(absent, share_unavailable=None)
+    assert _device_unavailable_text(no_share_reason) == (
+        "device attribution unavailable: history query failed (too_many_requests)"
+    )
+    no_diagnostic = build_overview(1, SINCE_BOOT, None, None, None)
+    assert _device_unavailable_text(no_diagnostic) == ""
+
+    share_failure = build_overview(
+        1,
+        SINCE_BOOT,
+        total,
+        None,
+        None,
+        share_error="share query unavailable",
+        coverage_diagnostic=cases[2][2],
+    )
+    assert _device_unavailable_text(share_failure) == (
+        "device attribution unavailable: share query unavailable; "
+        "history query failed (too_many_requests)"
+    )
+
+    available = build_overview(
+        1,
+        SINCE_BOOT,
+        total,
+        None,
+        disk_share(1, task_total=200),
+        coverage_diagnostic=cases[2][2],
+    )
+    assert _device_unavailable_text(available) == ""
+
+
 def test_build_overview_limits_device_lanes_and_counts_more() -> None:
     specs = [("8:4", 400), ("8:1", 1000), ("8:0", 1500), ("8:2", 700), ("8:9", 0)]
     rows = tuple(
@@ -1328,6 +1502,106 @@ class FakeFilesHistory:
         future: Future = Future()
         self.pending.append(future)
         return future
+
+
+def retained_file_result(window: Window):
+    from appio.contracts import (
+        FileCoverage,
+        FileRow,
+        FileTable,
+        HookHits,
+        UnknownOwnerOverflow,
+    )
+    from appio.history_router import FileViewResult
+
+    inner = coverage()
+    overflow = UnknownOwnerOverflow(
+        window, "overflow_owner_unknown", 0, 0, 0, inner
+    )
+    row = FileRow(
+        1, "report.txt", "resolved", False, "259:0", 42, 7, 3, 2,
+        100, 50, 150, BOOT, END - 1,
+    )
+    table = FileTable(
+        1, window, (row,), "bytes_total", "desc", None, overflow, inner
+    )
+    file_coverage = FileCoverage(
+        1, window, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        HookHits(0, 0, 0, 0, 0, 0), 100, 50, overflow, inner,
+    )
+    return FileViewResult(table, file_coverage, None)
+
+
+def retained_pending_files_view(qtbot):
+    total = app_total(1, "unit:/alpha.service", "Alpha", 200)
+    history = FakeFilesHistory(ranking_rows=(total,))
+    view = FilesView(history)
+    qtbot.addWidget(view)
+    view.set_window(SINCE_BOOT)
+    assert len(history.pending) == 1
+    history.pending[0].set_result(retained_file_result(SINCE_BOOT))
+    qtbot.waitUntil(lambda: view.model.rowCount() == 1)
+    view.request_refresh()
+    assert len(history.pending) == 2
+    assert view._outstanding is True
+    return view, history
+
+
+def files_noncaption_snapshot(view: FilesView, history: FakeFilesHistory):
+    return (
+        tuple(view.model._cells),
+        tuple(label.text() for label in view._footer_labels()),
+        view._window,
+        view._app_id,
+        view._scope_ready,
+        view._state,
+        view.last_result,
+        view.last_request,
+        tuple(view.requests),
+        view._generation,
+        view._outstanding,
+        view._refresh_wanted,
+        view._updating_scope,
+        view._deferred_window,
+        len(history.pending),
+    )
+
+
+def test_files_stall_caption_preserves_retained_table_and_footer(qtbot) -> None:
+    view, history = retained_pending_files_view(qtbot)
+    original_caption = view.files_updating.text()
+    assert original_caption == "updating to since_boot"
+    before = files_noncaption_snapshot(view, history)
+    stalled_text = "history read has not completed (loading); the reader is still busy"
+
+    view.set_stalled(True, stalled_text)
+
+    assert view.files_updating.text() == stalled_text
+    assert not view.files_updating.isHidden()
+    assert files_noncaption_snapshot(view, history) == before
+
+    view.set_stalled(False, "ignored while clearing")
+
+    assert view.files_updating.text() == original_caption
+    assert not view.files_updating.isHidden()
+    assert files_noncaption_snapshot(view, history) == before
+
+
+def test_files_set_stalled_rejects_invalid_arguments(qtbot) -> None:
+    view = FilesView(FakeFilesHistory())
+    qtbot.addWidget(view)
+    view.set_stalled(True, "history read has not completed (loading); the reader is still busy")
+    before = (view.files_updating.text(), view.files_updating.isHidden())
+
+    for stalled, text in ((1, "bad"), ("yes", "bad"), (True, ""), (True, None),
+                          (False, None)):
+        with pytest.raises(ValueError):
+            view.set_stalled(stalled, text)
+        assert (view.files_updating.text(), view.files_updating.isHidden()) == before
+
+    view.set_stalled(False, "this argument is ignored")
+    assert view.files_updating.text() == ""
+    assert view.files_updating.isHidden()
 
 
 def kpi_texts(window: AppIoWindow) -> list[str]:

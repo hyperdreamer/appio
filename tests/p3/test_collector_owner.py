@@ -53,9 +53,12 @@ class Local:
 class History:
     def __init__(self):
         self.gaps = []
+        self.invalidations = 0
+        self.view_state = "loading"
 
     def invalidate(self):
-        pass
+        self.invalidations += 1
+        self.view_state = f"unavailable:{self.invalidations}"
 
     def record_transport_gap(self, notice):
         self.gaps.append(notice)
@@ -306,6 +309,84 @@ def test_inactive_export_retires_unsampled_gui_and_installs_before_the_first_tic
     assert local.connection.execute("SELECT sum(read_bytes) FROM app_boot_total").fetchone()[0] == before + 30
     owner.close()
     history.close()
+
+
+def test_reconcile_same_history_key_does_not_invalidate(tmp_path):
+    owner = coordinator(tmp_path, [])
+    owner.reconcile(SILENT)
+    assert owner.history.invalidations == 1
+    state = owner.history.view_state
+
+    owner.reconcile(replace(SILENT, active="active"))
+
+    assert owner.history.invalidations == 1
+    assert owner.history.view_state == state
+    owner.close()
+
+
+def test_reconcile_changed_history_key_invalidates_once_per_change(tmp_path):
+    owner = coordinator(tmp_path, [])
+
+    assert owner.reconcile(SILENT).state == "enabled, not answering"
+    assert owner.reconcile(OFF).state == "off"
+    assert owner.reconcile(ON).state == "on, answering"
+
+    assert owner.history.invalidations == 3
+    owner.close()
+
+
+def test_reconcile_publishes_history_key_only_after_invalidation(tmp_path):
+    owner = coordinator(tmp_path, [])
+    owner.reconcile(SILENT)
+    previous_key = owner._history_key
+    original_invalidate = owner.history.invalidate
+    attempts = 0
+
+    def fail_once():
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("invalidation failed")
+        original_invalidate()
+
+    owner.history.invalidate = fail_once
+    changed = replace(SILENT, daemon_verified=True)
+    with pytest.raises(RuntimeError, match="invalidation failed"):
+        owner.reconcile(changed)
+    assert owner._history_key == previous_key
+
+    owner.reconcile(changed)
+    assert attempts == 2
+    assert owner.history.invalidations == 2
+    assert owner._history_key == ("unknown", False, True, False)
+    owner.close()
+
+
+def test_tick_local_returns_committed_advance_without_invalidation(tmp_path):
+    owner = coordinator(tmp_path, [])
+    owner.reconcile(OFF)
+    invalidations = owner.history.invalidations
+
+    assert owner.tick_local() is True
+    assert owner.history.invalidations == invalidations
+    assert "tick" in owner._local.events
+    owner.close()
+
+    no_local = coordinator(tmp_path, [])
+    no_local.reconcile(SILENT)
+    invalidations = no_local.history.invalidations
+    assert no_local.tick_local() is False
+    assert no_local.history.invalidations == invalidations
+    no_local.close()
+
+    failing = coordinator(tmp_path, [])
+    failing.reconcile(OFF)
+    error = RuntimeError("tick failed")
+    failing._local.tick = lambda: (_ for _ in ()).throw(error)
+    with pytest.raises(RuntimeError) as raised:
+        failing.tick_local()
+    assert raised.value is error
+    failing.close()
 
 
 def test_parent_symlink_does_not_redirect_the_lease(tmp_path):

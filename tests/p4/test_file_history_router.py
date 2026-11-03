@@ -4,6 +4,7 @@ Falsifiers: basename merge across stores; query on UI-thread SQLite; stale
 future publication; dropping HMAC continuations or snapshot/scope checks;
 claiming an unavailable source is a complete empty table.
 """
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import replace
 import json
 import threading
@@ -25,7 +26,14 @@ from appio.file_runtime import FileRuntime
 from appio.files import FileIdentityResolver
 from appio.history_router import FileViewResult, HistoryRouter
 from appio.iod_history import HistoryRpc
-from appio.iodclient import AppRegistry, ClientState, RemoteError
+from appio.iodclient import (
+    AppRegistry,
+    ClientState,
+    ClientUnavailable,
+    ConnectionLost,
+    RemoteError,
+    RequestRejected,
+)
 from appio.ipc_models import Capabilities, QueryRequest, validate_request
 from appio.query import QueryService
 from appio.store import AppIoStore
@@ -435,4 +443,279 @@ def test_local_cancellation_cannot_turn_bounded_executor_into_unbounded_queue(re
         assert router._executor._work_queue.qsize() <= 8
     finally:
         release.set()
+        router.close()
+
+
+def test_remote_query_errors_are_typed_without_rewriting_data_reason(tmp_path):
+    from tests.p3.test_history_router import source, window as process_window
+
+    cases = (
+        (RemoteError("remote_fault"), "remote_error", "remote_fault"),
+        (ClientUnavailable("daemon_unavailable"), "unavailable", "daemon_unavailable"),
+        (RequestRejected("too_many_requests"), "rejected", "too_many_requests"),
+        (ConnectionLost("connection_lost"), "transport", "connection_lost"),
+        (ValueError("  internal failure  "), "internal", "internal failure"),
+    )
+
+    class FailedQueryClient:
+        state = ClientState(verified=True, answering=True)
+
+        def __init__(self, error):
+            self.error = error
+
+        def query(self, _request):
+            future = Future()
+            future.set_exception(self.error)
+            return future
+
+    for index, (error, kind, reason) in enumerate(cases):
+        store, _ = source(tmp_path / f"remote-{index}.db")
+        router = HistoryRouter(QueryService(store), FailedQueryClient(error), AppRegistry())
+        scope = process_window(100, 110)
+        try:
+            router.prepare(scope)
+            router._local_future.result(timeout=10)
+            assert router._not_retained is False
+            assert router.ready(scope)
+            rows = router.ranking(scope, "total_bytes")
+            assert rows[0].coverage.unavailable_reason is None
+            assert router._not_retained is False
+            assert router.daemon_answer_error.kind == kind
+            assert router.daemon_answer_error.reason == reason
+        finally:
+            router.close()
+            store.connection.close()
+
+    pruned, _ = source(tmp_path / "pruned.db")
+    pruned.connection.execute("DELETE FROM collector_interval")
+    pruned.connection.commit()
+    router = HistoryRouter(QueryService(pruned), Client(), AppRegistry())
+    scope = Window("lifetime")
+    try:
+        router.prepare(scope)
+        router._local_future.result(timeout=10)
+        assert router.ready(scope)
+        rows = router.ranking(scope, "total_bytes")
+        assert rows[0].coverage.unavailable_reason == "not_retained"
+    finally:
+        router.close()
+        pruned.connection.close()
+
+
+def test_retirement_and_cancellation_do_not_set_history_failure_flags(retained):
+    router = HistoryRouter(QueryService(retained.db), Client(), AppRegistry())
+    try:
+        with pytest.raises(WindowUnavailableError):
+            router.prepare(Window("launch", "boot-A", launch_id=1))
+        assert router._not_retained is False
+        assert router._daemon_answer_error is None
+
+        router.invalidate()
+        assert router._not_retained is False
+        assert router._daemon_answer_error is None
+
+        marker = object()
+        router._not_retained = True
+        router._daemon_answer_error = marker
+        router.invalidate()
+        assert router._not_retained is True
+        assert router._daemon_answer_error is marker
+
+        router.prepare(WINDOW)
+        assert router._not_retained is False
+        assert router._daemon_answer_error is None
+    finally:
+        router.close()
+
+    unavailable = Future()
+    unavailable.set_exception(
+        WindowUnavailableError("file_source_unavailable", "query window retired")
+    )
+
+    class UnavailableQueryClient:
+        state = ClientState(verified=True, answering=True)
+
+        def __init__(self):
+            self.calls = 0
+
+        def query(self, _request):
+            self.calls += 1
+            return unavailable
+
+    unavailable_client = UnavailableQueryClient()
+    router = HistoryRouter(QueryService(retained.db), unavailable_client, AppRegistry())
+    try:
+        router.prepare(WINDOW)
+        router._local_future.result(timeout=10)
+        assert router.ready(WINDOW)
+        assert unavailable_client.calls == 1
+        assert router._pending is None
+        assert router._not_retained is False
+        assert router.daemon_answer_error is None
+    finally:
+        router.close()
+
+    cancelled = Future()
+    cancelled.cancel()
+
+    class CancelledQueryClient:
+        state = ClientState(verified=True, answering=True)
+
+        def __init__(self):
+            self.calls = 0
+
+        def query(self, _request):
+            self.calls += 1
+            return cancelled
+
+    cancelled_client = CancelledQueryClient()
+    router = HistoryRouter(QueryService(retained.db), cancelled_client, AppRegistry())
+    try:
+        router.prepare(WINDOW)
+        router._local_future.result(timeout=10)
+        assert router.ready(WINDOW)
+        assert cancelled_client.calls == 1
+        assert router._pending is None
+        assert router._not_retained is False
+        assert router._daemon_answer_error is None
+    finally:
+        router.close()
+
+
+def test_local_read_in_flight_tracks_every_unsettled_local_read(retained):
+    router = local_router(retained)
+    try:
+        router._local_future = None
+        assert router.local_read_in_flight is False
+
+        completed = Future()
+        completed.set_result(None)
+        router._local_future = completed
+        assert router.local_read_in_flight is False
+
+        cancelled = Future()
+        cancelled.cancel()
+        router._local_future = cancelled
+        assert router.local_read_in_flight is False
+
+        blocker_started = threading.Event()
+        release_blocker = threading.Event()
+        queued_started = threading.Event()
+        release_queued = threading.Event()
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            blocker = executor.submit(
+                lambda: (blocker_started.set(), release_blocker.wait(5))
+            )
+            assert blocker_started.wait(2)
+            queued = executor.submit(
+                lambda: (queued_started.set(), release_queued.wait(5))
+            )
+            try:
+                router._local_future = queued
+                assert router.local_read_in_flight is True
+                assert queued.running() is False
+                assert queued.done() is False
+
+                release_blocker.set()
+                assert queued_started.wait(2)
+                assert router.local_read_in_flight is True
+                assert queued.running() is True
+                assert queued.done() is False
+
+                release_queued.set()
+                queued.result(timeout=2)
+                blocker.result(timeout=2)
+                assert router.local_read_in_flight is False
+            finally:
+                release_blocker.set()
+                release_queued.set()
+    finally:
+        router.close()
+
+
+def test_queued_local_read_blocks_every_replacement_submission(retained, qtbot, monkeypatch):
+    from tests.p3.test_collector_window import OFF, FakeCoordinator, FakeSetup
+
+    from appio.ui.collector_window import CollectorWindow
+
+    history = HistoryRouter(QueryService(retained.db), Client(), AppRegistry())
+    current = Window("since_boot", "boot-A", end_mono_ns=H)
+    explicit = Window("range", "boot-A", 0, H)
+    blocker_started = threading.Event()
+    release_blocker = threading.Event()
+    blocker = history._executor.submit(
+        lambda: (blocker_started.set(), release_blocker.wait(5))
+    )
+    assert blocker_started.wait(2)
+
+    prepare_calls = []
+    original_prepare = history.prepare
+
+    def record_prepare(window):
+        prepare_calls.append(window)
+        return original_prepare(window)
+
+    monkeypatch.setattr(history, "prepare", record_prepare)
+    coordinator = FakeCoordinator()
+    window = CollectorWindow(
+        coordinator, history, FakeSetup(OFF), clock_ns=lambda: H - 1,
+        refresh_interval_ms=1000,
+    )
+    qtbot.addWidget(window)
+    qtbot.addWidget(window.settings)
+    window.show()
+    window._timer.stop()
+    monkeypatch.setattr(window, "_submit_probe", lambda **_kwargs: False)
+    try:
+        # Seed a genuine router preparation behind the occupied single worker.
+        history.prepare(current)
+        queued = history._local_future
+        assert queued is not None and queued.running() is False and not queued.done()
+        assert history.local_read_in_flight is True
+
+        for _ in range(5):
+            window._tick_target()
+        window.refresh()
+        window.show_window(explicit)
+        assert prepare_calls == [current]
+        assert window._pending is None
+        assert window._deferred_target == explicit
+
+        release_blocker.set()
+        blocker.result(timeout=5)
+        try:
+            queued.result(timeout=10)
+        except Exception:
+            if not queued.cancelled():
+                raise
+        qtbot.waitUntil(lambda: not history.local_read_in_flight, timeout=5000)
+        window._tick_target()
+        assert prepare_calls == [current, explicit]
+        assert window._pending == explicit
+    finally:
+        release_blocker.set()
+        try:
+            blocker.result(timeout=5)
+            if history._local_future is not None:
+                history._local_future.result(timeout=10)
+        except Exception:
+            pass
+        window.shutdown()
+
+
+def test_daemon_answer_error_rejects_invalid_kind_and_empty_reason(retained):
+    from appio.history_router import DaemonAnswerError
+
+    router = local_router(retained)
+    state = (router.view_state, router._generation, router._not_retained)
+    try:
+        for kind, reason in (
+            ("unknown", "reason"),
+            ("internal", ""),
+            ("internal", None),
+        ):
+            with pytest.raises(ValueError):
+                DaemonAnswerError(kind, reason)
+        assert (router.view_state, router._generation, router._not_retained) == state
+    finally:
         router.close()

@@ -480,6 +480,15 @@ class P3Harness:
         window = gui.window
         after = window.facts_applied
 
+        def advance_window_retry_floor():
+            floor = window._retry_after
+            clock_ns = window._clock_ns
+            if floor is not None and clock_ns() < floor:
+                # Expire the GUI's virtual retry floor without inventing daemon samples.
+                window._clock_ns = lambda clock_ns=clock_ns, floor=floor: max(
+                    clock_ns(), floor
+                )
+
         def applied():
             window.refresh()
             return window.facts_applied > after
@@ -487,6 +496,7 @@ class P3Harness:
         self.until(applied)
 
         def displayed():
+            advance_window_retry_floor()
             if window._pending is not None:
                 # Readiness polling is what the shell's own 100 ms timer does;
                 # submitting another probe here would retire the preparation the

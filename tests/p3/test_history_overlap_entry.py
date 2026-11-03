@@ -127,6 +127,14 @@ def test_live_incomplete_reply_cannot_resurrect_export_overlap_in_production_ent
                             and window.history.ready(window._displayed))
 
                 while not current():
+                    if window._retry_after is not None:
+                        clock_ns = window._clock_ns
+                        floor = window._retry_after
+                        if clock_ns() < floor:
+                            # Advance only the GUI's frozen virtual retry clock.
+                            window._clock_ns = lambda clock_ns=clock_ns, floor=floor: max(
+                                clock_ns(), floor
+                            )
                     drive()
                     window.refresh()
                     assert time.monotonic() < deadline, (
