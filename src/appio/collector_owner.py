@@ -28,6 +28,10 @@ from .query import QueryService
 from .store import AppIoStore
 
 
+OwnerKind = Literal["gui", "iod", "unknown"]
+HistoryKey = tuple[OwnerKind, bool, bool, bool]
+
+
 @dataclass(frozen=True)
 class ServiceFacts:
     enabled: bool | None
@@ -48,7 +52,7 @@ class ServiceFacts:
 
 @dataclass(frozen=True)
 class OwnerDecision:
-    owner: Literal["gui", "iod", "unknown"]
+    owner: OwnerKind
     may_collect_local: bool
     state: str
 
@@ -133,6 +137,7 @@ class CollectorCoordinator:
         self._local = None
         self._decision = OwnerDecision("unknown", False, "unavailable")
         self._facts = None
+        self._history_key: HistoryKey | None = None
         self._exports = []
         self.resume_handover: HandoverOffer | None = None
         self.outgoing_handover: HandoverOffer | None = None
@@ -193,19 +198,27 @@ class CollectorCoordinator:
                         self.lease.release()
                         raise
             self._decision = decision
-            self.history.invalidate()
+            key: HistoryKey = (
+                decision.owner,
+                decision.may_collect_local,
+                facts.daemon_verified,
+                facts.answering,
+            )
+            if key != self._history_key:
+                self.history.invalidate()
+            self._history_key = key
             return decision
         finally:
             self._busy = False
 
-    def tick_local(self) -> None:
+    def tick_local(self) -> bool:
         self._check()
         if not self._decision.may_collect_local or self._local is None:
-            return
+            return False
         self._busy = True
         try:
             self._local.tick()
-            self.history.invalidate()
+            return True
         finally:
             self._busy = False
 

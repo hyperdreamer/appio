@@ -9,6 +9,7 @@ and navigation that leaves collection and privilege state alone.
 from __future__ import annotations
 
 from concurrent.futures import Future
+from dataclasses import replace
 import threading
 import time
 from types import SimpleNamespace
@@ -312,6 +313,69 @@ def build(qtbot, *, facts=OFF, ready=False, setup=None, events=None, history=Non
     window.show()
     window._timer.stop()
     return window, coordinator, history, setup
+
+
+class CountingHistory:
+    def __init__(self):
+        self.invalidations = 0
+        self.view_state = "ready"
+
+    def invalidate(self):
+        self.invalidations += 1
+        self.view_state = f"unavailable:{self.invalidations}"
+
+
+def real_coordinator(tmp_path, history, local_factory):
+    return cw.CollectorCoordinator(
+        local_factory=local_factory,
+        client=SimpleNamespace(close=lambda: None),
+        history=history,
+        lease=cw.GuiLease(tmp_path / "collector.lock"),
+        clock=lambda: (END, END),
+    )
+
+
+def test_real_coordinator_probe_delta_liveness(tmp_path):
+    history = CountingHistory()
+    owner = real_coordinator(
+        tmp_path, history,
+        lambda: pytest.fail("same-key probe deltas must not start a local collector"),
+    )
+    facts = [SILENT if index % 2 == 0 else replace(SILENT, active="active")
+             for index in range(10)]
+
+    for current in facts:
+        owner.reconcile(current)
+        if history.invalidations:
+            assert history.view_state == "unavailable:1"
+
+    assert history.invalidations == 1
+    assert history.view_state == "unavailable:1"
+    owner.close()
+
+
+def test_real_coordinator_tick_advance_is_not_invalidation(tmp_path):
+    class Local:
+        baseline_only = True
+        last_frame = None
+
+        def tick(self):
+            return None
+
+        def quiesce(self):
+            return None
+
+        def close(self):
+            pass
+
+    history = CountingHistory()
+    owner = real_coordinator(tmp_path, history, Local)
+    owner.reconcile(OFF)
+    assert history.invalidations == 1
+
+    assert owner.tick_local() is True
+    assert history.invalidations == 1
+    owner.close()
 
 
 def refresh_and_settle(qtbot, window):
