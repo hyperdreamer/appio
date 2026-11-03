@@ -71,6 +71,8 @@ UNKNOWN = ServiceFacts(None, "unknown", False, False, None)
 
 BOOT = "boot-1"
 END = 8 * RAW_BUCKET_NS
+PENDING_BUDGET_NS = 30 * 10**9
+STALL_BUDGET_NS = PENDING_BUDGET_NS
 
 
 class FakeConnection:
@@ -1207,6 +1209,442 @@ def test_history_is_prepared_before_rendering_and_stale_detail_is_hidden(qtbot):
     assert set(history.ranking_calls) == {history.prepared}
 
 
+def test_pending_read_budget_shows_busy_without_retiring(qtbot):
+    now = [END - RAW_BUCKET_NS // 2]
+    history = CountingControlledHistory()
+    window, _, history, _ = controlled_build(qtbot, history=history)
+    window._timer.stop()
+    window._clock_ns = lambda: now[0]
+    window._tick_target()
+    pending = window._pending
+    pending_since = getattr(window, "_pending_since", now[0])
+    generation = history.generation
+    prepare_count = len(history.prepare_calls)
+    history.local_read_busy = True
+
+    now[0] = pending_since + STALL_BUDGET_NS - 1
+    window._poll_history()
+    assert getattr(window, "_stalled", False) is False
+    assert window._pending == pending
+
+    now[0] += 1
+    window._poll_history()
+    assert window._stalled is True
+    assert window._pending is pending
+    assert window._pending_since == pending_since
+    assert history.generation == generation
+    assert len(history.prepare_calls) == prepare_count
+    expected = "history read has not completed (loading); the reader is still busy"
+    assert window.history_state.text() == expected
+    assert window.files_view.files_updating.text() == expected
+
+
+def test_retirement_while_local_worker_busy_defers_without_submission(qtbot):
+    now = [END - RAW_BUCKET_NS // 2]
+    window, _, history, _ = controlled_build(qtbot)
+    window._timer.stop()
+    window._clock_ns = lambda: now[0]
+    window._tick_target()
+    pending = window._pending
+    assert pending is not None
+    window._current_window = lambda *_args: pending
+    history.local_read_busy = True
+    now[0] += STALL_BUDGET_NS
+    window._poll_history()
+    assert getattr(window, "_stalled", False) is True
+
+    history.view_state = "unavailable: ownership changed"
+    now[0] += 17
+    retired_at = now[0]
+    window._tick_target()
+    assert window._pending is None and window._pending_since is None
+    assert window._deferred_target == pending
+    assert window._retry_after == retired_at + STALL_BUDGET_NS
+    assert window._stalled is True
+    assert history.prepare_calls == [pending]
+    busy = "history read has not completed (unavailable: ownership changed); the reader is still busy"
+    assert window.history_state.text() == busy
+
+    now[0] = window._retry_after - 1
+    window._tick_target()
+    assert history.prepare_calls == [pending]
+    now[0] = window._retry_after + 1
+    window._tick_target()
+    assert history.prepare_calls == [pending]
+    history.local_read_busy = False
+    window._tick_target()
+    assert history.prepare_calls == [pending, pending]
+    assert window._pending == pending
+
+
+def test_retirement_retry_floor_blocks_then_submits_once(qtbot):
+    now = [END - RAW_BUCKET_NS // 2]
+    window, _, history, _ = controlled_build(qtbot)
+    window._timer.stop()
+    window._clock_ns = lambda: now[0]
+    window._tick_target()
+    target = window._pending
+    assert target is not None
+
+    history.view_state = "unavailable: synthetic retirement"
+    now[0] += 123
+    retired_at = now[0]
+    window._tick_target()
+    floor = retired_at + STALL_BUDGET_NS
+    assert window._pending is None and window._retry_after == floor
+    assert window._deferred_target == target
+    assert history.prepare_calls == [target]
+
+    for remaining, expected in (
+        (1_000_000_001, "retrying in 2 s"),
+        (1_000_000_000, "retrying in 1 s"),
+        (1, "retrying in 1 s"),
+    ):
+        now[0] = floor - remaining
+        window._tick_target()
+        assert window.history_state.text() == (
+            "history read has not completed (unavailable: synthetic retirement); "
+            + expected
+        )
+        assert history.prepare_calls == [target]
+
+    now[0] = floor
+    window._tick_target()
+    assert history.prepare_calls == [target, target]
+    assert window._pending == target
+    assert window._retry_after is None
+    assert "retrying" not in window.history_state.text()
+
+
+def test_prepare_failure_ownership_follows_submission_origin(qtbot, monkeypatch):
+    from appio.contracts import WindowUnavailableError
+
+    window, _, history, setup = controlled_build(qtbot)
+    window._timer.stop()
+    clock_target = scope_window()
+    history.prepare_failures.append(RuntimeError("clock failure"))
+    window._tick_target()
+    clock_retry = window._prepare_retry
+    assert clock_retry.owner == "clock" and clock_retry.window == clock_target
+    assert window._deferred_target is None
+    assert window._pending is None and window._pending_since is None
+    assert window._retry_after is None and window._stalled is False
+    assert window.error_label.text() == "appio: clock failure"
+    window._tick_target()
+    assert history.prepare_calls == [clock_target, clock_target]
+    assert window._prepare_retry is None and window._pending == clock_target
+    apply_scope(window, history, clock_target)
+
+    explicit = Window("range", BOOT, RAW_BUCKET_NS, END)
+    history.prepare_failures.append(RuntimeError("explicit failure"))
+    with pytest.raises(RuntimeError, match="explicit failure"):
+        window.show_window(explicit)
+    explicit_retry = window._prepare_retry
+    assert explicit_retry.owner == "explicit" and explicit_retry.window == explicit
+    assert window._deferred_target == explicit
+    assert window._retry_after is None and window._stalled is False
+    calls = tuple(history.prepare_calls)
+    window._tick_target()
+    assert window.apply_ready_frame() is False
+    assert tuple(history.prepare_calls) == calls
+
+    monkeypatch.setattr(window, "_submit_probe", lambda **_kwargs: False)
+    window._start("status", None)
+    setup.complete("status", ok("status"))
+    qtbot.waitUntil(lambda: not window.busy, timeout=1000)
+    assert tuple(history.prepare_calls) == calls
+
+    window.show_window(explicit)
+    assert history.prepare_calls == [clock_target, clock_target, explicit, explicit]
+    assert window._pending == explicit and window._prepare_retry is None
+    apply_scope(window, history, explicit)
+
+    old = Window("range", BOOT, 2 * RAW_BUCKET_NS, END)
+    replacement = Window("range", BOOT, 3 * RAW_BUCKET_NS, END)
+    history.prepare_failures.append(RuntimeError("superseded failure"))
+    with pytest.raises(RuntimeError, match="superseded failure"):
+        window.show_window(old)
+    old_retry = window._prepare_retry
+    window.show_window(replacement)
+    assert history.prepare_calls[-2:] == [old, replacement]
+    assert window._prepare_retry is None and window._pending == replacement
+    assert window._deferred_target == replacement
+    assert old_retry.owner == "explicit"
+    assert window._retry_after is None and window._stalled is False
+
+
+def test_precheck_refusal_propagates_after_a_prior_loading_failure(qtbot, monkeypatch):
+    window, _, history, _ = controlled_build(qtbot)
+    window._timer.stop()
+    target = scope_window()
+    history.prepare_failures.append(RuntimeError("synthetic submit failure"))
+    with pytest.raises(RuntimeError, match="synthetic submit failure"):
+        window.show_window(target)
+    assert history.view_state == "loading"
+    refusal = WindowUnavailableError("launch_attribution", "launch history is unavailable (A22)")
+
+    def refuse(_window):
+        raise refusal
+
+    monkeypatch.setattr(history, "prepare", refuse)
+    with pytest.raises(WindowUnavailableError) as caught:
+        window.show_window(target)
+    assert caught.value is refusal
+    assert window._prepare_retry is None
+    assert window._pending is None and window._pending_since is None
+    assert window._stalled is False and window._retry_after is None
+    assert window._deferred_target == target
+    assert window.error_label.text() == str(refusal)
+    assert not window.error_label.text().startswith("appio:")
+
+
+def _retire_stalled_window(qtbot, *, busy=True):
+    now = [END - RAW_BUCKET_NS // 2]
+    history = CountingControlledHistory()
+    window, _, history, setup = controlled_build(qtbot, history=history)
+    window._timer.stop()
+    window._clock_ns = lambda: now[0]
+    window._tick_target()
+    pending = window._pending
+    assert pending is not None
+    window._current_window = lambda *_args: pending
+    history.local_read_busy = busy
+    now[0] += STALL_BUDGET_NS
+    window._poll_history()
+    history.view_state = "unavailable: synthetic retirement"
+    now[0] += 1
+    window._tick_target()
+    assert window._pending is None
+    return window, history, setup, now, pending
+
+
+def test_explicit_refresh_during_stall_preserves_deferred_target_and_floor(qtbot):
+    window, history, _, now, pending = _retire_stalled_window(qtbot, busy=True)
+
+    class CommittedTickCoordinator(ControlledCoordinator):
+        def tick_local(self):
+            super().tick_local()
+            return True
+
+    coordinator = CommittedTickCoordinator()
+    coordinator.history = history
+    window.coordinator = coordinator
+    deferred = window._deferred_target
+    floor = window._retry_after
+    prepare_count = len(history.prepare_calls)
+    window._submit_probe = lambda **_kwargs: False
+    window._probe_ticket = 1
+    for _ in range(5):
+        window._apply_facts(cw.ProbePayload(
+            OFF, None, window._probe_ticket, window._setup_generation
+        ))
+    expected = (
+        f"history read has not completed ({history.view_state}); "
+        "the reader is still busy"
+    )
+    window.refresh()
+    assert history.prepare_calls == [pending] and len(history.prepare_calls) == prepare_count
+    assert window._deferred_target == deferred == pending
+    assert window._retry_after == floor
+    assert window._stalled is True
+    assert window.history_state.text() == expected
+    assert window.files_view.files_updating.text() == expected
+    assert now[0] < floor
+
+
+def test_show_window_during_stall_uses_submission_gate(qtbot):
+    window, history, _, _, pending = _retire_stalled_window(qtbot, busy=True)
+    requested = Window("range", BOOT, RAW_BUCKET_NS, END)
+    prior_target = window._target
+    prior_since = window._pending_since
+    prior_floor = window._retry_after
+    prior_busy = window.history_state.text()
+    window.show_window(requested)
+    assert history.prepare_calls == [pending]
+    assert window._deferred_target == requested
+    assert window._target == prior_target
+    assert window._pending is None and window._pending_since == prior_since is None
+    assert window._retry_after == prior_floor
+    assert window._stalled is True
+    assert window.history_state.text() == prior_busy
+    assert window.files_view.files_updating.text() == prior_busy
+
+
+def test_apply_ready_frame_retries_deferred_target_after_local_read_settles(qtbot):
+    window, _, history, _ = controlled_build(qtbot)
+    window._timer.stop()
+    requested = Window("range", BOOT, RAW_BUCKET_NS, END)
+    history.local_read_busy = True
+
+    window.show_window(requested)
+
+    assert history.prepare_calls == []
+    assert window._deferred_target == requested
+    history.local_read_busy = False
+
+    assert window.apply_ready_frame() is False
+    assert history.prepare_calls == [requested]
+    assert window._pending == requested
+
+
+def test_initial_read_passes_submission_gate_control(qtbot):
+    window, _, history, _ = controlled_build(qtbot)
+    window._timer.stop()
+    assert getattr(history, "local_read_in_flight", False) is False
+    window._tick_target()
+    target = window._target
+    assert target is not None and window._pending == target
+    assert len(history.prepare_calls) == 1
+    assert window._pending_since == END - RAW_BUCKET_NS // 2
+    window._tick_target()
+    assert history.prepare_calls == [target]
+
+
+def test_deferred_explicit_target_survives_other_frame_apply(qtbot):
+    window, _, history, _ = controlled_build(qtbot)
+    window._timer.stop()
+    first = scope_window()
+    second = Window("range", BOOT, RAW_BUCKET_NS, END)
+    window.show_window(first)
+    window.show_window(second)
+    assert history.prepare_calls == [first]
+    assert window._pending == first and window._deferred_target == second
+
+    apply_scope(window, history, first)
+    assert window._deferred_target == second
+    window._tick_target()
+    assert history.prepare_calls == [first, second]
+    assert window._pending == second and window._deferred_target == second
+    apply_scope(window, history, second)
+    assert window._deferred_target is None
+
+
+def test_apply_and_reprepare_clear_stall_state(qtbot):
+    now = [END - RAW_BUCKET_NS // 2]
+    window, _, history, _ = controlled_build(qtbot)
+    window._timer.stop()
+    window._clock_ns = lambda: now[0]
+    window._tick_target()
+    first = window._pending
+    assert first is not None
+    now[0] += STALL_BUDGET_NS
+    history.local_read_busy = True
+    window._poll_history()
+    assert window._stalled is True
+    expected = "history read has not completed (loading); the reader is still busy"
+    assert window.files_view.files_updating.text() == expected
+
+    apply_scope(window, history, first)
+    assert window._stalled is False and window._retry_after is None
+    assert window._pending is None and window._pending_since is None
+    assert window.files_view._stalled_caption is None
+
+    history.local_read_busy = False
+    replacement = Window("range", BOOT, RAW_BUCKET_NS, END)
+    window.show_window(replacement)
+    now[0] += STALL_BUDGET_NS
+    window._poll_history()
+    assert window._stalled is True
+    history.view_state = "unavailable: replacement retired"
+    now[0] += 1
+    window._tick_target()
+    floor = window._retry_after
+    assert floor == now[0] + STALL_BUDGET_NS
+    assert window._stalled is True
+    now[0] = floor
+    window._tick_target()
+    assert window._pending == replacement
+    assert window._pending_since == floor
+    assert window._retry_after is None and window._stalled is False
+    assert window.files_view._stalled_caption is None
+
+
+def test_collector_window_wires_stall_caption_to_real_files_view(qtbot, tmp_path, monkeypatch):
+    from tests.p4.test_file_runtime import Frames, event
+
+    from appio.bpf_fileio import BpfFileSource, VectorLoader
+    from appio.contracts import FILE_HOUR_NS as H
+    from appio.file_runtime import FileRuntime
+    from appio.files import FileIdentityResolver
+    from appio.history_router import HistoryRouter
+    from appio.iodclient import AppRegistry, ClientState
+    from appio.query import QueryService
+
+    class IdleClient:
+        state = ClientState()
+
+        def query(self, _request):
+            raise AssertionError("no remote source in this test")
+
+    frames = Frames(tmp_path / "stall-history.db")
+    loader = VectorLoader()
+    runtime = FileRuntime(
+        frames.db, source_factory=lambda: BpfFileSource(loader),
+        identity_resolver=FileIdentityResolver(lambda _dev: "fs-uuid"),
+    )
+    assert runtime.start().available
+    loader.queue(0, events=[event()])
+    runtime.consume(*frames.tick(0))
+    runtime.consume(*frames.tick(H))
+
+    history = HistoryRouter(QueryService(frames.db), IdleClient(), AppRegistry())
+    now = [H - 1]
+    window = CollectorWindow(
+        ControlledCoordinator(), history, ControlledSetup(OFF),
+        clock_ns=lambda: now[0], refresh_interval_ms=1000,
+    )
+    qtbot.addWidget(window)
+    qtbot.addWidget(window.settings)
+    window.show()
+    window._timer.stop()
+    release = threading.Event()
+    try:
+        window._tick_target()
+        first = window._pending
+        assert first is not None
+        qtbot.waitUntil(lambda: history.ready(first), timeout=5000)
+        assert window.apply_ready_frame()
+        assert window._displayed == first
+        qtbot.waitUntil(
+            lambda: window.files_view.last_result is not None
+            and window.files_view.model.rowCount() == 1
+            and not window.files_view._outstanding,
+            timeout=5000,
+        )
+
+        entered = threading.Event()
+        original_read = history._read_local
+
+        def held_read(paths, requested):
+            entered.set()
+            assert release.wait(5), "local history read was not released"
+            return original_read(paths, requested)
+
+        monkeypatch.setattr(history, "_read_local", held_read)
+        window.show_window(first)
+        assert entered.wait(2)
+        now[0] += STALL_BUDGET_NS
+        window._poll_history()
+        expected = "history read has not completed (loading); the reader is still busy"
+        assert window.history_state.text() == expected
+        assert window.files_view.files_updating.text() == expected
+        assert window._displayed == first
+        assert window.files_view.model.rowCount() == 1
+
+        release.set()
+        history._local_future.result(timeout=5)
+        window._poll_history()
+        assert window._displayed == first and window._pending is None
+        assert window.files_view._stalled_caption is None
+        assert not window.files_view.files_updating.isVisible()
+        assert window.files_view.model.rowCount() == 1
+    finally:
+        release.set()
+        window.shutdown()
+        runtime.close()
+        frames.db.close()
+
+
 @pytest.mark.parametrize("change", ["time", "boot"])
 def test_pending_history_retains_a_until_applied_before_b(qtbot, change):
     window, coordinator, history, setup = build(
@@ -1249,32 +1687,47 @@ def test_pending_history_retains_a_until_applied_before_b(qtbot, change):
 
 
 def test_pending_history_invalidation_reprepares_once(qtbot):
+    now = [END - RAW_BUCKET_NS // 2]
     window, coordinator, history, setup = build(
         qtbot, facts=ON, history=ControlledHistory())
     window._timer.stop()
     window._poll_timer.stop()
+    window._clock_ns = lambda: now[0]
     refresh_and_settle(qtbot, window)
     original_window = history.prepared
     assert window._pending == original_window
     assert len(history.actions) == 1
+    monkeypatch = pytest.MonkeyPatch()
+    try:
+        monkeypatch.setattr(window, "_current_window", lambda *_args: original_window)
+        history.view_state = "unavailable"
+        retired_at = now[0]
+        window._tick_target()
+        assert history.prepare_calls == [original_window]
+        assert window._pending is None and window._pending_since is None
+        assert window._deferred_target == original_window
+        assert window._retry_after == retired_at + STALL_BUDGET_NS
 
-    history.view_state = "unavailable"
-    refresh_and_settle(qtbot, window)
-    # Retirement drops the stale pending preparation and replaces it once.
-    assert len(history.actions) == 2
-    assert history.prepared == original_window
-    assert window._pending == original_window
-
-    history.become_ready(original_window)
-    assert window.apply_ready_frame() is True
-    assert window._displayed == original_window
-    assert window._prepared == original_window
+        now[0] = window._retry_after - 1
+        window._tick_target()
+        assert history.prepare_calls == [original_window]
+        now[0] = window._retry_after
+        window._tick_target()
+        assert history.prepare_calls == [original_window, original_window]
+        assert window._pending == original_window
+        history.become_ready(original_window)
+        assert window.apply_ready_frame() is True
+        assert window._displayed == original_window
+    finally:
+        monkeypatch.undo()
 
 
 def test_pending_history_changed_ownership_reprepares_once(qtbot):
+    now = [END - RAW_BUCKET_NS // 2]
     window, coordinator, history, setup = controlled_build(qtbot, facts=ON)
     window._timer.stop()
     window._poll_timer.stop()
+    window._clock_ns = lambda: now[0]
     refresh_and_settle(qtbot, window)
     original_window = history.prepared
     assert len(history.actions) == 1
@@ -1283,19 +1736,31 @@ def test_pending_history_changed_ownership_reprepares_once(qtbot):
     assert window.state_text == COLLECTOR_STATE_ON_ANSWERING
 
     setup.facts = OFF
-    # Changed ownership is reconciled as the new facts are applied, and that
-    # reconcile invalidates the router generation: the retained preparation is
-    # replaced exactly once while the requested scope is unchanged.
-    coordinator.invalidate_on = "reconcile"
     refresh_and_settle(qtbot, window)
     assert history.prepared == original_window
-    assert len(history.prepare_calls) == 2
-    assert len(history.actions) == 2
+    assert history.prepare_calls == [original_window]
+    assert len(history.actions) == 1
     assert window._pending == original_window
+    assert window._retry_after is None
     assert len(coordinator.reconciles) == 2
     assert coordinator.ticks == 2
     assert coordinator.reconciles[-1] == OFF
     assert window.state_text == COLLECTOR_STATE_OFF
+
+    # The owner transition itself does not pretend to retire this test double's
+    # read; a separate router retirement proves the new retry-floor contract.
+    history.invalidate()
+    retired_at = now[0]
+    window._tick_target()
+    assert window._pending is None and window._pending_since is None
+    assert window._deferred_target == original_window
+    assert window._retry_after == retired_at + STALL_BUDGET_NS
+    assert history.prepare_calls == [original_window]
+
+    now[0] = window._retry_after
+    window._tick_target()
+    assert history.prepare_calls == [original_window, original_window]
+    assert window._pending == original_window
 
 
 def test_no_boot_row_yet_waits_instead_of_querying_an_empty_scope(qtbot):
@@ -1685,6 +2150,48 @@ def test_real_history_router_gates_rendering_until_ready(qtbot, tmp_path):
         store.connection.close()
 
 
+def test_real_coordinator_holds_initial_preparation_until_source_key(qtbot, tmp_path):
+    from types import SimpleNamespace
+
+    from appio.ipc_models import StreamCursor
+
+    history = CountingControlledHistory()
+    history.client = SimpleNamespace(state=SimpleNamespace(
+        verified=True, answering=True, cursor=StreamCursor(BOOT, 1, 0),
+        pending_activation=False,
+    ))
+    owner = real_coordinator(
+        tmp_path, history,
+        lambda: pytest.fail("a daemon-owned window must not collect locally"),
+    )
+    owner.reconcile(SILENT)
+    setup = ControlledSetup(ON)
+    window = CollectorWindow(
+        owner, history, setup, clock_ns=lambda: END - RAW_BUCKET_NS // 2,
+        refresh_interval_ms=1000,
+    )
+    qtbot.addWidget(window)
+    qtbot.addWidget(window.settings)
+    window.show()
+    window._timer.stop()
+    explicit = scope_window(boot=BOOT, end=END + RAW_BUCKET_NS)
+    try:
+        window.refresh()
+        assert history.prepare_calls == []
+
+        window.show_window(explicit)
+        assert history.prepare_calls == []
+        assert window._deferred_target == explicit
+
+        qtbot.waitUntil(lambda: window.facts_applied == 1, timeout=2000)
+        assert history.invalidations == 2
+        assert history.prepare_calls == [explicit]
+        assert window._pending == explicit
+        assert window._retry_after is None
+    finally:
+        window.close()
+
+
 def test_window_keeps_in_flight_history_for_the_same_scope(qtbot, tmp_path, monkeypatch):
     """A responsive daemon must populate an open window without a manual refresh."""
     from collections import deque
@@ -1779,6 +2286,12 @@ def test_window_keeps_in_flight_history_for_the_same_scope(qtbot, tmp_path, monk
         on_gap=lambda notice: history_ref[0].record_transport_gap(notice),
         on_change=lambda: None,
     )
+
+    def prime_client():
+        client.pump()
+        return client.state.verified and client.state.answering
+
+    qtbot.waitUntil(prime_client, timeout=1500)
     history = HistoryRouter(QueryService(local), client, AppRegistry())
     read_local = history._read_local
 
@@ -1794,6 +2307,7 @@ def test_window_keeps_in_flight_history_for_the_same_scope(qtbot, tmp_path, monk
         client=client, history=history, lease=cw.GuiLease(tmp_path / "gui.lock"),
         clock=lambda: (120_000_000_000 - 1, 1_700_000_000_000_000_000),
     )
+    coordinator.reconcile(replace(SILENT, daemon_verified=True, answering=True))
     setup = FakeSetup(SILENT)
     now = 120_000_000_000 - 1
     window = CollectorWindow(
@@ -2016,9 +2530,14 @@ class ControlledHistory(FakeHistory):
         self.ready_windows: set[Window] = set()
         self.ready_immediately = ready
         self.file_futures: list[Future] = []
+        self.local_read_busy = False
         self.registry = SimpleNamespace(id_for=lambda key: 2 if key == "file:beta" else 3)
         self.file_apps: list[tuple[str, str, int]] = []
         self.local.file_applications = self._file_applications
+
+    @property
+    def local_read_in_flight(self):
+        return self.local_read_busy
 
     def _file_applications(self, _window):
         self.file_application_reads += 1
@@ -2291,17 +2810,35 @@ def test_window_local_tick_coalesces_invalidation_until_apply(qtbot):
 
 
 def test_retired_pending_preparation_is_replaced_once(qtbot):
+    now = [END - RAW_BUCKET_NS // 2]
     window, _, history, _ = controlled_build(qtbot)
-    window.refresh()
+    window._timer.stop()
+    window._clock_ns = lambda: now[0]
+    window._tick_target()
     target = window._pending
     assert target is not None
-    history.view_state = "unavailable: ownership changed"
-    window.refresh()
-    assert history.prepare_calls == [target, target]
-    window.refresh()
-    assert history.prepare_calls == [target, target]
-    apply_scope(window, history, target)
-    assert window._displayed == target
+    monkeypatch = pytest.MonkeyPatch()
+    try:
+        monkeypatch.setattr(window, "_current_window", lambda *_args: target)
+        history.view_state = "unavailable: ownership changed"
+        retired_at = now[0]
+        window._tick_target()
+        assert history.prepare_calls == [target]
+        assert window._deferred_target == target
+        assert window._pending is None
+        assert window._retry_after == retired_at + STALL_BUDGET_NS
+
+        now[0] = window._retry_after - 1
+        window._tick_target()
+        assert history.prepare_calls == [target]
+        now[0] = window._retry_after
+        window._tick_target()
+        assert history.prepare_calls == [target, target]
+        assert window._pending == target
+        apply_scope(window, history, target)
+        assert window._displayed == target
+    finally:
+        monkeypatch.undo()
 
 
 @pytest.mark.parametrize("owner", ["clock", "explicit"])
@@ -2374,7 +2911,7 @@ def test_prepare_failure_after_loading_keeps_frame_closed_and_retries_on_later_t
     previous_calls = len(calls)
     if resolution == "no_target":
         with monkeypatch.context() as no_target:
-            no_target.setattr(window, "_current_window", lambda: None)
+            no_target.setattr(window, "_current_window", lambda *_args: None)
             marker = window._prepare_retry
             window._tick_target()
             assert len(calls) == previous_calls
@@ -2521,7 +3058,7 @@ def test_explicit_show_window_driver_does_not_compute_clock_target(qtbot, monkey
 
     window, _, history, _ = controlled_build(qtbot)
     explicit = Window(kind="range", start_mono_ns=2, end_mono_ns=END, boot_id=BOOT)
-    monkeypatch.setattr(window, "_current_window", lambda: pytest.fail("clock target computed"))
+    monkeypatch.setattr(window, "_current_window", lambda *_args: pytest.fail("clock target computed"))
     def forbid_events(*_args, **_kwargs):
         pytest.fail("explicit scope driver pumped Qt events")
     with monkeypatch.context() as no_events:
@@ -3111,7 +3648,7 @@ def test_task4_m006_closed_target_tick_is_inert(qtbot, monkeypatch):
     window.close()
     before = (window._displayed, window._pending, tuple(history.prepare_calls))
     clocks = []
-    monkeypatch.setattr(window, "_current_window", lambda: clocks.append(True) or None)
+    monkeypatch.setattr(window, "_current_window", lambda *_args: clocks.append(True) or None)
     window._tick_target()
     assert clocks == []
     assert (window._displayed, window._pending, tuple(history.prepare_calls)) == before
@@ -3280,7 +3817,7 @@ def test_task4_m008_advancing_target_keeps_nonretired_pending_scope(qtbot, monke
     window._timer.stop()
     pending, target = scope_window(), scope_window(END + RAW_BUCKET_NS)
     window.show_window(pending)
-    monkeypatch.setattr(window, "_current_window", lambda: target)
+    monkeypatch.setattr(window, "_current_window", lambda *_args: target)
     calls = tuple(history.prepare_calls)
     window._tick_target()
     assert window._target == target and window._pending == pending
@@ -3296,7 +3833,7 @@ def test_task4_m012_explicit_retry_survives_nonempty_clock_target(qtbot, monkeyp
         window.show_window(scope_window())
     marker = window._prepare_retry
     calls = tuple(history.prepare_calls)
-    monkeypatch.setattr(window, "_current_window", lambda: scope_window(END + RAW_BUCKET_NS))
+    monkeypatch.setattr(window, "_current_window", lambda *_args: scope_window(END + RAW_BUCKET_NS))
     window._tick_target()
     assert window._prepare_retry is marker and marker.owner == "explicit"
     assert window._pending is None and not window.files_view._scope_ready
@@ -3309,10 +3846,10 @@ def test_task4_m016_validation_error_before_loading_propagates(qtbot, monkeypatc
     history.view_state = "ready"
 
     def invalid(_window):
-        raise ValueError("invalid window")
+        raise WindowUnavailableError("launch_attribution", "invalid window")
 
     monkeypatch.setattr(history, "prepare", invalid)
-    with pytest.raises(ValueError, match="invalid window"):
+    with pytest.raises(WindowUnavailableError, match="invalid window"):
         window._tick_target()
     assert window._prepare_retry is None and window._prepare_error is None
 

@@ -57,7 +57,7 @@ from ..activation import (
     STATE_NOT_DELEGATED,
 )
 from ..collector_owner import CollectorCoordinator, GuiLease, ServiceFacts, decide_owner
-from ..contracts import RAW_BUCKET_NS, Window
+from ..contracts import RAW_BUCKET_NS, Window, WindowUnavailableError
 from ..history_export import ExportResult
 from ..history_router import HistoryRouter
 from ..iodclient import ClientState
@@ -123,6 +123,7 @@ UNIT_SHOW_ARGV = (
 )
 HELPER_TIMEOUT_SECONDS = 120.0
 STATUS_TIMEOUT_SECONDS = 2.0
+PENDING_BUDGET_NS: int = 30 * 10**9
 MAX_HELPER_OUTPUT = 64 * 1024
 CONSENT_COMMAND_PREFIX = "/usr/bin/pkexec /usr/bin/appio-setup"
 
@@ -545,6 +546,10 @@ class CollectorWindow(QMainWindow):
         self._target: Window | None = None
         self._displayed: Window | None = None
         self._pending: Window | None = None
+        self._pending_since: int | None = None
+        self._stalled = False
+        self._retry_after: int | None = None
+        self._deferred_target: Window | None = None
         self._refresh_after_apply = False
         self._invalidated = False
         self._prepare_retry: PrepareRetry | None = None
@@ -753,88 +758,74 @@ class CollectorWindow(QMainWindow):
                 self.files_view.flush_refresh()
             if not self._busy:
                 self._submit_probe()
+        except WindowUnavailableError as error:
+            self._show_error(str(error) or type(error).__name__)
         except Exception as error:
             self._show_error(f"appio: {str(error) or type(error).__name__}")
 
     def _history_retired(self) -> bool:
         return str(getattr(self.history, "view_state", "")).startswith("unavailable")
 
-    def _tick_target(self) -> None:
+    def _tick_target(self, *, now: int | None = None) -> None:
         if self._closed:
             return
-        if self._pending is not None and self._history_retired():
-            self._pending = None
-        self._target = self._current_window()
+        now = self._clock_ns() if now is None else now
+        self._target = self._current_window(now)
         retry = self._prepare_retry
-        if self._target is None:
-            if retry is not None and retry.owner == "explicit":
-                self.files_view.set_updating_scope(retry.window)
-                self.files_view.set_scope_ready(False)
-                self._invalidated = False
-                self._sync_files()
-                self._render_files_message()
+
+        if self._pending is not None:
+            if self._history_retired():
+                self._retire_pending(now)
                 return
+            if (
+                self._pending_since is not None
+                and now - self._pending_since >= PENDING_BUDGET_NS
+            ):
+                self._stalled = True
+            self._invalidated = False
+            self._show_pending_status(now)
+            self._arm_poll()
+            return
+
+        if retry is not None and retry.owner == "explicit":
+            self.files_view.set_updating_scope(retry.window)
+            self.files_view.set_scope_ready(False)
+            self._invalidated = self._history_retired() and self._displayed is not None
+            self._show_pending_status(now)
+            self._render_files_message()
+            return
+
+        wanted = self._deferred_target or self._target
+        self._invalidated = self._history_retired() and self._displayed is not None
+        if wanted is None:
             if retry is not None:
+                self._prepare_retry = None
+                self._prepare_error = None
                 self._clear_error()
             self._displayed = None
-            self._pending = None
-            self._prepare_retry = None
-            self._prepare_error = None
+            self._pending_since = None
             self._invalidated = False
             self.files_view.set_updating_scope(None)
             self.files_view.set_scope_ready(True)
             self.history_state.setText("waiting for the first sample")
             self.history_state.setVisible(True)
             self._view.show_overview_status("waiting for the first sample", keep_frame=False)
+            self.files_view.set_stalled(False, "")
             self._poll_timer.stop()
             self._sync_files()
             return
-        if retry is not None and retry.owner == "explicit":
-            self.files_view.set_updating_scope(retry.window)
-            self.files_view.set_scope_ready(False)
-            self._invalidated = self._history_retired() and self._displayed is not None
-            self._render_files_message()
-            return
 
-        retrying = retry is not None and retry.owner == "clock"
-        self.files_view.set_scope_ready(self._pending is None and not retrying)
-        self._invalidated = self._history_retired() and self._displayed is not None
-        if self._pending is not None:
-            self._show_pending_status()
-            self._arm_poll()
-            return
-        if self._displayed is None or self._invalidated or retrying or self._target != self._displayed:
-            prepare_window = self._target
-            self.files_view.set_updating_scope(prepare_window)
-            self.files_view.set_scope_ready(False)
-            self.files_view.request_refresh()
-            try:
-                with self.files_view.transient_scope(retire_on_exit=True):
-                    self.history.prepare(prepare_window)
-            except Exception as error:
-                if self.history.view_state != "loading":
-                    raise
-                self._pending = None
-                self._prepare_retry = PrepareRetry(
-                    prepare_window, "clock", self._clock_ns()
-                )
-                self._prepare_error = f"appio: {str(error) or type(error).__name__}"
-                self._show_error(self._prepare_error)
-                self._show_pending_status()
-                self._poll_timer.stop()
-                self._render_files_message()
-                return
-            resolved_error = self._prepare_error
-            self._prepare_retry = None
-            self._prepare_error = None
-            self._pending = prepare_window
-            # Clear only the preparation error this tick resolved; a helper or
-            # probe failure that is still on screen must stay visible.
-            if resolved_error is not None and self.error_label.text() == resolved_error:
-                self._clear_error()
-            self._show_pending_status()
-            self._arm_poll()
-        elif self._displayed is not None:
+        retrying_clock = retry is not None and retry.owner == "clock"
+        needs_prepare = (
+            self._displayed is None
+            or self._invalidated
+            or retrying_clock
+            or self._deferred_target is not None
+            or self._stalled
+            or self._retry_after is not None
+            or wanted != self._displayed
+        )
+        if not needs_prepare:
             self.files_view.set_scope_ready(True)
             self.files_view.set_updating_scope(None)
             if self._history_ready(self._displayed):
@@ -842,64 +833,193 @@ class CollectorWindow(QMainWindow):
             self._render_files_message()
             self.history_state.setText("")
             self.history_state.setVisible(False)
+            self.files_view.set_stalled(False, "")
+            self._poll_timer.stop()
+            return
+
+        self.files_view.set_updating_scope(wanted)
+        self.files_view.set_scope_ready(False)
+        self.files_view.request_refresh()
+        if not self._submit_prepare(wanted, "clock", now=now):
+            self._show_pending_status(now)
             self._poll_timer.stop()
 
-    def _show_pending_status(self) -> None:
+    def _retire_pending(self, now: int) -> None:
+        if self._pending is None:
+            return
+        wanted = self._deferred_target or self._target
+        if wanted is not None:
+            self._deferred_target = wanted
+        self._pending = None
+        self._pending_since = None
+        self._retry_after = now + PENDING_BUDGET_NS
+        self._invalidated = self._displayed is not None
+        self._poll_timer.stop()
+        self._show_pending_status(now)
+
+    def _show_pending_status(self, now: int | None = None) -> None:
+        now = self._clock_ns() if now is None else now
+        view_state = str(self.history.view_state)
         if self._displayed is None:
-            self.history_state.setText(f"loading history ({self.history.view_state})")
+            text = f"loading history ({view_state})"
         else:
-            self.history_state.setText(f"updating ({self.history.view_state})")
+            text = f"updating ({view_state})"
+
+        stall_eligible = self._stalled or self._retry_after is not None
+        local_read_in_flight = getattr(self.history, "local_read_in_flight", False)
+        if stall_eligible and local_read_in_flight is True:
+            text = (
+                f"history read has not completed ({view_state}); "
+                "the reader is still busy"
+            )
+        elif self._retry_after is not None and now < self._retry_after:
+            remaining = self._retry_after - now
+            seconds = (remaining + 1_000_000_000 - 1) // 1_000_000_000
+            text = (
+                f"history read has not completed ({view_state}); "
+                f"retrying in {seconds} s"
+            )
+
+        self.history_state.setText(text)
         self.history_state.setVisible(True)
+        if stall_eligible and text.startswith("history read has not completed"):
+            self.files_view.set_stalled(True, text)
+        else:
+            self.files_view.set_stalled(False, "")
         self._render_files_message()
 
     def _arm_poll(self) -> None:
         if self._pending is not None and not self._poll_timer.isActive():
             self._poll_timer.start()
 
-    def apply_ready_frame(self) -> bool:
+    def _history_source_key_ready(self) -> bool:
+        coordinator = self.coordinator
+        if not isinstance(coordinator, CollectorCoordinator):
+            return True
+        facts = coordinator._facts
+        if facts is None:
+            return False
+        client_state = getattr(getattr(self.history, "client", None), "state", None)
+        if client_state is not None and (
+            facts.answering != client_state.answering
+            or (facts.daemon_verified and not client_state.verified)
+        ):
+            return False
+        if client_state is not None and client_state.verified and client_state.answering:
+            facts = replace(
+                facts,
+                daemon_verified=True,
+                answering=True,
+                pending_activation=client_state.pending_activation,
+            )
+            decision = decide_owner(facts)
+        else:
+            decision = coordinator._decision
+        return coordinator._history_key == (
+            decision.owner,
+            decision.may_collect_local,
+            facts.daemon_verified,
+            facts.answering,
+        )
+
+    def _submit_prepare(
+        self, wanted: Window, origin: Literal["clock", "explicit"], *, now: int | None = None
+    ) -> bool:
+        if self._closed:
+            return False
+        now = self._clock_ns() if now is None else now
+        if (
+            self._pending is not None
+            or not self._history_source_key_ready()
+            or getattr(self.history, "local_read_in_flight", False) is not False
+            or (self._retry_after is not None and now < self._retry_after)
+            or wanted is None
+        ):
+            return False
+
+        retry_error = self._prepare_error
+        self._prepare_retry = None
+        self._prepare_error = None
+        try:
+            with self.files_view.transient_scope(retire_on_exit=True):
+                self.history.prepare(wanted)
+        except WindowUnavailableError as error:
+            self._pending = None
+            self._pending_since = None
+            self._prepare_retry = None
+            self._prepare_error = None
+            self._show_error(str(error) or type(error).__name__)
+            self._show_pending_status(now)
+            self._poll_timer.stop()
+            self._render_files_message()
+            raise
+        except Exception as error:
+            self._pending = None
+            self._pending_since = None
+            self._prepare_retry = PrepareRetry(wanted, origin, now)
+            self._prepare_error = f"appio: {str(error) or type(error).__name__}"
+            self._show_error(self._prepare_error)
+            self._show_pending_status(now)
+            self._poll_timer.stop()
+            self._render_files_message()
+            if origin == "explicit":
+                raise
+            return False
+
+        self._pending = wanted
+        self._pending_since = now
+        self._stalled = False
+        self._retry_after = None
+        self._prepare_retry = None
+        self._prepare_error = None
+        if retry_error is not None and self.error_label.text() == retry_error:
+            self._clear_error()
+        self._show_pending_status(now)
+        self._arm_poll()
+        return True
+
+    def apply_ready_frame(self, *, now: int | None = None) -> bool:
         if self._closed:
             return False
         if self._prepare_retry is not None and self._prepare_retry.owner == "explicit":
             return False
+        now = self._clock_ns() if now is None else now
+        if self._pending is None and self._deferred_target is not None:
+            self._tick_target(now=now)
+            if self._pending is None:
+                return False
         if self._pending is None:
             return False
         if self._history_retired():
-            self._pending = None
-            self._invalidated = self._history_retired() and self._displayed is not None
+            self._retire_pending(now)
             return False
+        if self._pending_since is not None and now - self._pending_since >= PENDING_BUDGET_NS:
+            self._stalled = True
         if self.history.ready(self._pending):
             self._apply_frame()
             return True
+        self._show_pending_status(now)
         return False
 
     def show_window(self, window: Window) -> None:
         if self._closed:
             return
-        self._prepare_retry = None
-        self._prepare_error = None
+        now = self._clock_ns()
+        retry = self._prepare_retry
+        self._deferred_target = window
+        if retry is not None and (retry.owner != "explicit" or retry.window != window):
+            self._prepare_retry = None
+            self._prepare_error = None
+            if self.error_label.text().startswith("appio: "):
+                self._clear_error()
+
         self.files_view.set_updating_scope(window)
         self.files_view.set_scope_ready(False)
         self.files_view.request_refresh()
-        try:
-            with self.files_view.transient_scope(retire_on_exit=True):
-                self.history.prepare(window)
-        except Exception as error:
-            if self.history.view_state != "loading":
-                raise
-            self._pending = None
-            self._prepare_retry = PrepareRetry(window, "explicit", self._clock_ns())
-            self._prepare_error = f"appio: {str(error) or type(error).__name__}"
-            self._show_error(self._prepare_error)
-            self._show_pending_status()
-            self._poll_timer.stop()
+        accepted = self._submit_prepare(window, "explicit", now=now)
+        if not accepted:
+            self._show_pending_status(now)
             self._render_files_message()
-            raise
-        self._prepare_retry = None
-        self._prepare_error = None
-        self._pending = window
-        self._clear_error()
-        self._show_pending_status()
-        self._arm_poll()
 
     def _apply_frame(self) -> None:
         window = self._pending
@@ -907,6 +1027,11 @@ class CollectorWindow(QMainWindow):
             return
         self._displayed = window
         self._pending = None
+        self._pending_since = None
+        self._stalled = False
+        self._retry_after = None
+        if self._deferred_target == window:
+            self._deferred_target = None
         self._invalidated = False
         self.files_view.retire_deliveries()
         self.files_view.set_scope_ready(True)
@@ -914,20 +1039,24 @@ class CollectorWindow(QMainWindow):
         self.files_view.flush_refresh()
         self.files_view.set_updating_scope(None)
         self._render_files_message()
-        self._poll_timer.stop()
+        self.files_view.set_stalled(False, "")
         if self._refresh_after_apply:
             with self.files_view.transient_scope():
                 self._refresh_after_apply = False
                 self.history.invalidate()
+        self._poll_timer.stop()
 
     def _poll_history(self) -> None:
         if self._closed or self._pending is None:
             self._poll_timer.stop()
             return
+        now = self._clock_ns()
         try:
-            applied = self.apply_ready_frame()
+            applied = self.apply_ready_frame(now=now)
             if not applied and self._pending is None:
                 self._poll_timer.stop()
+        except WindowUnavailableError as error:
+            self._show_error(str(error) or type(error).__name__)
         except Exception as error:
             self._show_error(f"appio: {str(error) or type(error).__name__}")
 
@@ -983,7 +1112,7 @@ class CollectorWindow(QMainWindow):
         self.error_label.setText("")
         self.error_label.setVisible(False)
 
-    def _current_window(self) -> Window | None:
+    def _current_window(self, now_ns: int | None = None) -> Window | None:
         client = getattr(self.history, "client", None)
         state = getattr(client, "state", None)
         if state is not None and state.verified and state.answering:
@@ -1001,7 +1130,7 @@ class CollectorWindow(QMainWindow):
             if row is None or not row[0]:
                 return None
             boot_id = str(row[0])
-        now = self._clock_ns()
+        now = self._clock_ns() if now_ns is None else now_ns
         end = (now // RAW_BUCKET_NS + 1) * RAW_BUCKET_NS
         return Window(kind="since_boot", boot_id=boot_id, end_mono_ns=end)
 
@@ -1112,6 +1241,8 @@ class CollectorWindow(QMainWindow):
                 and self._history_ready(self._displayed)
             ):
                 self.files_view.flush_refresh()
+        except WindowUnavailableError as error:
+            self._show_error(str(error) or type(error).__name__)
         except Exception as error:
             self._show_error(f"appio: {str(error) or type(error).__name__}")
 

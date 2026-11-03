@@ -598,6 +598,76 @@ def test_local_read_in_flight_tracks_every_unsettled_local_read(retained):
         router.close()
 
 
+def test_queued_local_read_blocks_every_replacement_submission(retained, qtbot, monkeypatch):
+    from tests.p3.test_collector_window import OFF, FakeCoordinator, FakeSetup
+
+    from appio.ui.collector_window import CollectorWindow
+
+    history = HistoryRouter(QueryService(retained.db), Client(), AppRegistry())
+    current = Window("since_boot", "boot-A", end_mono_ns=H)
+    explicit = Window("range", "boot-A", 0, H)
+    blocker_started = threading.Event()
+    release_blocker = threading.Event()
+    blocker = history._executor.submit(
+        lambda: (blocker_started.set(), release_blocker.wait(5))
+    )
+    assert blocker_started.wait(2)
+
+    prepare_calls = []
+    original_prepare = history.prepare
+
+    def record_prepare(window):
+        prepare_calls.append(window)
+        return original_prepare(window)
+
+    monkeypatch.setattr(history, "prepare", record_prepare)
+    coordinator = FakeCoordinator()
+    window = CollectorWindow(
+        coordinator, history, FakeSetup(OFF), clock_ns=lambda: H - 1,
+        refresh_interval_ms=1000,
+    )
+    qtbot.addWidget(window)
+    qtbot.addWidget(window.settings)
+    window.show()
+    window._timer.stop()
+    monkeypatch.setattr(window, "_submit_probe", lambda **_kwargs: False)
+    try:
+        # Seed a genuine router preparation behind the occupied single worker.
+        history.prepare(current)
+        queued = history._local_future
+        assert queued is not None and queued.running() is False and not queued.done()
+        assert history.local_read_in_flight is True
+
+        for _ in range(5):
+            window._tick_target()
+        window.refresh()
+        window.show_window(explicit)
+        assert prepare_calls == [current]
+        assert window._pending is None
+        assert window._deferred_target == explicit
+
+        release_blocker.set()
+        blocker.result(timeout=5)
+        try:
+            queued.result(timeout=10)
+        except Exception:
+            if not queued.cancelled():
+                raise
+        qtbot.waitUntil(lambda: not history.local_read_in_flight, timeout=5000)
+        window._tick_target()
+        assert prepare_calls == [current, explicit]
+        assert window._pending == explicit
+    finally:
+        release_blocker.set()
+        try:
+            blocker.result(timeout=5)
+            if history._local_future is not None:
+                history._local_future.result(timeout=10)
+        except Exception:
+            pass
+        window.shutdown()
+
+
 def test_daemon_answer_error_rejects_invalid_kind_and_empty_reason(retained):
     from appio.history_router import DaemonAnswerError
 
