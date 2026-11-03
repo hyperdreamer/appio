@@ -173,10 +173,11 @@ class FakeCoordinator:
         self.events.append(("reconcile", facts))
         return decide_owner(facts)
 
-    def tick_local(self) -> None:
+    def tick_local(self) -> bool:
         self.ticks += 1
         self.actions.append(("tick_local",))
         self.events.append(("tick_local",))
+        return False
 
     def close(self) -> None:
         """The fake coordinator owns no writer or lease."""
@@ -2067,6 +2068,18 @@ class ControlledHistory(FakeHistory):
         self.invalidate()
 
 
+class CountingControlledHistory(ControlledHistory):
+    def __init__(self, *, ready=False, boot_id=BOOT):
+        self.invalidations = 0
+        self.generation = 0
+        super().__init__(ready=ready, boot_id=boot_id)
+
+    def invalidate(self) -> None:
+        self.invalidations += 1
+        self.generation += 1
+        super().invalidate()
+
+
 class ControlledSetup(FakeSetup):
     def __init__(self, facts=OFF, *, hold=False):
         super().__init__(facts)
@@ -2192,6 +2205,89 @@ def test_unchanged_facts_skip_reconcile_while_preparation_is_pending(qtbot):
     settle_probe(qtbot, window, after=after)
     assert len(coordinator.reconciles) == reconciles
     assert coordinator.ticks == 2
+
+
+def test_window_probe_delta_liveness_control(qtbot, tmp_path):
+    history = CountingControlledHistory()
+    owner = real_coordinator(
+        tmp_path, history,
+        lambda: pytest.fail("same-key probe deltas must not construct local collection"),
+    )
+    owner.reconcile(SILENT)
+    setup = ControlledSetup(SILENT)
+    window = CollectorWindow(
+        owner, history, setup, clock_ns=lambda: END - RAW_BUCKET_NS // 2,
+        refresh_interval_ms=1000,
+    )
+    qtbot.addWidget(window)
+    qtbot.addWidget(window.settings)
+    window.show()
+    window._timer.stop()
+    try:
+        window.refresh()
+        qtbot.waitUntil(lambda: window.facts_applied == 1, timeout=2000)
+        window._poll_timer.stop()
+        pending = window._pending
+        assert pending is not None
+        assert history.prepare_calls == [pending]
+        invalidations = history.invalidations
+        generation = history.generation
+
+        for index in range(8):
+            facts = SILENT if index % 2 == 0 else replace(SILENT, active="active")
+            window._apply_facts(cw.ProbePayload(
+                facts, None, window._probe_ticket, window._setup_generation
+            ))
+            assert window._pending == pending
+            assert history.prepare_calls == [pending]
+            assert history.invalidations == invalidations
+            assert history.generation == generation
+    finally:
+        window.close()
+
+
+def test_window_local_tick_coalesces_invalidation_until_apply(qtbot):
+    class CommittedTickCoordinator(ControlledCoordinator):
+        def tick_local(self):
+            super().tick_local()
+            return True
+
+    history = CountingControlledHistory()
+    setup = ControlledSetup(OFF)
+    window, _, history, _ = controlled_build(qtbot, history=history, setup=setup)
+    coordinator = CommittedTickCoordinator()
+    coordinator.history = history
+    window.coordinator = coordinator
+    window.refresh()
+    qtbot.waitUntil(lambda: window.facts_applied == 1, timeout=2000)
+    window._poll_timer.stop()
+
+    pending = window._pending
+    assert pending is not None
+    assert history.prepare_calls == [pending]
+    assert window._refresh_after_apply is True
+    invalidations = history.invalidations
+    generation = history.generation
+
+    for _ in range(4):
+        window._apply_facts(cw.ProbePayload(
+            window._facts, None, window._probe_ticket, window._setup_generation
+        ))
+        assert window._pending == pending
+        assert history.prepare_calls == [pending]
+        assert history.invalidations == invalidations
+        assert history.generation == generation
+        assert window._refresh_after_apply is True
+
+    apply_scope(window, history, pending)
+    assert window._refresh_after_apply is False
+    assert history.invalidations == invalidations + 1
+    assert history.generation == generation + 1
+    assert history.prepare_calls == [pending], "invalidation must not prepare inline"
+
+    window._tick_target()
+    assert history.prepare_calls == [pending, pending]
+    assert window._pending == pending
 
 
 def test_retired_pending_preparation_is_replaced_once(qtbot):

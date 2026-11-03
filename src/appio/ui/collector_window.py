@@ -545,6 +545,7 @@ class CollectorWindow(QMainWindow):
         self._target: Window | None = None
         self._displayed: Window | None = None
         self._pending: Window | None = None
+        self._refresh_after_apply = False
         self._invalidated = False
         self._prepare_retry: PrepareRetry | None = None
         self._prepare_error: str | None = None
@@ -914,6 +915,10 @@ class CollectorWindow(QMainWindow):
         self.files_view.set_updating_scope(None)
         self._render_files_message()
         self._poll_timer.stop()
+        if self._refresh_after_apply:
+            with self.files_view.transient_scope():
+                self._refresh_after_apply = False
+                self.history.invalidate()
 
     def _poll_history(self) -> None:
         if self._closed or self._pending is None:
@@ -1084,7 +1089,12 @@ class CollectorWindow(QMainWindow):
             with self.files_view.transient_scope():
                 if not keep_pending:
                     self.coordinator.reconcile(facts)
-                self.coordinator.tick_local()
+                committed = self.coordinator.tick_local()
+                if committed:
+                    if self._pending is None:
+                        self.history.invalidate()
+                    elif not self._history_retired():
+                        self._refresh_after_apply = True
         except Exception as error:
             self._show_error(f"appio: {str(error) or type(error).__name__}")
             return
