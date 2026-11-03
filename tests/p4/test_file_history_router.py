@@ -527,20 +527,55 @@ def test_retirement_and_cancellation_do_not_set_history_failure_flags(retained):
     finally:
         router.close()
 
+    unavailable = Future()
+    unavailable.set_exception(
+        WindowUnavailableError("file_source_unavailable", "query window retired")
+    )
+
+    class UnavailableQueryClient:
+        state = ClientState(verified=True, answering=True)
+
+        def __init__(self):
+            self.calls = 0
+
+        def query(self, _request):
+            self.calls += 1
+            return unavailable
+
+    unavailable_client = UnavailableQueryClient()
+    router = HistoryRouter(QueryService(retained.db), unavailable_client, AppRegistry())
+    try:
+        router.prepare(WINDOW)
+        router._local_future.result(timeout=10)
+        assert router.ready(WINDOW)
+        assert unavailable_client.calls == 1
+        assert router._pending is None
+        assert router._not_retained is False
+        assert router.daemon_answer_error is None
+    finally:
+        router.close()
+
     cancelled = Future()
     cancelled.cancel()
 
     class CancelledQueryClient:
         state = ClientState(verified=True, answering=True)
 
+        def __init__(self):
+            self.calls = 0
+
         def query(self, _request):
+            self.calls += 1
             return cancelled
 
-    router = HistoryRouter(QueryService(retained.db), CancelledQueryClient(), AppRegistry())
+    cancelled_client = CancelledQueryClient()
+    router = HistoryRouter(QueryService(retained.db), cancelled_client, AppRegistry())
     try:
         router.prepare(WINDOW)
         router._local_future.result(timeout=10)
         assert router.ready(WINDOW)
+        assert cancelled_client.calls == 1
+        assert router._pending is None
         assert router._not_retained is False
         assert router._daemon_answer_error is None
     finally:

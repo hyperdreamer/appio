@@ -73,6 +73,7 @@ from appio.ui.render_model import (
     OverviewModel,
     RankingModel,
     RankingRow,
+    SHARE_UNAVAILABLE_REASON,
     _coverage_text,
     build_overview,
     build_ranking,
@@ -869,6 +870,16 @@ def test_each_diagnostic_kind_matches_coverage_and_device_wording(qtbot) -> None
         1, SINCE_BOOT, None, None, None, coverage_diagnostic=cases[2][2]
     )
     assert _device_unavailable_text(absent) == (
+        "device attribution unavailable: not in the process ranking; "
+        "history query failed (too_many_requests)"
+    )
+    split_unavailable = replace(absent, share_unavailable=SHARE_UNAVAILABLE_REASON)
+    assert _device_unavailable_text(split_unavailable) == (
+        f"device attribution unavailable: {SHARE_UNAVAILABLE_REASON}; "
+        "history query failed (too_many_requests)"
+    )
+    no_share_reason = replace(absent, share_unavailable=None)
+    assert _device_unavailable_text(no_share_reason) == (
         "device attribution unavailable: history query failed (too_many_requests)"
     )
     no_diagnostic = build_overview(1, SINCE_BOOT, None, None, None)

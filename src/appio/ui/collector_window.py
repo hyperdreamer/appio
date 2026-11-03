@@ -607,6 +607,11 @@ class CollectorWindow(QMainWindow):
         self.banner_detail.setVisible(False)
         status_layout.addWidget(self.banner_status)
         status_layout.addWidget(self.banner_detail)
+        # Propagate word-wrapped label height through the nested banner widgets.
+        for widget in (status_column, banner):
+            size_policy = widget.sizePolicy()
+            size_policy.setHeightForWidth(True)
+            widget.setSizePolicy(size_policy)
         self.banner_open_settings = QPushButton("Open settings")
         self.banner_open_settings.setObjectName("banner_open_settings")
         self.banner_open_settings.setToolTip("Opens Settings at the System services switch.")
@@ -892,36 +897,6 @@ class CollectorWindow(QMainWindow):
         if self._pending is not None and not self._poll_timer.isActive():
             self._poll_timer.start()
 
-    def _history_source_key_ready(self) -> bool:
-        coordinator = self.coordinator
-        if not isinstance(coordinator, CollectorCoordinator):
-            return True
-        facts = coordinator._facts
-        if facts is None:
-            return False
-        client_state = getattr(getattr(self.history, "client", None), "state", None)
-        if client_state is not None and (
-            facts.answering != client_state.answering
-            or (facts.daemon_verified and not client_state.verified)
-        ):
-            return False
-        if client_state is not None and client_state.verified and client_state.answering:
-            facts = replace(
-                facts,
-                daemon_verified=True,
-                answering=True,
-                pending_activation=client_state.pending_activation,
-            )
-            decision = decide_owner(facts)
-        else:
-            decision = coordinator._decision
-        return coordinator._history_key == (
-            decision.owner,
-            decision.may_collect_local,
-            facts.daemon_verified,
-            facts.answering,
-        )
-
     def _submit_prepare(
         self, wanted: Window, origin: Literal["clock", "explicit"], *, now: int | None = None
     ) -> bool:
@@ -930,7 +905,6 @@ class CollectorWindow(QMainWindow):
         now = self._clock_ns() if now is None else now
         if (
             self._pending is not None
-            or not self._history_source_key_ready()
             or getattr(self.history, "local_read_in_flight", False) is not False
             or (self._retry_after is not None and now < self._retry_after)
             or wanted is None

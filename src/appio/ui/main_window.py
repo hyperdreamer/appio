@@ -54,7 +54,6 @@ from appio.ui.render_model import (
     EMPTY_RANKING_TEXT,
     KPI_CAPTIONS,
     MAX_DEVICE_LANES,
-    NOT_RANKED_REASON,
     SHARE_UNAVAILABLE_REASON,
     OverviewModel,
     RankingModel,
@@ -178,10 +177,7 @@ def _device_unavailable_text(model: OverviewModel | None) -> str:
     if model.share is None:
         if diagnostic is None:
             return ""
-        if model.share_unavailable is None or model.share_unavailable in (
-            SHARE_UNAVAILABLE_REASON,
-            NOT_RANKED_REASON,
-        ):
+        if model.share_unavailable is None:
             return f"device attribution unavailable: {diagnostic}"
         return (
             f"device attribution unavailable: {model.share_unavailable}; "

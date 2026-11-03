@@ -2098,6 +2098,45 @@ def test_banner_detail_layout_wraps_and_is_state_gated(qtbot):
     assert window.banner_detail.text() == "daemon status reports not answering"
     assert window.banner_detail.isHidden() is False
 
+    cause_facts = ServiceFacts(
+        True, "active", False, False, None, "auto-restart", "exit-code", 123456
+    )
+    history.client.state = ClientState(
+        verified=False, answering=False, last_error="socket_mode"
+    )
+    window._render(cause_facts)
+    assert window.banner_detail.text() == (
+        "socket: socket_mode; 123456 restarts; failed: exit-code; restarting"
+    )
+
+    window.resize(980, 620)
+    qtbot.wait(0)
+    qtbot.waitUntil(
+        lambda: window.banner_detail.height()
+        >= window.banner_detail.heightForWidth(window.banner_detail.width()),
+        timeout=1000,
+    )
+    assert window.width() == 980
+    required_height = window.banner_detail.heightForWidth(window.banner_detail.width())
+    assert window.banner_detail.width() > 0
+    assert required_height > 0
+    assert window.banner_detail.height() >= required_height
+
+    minimum_width = max(window.minimumWidth(), window.minimumSizeHint().width())
+    assert minimum_width <= 980
+    window.resize(minimum_width, window.height())
+    qtbot.wait(0)
+    qtbot.waitUntil(
+        lambda: window.banner_detail.height()
+        >= window.banner_detail.heightForWidth(window.banner_detail.width()),
+        timeout=1000,
+    )
+    assert window.width() == minimum_width
+    required_height = window.banner_detail.heightForWidth(window.banner_detail.width())
+    assert window.banner_detail.width() > 0
+    assert required_height > 0
+    assert window.banner_detail.height() >= required_height
+
     history.client.state = ClientState()
     window._render(SILENT)
     assert window.banner_detail.isHidden() is True
@@ -2150,7 +2189,7 @@ def test_real_history_router_gates_rendering_until_ready(qtbot, tmp_path):
         store.connection.close()
 
 
-def test_real_coordinator_holds_initial_preparation_until_source_key(qtbot, tmp_path):
+def test_real_coordinator_allows_initial_preparation_before_first_probe(qtbot, tmp_path):
     from types import SimpleNamespace
 
     from appio.ipc_models import StreamCursor
@@ -2164,7 +2203,6 @@ def test_real_coordinator_holds_initial_preparation_until_source_key(qtbot, tmp_
         tmp_path, history,
         lambda: pytest.fail("a daemon-owned window must not collect locally"),
     )
-    owner.reconcile(SILENT)
     setup = ControlledSetup(ON)
     window = CollectorWindow(
         owner, history, setup, clock_ns=lambda: END - RAW_BUCKET_NS // 2,
@@ -2174,19 +2212,16 @@ def test_real_coordinator_holds_initial_preparation_until_source_key(qtbot, tmp_
     qtbot.addWidget(window.settings)
     window.show()
     window._timer.stop()
-    explicit = scope_window(boot=BOOT, end=END + RAW_BUCKET_NS)
     try:
-        window.refresh()
-        assert history.prepare_calls == []
-
-        window.show_window(explicit)
-        assert history.prepare_calls == []
-        assert window._deferred_target == explicit
-
-        qtbot.waitUntil(lambda: window.facts_applied == 1, timeout=2000)
-        assert history.invalidations == 2
-        assert history.prepare_calls == [explicit]
-        assert window._pending == explicit
+        assert owner._facts is None
+        assert owner._history_key is None
+        window._tick_target(now=END)
+        target = window._target
+        assert target is not None
+        assert history.prepare_calls == [target]
+        assert window._pending == target
+        assert window._pending_since == END
+        assert owner._history_key is None
         assert window._retry_after is None
     finally:
         window.close()
