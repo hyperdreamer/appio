@@ -457,7 +457,7 @@ window's coalescing. Neither arm can stand in for the other.
 - `tests/p3/test_collector_owner.py`'s `History` double gains an invalidate counter so
   tests 1–3 assert calls, not merely absence of failure.
 - The files-view double in `tests/p3/test_collector_window.py` forwards
-  `set_stalled` to the real `FilesView` state, so test 18 asserts the production widget
+  `set_stalled` to the real `FilesView` state, so test 20 asserts the production widget
   path rather than a caption a double invented.
 
 ### 7.6 Gates
