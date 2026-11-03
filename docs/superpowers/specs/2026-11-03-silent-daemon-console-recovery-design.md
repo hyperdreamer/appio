@@ -147,50 +147,44 @@ staleness-key change retires a pending read.
 ### 5.3 A slow read stops claiming to be updating
 
 New window fields: `_pending_since: int | None`, `_stalled: bool`, `_retry_after:
-int | None`, `_refresh_after_apply: bool`, and `PENDING_BUDGET_NS = 30 * 10**9`.
+int | None`, `_deferred_target: Window | None`, `_refresh_after_apply: bool`, and
+`PENDING_BUDGET_NS = 30 * 10**9`.
 
-- Accepting a preparation sets `_pending_since = now` and `_stalled = False`.
-- In `_tick_target`, when `_pending` is not None and
-  `now - _pending_since >= PENDING_BUDGET_NS`, set `_stalled = True`. The pending read
-  is **not** discarded: a submitted future cannot be interrupted, so abandoning a read
-  that is still working only guarantees the work is wasted.
-- Labels, both in the existing `history_state` label:
-  - stalled with the read still in flight:
-    `history read has not completed (<view_state>); the reader is still busy`
-  - after the router retires the generation (`_history_retired()`): the pending read is
-    cleared, `_retry_after = now + PENDING_BUDGET_NS`, and the label reads
-    `history read has not completed (<view_state>); retrying in <n> s`
-One transition rule governs retirement, refresh, and the floor:
+Exactly these rules set or clear those fields; no other code path may.
 
-- **Retirement** (the router reports `view_state` unavailable) always records the
-  wanted scope in `_deferred_target`, clears `_pending`, and sets
-  `_retry_after = now + PENDING_BUDGET_NS`. It never clears the pause and never submits
-  immediately.
-- **`_tick_target`** submits exactly one preparation when, and only when, all four hold:
-  `_deferred_target` is set, `local_read_in_flight` is false,
-  `now >= _retry_after`, and no preparation is already pending.
-- **The label follows the worker, not the intent**: `the reader is still busy` while
-  `local_read_in_flight` is true (whether or not a retirement happened), and
-  `retrying in <n> s` only when the worker is free and a floor is outstanding.
-- **An explicit refresh** re-arms the deferred target and leaves `_retry_after` alone.
-  It cannot clear a busy label while the worker is still occupied, and it cannot
-  discard `_deferred_target`.
-- No preparation is submitted while `local_read_in_flight` is true (new read-only
-  router property over `_local_future`, `src/appio/history_router.py:127`, `:759`,
-  `:769`), on every path — tick, refresh, retirement, and explicit request. A wedged
-  read therefore cannot accumulate duplicates behind it, and an explicit refresh cannot
-  discard the deferred target.
-- `_stalled`, the stalled label, and `_retry_after` are cleared by an applied frame, by
-  an invalidation followed by a fresh preparation, and by an explicit refresh.
-- The Files pane has its own caption (`files_updating`, today
-  `updating to <kind>`, `src/appio/ui/files_view.py:759-769`). It gains a real stall
-  input — `FilesView.set_stalled(stalled: bool, text: str)` — driven by the same
-  `_stalled`/`_retry_after` transitions, so a retained table is never merely labelled
-  "updating" while the console has already admitted the read is slow.
-- Accepted residual: a read that never returns leaves the console saying
-  `the reader is still busy`. That is the truth, and it is a bounded *claim*, not a
-  bounded read. Reclaiming a wedged worker thread is explicitly out of scope (§3);
-  the window never reports a repair it cannot perform.
+1. **Accepting a preparation** sets `_pending_since = now` and `_stalled = False`.
+2. **Budget.** If `_pending` is not None and `now - _pending_since >= PENDING_BUDGET_NS`,
+   set `_stalled = True`. The read stays pending: a submitted future cannot be
+   interrupted, so abandoning a working read only guarantees the work is wasted.
+3. **Retirement** (the router reports `view_state` unavailable) sets
+   `_deferred_target` to the wanted scope, clears `_pending`, and sets
+   `_retry_after = now + PENDING_BUDGET_NS`. It never clears `_stalled` and never
+   submits anything by itself.
+4. **Submission.** Exactly one preparation is issued when, and only when, all four hold:
+   `_deferred_target` is set, `local_read_in_flight` is false,
+   `now >= _retry_after`, and `_pending` is None. This is the only submission gate.
+5. **Label**, derived — never latched — from the worker and the floor:
+   - `local_read_in_flight` → `history read has not completed (<view_state>); the reader is still busy`
+   - otherwise, `_retry_after` in the future → `history read has not completed (<view_state>); retrying in <n> s`
+   - otherwise → no stall label
+6. **Clearing.** Only an applied frame, or an accepted preparation, clears `_stalled`,
+   `_retry_after`, and `_deferred_target`. An explicit refresh re-arms
+   `_deferred_target`, never changes `_retry_after`, and never clears a busy label.
+7. **Every path obeys rule 4,** including `show_window`, which today calls
+   `history.prepare` directly (`src/appio/ui/collector_window.py:810`). That call
+   becomes a deferred request, so an explicit scope change cannot queue a second read
+   behind a busy worker.
+
+The Files pane has its own caption (`files_updating`, today `updating to <kind>`,
+`src/appio/ui/files_view.py:759-769`). It gains a real stall input —
+`FilesView.set_stalled(stalled: bool, text: str)` — driven by rules 3-6, so a retained
+table is never merely labelled "updating" while the console has already admitted the
+read is slow.
+
+Accepted residual: a read that never returns leaves the console saying
+`the reader is still busy`. That is the truth, and it is a bounded *claim*, not a
+bounded read. Reclaiming a wedged worker thread is explicitly out of scope (§3); the
+window never reports a repair it cannot perform.
 
 The deadline is a clock deadline, not scope identity: `_current_window()` advances its
 end to the next `RAW_BUCKET_NS` boundary (`:921-923`), so a pause keyed on the scope
@@ -327,7 +321,8 @@ local tick ──► committed advance ──┬─ nothing pending ──► in
                                     └─ read pending ──► _refresh_after_apply ──► one invalidate on apply
 pending read ──► 30 s budget ──┬─ still running ──► "the reader is still busy" (kept, not discarded)
                                └─ router retired it ──► "retrying in <n> s" ──► one reprepare
-remote failure ──► daemon_answer_error ──► "reason: <contract reason>; <per-kind clause>"
+remote failure ──► daemon_answer_error ──┬─ data reason present ──► "reason: <contract reason>; <per-kind clause>"
+                                         └─ no data reason ──────► "reason: <per-kind clause>"
 ```
 
 ### 5.7 State fields
@@ -400,9 +395,12 @@ window's coalescing. Neither arm can stand in for the other.
    the floor elapses even though the worker frees immediately after retirement.
 8. Retirement with the worker free: the label reads `retrying in <n> s`, and exactly one
    preparation is submitted once the floor elapses — not before.
-9. Explicit refresh during a stall: no preparation is submitted while
-   `local_read_in_flight` is true, `_deferred_target` survives, and the busy label is not
-   cleared. Five ticks and one refresh together submit zero preparations.
+9a. Explicit refresh during a stall: no preparation is submitted while
+   `local_read_in_flight` is true, `_deferred_target` survives, `_retry_after` is
+   unchanged by the refresh, and the busy label is not cleared. Five ticks and one
+   refresh together submit zero preparations.
+9b. `show_window` during a stall: the explicit scope change arms `_deferred_target`,
+   submits nothing while the worker is busy, and does not clear `_retry_after`.
 10. Clearing: an applied frame, and an invalidation followed by a fresh preparation,
     each clear `_stalled`, the stalled label, and `_retry_after`.
 
