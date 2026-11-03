@@ -8,6 +8,7 @@ window that reached past the contract would fail at import or at call time.
 from __future__ import annotations
 
 from concurrent.futures import Future
+from dataclasses import replace
 import inspect
 import math
 from types import SimpleNamespace
@@ -64,7 +65,7 @@ from appio.ui.formatting import (
 )
 from appio.ui.charts import ChartColumn, ChartSegment
 from appio.ui.files_view import FilesView
-from appio.ui.main_window import AppIoWindow, RankingDelegate
+from appio.ui.main_window import AppIoWindow, RankingDelegate, _device_unavailable_text
 from appio.ui.render_model import (
     MAX_DEVICE_LANES,
     DeviceLaneModel,
@@ -72,6 +73,7 @@ from appio.ui.render_model import (
     OverviewModel,
     RankingModel,
     RankingRow,
+    _coverage_text,
     build_overview,
     build_ranking,
     scope_text,
@@ -734,6 +736,167 @@ def test_build_overview_has_five_ordered_kpis_and_none_peak_is_unavailable() -> 
     )
     assert "series coverage: coverage: complete" in differing.detail_line
     assert differing.coverage_line.startswith("coverage: complete;")
+
+
+def test_coverage_diagnostic_composes_with_contract_reason(qtbot) -> None:
+    base = (
+        "coverage: complete; device attribution: available; tier: raw; "
+        "gaps: 0; suspends: False"
+    )
+    diagnostic = "daemon reported an error (bad_query)"
+    data_coverage = coverage(
+        complete=False,
+        device_state="incomplete",
+        gap_intervals=3,
+        unavailable_reason="not_retained",
+    )
+    data_prefix = (
+        "coverage: incomplete; device attribution: incomplete; tier: raw; "
+        "gaps: 3; suspends: False"
+    )
+    assert _coverage_text(coverage()) == base
+    assert _coverage_text(data_coverage) == f"{data_prefix}; reason: not_retained"
+    assert _coverage_text(coverage(), diagnostic) == f"{base}; reason: {diagnostic}"
+    assert _coverage_text(data_coverage, diagnostic) == (
+        f"{data_prefix}; reason: not_retained; {diagnostic}"
+    )
+
+    total = replace(
+        app_total(1, "unit:/alpha.service", "Alpha", 200),
+        coverage=data_coverage,
+    )
+    series = Series(1, SINCE_BOOT, "raw", (), (), (), data_coverage)
+    normal = build_overview(
+        1, SINCE_BOOT, total, series, None, coverage_diagnostic=diagnostic
+    )
+    assert normal.coverage_diagnostic == diagnostic
+    assert normal.coverage_line == f"{data_prefix}; reason: not_retained; {diagnostic}"
+    assert build_overview(1, SINCE_BOOT, total, series, None).coverage_diagnostic is None
+
+    file_only = build_overview(
+        1, SINCE_BOOT, None, None, None, coverage_diagnostic=diagnostic
+    )
+    assert file_only.coverage_line == f"coverage: unavailable; reason: {diagnostic}"
+    refused = build_overview(
+        1,
+        SINCE_BOOT,
+        None,
+        None,
+        None,
+        ranking_error="window unavailable",
+        coverage_diagnostic=diagnostic,
+    )
+    assert refused.coverage_line == f"coverage: unavailable; reason: {diagnostic}"
+
+    whitespace = build_overview(
+        1, SINCE_BOOT, None, None, None, coverage_diagnostic="  "
+    )
+    assert whitespace.coverage_diagnostic == "  "
+    for invalid in ("", 17, "\ud800"):
+        with pytest.raises(ValueError):
+            build_overview(
+                1, SINCE_BOOT, None, None, None, coverage_diagnostic=invalid
+            )
+        with pytest.raises(ValueError):
+            replace(file_only, coverage_diagnostic=invalid)
+
+    alpha = app_total(1, "unit:/alpha.service", "Alpha", 200)
+    file_key = "unit:retained-only.service"
+    files = FakeFilesHistory(
+        ranking_rows=(alpha,),
+        local_applications=((file_key, "Retained only", 40),),
+        registry_ids={file_key: 99},
+    )
+    window, service = build(qtbot, [alpha], files_view=FilesView(files))
+    assert window._overview_model.coverage_diagnostic is None
+    service.daemon_answer_error = SimpleNamespace(kind="remote_error", reason="bad_query")
+
+    window.refresh()
+    assert window._overview_model.coverage_diagnostic == diagnostic
+    assert label(window, "coverage_label").text().endswith(f"; reason: {diagnostic}")
+
+    selector = window.files_view.app_selector
+    selector.setCurrentIndex(selector.findData(99))
+    file_model = window._overview_model
+    assert file_model.coverage_diagnostic == diagnostic
+    assert file_model.coverage_line == f"coverage: unavailable; reason: {diagnostic}"
+
+    selector.setCurrentIndex(selector.findData(1))
+    mismatched = Series(
+        1,
+        Window(kind="since_boot", boot_id=BOOT, end_mono_ns=END + 1),
+        "raw",
+        (),
+        (),
+        (),
+        coverage(),
+    )
+    service.set_series(1, mismatched)
+    window.refresh()
+    refusal_model = window._overview_model
+    assert refusal_model.coverage_diagnostic == diagnostic
+    assert label(window, "coverage_label").text().endswith(f"; reason: {diagnostic}")
+
+
+def test_each_diagnostic_kind_matches_coverage_and_device_wording(qtbot) -> None:
+    cases = (
+        ("remote_error", "bad_query", "daemon reported an error (bad_query)"),
+        ("unavailable", "no_daemon", "no answering daemon (no_daemon)"),
+        ("rejected", "too_many_requests", "history query failed (too_many_requests)"),
+        ("transport", "connection_lost", "connection lost before the answer (connection_lost)"),
+        ("internal", "database failure", "history query failed (database failure)"),
+    )
+    data = coverage(
+        complete=False,
+        device_state="incomplete",
+        unavailable_reason="not_retained",
+    )
+    total = app_total(1, "unit:/alpha.service", "Alpha", 200)
+    share = disk_share(1, task_total=200, residual_total=None, cov=data)
+    window, service = build(qtbot, [total], {1: share})
+
+    for kind, reason, clause in cases:
+        service.daemon_answer_error = SimpleNamespace(kind=kind, reason=reason)
+        window.refresh()
+        assert label(window, "coverage_label").text().endswith(
+            f"; reason: not_retained; {clause}"
+        )
+        assert label(window, "device_reason").text() == (
+            f"device attribution unavailable: not_retained; {clause}"
+        )
+
+    absent = build_overview(
+        1, SINCE_BOOT, None, None, None, coverage_diagnostic=cases[2][2]
+    )
+    assert _device_unavailable_text(absent) == (
+        "device attribution unavailable: history query failed (too_many_requests)"
+    )
+    no_diagnostic = build_overview(1, SINCE_BOOT, None, None, None)
+    assert _device_unavailable_text(no_diagnostic) == ""
+
+    share_failure = build_overview(
+        1,
+        SINCE_BOOT,
+        total,
+        None,
+        None,
+        share_error="share query unavailable",
+        coverage_diagnostic=cases[2][2],
+    )
+    assert _device_unavailable_text(share_failure) == (
+        "device attribution unavailable: share query unavailable; "
+        "history query failed (too_many_requests)"
+    )
+
+    available = build_overview(
+        1,
+        SINCE_BOOT,
+        total,
+        None,
+        disk_share(1, task_total=200),
+        coverage_diagnostic=cases[2][2],
+    )
+    assert _device_unavailable_text(available) == ""
 
 
 def test_build_overview_limits_device_lanes_and_counts_more() -> None:

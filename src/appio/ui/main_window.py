@@ -54,6 +54,7 @@ from appio.ui.render_model import (
     EMPTY_RANKING_TEXT,
     KPI_CAPTIONS,
     MAX_DEVICE_LANES,
+    NOT_RANKED_REASON,
     SHARE_UNAVAILABLE_REASON,
     OverviewModel,
     RankingModel,
@@ -95,6 +96,24 @@ def _error_text(error: BaseException) -> str:
     """A nonempty reason for an operational failure (spec §7)."""
 
     return str(error) or type(error).__name__
+
+
+def _coverage_diagnostic(service: object) -> str | None:
+    error = getattr(service, "daemon_answer_error", None)
+    if error is None:
+        return None
+    clauses = {
+        "remote_error": "daemon reported an error",
+        "unavailable": "no answering daemon",
+        "rejected": "history query failed",
+        "transport": "connection lost before the answer",
+        "internal": "history query failed",
+    }
+    clause = clauses.get(getattr(error, "kind", None))
+    reason = getattr(error, "reason", None)
+    if clause is None or not isinstance(reason, str) or not reason:
+        return None
+    return f"{clause} ({reason})"
 
 
 class _ProcessOnlyFilesSource:
@@ -153,12 +172,27 @@ def _device_available(share: DiskShare) -> bool:
 def _device_unavailable_text(model: OverviewModel | None) -> str:
     """The device-attribution strip, distinct from the DEVICE KPI value."""
 
-    if model is None or model.share is None:
+    if model is None:
         return ""
+    diagnostic = model.coverage_diagnostic
+    if model.share is None:
+        if diagnostic is None:
+            return ""
+        if model.share_unavailable is None or model.share_unavailable in (
+            SHARE_UNAVAILABLE_REASON,
+            NOT_RANKED_REASON,
+        ):
+            return f"device attribution unavailable: {diagnostic}"
+        return (
+            f"device attribution unavailable: {model.share_unavailable}; "
+            f"{diagnostic}"
+        )
     share = model.share
     if _device_available(share):
         return ""
     reason = share.coverage.unavailable_reason or share.coverage.device_state
+    if diagnostic is not None:
+        reason = f"{reason}; {diagnostic}"
     return f"device attribution unavailable: {reason}"
 
 
@@ -813,7 +847,15 @@ class AppIoWindow(QMainWindow):
         total = self._totals.get(app_id)
         if total is None:
             # A file-only subject: one subject, five unavailable KPIs.
-            self._apply_overview(build_overview(app_id, window, None, None, None))
+            diagnostic = _coverage_diagnostic(self._service)
+            self._apply_overview(build_overview(
+                app_id,
+                window,
+                None,
+                None,
+                None,
+                coverage_diagnostic=diagnostic,
+            ))
             return
 
         series: Series | None = None
@@ -830,6 +872,7 @@ class AppIoWindow(QMainWindow):
         except Exception as error:
             share_error = _error_text(error)
 
+        diagnostic = _coverage_diagnostic(self._service)
         try:
             model = build_overview(
                 app_id,
@@ -839,6 +882,7 @@ class AppIoWindow(QMainWindow):
                 share,
                 series_error=series_error,
                 share_error=share_error,
+                coverage_diagnostic=diagnostic,
             )
         except ValueError as error:
             # A result that contradicts its own subject/window is a refusal to
@@ -852,6 +896,7 @@ class AppIoWindow(QMainWindow):
                 None,
                 series_error=refused,
                 share_error=refused,
+                coverage_diagnostic=diagnostic,
             )
         self._apply_overview(model)
 

@@ -212,6 +212,7 @@ class OverviewModel:
     reconciliation: str | None
     coverage_line: str
     detail_line: str
+    coverage_diagnostic: str | None = None
 
     def __post_init__(self) -> None:
         _require_int(self.app_id, "overview.app_id", minimum=1)
@@ -271,6 +272,7 @@ class OverviewModel:
         reconciliation = _require_optional_text(
             self.reconciliation, "overview.reconciliation"
         )
+        _require_optional_text(self.coverage_diagnostic, "overview.coverage_diagnostic")
 
         if self.share is not None:
             if not isinstance(self.share, DiskShare):
@@ -356,20 +358,34 @@ def _unavailable_kpis() -> tuple[Kpi, ...]:
     return tuple(Kpi(caption, UNAVAILABLE) for caption in KPI_CAPTIONS)
 
 
-def _coverage_text(coverage: Coverage) -> str:
-    """Render one source's coverage summary, never combining two sources."""
+def _coverage_text(
+    coverage: Coverage, coverage_diagnostic: str | None = None
+) -> str:
+    """Render one source's coverage summary and its separate client cause."""
 
     state = "complete" if coverage.complete else "incomplete"
-    reason = (
-        f"; reason: {coverage.unavailable_reason}"
-        if coverage.unavailable_reason is not None
-        else ""
+    causes = []
+    if coverage.unavailable_reason is not None:
+        causes.append(coverage.unavailable_reason)
+    diagnostic = _require_optional_text(
+        coverage_diagnostic, "overview.coverage_diagnostic"
     )
+    if diagnostic is not None:
+        causes.append(diagnostic)
+    reason = "" if not causes else f"; reason: {causes[0]}"
+    if len(causes) > 1:
+        reason += f"; {causes[1]}"
     return (
         f"coverage: {state}; device attribution: {coverage.device_state}; "
         f"tier: {coverage.tier}; gaps: {coverage.gap_intervals}; "
         f"suspends: {coverage.spans_suspend}{reason}"
     )
+
+
+def _unavailable_coverage_text(coverage_diagnostic: str | None) -> str:
+    if coverage_diagnostic is None:
+        return COVERAGE_UNAVAILABLE
+    return f"{COVERAGE_UNAVAILABLE}; reason: {coverage_diagnostic}"
 
 
 def _reconciliation_text(share: DiskShare) -> str | None:
@@ -427,6 +443,7 @@ def build_overview(
     ranking_error: str | None = None,
     series_error: str | None = None,
     share_error: str | None = None,
+    coverage_diagnostic: str | None = None,
 ) -> OverviewModel:
     """Build the Overview pane from independently available query results."""
 
@@ -442,6 +459,9 @@ def build_overview(
     ranking_reason = _require_optional_text(ranking_error, "overview.ranking_error")
     series_reason = _require_optional_text(series_error, "overview.series_error")
     share_reason = _require_optional_text(share_error, "overview.share_error")
+    diagnostic = _require_optional_text(
+        coverage_diagnostic, "overview.coverage_diagnostic"
+    )
 
     # An object supplied together with its own error is a contradiction.
     if total is not None and ranking_reason is not None:
@@ -483,8 +503,9 @@ def build_overview(
             None,
             ranking_reason,
             None,
-            COVERAGE_UNAVAILABLE,
+            _unavailable_coverage_text(diagnostic),
             ranking_reason,
+            diagnostic,
         )
 
     # A subject outside the process ranking (for example a file-only app).
@@ -499,8 +520,9 @@ def build_overview(
             None,
             NOT_RANKED_REASON,
             None,
-            COVERAGE_UNAVAILABLE,
+            _unavailable_coverage_text(diagnostic),
             NOT_RANKED_REASON,
+            diagnostic,
         )
 
     # KPIs: the share owns TOTAL/READ/WRITE/DEVICE, the ranking owns PEAK.
@@ -562,7 +584,7 @@ def build_overview(
         sources.append(("series", series.coverage))
     sources.append(("ranking", total.coverage))
     primary_name, primary_coverage = sources[0]
-    coverage_line = _coverage_text(primary_coverage)
+    coverage_line = _coverage_text(primary_coverage, diagnostic)
 
     detail_parts = [f"window: {kind}; tier: {primary_coverage.tier}"]
     if chronology_reason is not None:
@@ -588,6 +610,7 @@ def build_overview(
         reconciliation,
         coverage_line,
         "".join(detail_parts),
+        diagnostic,
     )
 
 
