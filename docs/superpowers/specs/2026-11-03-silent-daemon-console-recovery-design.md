@@ -47,9 +47,11 @@ coverage footer (`src/appio/ui/render_model.py:359-372`) and the device strip
 
 ### 1.3 The banner cannot say why
 
-`display_state` produces one of the five fixed state strings
+`display_state` returns either the `decide_owner` state — one of the five owner strings
 (`src/appio/ui/collector_window.py:322`, `2026-10-21-app-io-monitor-spec.md` §12:
-"Daemon enabled but silent | Preserve `enabled, not answering`"). The window already
+"Daemon enabled but silent | Preserve `enabled, not answering`") — or, once a root probe
+has run, one of the five activation display states defined in
+`src/appio/activation.py:119-134`. The window already
 holds the client's own refusal reason (`ClientState.last_error`) and
 the client's silence budget (`NO_ANSWER_NS`, 5 s,
 `src/appio/iodclient.py:109-110`), but the probe asks
@@ -170,6 +172,11 @@ int | None`, `_refresh_after_apply: bool`, and `PENDING_BUDGET_NS = 30 * 10**9`.
   discard the deferred target.
 - `_stalled`, the stalled label, and `_retry_after` are cleared by an applied frame, by
   an invalidation followed by a fresh preparation, and by an explicit refresh.
+- The Files pane has its own caption (`files_updating`, today
+  `updating to <kind>`, `src/appio/ui/files_view.py:759-769`). It gains a real stall
+  input — `FilesView.set_stalled(stalled: bool, text: str)` — driven by the same
+  `_stalled`/`_retry_after` transitions, so a retained table is never merely labelled
+  "updating" while the console has already admitted the read is slow.
 - Accepted residual: a read that never returns leaves the console saying
   `the reader is still busy`. That is the truth, and it is a bounded *claim*, not a
   bounded read. Reclaiming a wedged worker thread is explicitly out of scope (§3);
@@ -269,6 +276,8 @@ only from observations the client actually publishes (`ClientState.last_error`,
 | `last_error == "path_unverifiable"` | `socket: socket path could not be verified` |
 | `last_error == "peer_unreadable"` | `socket: peer credentials unreadable` |
 | `last_error == "daemon_not_answering"` (connected, silent for `NO_ANSWER_NS`) | `socket: connected, no answer within 5 s` |
+| `last_error == "connection_lost"` (socket error mid-read) | `socket: connection lost` |
+| `last_error == "transport_lost"` (peer closed the stream) | `socket: transport closed by the daemon` |
 | any `PeerRejected.reason` token (e.g. `socket_not_connected`) | `socket: <token>` |
 | no client observation at all | clause omitted |
 
@@ -300,7 +309,7 @@ local tick ──► committed advance ──┬─ nothing pending ──► in
                                     └─ read pending ──► _refresh_after_apply ──► one invalidate on apply
 pending read ──► 30 s budget ──┬─ still running ──► "the reader is still busy" (kept, not discarded)
                                └─ router retired it ──► "retrying in <n> s" ──► one reprepare
-remote failure ──► daemon_answer_error ──► "reason: daemon answer unusable (…)"
+remote failure ──► daemon_answer_error ──► "reason: <per-kind clause from §5.4>"
 ```
 
 ### 5.7 State fields
@@ -329,7 +338,7 @@ remote failure ──► daemon_answer_error ──► "reason: daemon answer un
 | Read still running when the budget expires | label says `the reader is still busy`; the read stays pending and nothing is submitted behind it |
 | Read never returns | the same honest label stands; no repair is claimed and no duplicate is queued |
 | Router retirement during a stall pause | pause cleared; the label does not claim a daemon failure, because retirement is not one |
-| Remote query fails after a local answer arrives | local rows stay; the footer says `daemon answer unusable (…)`, never `not_retained` |
+| Remote query fails after a local answer arrives | local rows stay; the footer shows the data reason, the per-kind client clause, or both when both are true |
 
 ## 7. Test strategy
 
@@ -347,20 +356,24 @@ before the change is not evidence and is not accepted.
 
 ### 7.2 Window liveness (`tests/p3/test_collector_window.py`)
 
-Tests 4 and 5 use a coordinator double that invalidates exactly where production does:
-`reconcile` invalidates when the staleness key changes, `tick_local` never invalidates,
-and the double counts invalidations. Each test first asserts the control — the old
-generation is retired — so the coalescing assertion cannot pass on today's code.
+Each liveness claim is proved twice: once against the **real**
+`CollectorCoordinator` with a counting history double — that arm is red on today's code
+and is the regression — and once at the window against a coordinator double that
+invalidates exactly where the fixed production coordinator does, which pins the
+window's coalescing. Neither arm can stand in for the other.
 
-4. Owner-equivalent probe storm: ten refreshes alternating `SILENT` and
-   `replace(SILENT, active="active")` while one read is held; control: the same storm
-   with the key forced to change retires the read once; fixed: the read survives, the
-   generation does not change, and no second prepare is issued.
-5. Sample storm: local collection active and one read held; every refresh commits a
-   frame. Control: the pre-change `tick_local` invalidates on every sample; fixed: the
-   read is never retired during the storm (`_pending` unchanged, no second prepare),
-   `_refresh_after_apply` is set, and exactly one replacement is prepared after the
-   frame applies.
+4a. Real coordinator: ten `reconcile` calls alternating `SILENT` and
+    `replace(SILENT, active="active")` produce exactly one invalidate in total (the
+    first call), and `view_state` never moves again. Today the same storm invalidates
+    ten times.
+4b. Window: with that same coordinator shape, a held read survives the storm, the
+    generation does not change, and no second prepare is issued.
+5a. Real coordinator: `tick_local` on a committed tick returns an advance and performs
+    no invalidate. Today it invalidates.
+5b. Window: local collection active and one read held; every refresh commits a frame.
+    The read is never retired during the storm (`_pending` unchanged, no second
+    prepare), `_refresh_after_apply` is set, and exactly one replacement is prepared
+    after the frame applies.
 6. Budget expiry with the read still in flight: `history_state` reads
    `history read has not completed (loading); the reader is still busy`; `_pending` is
    unchanged and nothing is submitted.
@@ -400,9 +413,10 @@ generation is retired — so the coalescing assertion cannot pass on today's cod
 17. Layout: `banner_detail` sits below `banner_status` inside the status column, is
     visible only in the states of §5.5, and its text fits without clipping at the
     shipped window width and at the window's minimum width.
-18. Files during a stall: the retained table is labelled with the stalled state, not
-    merely `updating to <kind>` (`src/appio/ui/files_view.py:759-769`), asserted in the
-    same test that asserts test 6's console label.
+18. Files during a stall: on the real `FilesView` with retained rows,
+    `set_stalled(True, text)` replaces the generic `updating to <kind>` caption
+    (`src/appio/ui/files_view.py:759-769`), and `set_stalled(False, "")` restores it;
+    asserted alongside test 6's console label, not on a mock branch.
 
 ### 7.5 Existing tests that must change
 
@@ -415,16 +429,27 @@ generation is retired — so the coalescing assertion cannot pass on today's cod
   §7.2, so no window test can pass by asserting behaviour the fake never performs.
 - `tests/p3/test_collector_owner.py`'s `History` double gains an invalidate counter so
   tests 1–3 assert calls, not merely absence of failure.
-- The files-view double in `tests/p3/test_collector_window.py` gains the stalled
-  caption so test 18 asserts the real widget path, not a mock branch.
+- The files-view double in `tests/p3/test_collector_window.py` forwards
+  `set_stalled` to the real `FilesView` state, so test 18 asserts the production widget
+  path rather than a caption a double invented.
 
 ### 7.6 Gates
 
 Full suite in the pinned environment, compared with the recorded baseline
 `2652 passed, 1 failed (missing `clang` in tests/p4/test_bpf_build.py), 2 skipped`:
-no new failures. Plus a live check on a host with the daemon installed: with the unit
-stopped the console settles into the stalled label instead of a permanent spinner, and
-the banner names the socket cause.
+no new failures.
+
+Two separate live checks on a host with the daemon installed, because stopping the
+unit satisfies neither on its own:
+
+1. **Cause line.** A deliberately crash-looping daemon (a unit whose exec keeps failing
+   under `Restart=on-failure`) must render `enabled, not answering` with the socket
+   clause, and after the start-limit gives up it must render `off` with
+   `enabled but not running: failed: …`.
+2. **Stall.** The slow-read label is exercised by holding the reader (a large store or a
+   database lock), not by stopping the daemon; stopping the daemon alone leaves the
+   local reader healthy. The check asserts that the console leaves `updating (loading)`
+   for `the reader is still busy` within the budget while the frame stays on screen.
 
 ## 8. Risks
 
