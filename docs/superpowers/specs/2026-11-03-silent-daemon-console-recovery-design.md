@@ -19,7 +19,7 @@ Three separate faults produce that one picture.
 | Cause | Evidence | Effect |
 | --- | --- | --- |
 | Every probe delta invalidates stored history | `CollectorCoordinator.reconcile` calls `history.invalidate()` unconditionally (`src/appio/collector_owner.py:196`), whatever the owner decision | A prepared read is retired by a fact change that changes nothing a reader can see |
-| A crash-looping unit changes facts every second | `_ACTIVE_STATES` has no `activating` entry (`src/appio/ui/collector_window.py:139-145`), so `active` and `activating` both map to `"unknown"`; `decide_owner` returns the same decision for both (`src/appio/collector_owner.py:56-63`) | The owner is `unknown → unknown` while the facts differ every refresh, so the invalidation never stops |
+| A crash-looping unit changes facts every second | `_ACTIVE_STATES` maps `active` to `active` but has no `activating` entry, which falls back to `unknown` (`src/appio/ui/collector_window.py:139-145`); `decide_owner` nevertheless returns the same decision for both (`src/appio/collector_owner.py:56-63`) | The owner is `unknown → unknown` while the facts differ every refresh, so the invalidation never stops |
 | Invalidation discards the frame under preparation | `invalidate()` bumps the generation, cancels file requests and sets `view_state = "unavailable"` (`src/appio/history_router.py:413-421`); `_tick_target` drops `_pending` when the router reports retirement (`src/appio/ui/collector_window.py:690-691`) and immediately prepares again (`:735-748`) | `_show_pending_status` prints `updating (loading)` (`:772-780`) for as long as the invalidation continues |
 | Nothing bounds the wait | `_pending` has no timestamp and no deadline; `apply_ready_frame` only ever retires on router retirement (`:784-800`) | `updating (loading)` can last forever with no honest label |
 
@@ -33,10 +33,12 @@ is still being prepared.
 
 ### 1.2 The reason is fabricated
 
-`_not_retained` is set whenever a remote query fails or is retired
-(`src/appio/history_router.py:641`, `:646`, `:899`), and is then stamped into a
-contract data field: `Coverage.unavailable_reason = "not_retained"`
-(`:916`, `:945`, `:997`). `not_retained` is a *data* reason — retained history was
+One boolean carries two unrelated meanings. Local retention loss sets
+`_not_retained` when a persisted interval cannot be corrected or a legacy aggregate
+carries no ownership receipt (`src/appio/history_router.py:641`, `:646`), and a *failed
+remote query* sets the same flag (`:899`). Both are then stamped into a contract data
+field, `Coverage.unavailable_reason = "not_retained"` (`:916`, `:945`, `:997`), so a
+dead daemon is reported as expired history. `not_retained` is a *data* reason — retained history was
 pruned (`src/appio/contracts.py:323-359`, `2026-10-21-app-io-monitor-spec.md` §4) —
 so a dead daemon is reported as expired history. Because the same token feeds the
 coverage footer (`src/appio/ui/render_model.py:359-372`) and the device strip
@@ -156,10 +158,16 @@ int | None`, `_refresh_after_apply: bool`, and `PENDING_BUDGET_NS = 30 * 10**9`.
   - after the router retires the generation (`_history_retired()`): the pending read is
     cleared, `_retry_after = now + PENDING_BUDGET_NS`, and the label reads
     `history read has not completed (<view_state>); retrying in <n> s`
+- A retirement that leaves the worker busy records the wanted target in
+  `_deferred_target` instead of forgetting it: `_tick_target` submits exactly one
+  preparation when, and only when, `local_read_in_flight` is false, the retry floor has
+  elapsed, and `_deferred_target` is set. The busy label stays until a replacement is
+  actually accepted, so it never claims a retry that has not happened.
 - No preparation is submitted while `local_read_in_flight` is true (new read-only
   router property over `_local_future`, `src/appio/history_router.py:127`, `:759`,
-  `:769`), on every path — tick, refresh, and explicit request. A wedged read
-  therefore cannot accumulate duplicates behind it.
+  `:769`), on every path — tick, refresh, retirement, and explicit request. A wedged
+  read therefore cannot accumulate duplicates behind it, and an explicit refresh cannot
+  discard the deferred target.
 - `_stalled`, the stalled label, and `_retry_after` are cleared by an applied frame, by
   an invalidation followed by a fresh preparation, and by an explicit refresh.
 - Accepted residual: a read that never returns leaves the console saying
@@ -204,10 +212,23 @@ typed value.
 
 Rendering: `build_overview` gains one optional keyword `coverage_diagnostic: str | None
 = None` and `OverviewModel` gains the matching field (`src/appio/ui/render_model.py:420-430`;
-interface amendment ratified in §9). `_coverage_text` prefers that diagnostic over the
-contract reason and prints `reason: daemon answer unusable (<kind>: <reason>)`;
-`main_window._device_unavailable_text` reads the same string, so the coverage footer
-and the device strip say the same thing.
+interface amendment ratified in §9). `main_window._device_unavailable_text` reads the
+same string, so the coverage footer and the device strip say the same thing.
+
+Wording is chosen by kind, so that a local refusal is never blamed on the daemon:
+
+| `kind` | Rendered clause |
+| --- | --- |
+| `remote_error` | `daemon reported an error (<reason>)` |
+| `unavailable` | `no answering daemon (<reason>)` |
+| `rejected` | `history query failed (<reason>)` |
+| `transport` | `connection lost before the answer (<reason>)` |
+| `internal` | `history query failed (<reason>)` |
+
+`_coverage_text` **composes** the two independent causes instead of letting one hide
+the other: the contract reason first when the data has one, then this clause —
+`reason: not_retained; daemon report: remote_error (… )`. When only one cause exists,
+only that one is printed.
 
 ### 5.5 One honest cause line under the state
 
@@ -227,8 +248,16 @@ New pure function in `src/appio/ui/collector_window.py`:
 def silence_cause(facts: ServiceFacts, client_state: ClientState | None) -> str | None
 ```
 
-It returns `None` unless the state is `enabled, not answering`; otherwise it joins one
-socket clause and one systemd clause when each is available. The clauses are built
+It returns `None` unless one of two situations holds: the state is
+`enabled, not answering`, or the state is `off` while `facts.enabled is True` **and**
+systemd reports failure evidence (`SubState == "failed"` or a `Result` other than
+`success`/`none`). The second case is the daemon that was enabled, crashed, and was
+given up on: `_ACTIVE_STATES` maps `failed` to `inactive`
+(`src/appio/ui/collector_window.py:139-145`) and `decide_owner` calls that `off`
+(`src/appio/collector_owner.py:56-63`), so without this case the crash-after-give-up
+daemon is reported as a normal stopped service. For that case the systemd clause leads
+(`enabled but not running: failed: <result>`); otherwise the function joins one socket
+clause and one systemd clause when each is available. The clauses are built
 only from observations the client actually publishes (`ClientState.last_error`,
 `iodclient.py:910-979`, `_publish` `:1325-1333`):
 
@@ -239,6 +268,7 @@ only from observations the client actually publishes (`ClientState.last_error`,
 | `last_error == "connect_failed"` | `socket: connect failed` |
 | `last_error == "path_unverifiable"` | `socket: socket path could not be verified` |
 | `last_error == "peer_unreadable"` | `socket: peer credentials unreadable` |
+| `last_error == "daemon_not_answering"` (connected, silent for `NO_ANSWER_NS`) | `socket: connected, no answer within 5 s` |
 | any `PeerRejected.reason` token (e.g. `socket_not_connected`) | `socket: <token>` |
 | no client observation at all | clause omitted |
 
@@ -281,6 +311,7 @@ remote failure ──► daemon_answer_error ──► "reason: daemon answer un
 | `_pending_since` | `CollectorWindow` | clock of the accepted preparation |
 | `_stalled` | `CollectorWindow` | the pending read passed its budget; the label says so |
 | `_retry_after` | `CollectorWindow` | earliest next preparation after a stall |
+| `_deferred_target` | `CollectorWindow` | the scope to prepare once the busy worker is free |
 | `_refresh_after_apply` | `CollectorWindow` | a sample landed while a read was pending; invalidate once the frame applies |
 | `local_read_in_flight` | `HistoryRouter` | read-only: the single worker is still running a local read |
 | `daemon_answer_error` | `HistoryRouter` | display-only client diagnostic, never a data reason |
@@ -316,49 +347,60 @@ before the change is not evidence and is not accepted.
 
 ### 7.2 Window liveness (`tests/p3/test_collector_window.py`)
 
+Tests 4 and 5 use a coordinator double that invalidates exactly where production does:
+`reconcile` invalidates when the staleness key changes, `tick_local` never invalidates,
+and the double counts invalidations. Each test first asserts the control — the old
+generation is retired — so the coalescing assertion cannot pass on today's code.
+
 4. Owner-equivalent probe storm: ten refreshes alternating `SILENT` and
-   `replace(SILENT, active="active")` while one read is held; the read survives, the
+   `replace(SILENT, active="active")` while one read is held; control: the same storm
+   with the key forced to change retires the read once; fixed: the read survives, the
    generation does not change, and no second prepare is issued.
 5. Sample storm: local collection active and one read held; every refresh commits a
-   frame. The read is never retired during the storm (`_pending` unchanged, no second
-   prepare), `_refresh_after_apply` is set, and exactly one replacement is prepared
-   after the frame applies.
+   frame. Control: the pre-change `tick_local` invalidates on every sample; fixed: the
+   read is never retired during the storm (`_pending` unchanged, no second prepare),
+   `_refresh_after_apply` is set, and exactly one replacement is prepared after the
+   frame applies.
 6. Budget expiry with the read still in flight: `history_state` reads
    `history read has not completed (loading); the reader is still busy`; `_pending` is
    unchanged and nothing is submitted.
-7. Retirement with a retry floor: the router retires the generation; the pending read
-   is cleared, the label reads
-   `history read has not completed (loading); retrying in <n> s`, and exactly one
-   preparation is submitted after the floor.
-8. Clearing: an applied frame, an explicit refresh, and an invalidation followed by a
-   fresh preparation each clear `_stalled`, the stalled label, and `_retry_after`.
-9. No duplicates behind a wedged read: with `local_read_in_flight` true, five ticks and
-   one explicit refresh submit zero preparations.
+7. Retirement while the worker is busy: the router retires the generation, the busy
+   label stays (no retry is claimed), `_deferred_target` is set, and exactly one
+   preparation is submitted once the worker is idle and the floor has elapsed.
+8. Clearing: an applied frame, and an invalidation followed by a fresh preparation,
+   each clear `_stalled`, the stalled label, and `_retry_after`.
+9. No duplicates: with `local_read_in_flight` true, five ticks and one explicit refresh
+   submit zero preparations and do not discard `_deferred_target`.
 
 ### 7.3 Router and rendering (`tests/p4/test_file_history_router.py`, `tests/test_ui.py`)
 
 10. Classification, one case per class: `RemoteError` → `remote_error`,
     `ClientUnavailable` → `unavailable`, `RequestRejected` → `rejected`,
     `ConnectionLost` → `transport`, an unrecognised failure → `internal`. Each leaves
-    `coverage.unavailable_reason` as the data says (unset when no data reason exists),
-    and a pruned-row query still yields `not_retained`.
+    `coverage.unavailable_reason` exactly as the data says, and a pruned-row query
+    still yields `not_retained`.
 11. Retirement is not a daemon failure: `invalidate()`, `WindowUnavailableError`, and a
     cancelled query set neither `_not_retained` nor `daemon_answer_error`.
-12. `_coverage_text` renders exactly one reason clause,
-    `reason: daemon answer unusable (<kind>: <reason>)`, and the device strip uses the
-    same string.
+12. Composition: local retention loss **and** a remote failure in the same generation
+    print both causes; each cause alone prints only itself.
+13. Wording per kind in `_coverage_text` and the device strip, including
+    `RequestRejected("too_many_requests")`, whose line must not blame the daemon.
 
 ### 7.4 Banner and Files (`tests/p3/test_collector_window.py`, `tests/test_ui.py`)
 
-13. `parse_unit_facts` accepts the five-property output; ignores a malformed or absent
+14. `parse_unit_facts` accepts the five-property output; ignores a malformed or absent
     optional property while still returning the required facts; still fails closed on a
     duplicated key or a malformed line.
-14. `silence_cause` for every row of §5.5's socket table, for restart/failure evidence,
-    and `None` for every other state.
-15. Layout: `banner_detail` sits below `banner_status` inside the status column, is
-    visible only in `enabled, not answering`, and its text fits without clipping at the
+15. `silence_cause` for every row of §5.5's socket table, including
+    `daemon_not_answering`, built from the client's published state rather than from a
+    hand-assembled token list.
+16. The enabled-but-failed case: an enabled unit reported `inactive` with `Result` a
+    failure produces `off` **with** the `enabled but not running` cause; an enabled unit
+    reported `inactive` with no failure evidence produces `off` with no cause line.
+17. Layout: `banner_detail` sits below `banner_status` inside the status column, is
+    visible only in the states of §5.5, and its text fits without clipping at the
     shipped window width and at the window's minimum width.
-16. Files during a stall: the retained table is labelled with the stalled state, not
+18. Files during a stall: the retained table is labelled with the stalled state, not
     merely `updating to <kind>` (`src/appio/ui/files_view.py:759-769`), asserted in the
     same test that asserts test 6's console label.
 
@@ -368,12 +410,13 @@ before the change is not evidence and is not accepted.
   (`tests/p3/test_collector_window.py:1208`) drives retirement through a fake knob
   (`coordinator.invalidate_on = "reconcile"`). It keeps its ownership assertions; the
   invalidation assertion moves to test 2.
-- The fake coordinator's `tick_local` invalidates unconditionally; it returns an
-  advance flag so window tests exercise the real coalescing rule.
+- `FakeCoordinator.tick_local` returns the advance flag production now returns, and
+  `ControlledCoordinator` is replaced by the production-compatible double described in
+  §7.2, so no window test can pass by asserting behaviour the fake never performs.
+- `tests/p3/test_collector_owner.py`'s `History` double gains an invalidate counter so
+  tests 1–3 assert calls, not merely absence of failure.
 - The files-view double in `tests/p3/test_collector_window.py` gains the stalled
-  caption so test 16 asserts the real widget path, not a mock branch.
-- `tests/p3/test_collector_owner.py`'s `History` double gains a counter so tests 1–3
-  assert invalidate calls rather than mere absence of failure.
+  caption so test 18 asserts the real widget path, not a mock branch.
 
 ### 7.6 Gates
 
