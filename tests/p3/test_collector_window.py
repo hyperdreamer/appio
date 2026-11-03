@@ -1373,6 +1373,54 @@ def test_prepare_failure_ownership_follows_submission_origin(qtbot, monkeypatch)
     assert window._retry_after is None and window._stalled is False
 
 
+def test_deferred_explicit_prepare_failure_keeps_explicit_retry_owner(qtbot, monkeypatch):
+    window, _, history, _ = controlled_build(qtbot)
+    window._timer.stop()
+    requested = Window("range", BOOT, RAW_BUCKET_NS, END)
+    history.local_read_busy = True
+
+    window.show_window(requested)
+
+    assert history.prepare_calls == []
+    assert window._deferred_target == requested
+    history.local_read_busy = False
+    history.prepare_failures.append(RuntimeError("deferred explicit failure"))
+
+    deferred_error = None
+    try:
+        window._tick_target()
+    except RuntimeError as error:
+        deferred_error = error
+
+    retry = window._prepare_retry
+    assert retry.owner == "explicit" and retry.window == requested
+    assert deferred_error is not None
+    assert str(deferred_error) == "deferred explicit failure"
+    assert window._deferred_target == requested
+    calls = tuple(history.prepare_calls)
+    assert calls == (requested,)
+
+    for _ in range(3):
+        window._tick_target()
+        assert window.apply_ready_frame() is False
+        assert tuple(history.prepare_calls) == calls
+        assert window._prepare_retry is retry
+
+    window.show_window(requested)
+    assert history.prepare_calls == [requested, requested]
+    assert window._pending == requested and window._prepare_retry is None
+    apply_scope(window, history, requested)
+    assert window._deferred_target is None
+    assert window._deferred_origin is None
+
+    ordinary = scope_window(END + RAW_BUCKET_NS)
+    monkeypatch.setattr(window, "_current_window", lambda *_args: ordinary)
+    history.prepare_failures.append(RuntimeError("ordinary clock failure"))
+    window._tick_target()
+    assert window._prepare_retry.owner == "clock"
+    assert window._deferred_target is None and window._deferred_origin is None
+
+
 def test_precheck_refusal_propagates_after_a_prior_loading_failure(qtbot, monkeypatch):
     window, _, history, _ = controlled_build(qtbot)
     window._timer.stop()

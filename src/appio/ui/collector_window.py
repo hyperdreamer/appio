@@ -550,6 +550,7 @@ class CollectorWindow(QMainWindow):
         self._stalled = False
         self._retry_after: int | None = None
         self._deferred_target: Window | None = None
+        self._deferred_origin: Literal["clock", "explicit"] | None = None
         self._refresh_after_apply = False
         self._invalidated = False
         self._prepare_retry: PrepareRetry | None = None
@@ -801,6 +802,11 @@ class CollectorWindow(QMainWindow):
             return
 
         wanted = self._deferred_target or self._target
+        origin = (
+            self._deferred_origin or "clock"
+            if self._deferred_target is not None
+            else "clock"
+        )
         self._invalidated = self._history_retired() and self._displayed is not None
         if wanted is None:
             if retry is not None:
@@ -845,7 +851,7 @@ class CollectorWindow(QMainWindow):
         self.files_view.set_updating_scope(wanted)
         self.files_view.set_scope_ready(False)
         self.files_view.request_refresh()
-        if not self._submit_prepare(wanted, "clock", now=now):
+        if not self._submit_prepare(wanted, origin, now=now):
             self._show_pending_status(now)
             self._poll_timer.stop()
 
@@ -854,6 +860,8 @@ class CollectorWindow(QMainWindow):
             return
         wanted = self._deferred_target or self._target
         if wanted is not None:
+            if self._deferred_target is None:
+                self._deferred_origin = "clock"
             self._deferred_target = wanted
         self._pending = None
         self._pending_since = None
@@ -981,6 +989,7 @@ class CollectorWindow(QMainWindow):
         now = self._clock_ns()
         retry = self._prepare_retry
         self._deferred_target = window
+        self._deferred_origin = "explicit"
         if retry is not None and (retry.owner != "explicit" or retry.window != window):
             self._prepare_retry = None
             self._prepare_error = None
@@ -1006,6 +1015,7 @@ class CollectorWindow(QMainWindow):
         self._retry_after = None
         if self._deferred_target == window:
             self._deferred_target = None
+            self._deferred_origin = None
         self._invalidated = False
         self.files_view.retire_deliveries()
         self.files_view.set_scope_ready(True)
