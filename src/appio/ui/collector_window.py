@@ -60,6 +60,7 @@ from ..collector_owner import CollectorCoordinator, GuiLease, ServiceFacts, deci
 from ..contracts import RAW_BUCKET_NS, Window
 from ..history_export import ExportResult
 from ..history_router import HistoryRouter
+from ..iodclient import ClientState
 from ..ipc_models import validate_server_message
 from ..ipc_protocol import FrameDecoder, MAX_OUTBOUND, ProtocolError, encode_frame
 from ..ipc_security import read_peer, require_root_server
@@ -92,6 +93,7 @@ __all__ = [
     "parse_unit_facts",
     "production_probe",
     "run_interactive",
+    "silence_cause",
 ]
 
 #: The four honest service states the switch may display. They are the exact
@@ -116,7 +118,7 @@ UNIT_SHOW_ARGV = (
     "/usr/bin/systemctl",
     "show",
     "appio-iod.service",
-    "--property=UnitFileState,ActiveState",
+    "--property=UnitFileState,ActiveState,SubState,Result,NRestarts",
     "--no-pager",
 )
 HELPER_TIMEOUT_SECONDS = 120.0
@@ -335,6 +337,68 @@ def display_state(facts: ServiceFacts, probe_state: str | None = None) -> str:
     return state
 
 
+_SOCKET_CAUSES: dict[str, str] = {
+    "daemon_absent": "socket: nothing listening at /run/appio/iod.sock",
+    "connect_failed": "socket: connect failed",
+    "path_unverifiable": "socket: socket path could not be verified",
+    "peer_unreadable": "socket: peer credentials unreadable",
+    "daemon_not_answering": "socket: connected, no answer within 5 s",
+    "connection_lost": "socket: connection lost",
+    "transport_lost": "socket: transport closed by the daemon",
+}
+_PEER_REJECTION_CAUSES = frozenset({
+    "appio_group_missing", "peercred_unsupported", "socket_not_connected",
+    "peercred_unavailable", "invalid_peercred", "server_uid_nonzero",
+    "directory_missing", "directory_metadata_invalid", "directory_not_directory",
+    "directory_owner", "directory_group", "directory_mode", "socket_missing",
+    "socket_metadata_invalid", "path_symlink", "socket_not_socket", "socket_owner",
+    "socket_group", "socket_mode",
+})
+
+
+def silence_cause(facts: ServiceFacts, client_state: ClientState | None) -> str | None:
+    """Describe only observed socket or systemd causes for a silent owner state."""
+
+    owner_state = decide_owner(facts).state
+    enabled_failure = owner_state == COLLECTOR_STATE_OFF and facts.enabled is True and (
+        facts.sub_state == "failed"
+        or facts.result is not None and facts.result not in ("success", "none")
+    )
+    if owner_state != COLLECTOR_STATE_SILENT and not enabled_failure:
+        return None
+
+    socket_clause = None
+    if client_state is not None:
+        last_error = client_state.last_error
+        if last_error is None and client_state.verified is True and client_state.answering is False:
+            socket_clause = "daemon status reports not answering"
+        elif isinstance(last_error, str):
+            socket_clause = _SOCKET_CAUSES.get(last_error)
+            if socket_clause is None and last_error in _PEER_REJECTION_CAUSES:
+                socket_clause = f"socket: {last_error}"
+
+    clauses: list[str] = []
+    if enabled_failure:
+        if facts.result is not None and facts.result not in ("success", "none"):
+            clauses.append(f"enabled but not running: failed: {facts.result}")
+        else:
+            clauses.append("enabled but not running: failed")
+    if owner_state == COLLECTOR_STATE_SILENT and socket_clause is not None:
+        clauses.append(socket_clause)
+    elif enabled_failure and socket_clause is not None:
+        clauses.append(socket_clause)
+
+    if facts.restarts is not None and facts.restarts > 0:
+        clauses.append(f"{facts.restarts} restarts")
+    if (facts.result is not None and facts.result not in ("success", "none")
+            and not enabled_failure):
+        clauses.append(f"failed: {facts.result}")
+    if facts.sub_state == "auto-restart":
+        clauses.append("restarting")
+
+    return "; ".join(clauses) or None
+
+
 # --------------------------------------------------------------------------- #
 # Settings: the one place that owns the switch
 # --------------------------------------------------------------------------- #
@@ -524,13 +588,23 @@ class CollectorWindow(QMainWindow):
         banner.setObjectName("status_banner")
         banner_layout = QHBoxLayout(banner)
         banner_layout.setContentsMargins(0, 0, 0, 0)
+        status_column = QWidget(banner)
+        status_layout = QVBoxLayout(status_column)
+        status_layout.setContentsMargins(0, 0, 0, 0)
         self.banner_status = QLabel(COLLECTOR_STATE_UNAVAILABLE)
         self.banner_status.setObjectName("banner_status")
         self.banner_status.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.banner_detail = QLabel("")
+        self.banner_detail.setObjectName("banner_detail")
+        self.banner_detail.setWordWrap(True)
+        self.banner_detail.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.banner_detail.setVisible(False)
+        status_layout.addWidget(self.banner_status)
+        status_layout.addWidget(self.banner_detail)
         self.banner_open_settings = QPushButton("Open settings")
         self.banner_open_settings.setObjectName("banner_open_settings")
         self.banner_open_settings.setToolTip("Opens Settings at the System services switch.")
-        banner_layout.addWidget(self.banner_status, 1)
+        banner_layout.addWidget(status_column, 1)
         banner_layout.addWidget(self.banner_open_settings)
         outer.addWidget(banner)
 
@@ -885,6 +959,10 @@ class CollectorWindow(QMainWindow):
         state = display_state(facts, self._probe_state)
         self.state_text = state
         self.banner_status.setText(state)
+        client_state = getattr(getattr(self.history, "client", None), "state", None)
+        cause = silence_cause(facts, client_state)
+        self.banner_detail.setText("" if cause is None else cause)
+        self.banner_detail.setVisible(cause is not None)
         self.settings.status_label.setText(state)
         self.settings.show_switch(
             facts.enabled,
@@ -1249,23 +1327,37 @@ class CollectorWindow(QMainWindow):
 # --------------------------------------------------------------------------- #
 
 
-def parse_unit_facts(stdout: str) -> tuple[bool | None, str]:
-    """Map ``systemctl show`` output to (enabled, active) without inventing either."""
+def parse_unit_facts(
+    stdout: str,
+) -> tuple[bool | None, str, str | None, str | None, int | None]:
+    """Map required service fields and optional observed failure details."""
 
     if not isinstance(stdout, str):
-        return None, "unknown"
+        return None, "unknown", None, None, None
     rows: dict[str, str] = {}
     for line in stdout.splitlines():
         if not line.strip():
             continue  # systemctl may end its output with a blank line
         key, separator, value = line.partition("=")
         if not separator or key in rows:
-            return None, "unknown"
+            return None, "unknown", None, None, None
         rows[key] = value.strip()
-    if set(rows) != {"UnitFileState", "ActiveState"}:
-        return None, "unknown"
-    return _ENABLED_STATES.get(rows["UnitFileState"]), _ACTIVE_STATES.get(
-        rows["ActiveState"], "unknown"
+    required = {"UnitFileState", "ActiveState"}
+    allowed = required | {"SubState", "Result", "NRestarts"}
+    if not required.issubset(rows) or not set(rows).issubset(allowed):
+        return None, "unknown", None, None, None
+    raw_restarts = rows.get("NRestarts")
+    restarts = (
+        int(raw_restarts)
+        if raw_restarts is not None and raw_restarts.isascii() and raw_restarts.isdecimal()
+        else None
+    )
+    return (
+        _ENABLED_STATES.get(rows["UnitFileState"]),
+        _ACTIVE_STATES.get(rows["ActiveState"], "unknown"),
+        rows.get("SubState") or None,
+        rows.get("Result") or None,
+        restarts,
     )
 
 
@@ -1312,12 +1404,14 @@ def production_probe(
     read_status = status_reader or _read_daemon_status
     enabled: bool | None = None
     active = "unknown"
+    sub_state = result = None
+    restarts = None
     try:
-        result = run(UNIT_SHOW_ARGV)
+        command_result = run(UNIT_SHOW_ARGV)
     except (OSError, subprocess.SubprocessError):
-        result = None
-    if isinstance(result, CommandResult) and result.returncode == 0:
-        enabled, active = parse_unit_facts(result.stdout)
+        command_result = None
+    if isinstance(command_result, CommandResult) and command_result.returncode == 0:
+        enabled, active, sub_state, result, restarts = parse_unit_facts(command_result.stdout)
     status: object = None
     try:
         status = read_status()
@@ -1326,8 +1420,9 @@ def production_probe(
     if isinstance(status, dict) and status.get("answering") is True:
         pending = status.get("pending_activation")
         return ServiceFacts(enabled, active, True, True,
-                            pending if type(pending) is bool else None)
-    return ServiceFacts(enabled, active, False, False, None)
+                            pending if type(pending) is bool else None,
+                            sub_state, result, restarts)
+    return ServiceFacts(enabled, active, False, False, None, sub_state, result, restarts)
 
 
 # --------------------------------------------------------------------------- #

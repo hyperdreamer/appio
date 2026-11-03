@@ -574,6 +574,7 @@ def test_current_link_status_requires_verification_and_preserves_activation(
     window, _, history, _ = build(qtbot, facts=SILENT)
     history.client = SimpleNamespace(state=SimpleNamespace(
         verified=verified, answering=answering, pending_activation=pending, cursor=None,
+        last_error=None,
     ))
     refresh_and_settle(qtbot, window)
     assert window.state_text == expected
@@ -1340,16 +1341,21 @@ def test_a_refresh_failure_is_reported_instead_of_crashing_the_timer(qtbot):
      ("disabled", False), ("masked", False), ("indirect", False), ("mystery", None)],
 )
 def test_unit_file_states_map_to_probed_enablement(unit_state, expected):
-    enabled, active = cw.parse_unit_facts(f"UnitFileState={unit_state}\nActiveState=active\n")
+    enabled, active, sub_state, result, restarts = cw.parse_unit_facts(
+        f"UnitFileState={unit_state}\nActiveState=active\n")
     assert enabled is expected
     assert active == "active"
+    assert (sub_state, result, restarts) == (None, None, None)
 
 
 def test_a_malformed_or_failed_unit_query_is_unknown_not_off():
-    assert cw.parse_unit_facts("ActiveState=active\n") == (None, "unknown")
+    unknown = (None, "unknown", None, None, None)
+    assert cw.parse_unit_facts("ActiveState=active\n") == unknown
     # A trailing blank line is not a malformed reply.
-    assert cw.parse_unit_facts("UnitFileState=enabled\nActiveState=inactive\n\n") == (True, "inactive")
-    assert cw.parse_unit_facts("UnitFileState=off\nActiveState=dead\n") == (None, "unknown")
+    assert cw.parse_unit_facts(
+        "UnitFileState=enabled\nActiveState=inactive\n\n") == (
+            True, "inactive", None, None, None)
+    assert cw.parse_unit_facts("UnitFileState=off\nActiveState=dead\n") == unknown
     facts = cw.production_probe(
         command=lambda argv: CommandResult(1, "", "no systemd"),
         status_reader=lambda: None)
@@ -1359,16 +1365,276 @@ def test_a_malformed_or_failed_unit_query_is_unknown_not_off():
         status_reader=lambda: None) == ServiceFacts(None, "unknown", False, False, None)
 
 
+def test_parse_unit_facts_accepts_optional_systemd_properties():
+    assert cw.UNIT_SHOW_ARGV == (
+        "/usr/bin/systemctl", "show", "appio-iod.service",
+        "--property=UnitFileState,ActiveState,SubState,Result,NRestarts", "--no-pager")
+    parsed = cw.parse_unit_facts(
+        "UnitFileState=enabled\nActiveState=failed\n"
+        "SubState= auto-restart \nResult= exit-code \nNRestarts= 12 \n")
+    assert parsed == (True, "inactive", "auto-restart", "exit-code", 12)
+
+    for raw in ("", "-1", "+1", "1.0", "١", "1x"):
+        assert cw.parse_unit_facts(
+            f"UnitFileState=enabled\nActiveState=active\nNRestarts={raw}\n"
+        ) == (True, "active", None, None, None)
+    assert cw.parse_unit_facts(
+        "UnitFileState=enabled\nActiveState=active\nSubState=  \nResult=  \n"
+        "NRestarts=3\n") == (True, "active", None, None, 3)
+
+    unknown = (None, "unknown", None, None, None)
+    assert cw.parse_unit_facts(
+        "UnitFileState=enabled\nActiveState=active\nExtra=value\n") == unknown
+    assert cw.parse_unit_facts(
+        "UnitFileState=enabled\nActiveState=active\nSubState=running\n"
+        "SubState=dead\n") == unknown
+    assert cw.parse_unit_facts(
+        "UnitFileState=enabled\nmalformed\nActiveState=active\n") == unknown
+
+    for kwargs in (
+        {"sub_state": ""}, {"sub_state": 1}, {"result": ""}, {"result": 1},
+        {"restarts": True}, {"restarts": -1}, {"restarts": 1.0},
+    ):
+        with pytest.raises(ValueError):
+            ServiceFacts(True, "active", False, False, None, **kwargs)
+
+
 def test_the_production_probe_uses_the_daemon_status_for_answering_and_pending():
+    response = (
+        "UnitFileState=enabled\nActiveState=active\nSubState=running\n"
+        "Result=success\nNRestarts=3\n")
     facts = cw.production_probe(
-        command=lambda argv: CommandResult(0, "UnitFileState=enabled\nActiveState=active\n", ""),
+        command=lambda argv: CommandResult(0, response, ""),
         status_reader=lambda: {"answering": True, "pending_activation": True})
-    assert facts == ServiceFacts(True, "active", True, True, True)
+    assert facts == ServiceFacts(True, "active", True, True, True,
+                                 "running", "success", 3)
     silent = cw.production_probe(
-        command=lambda argv: CommandResult(0, "UnitFileState=enabled\nActiveState=active\n", ""),
+        command=lambda argv: CommandResult(0, response, ""),
         status_reader=lambda: None)
     assert silent.answering is False and silent.daemon_verified is False
     assert silent.pending_activation is None
+    assert (silent.sub_state, silent.result, silent.restarts) == ("running", "success", 3)
+
+    observed = []
+    failed_command = cw.production_probe(
+        command=lambda argv: CommandResult(1, response, "systemctl failed"),
+        status_reader=lambda: observed.append("socket") or {"answering": False})
+    assert observed == ["socket"]
+    assert failed_command == ServiceFacts(None, "unknown", False, False, None)
+
+
+def test_silence_cause_maps_every_published_socket_observation():
+    import socket
+
+    from appio.iodclient import ClientState, IodClient
+    from appio.ipc_protocol import encode_frame
+    from appio.ipc_security import Peer, PeerRejected
+
+    now = [0]
+    clients = []
+    servers = []
+
+    def make_client(*, path_verifier=None, peer_reader=None, connector=None):
+        client = IodClient(
+            cw.SOCKET_PATH,
+            path_verifier=path_verifier if path_verifier is not None else lambda path: None,
+            peer_reader=peer_reader if peer_reader is not None else lambda sock: Peer(
+                pid=4321, uid=0, gid=0),
+            connector=connector,
+            clock_ns=lambda: now[0],
+            on_gap=lambda gap: None,
+            on_change=lambda: None,
+        )
+        clients.append(client)
+        return client
+
+    def peer_server(_path):
+        client_socket, server_socket = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+        servers.append(server_socket)
+        return client_socket
+
+    def state_from_peer_rejection(reason):
+        def refuse(_path):
+            raise PeerRejected(reason, "test refusal")
+
+        client = make_client(path_verifier=refuse)
+        client.connect()
+        return client.state
+
+    try:
+        peer_tokens = (
+            "appio_group_missing", "peercred_unsupported", "socket_not_connected",
+            "peercred_unavailable", "invalid_peercred", "server_uid_nonzero",
+            "directory_missing", "directory_metadata_invalid", "directory_not_directory",
+            "directory_owner", "directory_group", "directory_mode", "socket_missing",
+            "socket_metadata_invalid", "path_symlink", "socket_not_socket", "socket_owner",
+            "socket_group", "socket_mode",
+        )
+        states = {token: state_from_peer_rejection(token) for token in peer_tokens}
+
+        def connector_error(error):
+            def connect(_path):
+                raise error
+            return connect
+
+        client = make_client(connector=connector_error(FileNotFoundError(2, "missing")))
+        client.connect()
+        states["daemon_absent"] = client.state
+
+        client = make_client(connector=connector_error(OSError("connect failed")))
+        client.connect()
+        states["connect_failed"] = client.state
+
+        def unverifiable(_path):
+            raise ValueError("unverifiable")
+
+        client = make_client(path_verifier=unverifiable)
+        client.connect()
+        states["path_unverifiable"] = client.state
+
+        def unreadable_peer(_sock):
+            raise OSError("peer credentials unreadable")
+
+        client = make_client(peer_reader=unreadable_peer, connector=peer_server)
+        client.connect()
+        states["peer_unreadable"] = client.state
+
+        now[0] = 0
+        client = make_client(connector=peer_server)
+        client.connect()
+        now[0] = 5_000_000_000
+        client.pump()
+        states["daemon_not_answering"] = client.state
+
+        client = make_client(connector=peer_server)
+        client.connect()
+        server = servers[-1]
+        server.recv(65536)
+        server.sendall(encode_frame({
+            "protocol": 1, "type": "status", "request_id": "st1", "enabled": True,
+            "answering": True, "pending_activation": False,
+            "ownership_start_mono_ns": None, "cursor": None,
+        }))
+        client.pump()
+        server.recv(65536)
+        server.close()
+        servers.remove(server)
+        client.pump()
+        states["transport_lost"] = client.state
+
+        class BrokenRecvSocket(socket.socket):
+            def recv(self, bufsize, flags=0):
+                raise OSError("connection reset")
+
+        def broken_connector(_path):
+            raw, server = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+            servers.append(server)
+            return BrokenRecvSocket(family=socket.AF_UNIX, type=socket.SOCK_STREAM,
+                                    fileno=raw.detach())
+
+        client = make_client(connector=broken_connector)
+        client.connect()
+        client.pump()
+        states["connection_lost"] = client.state
+
+        facts = ServiceFacts(True, "active", False, False, None)
+        expected = {
+            "daemon_absent": "socket: nothing listening at /run/appio/iod.sock",
+            "connect_failed": "socket: connect failed",
+            "path_unverifiable": "socket: socket path could not be verified",
+            "peer_unreadable": "socket: peer credentials unreadable",
+            "daemon_not_answering": "socket: connected, no answer within 5 s",
+            "connection_lost": "socket: connection lost",
+            "transport_lost": "socket: transport closed by the daemon",
+        }
+        expected.update({token: f"socket: {token}" for token in peer_tokens})
+        for token, state in states.items():
+            assert isinstance(state, ClientState)
+            assert state.last_error == token
+            assert cw.silence_cause(facts, state) == expected[token]
+
+        now[0] = 0
+        client = make_client(connector=peer_server)
+        client.connect()
+        server = servers[-1]
+        server.recv(65536)
+        server.sendall(encode_frame({
+            "protocol": 1, "type": "status", "request_id": "st1", "enabled": True,
+            "answering": False, "pending_activation": False,
+            "ownership_start_mono_ns": None, "cursor": None,
+        }))
+        client.pump()
+        assert client.state.verified and not client.state.answering
+        assert client.state.last_error is None
+        assert cw.silence_cause(facts, client.state) == "daemon status reports not answering"
+
+        client = make_client(path_verifier=lambda path: (_ for _ in ()).throw(
+            PeerRejected("future_socket_reason", "unknown")))
+        client.connect()
+        assert cw.silence_cause(facts, client.state) is None
+        assert cw.silence_cause(facts, None) is None
+    finally:
+        for client in clients:
+            client.close()
+        for server in servers:
+            server.close()
+
+
+def test_enabled_but_failed_unit_gets_off_cause_only_with_failure_evidence():
+    failed = ServiceFacts(True, "inactive", False, False, None,
+                          "failed", "exit-code", 2)
+    assert cw.silence_cause(failed, None) == (
+        "enabled but not running: failed: exit-code; 2 restarts")
+
+    state_only = ServiceFacts(True, "inactive", False, False, None, "failed", None)
+    assert cw.silence_cause(state_only, None) == "enabled but not running: failed"
+    assert cw.silence_cause(ServiceFacts(True, "inactive", False, False, None), None) is None
+    assert cw.silence_cause(
+        ServiceFacts(True, "inactive", False, False, None, "dead", "success"), None
+    ) is None
+    assert cw.silence_cause(OFF, None) is None
+
+
+def test_silence_cause_orders_systemd_evidence_and_combines_socket():
+    class State:
+        verified = False
+        answering = False
+        last_error = "socket_mode"
+
+    facts = ServiceFacts(True, "active", False, False, None,
+                         "auto-restart", "exit-code", 2)
+    assert cw.silence_cause(facts, State()) == (
+        "socket: socket_mode; 2 restarts; failed: exit-code; restarting")
+
+    off = ServiceFacts(True, "inactive", False, False, None,
+                       "failed", "exit-code", 2)
+    assert cw.silence_cause(off, State()) == (
+        "enabled but not running: failed: exit-code; socket: socket_mode; 2 restarts")
+
+
+def test_banner_detail_layout_wraps_and_is_state_gated(qtbot):
+    from PyQt6.QtWidgets import QHBoxLayout, QVBoxLayout, QWidget
+
+    from appio.iodclient import ClientState
+
+    window, coordinator, history, setup = build(qtbot, facts=SILENT)
+    assert isinstance(window.banner_detail.parentWidget().layout(), QVBoxLayout)
+    detail_layout = window.banner_detail.parentWidget().layout()
+    assert detail_layout.indexOf(window.banner_status) == 0
+    assert detail_layout.indexOf(window.banner_detail) == 1
+    assert window.banner_detail.wordWrap() is True
+    assert isinstance(window.findChild(QWidget, "status_banner").layout(), QHBoxLayout)
+
+    history.client = SimpleNamespace(state=ClientState(
+        verified=True, answering=False, last_error=None))
+    window._render(SILENT)
+    assert window.banner_status.text() == COLLECTOR_STATE_SILENT
+    assert window.banner_detail.text() == "daemon status reports not answering"
+    assert window.banner_detail.isHidden() is False
+
+    history.client.state = ClientState()
+    window._render(SILENT)
+    assert window.banner_detail.isHidden() is True
 
 
 # --------------------------------------------------------------------------- #
@@ -3180,7 +3446,8 @@ def task4_connection_promotion(qtbot, *, verified):
     facts = replace(OFF, enabled=True, daemon_verified=False,
                     answering=False, pending_activation=False)
     history.client = SimpleNamespace(state=SimpleNamespace(
-        verified=verified, answering=True, pending_activation=True, cursor=None))
+        verified=verified, answering=True, pending_activation=True, cursor=None,
+        last_error=None))
     expected = (replace(facts, daemon_verified=True, answering=True, pending_activation=True)
                 if verified else facts)
     window._probe_ticket = 1

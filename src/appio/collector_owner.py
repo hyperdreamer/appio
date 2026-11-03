@@ -39,6 +39,9 @@ class ServiceFacts:
     daemon_verified: bool
     answering: bool
     pending_activation: bool | None
+    sub_state: str | None = None
+    result: str | None = None
+    restarts: int | None = None
 
     def __post_init__(self):
         if self.active not in ("absent", "inactive", "active", "unknown"):
@@ -48,6 +51,14 @@ class ServiceFacts:
                 raise ValueError(f"{name} must be boolean or None")
         if type(self.daemon_verified) is not bool or type(self.answering) is not bool:
             raise ValueError("daemon facts must be boolean")
+        for name in ("sub_state", "result"):
+            value = getattr(self, name)
+            if value is not None and (not isinstance(value, str) or not value):
+                raise ValueError(f"{name} must be a nonempty string or None")
+        if self.restarts is not None and (
+            type(self.restarts) is not int or self.restarts < 0
+        ):
+            raise ValueError("restarts must be a nonnegative integer or None")
 
 
 @dataclass(frozen=True)
