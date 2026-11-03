@@ -9,7 +9,7 @@ import pytest
 
 from appio.contracts import Window, WindowUnavailableError
 from appio.handover import HandoverOffer, baseline_seed, capture_handover
-from appio.history_router import HistoryRouter, HistorySegment
+from appio.history_router import DaemonAnswerError, HistoryRouter, HistorySegment
 from appio.iodclient import AppRegistry, ClientState
 from appio.procs import AppKeyInputs, IoReadOutcome, ProcessIdentity, StableProcRecord
 from appio.query import QueryService
@@ -419,8 +419,11 @@ def test_remote_evidence_rejections_have_no_numeric_fallback(tmp_path, variant):
         "snapshot": "fixed", "next_cursor": "more" if variant == "paginated" else None})
     history._local_future.result(timeout=10)
     assert history.ready(scope)
-    assert history.ranking(scope, "total_bytes") == []
-    assert "not_retained" in history.view_state
+    ranked = history.ranking(scope, "total_bytes")
+    assert ranked == []
+    assert isinstance(history.daemon_answer_error, DaemonAnswerError)
+    assert history.daemon_answer_error.kind == "internal"
+    assert "not_retained" not in history.view_state
 
 
 def test_incomplete_remote_history_is_retained_with_honest_coverage(tmp_path):
@@ -520,5 +523,11 @@ def test_empty_or_partial_remote_answer_cannot_replace_proved_local_bytes(tmp_pa
     if work is not None:
         work.result(timeout=10)
     assert history.ready(scope)
-    assert sum(row.read_bytes for row in history.ranking(scope, "total_bytes")) == 20
-    assert "not_retained" in history.view_state
+    rows = history.ranking(scope, "total_bytes")
+    assert sum(row.read_bytes for row in rows) == 20
+    expected = QueryService(local).ranking(scope, "total_bytes")
+    assert [row.coverage.unavailable_reason for row in rows] == [
+        row.coverage.unavailable_reason for row in expected]
+    assert isinstance(history.daemon_answer_error, DaemonAnswerError)
+    assert history.daemon_answer_error.kind == "internal"
+    assert "not_retained" not in history.view_state
