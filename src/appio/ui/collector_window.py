@@ -802,11 +802,6 @@ class CollectorWindow(QMainWindow):
             return
 
         wanted = self._deferred_target or self._target
-        origin = (
-            self._deferred_origin or "clock"
-            if self._deferred_target is not None
-            else "clock"
-        )
         self._invalidated = self._history_retired() and self._displayed is not None
         if wanted is None:
             if retry is not None:
@@ -851,7 +846,8 @@ class CollectorWindow(QMainWindow):
         self.files_view.set_updating_scope(wanted)
         self.files_view.set_scope_ready(False)
         self.files_view.request_refresh()
-        if not self._submit_prepare(wanted, origin, now=now):
+        candidate = self._target if self._target is not None else wanted
+        if not self._submit_prepare(candidate, "clock", now=now):
             self._show_pending_status(now)
             self._poll_timer.stop()
 
@@ -911,6 +907,9 @@ class CollectorWindow(QMainWindow):
         if self._closed:
             return False
         now = self._clock_ns() if now is None else now
+        if self._deferred_target is not None:
+            wanted = self._deferred_target
+            origin = self._deferred_origin or origin
         if (
             self._pending is not None
             or getattr(self.history, "local_read_in_flight", False) is not False

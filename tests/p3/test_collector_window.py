@@ -1548,6 +1548,38 @@ def test_initial_read_passes_submission_gate_control(qtbot):
     assert history.prepare_calls == [target]
 
 
+def test_deferred_explicit_scope_wins_over_clock_candidate_after_clock_frame_applies(qtbot):
+    window, _, history, _ = controlled_build(qtbot)
+    window._timer.stop()
+    window._poll_timer.stop()
+
+    clock_scope = scope_window()
+    explicit_scope = Window("range", BOOT, RAW_BUCKET_NS, END)
+    window._current_window = lambda *_args: clock_scope
+    window._tick_target()
+    assert window._pending == clock_scope
+    assert history.prepare_calls == [clock_scope]
+
+    window.show_window(explicit_scope)
+    assert history.prepare_calls == [clock_scope]
+    assert window._deferred_target == explicit_scope
+
+    apply_scope(window, history, clock_scope)
+    assert window._deferred_target == explicit_scope
+
+    # A clock pass may still offer its old candidate; the gate must arbitrate
+    # against the newer deferred request at the moment it accepts a read.
+    assert window._submit_prepare(clock_scope, "clock")
+    assert history.prepare_calls == [clock_scope, explicit_scope]
+    assert window._pending == explicit_scope
+    assert window._deferred_target == explicit_scope
+    assert window._deferred_origin == "explicit"
+
+    apply_scope(window, history, explicit_scope)
+    assert window._deferred_target is None
+    assert window._deferred_origin is None
+
+
 def test_deferred_explicit_target_survives_other_frame_apply(qtbot):
     window, _, history, _ = controlled_build(qtbot)
     window._timer.stop()

@@ -134,6 +134,7 @@ class P3Harness:
         self.amount = 100
         self.guis = []
         self.imports = []
+        self.query_routers = {}
         self.gui = None
         self.daemon = None
         self.last_reply = None
@@ -530,6 +531,9 @@ class P3Harness:
         gui = gui or self.gui
         if gui is None:
             return
+        query_history = self.query_routers.pop(id(gui), None)
+        if query_history is not None:
+            query_history.close()
         gui.window.shutdown()
         future = gui.history._local_future
         if future is not None and not future.cancelled():
@@ -604,11 +608,30 @@ class P3Harness:
 
     def query(self, window: Window, *, gui=None):
         gui = gui or self.gui
-        gui.history.prepare(window)
-        # No window refresh, queued fact application, readiness apply or target
-        # calculation may happen inside this wait.
-        self.until(lambda: gui.history.ready(window), process_events=False)
-        return gui.history.ranking(window, "total_bytes")
+        previous = self.query_routers.pop(id(gui), None)
+        if previous is not None:
+            previous.close()
+        history = HistoryRouter(gui.history.local, gui.client, gui.history.registry)
+        for collector_id, (service, owner) in gui.history._sources.items():
+            if collector_id != "local":
+                history.add_source(service, collector_id=collector_id, owner=owner)
+        try:
+            history.prepare(window)
+            # Keep this low-level query separate from the active window's gated
+            # preparation state; both use the same production sources and client.
+            self.until(lambda: history.ready(window), process_events=False)
+            self.query_routers[id(gui)] = history
+            return history.ranking(window, "total_bytes")
+        except BaseException:
+            history.close()
+            raise
+
+    def disk_share(self, app_id: int, window: Window, *, gui=None):
+        gui = gui or self.gui
+        history = self.query_routers.get(id(gui))
+        if history is None:
+            raise AssertionError("query must be completed before reading its disk share")
+        return history.disk_share(app_id, window)
 
     def render(self, window, *, gui=None):
         gui = gui or self.gui

@@ -115,7 +115,7 @@ def test_absent_daemon_is_unavailable_and_two_guis_have_one_fallback_writer(tmp_
         scope = Window("range", BOOT, 10 * NS, 20 * NS)
         row, = h.query(scope, gui=first)
         assert (row.read_bytes, row.write_bytes) == (48, 32)
-        share = first.history.disk_share(row.app_id, scope)
+        share = h.disk_share(row.app_id, scope, gui=first)
         assert share.device_total_bytes is None and share.residual_total is None
         h.render(scope, gui=first)
         assert first.window.view.findChild(QLabel, "device_value").text() == "unavailable"
