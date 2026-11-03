@@ -150,7 +150,9 @@ New window fields: `_pending_since: int | None`, `_stalled: bool`, `_retry_after
 int | None`, `_deferred_target: Window | None`, `_refresh_after_apply: bool`, and
 `PENDING_BUDGET_NS = 30 * 10**9`.
 
-Exactly these rules set or clear those fields; no other code path may.
+Exactly these rules set or clear `_pending_since`, `_stalled`, `_retry_after` and
+`_deferred_target`; no other code path may. (`_refresh_after_apply` belongs to §5.2's
+coalescing rule and is untouched by this rule set.)
 
 1. **Accepting a preparation** sets `_pending_since = now` and `_stalled = False`.
 2. **Budget.** If `_pending` is not None and `now - _pending_since >= PENDING_BUDGET_NS`,
@@ -170,7 +172,8 @@ Exactly these rules set or clear those fields; no other code path may.
    - `local_read_in_flight` → `history read has not completed (<view_state>); the reader is still busy`
    - otherwise, `_retry_after` in the future → `history read has not completed (<view_state>); retrying in <n> s`
    - otherwise → no stall label
-6. **Clearing.** Applying a frame clears `_stalled` and `_retry_after`.
+6. **Clearing.** Accepting a preparation clears `_stalled` and `_retry_after` — the
+   floor has served its purpose. Applying a frame also clears both.
    `_deferred_target` is cleared **only** when the applied frame is that deferred scope;
    applying any other frame leaves it armed, so an explicit request made while another
    read was pending still gets prepared. An explicit refresh re-arms `_deferred_target`,
@@ -360,8 +363,9 @@ remote failure ──► daemon_answer_error ──┬─ data reason present �
 
 ## 7. Test strategy
 
-Every guarantee below is written to fail on today's code; a test that would pass
-before the change is not evidence and is not accepted.
+Most guarantees below are written to fail on today's code; a test that would pass
+before the change is not evidence of the fix and is accepted only where it is labelled a
+**control** — a behaviour that must keep working, such as the initial load.
 
 ### 7.1 Coordinator (`tests/p3/test_collector_owner.py`)
 
@@ -406,9 +410,9 @@ window's coalescing. Neither arm can stand in for the other.
    refresh together submit zero preparations.
 9b. `show_window` during a stall: the explicit scope change arms `_deferred_target`,
    submits nothing while the worker is busy, and does not clear `_retry_after`.
-9c. Initial load: no deferred target and no floor still submits exactly one preparation
-   (the gate cannot block the first read); a second pass while it is pending submits
-   nothing.
+9c. **Control** (passes before and after): the initial load — no deferred target and no
+   floor — still submits exactly one preparation, and a second pass while it is pending
+   submits nothing. It guards the gate against blocking the first read.
 9d. `show_window(B)` while scope A is pending: B is armed, A applies and does **not**
    clear B, and B is prepared exactly once afterwards. Applying B then clears it.
 10. Clearing: an applied frame, and an invalidation followed by a fresh preparation,
