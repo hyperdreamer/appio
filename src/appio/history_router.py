@@ -18,11 +18,12 @@ even when excluding uncertain whole deltas has reduced every counter to zero.
 from __future__ import annotations
 
 from collections import defaultdict
-from concurrent.futures import Future, InvalidStateError, ThreadPoolExecutor
+from concurrent.futures import CancelledError, Future, InvalidStateError, ThreadPoolExecutor
 from dataclasses import dataclass, replace
 import json
 from pathlib import Path
 import sqlite3
+from typing import Literal
 from types import SimpleNamespace
 
 from .contracts import (
@@ -31,7 +32,16 @@ from .contracts import (
 )
 from .durable import decode_handover
 from .file_runtime import FileAvailability
-from .iodclient import AppRegistry, GapNotice, IodClient, IodClientError, RequestRejected
+from .iodclient import (
+    AppRegistry,
+    ClientUnavailable,
+    ConnectionLost,
+    GapNotice,
+    IodClient,
+    IodClientError,
+    RemoteError,
+    RequestRejected,
+)
 from .ipc_models import QueryRequest
 from .ownership import ownership_exclusions, subtract_intervals
 from .query import QueryService, _model_coverage, _reduce_coverage
@@ -40,6 +50,18 @@ from .store import AppIoStore, _empty_coverage
 _COUNTERS = ("rchar", "wchar", "read_bytes", "write_bytes")
 _PEAKS = ("peak_read_bps", "peak_write_bps", "peak_total_bps")
 _METRICS = ("total_bytes", "read_bytes", "write_bytes", "rchar", "wchar")
+
+
+@dataclass(frozen=True)
+class DaemonAnswerError:
+    kind: Literal["remote_error", "unavailable", "rejected", "transport", "internal"]
+    reason: str
+
+    def __post_init__(self):
+        if self.kind not in ("remote_error", "unavailable", "rejected", "transport", "internal"):
+            raise ValueError("invalid daemon answer error kind")
+        if not isinstance(self.reason, str) or not self.reason:
+            raise ValueError("daemon answer error reason must be a non-empty string")
 
 
 @dataclass(frozen=True)
@@ -126,6 +148,7 @@ class HistoryRouter:
         self._all_segments = ()
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="appio-history")
         self._local_future = None
+        self._daemon_answer_error: DaemonAnswerError | None = None
         self._local_generation = None
         self._cached_parts = {}
         self._remote_snapshot = None
@@ -133,6 +156,14 @@ class HistoryRouter:
         self._file_jobs = set()
         self._file_workers = set()
         self._file_status = FileAvailability(True, False)
+
+    @property
+    def daemon_answer_error(self) -> DaemonAnswerError | None:
+        return self._daemon_answer_error
+
+    @property
+    def local_read_in_flight(self) -> bool:
+        return self._local_future is not None and not self._local_future.done()
 
     def _cancel_file_requests(self):
         for future in tuple(self._file_jobs):
@@ -754,6 +785,7 @@ class HistoryRouter:
         self._ranking, self._remote_parts, self._queue, self._cached_parts = [], {}, [], {}
         self._remote = self._remote_snapshot = None
         self._not_retained = self._chronology_unproved = False
+        self._daemon_answer_error = None
         self.view_state = "loading"
         if self._local_future is not None:
             self._local_future.cancel()
@@ -891,12 +923,27 @@ class HistoryRouter:
                         if value.window != window or response.get("snapshot") != self._remote_snapshot:
                             raise ValueError("remote history answered a different scope or snapshot")
                         self._remote_parts[(request.kind, request.app_key)] = value
-                except Exception:
-                    # Keep only locally proved/exported contributions. No stale
-                    # remote result may populate a new window or widen its scope.
+                except (WindowUnavailableError, CancelledError):
                     self._remote = None
                     self._queue = []
-                    self._not_retained = True
+                except Exception as error:
+                    # Keep only locally proved contributions. A client-side query
+                    # failure is diagnostic state, not evidence about retention.
+                    self._remote = None
+                    self._queue = []
+                    if isinstance(error, RemoteError):
+                        kind = "remote_error"
+                    elif isinstance(error, ClientUnavailable):
+                        kind = "unavailable"
+                    elif isinstance(error, RequestRejected):
+                        kind = "rejected"
+                    elif isinstance(error, ConnectionLost):
+                        kind = "transport"
+                    else:
+                        kind = "internal"
+                    reason = (error.reason if isinstance(error, IodClientError)
+                              else str(error).strip() or type(error).__name__)
+                    self._daemon_answer_error = DaemonAnswerError(kind, reason)
             self._dispatch()
         self._dispatch()
         if self._pending is None and not self._queue:
