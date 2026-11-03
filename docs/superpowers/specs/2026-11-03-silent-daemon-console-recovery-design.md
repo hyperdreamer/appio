@@ -160,11 +160,21 @@ int | None`, `_refresh_after_apply: bool`, and `PENDING_BUDGET_NS = 30 * 10**9`.
   - after the router retires the generation (`_history_retired()`): the pending read is
     cleared, `_retry_after = now + PENDING_BUDGET_NS`, and the label reads
     `history read has not completed (<view_state>); retrying in <n> s`
-- A retirement that leaves the worker busy records the wanted target in
-  `_deferred_target` instead of forgetting it: `_tick_target` submits exactly one
-  preparation when, and only when, `local_read_in_flight` is false, the retry floor has
-  elapsed, and `_deferred_target` is set. The busy label stays until a replacement is
-  actually accepted, so it never claims a retry that has not happened.
+One transition rule governs retirement, refresh, and the floor:
+
+- **Retirement** (the router reports `view_state` unavailable) always records the
+  wanted scope in `_deferred_target`, clears `_pending`, and sets
+  `_retry_after = now + PENDING_BUDGET_NS`. It never clears the pause and never submits
+  immediately.
+- **`_tick_target`** submits exactly one preparation when, and only when, all four hold:
+  `_deferred_target` is set, `local_read_in_flight` is false,
+  `now >= _retry_after`, and no preparation is already pending.
+- **The label follows the worker, not the intent**: `the reader is still busy` while
+  `local_read_in_flight` is true (whether or not a retirement happened), and
+  `retrying in <n> s` only when the worker is free and a floor is outstanding.
+- **An explicit refresh** re-arms the deferred target and leaves `_retry_after` alone.
+  It cannot clear a busy label while the worker is still occupied, and it cannot
+  discard `_deferred_target`.
 - No preparation is submitted while `local_read_in_flight` is true (new read-only
   router property over `_local_future`, `src/appio/history_router.py:127`, `:759`,
   `:769`), on every path — tick, refresh, retirement, and explicit request. A wedged
@@ -183,7 +193,7 @@ int | None`, `_refresh_after_apply: bool`, and `PENDING_BUDGET_NS = 30 * 10**9`.
   the window never reports a repair it cannot perform.
 
 The deadline is a clock deadline, not scope identity: `_current_window()` advances its
-end to the next `RAW_BUCKET_NS` boundary (`:899-916`), so a pause keyed on the scope
+end to the next `RAW_BUCKET_NS` boundary (`:921-923`), so a pause keyed on the scope
 would never fire.
 
 ### 5.4 A client failure is not a retention reason
@@ -218,8 +228,8 @@ through `_not_retained` alone, so pruned history keeps its contract reason and i
 typed value.
 
 Rendering: `build_overview` gains one optional keyword `coverage_diagnostic: str | None
-= None` and `OverviewModel` gains the matching field (`src/appio/ui/render_model.py:420-430`;
-interface amendment ratified in §9). `main_window._device_unavailable_text` reads the
+= None` and `OverviewModel` gains the matching field (`src/appio/ui/render_model.py:201-214` for the model, `:420-430` for the
+builder; interface amendment ratified in §9). `main_window._device_unavailable_text` reads the
 same string, so the coverage footer and the device strip say the same thing.
 
 Wording is chosen by kind, so that a local refusal is never blamed on the daemon:
@@ -233,9 +243,16 @@ Wording is chosen by kind, so that a local refusal is never blamed on the daemon
 | `internal` | `history query failed (<reason>)` |
 
 `_coverage_text` **composes** the two independent causes instead of letting one hide
-the other: the contract reason first when the data has one, then this clause —
-`reason: not_retained; daemon report: remote_error (… )`. When only one cause exists,
-only that one is printed.
+the other. There is exactly one canonical form, and these are the only three outputs:
+
+| Causes present | Exact footer clause |
+| --- | --- |
+| data reason only | `reason: not_retained` (or the contract's own token) |
+| client diagnostic only | `reason: <per-kind clause>` |
+| both | `reason: <contract reason>; <per-kind clause>` |
+
+so a dead daemon next to pruned history reads
+`reason: not_retained; daemon reported an error (… )`.
 
 ### 5.5 One honest cause line under the state
 
@@ -265,8 +282,9 @@ given up on: `_ACTIVE_STATES` maps `failed` to `inactive`
 daemon is reported as a normal stopped service. For that case the systemd clause leads
 (`enabled but not running: failed: <result>`); otherwise the function joins one socket
 clause and one systemd clause when each is available. The clauses are built
-only from observations the client actually publishes (`ClientState.last_error`,
-`iodclient.py:910-979`, `_publish` `:1325-1333`):
+only from observations the client actually publishes (`ClientState.last_error`:
+connect and refusal paths `iodclient.py:905-979`, stream-loss tokens `:1043-1046`,
+`_publish` `:1327-1338`):
 
 | Observation | Clause |
 | --- | --- |
@@ -309,7 +327,7 @@ local tick ──► committed advance ──┬─ nothing pending ──► in
                                     └─ read pending ──► _refresh_after_apply ──► one invalidate on apply
 pending read ──► 30 s budget ──┬─ still running ──► "the reader is still busy" (kept, not discarded)
                                └─ router retired it ──► "retrying in <n> s" ──► one reprepare
-remote failure ──► daemon_answer_error ──► "reason: <per-kind clause from §5.4>"
+remote failure ──► daemon_answer_error ──► "reason: <contract reason>; <per-kind clause>"
 ```
 
 ### 5.7 State fields
@@ -337,7 +355,7 @@ remote failure ──► daemon_answer_error ──► "reason: <per-kind clause
 | Read exceeds the budget repeatedly | every stall is labelled, the retry floor prevents a busy loop, no numeric zero is invented |
 | Read still running when the budget expires | label says `the reader is still busy`; the read stays pending and nothing is submitted behind it |
 | Read never returns | the same honest label stands; no repair is claimed and no duplicate is queued |
-| Router retirement during a stall pause | pause cleared; the label does not claim a daemon failure, because retirement is not one |
+| Router retirement during a stall pause | retirement records the deferred target and starts the floor (it never clears the pause); the label follows the worker, and no daemon failure is claimed because retirement is not one |
 | Remote query fails after a local answer arrives | local rows stay; the footer shows the data reason, the per-kind client clause, or both when both are true |
 
 ## 7. Test strategy
@@ -377,46 +395,55 @@ window's coalescing. Neither arm can stand in for the other.
 6. Budget expiry with the read still in flight: `history_state` reads
    `history read has not completed (loading); the reader is still busy`; `_pending` is
    unchanged and nothing is submitted.
-7. Retirement while the worker is busy: the router retires the generation, the busy
-   label stays (no retry is claimed), `_deferred_target` is set, and exactly one
-   preparation is submitted once the worker is idle and the floor has elapsed.
-8. Clearing: an applied frame, and an invalidation followed by a fresh preparation,
-   each clear `_stalled`, the stalled label, and `_retry_after`.
-9. No duplicates: with `local_read_in_flight` true, five ticks and one explicit refresh
-   submit zero preparations and do not discard `_deferred_target`.
+7. Retirement while the worker is busy: the busy label stays (no retry is claimed),
+   `_deferred_target` is set, `_retry_after` is set, and **nothing** is submitted before
+   the floor elapses even though the worker frees immediately after retirement.
+8. Retirement with the worker free: the label reads `retrying in <n> s`, and exactly one
+   preparation is submitted once the floor elapses — not before.
+9. Explicit refresh during a stall: no preparation is submitted while
+   `local_read_in_flight` is true, `_deferred_target` survives, and the busy label is not
+   cleared. Five ticks and one refresh together submit zero preparations.
+10. Clearing: an applied frame, and an invalidation followed by a fresh preparation,
+    each clear `_stalled`, the stalled label, and `_retry_after`.
 
 ### 7.3 Router and rendering (`tests/p4/test_file_history_router.py`, `tests/test_ui.py`)
 
-10. Classification, one case per class: `RemoteError` → `remote_error`,
+11. Classification, one case per class: `RemoteError` → `remote_error`,
     `ClientUnavailable` → `unavailable`, `RequestRejected` → `rejected`,
     `ConnectionLost` → `transport`, an unrecognised failure → `internal`. Each leaves
     `coverage.unavailable_reason` exactly as the data says, and a pruned-row query
     still yields `not_retained`.
-11. Retirement is not a daemon failure: `invalidate()`, `WindowUnavailableError`, and a
+12. Retirement is not a daemon failure: `invalidate()`, `WindowUnavailableError`, and a
     cancelled query set neither `_not_retained` nor `daemon_answer_error`.
-12. Composition: local retention loss **and** a remote failure in the same generation
-    print both causes; each cause alone prints only itself.
-13. Wording per kind in `_coverage_text` and the device strip, including
+13. Composition, asserting the exact strings of §5.4's three-row table: data reason
+    only, client diagnostic only, and both in one clause separated by `; `.
+14. Wording per kind in `_coverage_text` **and** `_device_unavailable_text`, including
     `RequestRejected("too_many_requests")`, whose line must not blame the daemon.
 
 ### 7.4 Banner and Files (`tests/p3/test_collector_window.py`, `tests/test_ui.py`)
 
-14. `parse_unit_facts` accepts the five-property output; ignores a malformed or absent
+15. `parse_unit_facts` accepts the five-property output; ignores a malformed or absent
     optional property while still returning the required facts; still fails closed on a
     duplicated key or a malformed line.
-15. `silence_cause` for every row of §5.5's socket table, including
+16. `silence_cause` for every row of §5.5's socket table, including
     `daemon_not_answering`, built from the client's published state rather than from a
     hand-assembled token list.
-16. The enabled-but-failed case: an enabled unit reported `inactive` with `Result` a
+17. The enabled-but-failed case: an enabled unit reported `inactive` with `Result` a
     failure produces `off` **with** the `enabled but not running` cause; an enabled unit
     reported `inactive` with no failure evidence produces `off` with no cause line.
-17. Layout: `banner_detail` sits below `banner_status` inside the status column, is
+18. systemd evidence rows, one case each: `NRestarts > 0` → `<n> restarts`;
+    `Result = "exit-code"` → `failed: exit-code`; `SubState == "auto-restart"` →
+    `restarting`; and the combined case asserting the exact joined string when a socket
+    clause and restart evidence are both present.
+19. Layout: `banner_detail` sits below `banner_status` inside the status column, is
     visible only in the states of §5.5, and its text fits without clipping at the
     shipped window width and at the window's minimum width.
-18. Files during a stall: on the real `FilesView` with retained rows,
+20. Files during a stall, on the real `FilesView` with retained rows:
     `set_stalled(True, text)` replaces the generic `updating to <kind>` caption
-    (`src/appio/ui/files_view.py:759-769`), and `set_stalled(False, "")` restores it;
-    asserted alongside test 6's console label, not on a mock branch.
+    (`src/appio/ui/files_view.py:759-769`), and `set_stalled(False, "")` restores it.
+21. Wiring, with a real `CollectorWindow` and `FilesView`: a held read drives the stall
+    caption into the view, and the caption clears when the frame applies — proving the
+    window calls the setter, not that the setter works alone.
 
 ### 7.5 Existing tests that must change
 
