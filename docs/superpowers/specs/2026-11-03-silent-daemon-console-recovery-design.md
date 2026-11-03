@@ -89,7 +89,7 @@ crash loop, a permission refusal, and a daemon that never started.
 | D1 | Scope | All three faults: permanent spinner, fabricated reason, and the boxed banner |
 | D2 | Banner content | The ratified state string stays; a cause line is added from the socket observation **and** systemd restart/failure evidence |
 | D3 | Banner layout | Option A: the cause is a second, muted line under the state inside the banner strip |
-| D4 | Slow read | Bounded wait (30 s), honest stalled label, rate-limited retry that heals itself |
+| D4 | Slow read | Bounded wait (30 s), honest stalled label, retry rate-limited to one per budget |
 
 Mockup of record for D3: `assets/2026-11-03-silent-daemon-cause.png`.
 
@@ -266,11 +266,10 @@ every existing assertion keep working.
 ```text
 probe facts ──► decide_owner ──► HistoryKey ──┬─ same ──► no invalidate (frame survives)
                                               └─ differs ──► invalidate ──► reprepare
-local tick ──► TickResult.rows_written ──┬─ 0 ──► no invalidate
-                                         ├─ >0, nothing pending ──► invalidate
-                                         └─ >0, read pending ──► _refresh_after_apply
-pending read ──► 30 s budget ──┬─ read still running ──► "the reader is still busy"
-                               └─ read finished ──► "retrying in <n> s" ──► one reprepare
+local tick ──► committed advance ──┬─ nothing pending ──► invalidate
+                                    └─ read pending ──► _refresh_after_apply ──► one invalidate on apply
+pending read ──► 30 s budget ──┬─ still running ──► "the reader is still busy" (kept, not discarded)
+                               └─ router retired it ──► "retrying in <n> s" ──► one reprepare
 remote failure ──► daemon_answer_error ──► "reason: daemon answer unusable (…)"
 ```
 
@@ -390,7 +389,7 @@ the banner names the socket cause.
 | --- | --- |
 | Over-eager no-invalidate leaves stale data on screen | The key contains every input that selects a source; a genuine source change still invalidates |
 | A 30 s budget masks a permanently broken read | The label is explicit and rate-limited; the data shown is still labelled `incomplete` |
-| `rows_written` misses a reader-visible table | The spec enumerates the tables the router queries and a test pins the idle-tick case |
+| Treating a "quiet" tick as no advance hides a moved checkpoint | No row-count test is used for staleness; a tick always counts as an advance and the window coalesces instead |
 | A longer banner strip crowds a narrow window | The cause line wraps inside the existing strip; the mockup was checked at the shipped width |
 | Removing the fabricated reason hides a real gap | The contract reason still comes from rows; only the client-failure case changes wording |
 
