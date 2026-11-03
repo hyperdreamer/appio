@@ -1493,6 +1493,106 @@ class FakeFilesHistory:
         return future
 
 
+def retained_file_result(window: Window):
+    from appio.contracts import (
+        FileCoverage,
+        FileRow,
+        FileTable,
+        HookHits,
+        UnknownOwnerOverflow,
+    )
+    from appio.history_router import FileViewResult
+
+    inner = coverage()
+    overflow = UnknownOwnerOverflow(
+        window, "overflow_owner_unknown", 0, 0, 0, inner
+    )
+    row = FileRow(
+        1, "report.txt", "resolved", False, "259:0", 42, 7, 3, 2,
+        100, 50, 150, BOOT, END - 1,
+    )
+    table = FileTable(
+        1, window, (row,), "bytes_total", "desc", None, overflow, inner
+    )
+    file_coverage = FileCoverage(
+        1, window, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        HookHits(0, 0, 0, 0, 0, 0), 100, 50, overflow, inner,
+    )
+    return FileViewResult(table, file_coverage, None)
+
+
+def retained_pending_files_view(qtbot):
+    total = app_total(1, "unit:/alpha.service", "Alpha", 200)
+    history = FakeFilesHistory(ranking_rows=(total,))
+    view = FilesView(history)
+    qtbot.addWidget(view)
+    view.set_window(SINCE_BOOT)
+    assert len(history.pending) == 1
+    history.pending[0].set_result(retained_file_result(SINCE_BOOT))
+    qtbot.waitUntil(lambda: view.model.rowCount() == 1)
+    view.request_refresh()
+    assert len(history.pending) == 2
+    assert view._outstanding is True
+    return view, history
+
+
+def files_noncaption_snapshot(view: FilesView, history: FakeFilesHistory):
+    return (
+        tuple(view.model._cells),
+        tuple(label.text() for label in view._footer_labels()),
+        view._window,
+        view._app_id,
+        view._scope_ready,
+        view._state,
+        view.last_result,
+        view.last_request,
+        tuple(view.requests),
+        view._generation,
+        view._outstanding,
+        view._refresh_wanted,
+        view._updating_scope,
+        view._deferred_window,
+        len(history.pending),
+    )
+
+
+def test_files_stall_caption_preserves_retained_table_and_footer(qtbot) -> None:
+    view, history = retained_pending_files_view(qtbot)
+    original_caption = view.files_updating.text()
+    assert original_caption == "updating to since_boot"
+    before = files_noncaption_snapshot(view, history)
+    stalled_text = "history read has not completed (loading); the reader is still busy"
+
+    view.set_stalled(True, stalled_text)
+
+    assert view.files_updating.text() == stalled_text
+    assert not view.files_updating.isHidden()
+    assert files_noncaption_snapshot(view, history) == before
+
+    view.set_stalled(False, "ignored while clearing")
+
+    assert view.files_updating.text() == original_caption
+    assert not view.files_updating.isHidden()
+    assert files_noncaption_snapshot(view, history) == before
+
+
+def test_files_set_stalled_rejects_invalid_arguments(qtbot) -> None:
+    view = FilesView(FakeFilesHistory())
+    qtbot.addWidget(view)
+    view.set_stalled(True, "history read has not completed (loading); the reader is still busy")
+    before = (view.files_updating.text(), view.files_updating.isHidden())
+
+    for stalled, text in ((1, "bad"), ("yes", "bad"), (True, ""), (True, None),
+                          (False, None)):
+        with pytest.raises(ValueError):
+            view.set_stalled(stalled, text)
+        assert (view.files_updating.text(), view.files_updating.isHidden()) == before
+
+    view.set_stalled(False, "this argument is ignored")
+    assert view.files_updating.text() == ""
+    assert view.files_updating.isHidden()
+
+
 def kpi_texts(window: AppIoWindow) -> list[str]:
     return [label(window, name).text() for name in KPI_NAMES]
 
