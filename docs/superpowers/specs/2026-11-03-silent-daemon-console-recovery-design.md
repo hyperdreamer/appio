@@ -160,16 +160,21 @@ Exactly these rules set or clear those fields; no other code path may.
    `_deferred_target` to the wanted scope, clears `_pending`, and sets
    `_retry_after = now + PENDING_BUDGET_NS`. It never clears `_stalled` and never
    submits anything by itself.
-4. **Submission.** Exactly one preparation is issued when, and only when, all four hold:
-   `_deferred_target` is set, `local_read_in_flight` is false,
-   `now >= _retry_after`, and `_pending` is None. This is the only submission gate.
+4. **Submission gate.** A preparation may be issued only when all four hold:
+   no preparation is pending (`_pending is None`), `local_read_in_flight` is false, the
+   retry floor has elapsed (`_retry_after is None`, or `now >= _retry_after`), and there
+   is a scope to prepare — `wanted = _deferred_target or _target`. An initial load has
+   no deferred target and no floor, so `wanted` is simply `_target`; the gate must never
+   block the first read. At most one preparation is submitted per satisfied pass.
 5. **Label**, derived — never latched — from the worker and the floor:
    - `local_read_in_flight` → `history read has not completed (<view_state>); the reader is still busy`
    - otherwise, `_retry_after` in the future → `history read has not completed (<view_state>); retrying in <n> s`
    - otherwise → no stall label
-6. **Clearing.** Only an applied frame, or an accepted preparation, clears `_stalled`,
-   `_retry_after`, and `_deferred_target`. An explicit refresh re-arms
-   `_deferred_target`, never changes `_retry_after`, and never clears a busy label.
+6. **Clearing.** Applying a frame clears `_stalled` and `_retry_after`.
+   `_deferred_target` is cleared **only** when the applied frame is that deferred scope;
+   applying any other frame leaves it armed, so an explicit request made while another
+   read was pending still gets prepared. An explicit refresh re-arms `_deferred_target`,
+   never changes `_retry_after`, and never clears a busy label.
 7. **Every path obeys rule 4,** including `show_window`, which today calls
    `history.prepare` directly (`src/appio/ui/collector_window.py:810`). That call
    becomes a deferred request, so an explicit scope change cannot queue a second read
@@ -401,6 +406,11 @@ window's coalescing. Neither arm can stand in for the other.
    refresh together submit zero preparations.
 9b. `show_window` during a stall: the explicit scope change arms `_deferred_target`,
    submits nothing while the worker is busy, and does not clear `_retry_after`.
+9c. Initial load: no deferred target and no floor still submits exactly one preparation
+   (the gate cannot block the first read); a second pass while it is pending submits
+   nothing.
+9d. `show_window(B)` while scope A is pending: B is armed, A applies and does **not**
+   clear B, and B is prepared exactly once afterwards. Applying B then clears it.
 10. Clearing: an applied frame, and an invalidation followed by a fresh preparation,
     each clear `_stalled`, the stalled label, and `_retry_after`.
 
