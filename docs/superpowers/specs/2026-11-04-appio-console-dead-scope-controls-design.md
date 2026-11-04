@@ -191,37 +191,65 @@ assistive technology reads; no separate accessible description is added, because
 removed chip was the only element that carried one. Tests assert the label exists,
 is visible, and equals the exact A22 string.
 
-### 6.1 A refused window clears both panes
+### 6.1 A refused window clears the Files pane it owns
 
 `_render_unavailable` (`src/appio/ui/main_window.py:1037-1053`) writes only
-`_detail_state`, which lives in the Overview page (`:521-524`), and `set_window`
-returns before `_sync_files` (`:621`). With the Files tab selected, a refused window
-would therefore leave the previous window's file rows on screen — a numeric series
-under a refused label, which A22's "no stale numeric series/totals" forbids. The
-removal of the always-visible chip label makes that failure reachable in a way no
-reader could explain.
+`_detail_state`, which lives in the Overview page (`:521-524`), and a refused
+`set_window` returns at `:621` before `self._sync_owned_files()` (`:626`). With the
+Files tab selected, a refused window would therefore leave the previous window's
+file rows on screen — a numeric series under a refused label, which A22's "no stale
+numeric series/totals" forbids. The always-visible chip sentence used to hide that
+failure; removing it makes it reachable.
 
-A refused window must clear the file pane as well:
+**Ownership.** Only the owner clears. `AppIoWindow` owns the Files scope when it was
+constructed with boot arguments (`self._owns_files_scope`,
+`src/appio/ui/main_window.py:360`), which is the standalone case. In the embedded
+console the shell owns Files (`src/appio/ui/collector_window.py:732`
+`_sync_files`), its own refusal path never reaches `set_window` (§6 row 2), and
+`_render_files_message` (`:719-728`) already derives its caption from
+`files_view.state` and `unavailable_text()`. No second owner is introduced.
+
+**Standalone `set_window`.**
 
 ```python
 if reason is not None:
     self._render_unavailable(reason)
-    self.files_view.refuse(reason)          # new public method
-    self.files_message.setText(reason)
-    self.files_message.setVisible(True)
+    if self._owns_files_scope:
+        self.files_view.refuse(reason)      # new public method
+        self.files_message.setText(reason)
+        self.files_message.setVisible(True)
     return
+if self._owns_files_scope:
+    # A supported adoption retires the refusal caption.
+    self.files_message.setText("")
+    self.files_message.setVisible(False)
+self.refresh()
+...
 ```
 
-`FilesView.refuse(reason)` is a thin public wrapper over the existing
-`_set_unavailable(None, reason)` (`src/appio/ui/files_view.py:1094-1102`), which
-already clears the model, resets the footers to `unavailable`, and shows the state
-label. The exact A22 text therefore appears in the Overview status line, the Files
-state line, and `files_message`, whichever tab is selected, and no row from a
-previous window survives.
+**`FilesView.refuse(reason)` contract.** It performs four duties in one call, in this
+order, because each guards a different way old data could reappear:
 
-This is a defect the change exposes rather than a new feature: before this design
-the same stale rows could appear, hidden only by the chip's permanent sentence. The
-design records it because goal 4 cannot be met otherwise.
+1. `self.retire_deliveries()` (`src/appio/ui/files_view.py:590-596`) bumps the
+generation, so a delivery already in flight cannot publish (`_on_delivered` drops a
+stale generation at `:807`), and then `self._refresh_wanted = False`, because no
+replacement is owed for a refused scope.
+2. `self._window = None` and `self._deferred_window = None`. Without this a later
+   adoption of the *same* window computes `changed = window != self._window` as false
+   (`:638`) and issues no query, leaving Files permanently unavailable.
+3. `self._app_id = None`, `self._choices_loaded = False`, and the application
+   selector is cleared and hidden inside a `blockSignals` guard, because its items
+   embed the previous scope's byte totals (`:966-974`).
+4. `self._set_unavailable(None, reason)` (`:1094-1102`), which clears the model,
+   resets every footer label to `unavailable`, and shows the state label.
+
+The exact A22 text therefore appears in the Overview status line, the Files state
+line, and `files_message`, whichever tab is selected, and no row, total, or selector
+entry from a previous window survives.
+
+This is a defect the change exposes rather than a new feature: the same stale rows
+could appear before, hidden only by the chip's permanent sentence. The design records
+it because goal 4 cannot be met otherwise.
 
 No new error state, label, or log line is added.
 
@@ -247,11 +275,20 @@ No new error state, label, or log line is added.
   `set_window` with `since_boot`, `lifetime`, an over-long range, and a launch window
   each leaves `scope_range` hidden, disabled and unchecked. This pins the transition
   direction, which entry-only assertions cannot catch.
-- New `test_refused_window_clears_files_and_shows_the_reason`: with the Files tab
-  selected (`tests/test_ui.py:1828` shows the `setCurrentIndex(1)` idiom) and a
-  populated table, `set_window(launch)` leaves the table empty, `files_message`
-  visible with the exact A22 text, `FilesView.state == "unavailable"`, and no
-  additional query.
+- New `test_refused_window_clears_files_and_shows_the_reason`: with a standalone
+  window, the Files tab selected (`tests/test_ui.py:1828` shows the
+  `setCurrentIndex(1)` idiom), a populated table, a populated application selector,
+  and one in-flight delivery, `set_window(launch)` leaves the table empty, the
+  selector hidden and empty, every footer at `unavailable`,
+  `FilesView.state == "unavailable"`, `files_message` visible with the exact A22
+  text, and no query dispatched.
+- New `test_late_delivery_after_refusal_never_republishes`: a delivery settled before
+  the refusal, delivered after `refuse()`, changes no row and no footer.
+- New `test_returning_to_the_refused_window_reloads_once`: supported W → launch → the
+  same W issues exactly one new file query and restores rows, proving `refuse()`
+  forgot the adopted scope (`src/appio/ui/files_view.py:638`).
+- New `test_supported_adoption_clears_the_refusal_message`: refusal followed by a
+  supported window leaves `files_message` hidden with empty text.
 
 ### 7.3 Changed in `tests/acceptance/test_p1_p2.py`
 
@@ -286,10 +323,10 @@ Both rows keep: the exact message rendered, `detail_state == message`, and
 ### 7.5 Gates
 
 - `python -m pytest tests/test_ui.py tests/acceptance/test_p1_p2.py` passes.
-- The full suite collects exactly one more test than before: §7.1 rewrites two tests
-  one-for-one, §7.2 extends one existing test, and §7.2 adds three new tests, so the
-  net change is +3 collected, not +2 — state the observed before/after counts in the
-  implementation report rather than relying on arithmetic.
+- The full suite's collected count: §7.1 rewrites two tests one-for-one, §7.2
+  extends one existing test and adds six new tests, and §7.3 renames one. Record the
+  observed before/after collected counts in the implementation report rather than
+  relying on arithmetic.
 - Mutation checks: re-adding a disabled `scope_launch` button fails
   `test_launch_scope_is_not_offered_and_detail_fallback_keeps_a22_text`; making
   `scope_range` visible unconditionally fails the empty-console and over-long-range
@@ -319,7 +356,7 @@ over-long-range row (`:1036`) — that require a disabled control.
 
 Amended by the user's ruling: the requirement becomes "no control offered for a
 scope that is never actionable; the exact reason text remains visible in the detail
-view". The amendment touches exactly three places, and every store outcome — the
+view". The amendment touches exactly four places, and every store outcome — the
 exception type, reason token, and message — stays byte-identical:
 
 | Location | Current text | Amended text |
