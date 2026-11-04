@@ -596,6 +596,23 @@ class FilesView(QWidget):
         self._outstanding = False
         self._update_updating_label()
 
+    def refuse(self, reason: str) -> None:
+        """Clear a refused scope without adopting it or issuing a query."""
+
+        self.retire_deliveries()
+        self._refresh_wanted = False
+        self._window = None
+        self._deferred_window = None
+        blocked = self.app_selector.blockSignals(True)
+        try:
+            self._app_id = None
+            self._choices_loaded = False
+            self.app_selector.clear()
+            self.app_selector.setVisible(False)
+        finally:
+            self.app_selector.blockSignals(blocked)
+        self._set_unavailable(None, reason)
+
     def refresh_wanted(self) -> bool:
         """Report the deferred refresh flag without consuming it."""
 
