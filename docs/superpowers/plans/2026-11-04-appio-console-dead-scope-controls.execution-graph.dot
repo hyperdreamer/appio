@@ -1,0 +1,16 @@
+digraph execution_graph {
+  rankdir=LR;
+  node [shape=box, style=rounded, fontname="Helvetica"];
+  subgraph cluster_main {
+    label="lane main";
+    "T-001" [label="T-001 · plan task 1\nAdd the ordered FilesView refusal boundary\nstandard"];
+    "T-002" [label="T-002 · plan task 2\nRemove Launch and wire the scope-control lifecycle\nstandard"];
+    "T-003" [label="T-003 · plan task 3\nPin all scope states and refusal cleanup in UI tests\nadvanced"];
+    "T-004" [label="T-004 · plan task 4\nMigrate the real-query A22 acceptance controls\nfast"];
+    "T-005" [label="T-005 · plan task 5\nProve the mutation inventory and run the final implementation gates\nstandard"];
+    "T-001" -> "T-002";
+    "T-002" -> "T-003";
+    "T-003" -> "T-004";
+    "T-004" -> "T-005";
+  }
+}

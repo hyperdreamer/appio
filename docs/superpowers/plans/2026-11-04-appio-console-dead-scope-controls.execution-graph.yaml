@@ -1,0 +1,141 @@
+# appio dead scope controls execution manifest — derived from the signed plan and documents.
+# One lane: every task mutates a single shared file or the one test module that other tasks read,
+# so a sequential lane is the only partition whose ownership is statically disjoint.
+schema_version: 1
+epoch: 1
+source_plan:
+  path: "docs/superpowers/plans/2026-11-04-appio-console-dead-scope-controls.md"
+  sha256: "9761771b40cb29d890e10c79a659863db1406392681a02be2ae2d82331570ca9"
+  commit: "989026b7c5b777384c66738904e57b8ed929d72e"
+  tasks: 5
+source_documents:
+  - path: "docs/superpowers/specs/2026-11-04-appio-console-dead-scope-controls-spec.md"
+    sha256: "176cb8faf7345b4e7bbfc873b94ee67b6348f6041c3e12fe2e66668ce4518a16"
+  - path: "docs/superpowers/specs/2026-11-04-appio-console-dead-scope-controls-design.md"
+    sha256: "9c63c6971fed6c81f2123cf3b72b8b19ddb1e6a801e48a3b266a0fcda0a5e0ba"
+derivation:
+  lane_from: "one lane; tasks 1-4 each own one file and task 3 reads the tasks 1-2 outputs"
+  depends_on_from: "same-lane predecessor edge for every task after the first"
+  ownership_from: "plan Files allowlists, line suffixes stripped; task 5 owns no repository path"
+  validation_from: "the plan per-task pytest commands and the task 5 full suite, as argv with no shell metacharacters"
+  exclusive_resources_policy: "none; every task uses private /tmp probe roots, offscreen Qt and injected fakes, and runs no real service or helper"
+  interface_policy: "one new public method produced by T-001 and consumed by T-002; the signature digest is sha256 over the whitespace-normalized signature"
+  signature_normalization: "Collapse ASCII whitespace runs to one space; trim; SHA-256 over UTF-8 signature bytes without trailing newline."
+lanes:
+  - id: main
+    task_ids: [T-001, T-002, T-003, T-004, T-005]
+interfaces:
+  - id: appio.ui.filesview.refuse.v1
+    producer: T-001
+    signature: "FilesView.refuse(self, reason: str) -> None"
+    signature_sha256: "3c59856908c985a5514437b26830d2d9fea5fbdf138ef40ac17a80e0381277d1"
+tasks:
+  - id: T-001
+    plan_task: 1
+    title: "Add the ordered FilesView refusal boundary"
+    implementer_tier: "standard"
+    lane: main
+    sequence: 1
+    depends_on: []
+    owns:
+      - "src/appio/ui/files_view.py"
+    resources: []
+    produces: ["appio.ui.filesview.refuse.v1"]
+    consumes: []
+    validation:
+      - argv: [python, -m, pytest, tests/p4/test_files_view.py, tests/p4/test_files_tab_scope_text.py]
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+          QT_QPA_PLATFORM: "offscreen"
+          PYTEST_QT_API: "pyqt6"
+  - id: T-002
+    plan_task: 2
+    title: "Remove Launch and wire the scope-control lifecycle"
+    implementer_tier: "standard"
+    lane: main
+    sequence: 2
+    depends_on: ["T-001"]
+    owns:
+      - "src/appio/ui/main_window.py"
+    resources: []
+    produces: []
+    consumes: ["appio.ui.filesview.refuse.v1"]
+    validation:
+      - argv: [python, -m, pytest, tests/test_ui.py, -k, not test_disabled_launch_control_uses_exact_a22_reason and not test_over_365_day_range_control_uses_exact_a22_reason]
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+          QT_QPA_PLATFORM: "offscreen"
+          PYTEST_QT_API: "pyqt6"
+      - argv: [python, -m, pytest, tests/p3/test_p3_acceptance.py::test_a22_exact_messages_in_client_router_and_window]
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+          QT_QPA_PLATFORM: "offscreen"
+          PYTEST_QT_API: "pyqt6"
+  - id: T-003
+    plan_task: 3
+    title: "Pin all scope states and refusal cleanup in UI tests"
+    implementer_tier: "advanced"
+    lane: main
+    sequence: 3
+    depends_on: ["T-002"]
+    owns:
+      - "tests/test_ui.py"
+    resources: []
+    produces: []
+    consumes: ["appio.ui.filesview.refuse.v1"]
+    validation:
+      - argv: [python, -m, pytest, tests/test_ui.py]
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+          QT_QPA_PLATFORM: "offscreen"
+          PYTEST_QT_API: "pyqt6"
+      - argv: [python, -m, pytest, tests/p3/test_p3_acceptance.py::test_a22_exact_messages_in_client_router_and_window]
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+          QT_QPA_PLATFORM: "offscreen"
+          PYTEST_QT_API: "pyqt6"
+  - id: T-004
+    plan_task: 4
+    title: "Migrate the real-query A22 acceptance controls"
+    implementer_tier: "fast"
+    lane: main
+    sequence: 4
+    depends_on: ["T-003"]
+    owns:
+      - "tests/acceptance/test_p1_p2.py"
+    resources: []
+    produces: []
+    consumes: []
+    validation:
+      - argv: [python, -m, pytest, tests/acceptance/test_p1_p2.py]
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+          QT_QPA_PLATFORM: "offscreen"
+          PYTEST_QT_API: "pyqt6"
+  - id: T-005
+    plan_task: 5
+    title: "Prove the mutation inventory and run the final implementation gates"
+    implementer_tier: "standard"
+    lane: main
+    sequence: 5
+    depends_on: ["T-004"]
+    owns: []
+    resources: []
+    produces: []
+    consumes: []
+    validation:
+      - argv: [python, -m, pytest, tests/test_ui.py, tests/acceptance/test_p1_p2.py]
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+          QT_QPA_PLATFORM: "offscreen"
+          PYTEST_QT_API: "pyqt6"
+      - argv: [python, -m, pytest, --collect-only, -q]
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+          QT_QPA_PLATFORM: "offscreen"
+          PYTEST_QT_API: "pyqt6"
+      - argv: [python, -m, pytest]
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+          QT_QPA_PLATFORM: "offscreen"
+          PYTEST_QT_API: "pyqt6"
