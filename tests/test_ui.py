@@ -11,6 +11,7 @@ from concurrent.futures import Future
 from dataclasses import replace
 import inspect
 import math
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -23,7 +24,7 @@ from pytestqt.qt_compat import qt_api
 if qt_api.pytest_qt_api != "pyqt6":
     qt_api.set_qt_api("pyqt6")
 
-from PyQt6.QtCore import QRect, Qt
+from PyQt6.QtCore import QObject, QRect, Qt, pyqtSlot
 from PyQt6.QtGui import (
     QColor,
     QImage,
@@ -64,6 +65,7 @@ from appio.ui.formatting import (
     format_residual,
 )
 from appio.ui.charts import ChartColumn, ChartSegment
+from appio.ui.collector_window import CollectorWindow
 from appio.ui.files_view import FilesView
 from appio.ui.main_window import AppIoWindow, RankingDelegate, _device_unavailable_text
 from appio.ui.render_model import (
@@ -409,85 +411,75 @@ def test_peak_none_is_unavailable_and_measured_zero_is_zero(qtbot) -> None:
 def test_empty_supported_range_labels_the_active_window(qtbot) -> None:
     window, _ = build(qtbot, [])
     assert "window: since_boot" in label(window, "detail_state").text()
-
-    window.set_window(
-        Window(
-            kind="range",
-            boot_id=BOOT,
-            start_mono_ns=0,
-            end_mono_ns=MAX_RANGE_NS,
-        )
-    )
-
+    control = window.findChild(QAbstractButton, "scope_range")
+    assert control is not None and control.isHidden()
+    assert not control.isEnabled() and not control.isChecked()
+    requested = Window("range", BOOT, 0, MAX_RANGE_NS)
+    window.set_window(requested)
     detail = label(window, "detail_state").text()
     assert detail.startswith("window: range")
     assert "since boot" not in detail
+    assert window._active_window is requested
+    assert window.findChild(QAbstractButton, "scope_range") is control
+    assert control.isVisible() and control.isEnabled() and control.isChecked()
+    assert label(window, "range_reason").text() == ""
+    assert label(window, "range_reason").isHidden()
+    assert control.toolTip() == control.accessibleDescription() == ""
 
 
 # --------------------------------------------------------------------------
-# 5. Disabled launch and over-365-day ranges carry the exact A22 text.
+# 5. Launch is not offered; disabled ranges keep the exact A22 text.
 # --------------------------------------------------------------------------
 
 
-def test_disabled_launch_control_uses_exact_a22_reason(qtbot) -> None:
-    totals = [app_total(1, "unit:/alpha.service", "Alpha", 100)]
-    window, service = build(qtbot, totals)
-
-    launch = window.findChild(QAbstractButton, "scope_launch")
-    reason = label(window, "launch_reason")
-    assert launch is not None
-    assert not launch.isEnabled()
-    assert not launch.isChecked()
-    assert reason.text() == A22_LAUNCH_TEXT
+def test_launch_scope_is_not_offered_and_detail_fallback_keeps_a22_text(qtbot) -> None:
+    total = app_total(1, "unit:/alpha.service", "Alpha", 200, peak_bps=100)
+    task, devices = series_points()
+    series = Series(1, SINCE_BOOT, "raw", task, devices, (), coverage())
+    window, service = build(qtbot, [total], series={1: series})
+    assert listing(window).count() == 1
+    assert window._total_chart.segments()
+    assert window._donut.shares() is not None
+    assert window._share_bars.fractions()
+    assert window.findChild(QAbstractButton, "scope_launch") is None
+    assert window.findChild(QLabel, "launch_reason") is None
     assert A22_LAUNCH_REASON == A22_LAUNCH_TEXT
-    assert launch.accessibleDescription() == A22_LAUNCH_TEXT
-    assert not reason.isHidden()
-
-    # A persisted launch selection must render unavailable and must not query.
-    ranking_before = len(service.ranking_calls)
-    share_before = len(service.disk_share_calls)
-    window.set_window(Window(kind="launch", boot_id=BOOT, launch_id=1))
-    assert len(service.ranking_calls) == ranking_before
-    assert len(service.disk_share_calls) == share_before
-    assert not launch.isChecked()
-    assert label(window, "detail_state").text() == A22_LAUNCH_REASON
-    assert "unavailable" in label(window, "residual_value").text()
-    # No stale numeric totals may survive under the disabled label.
-    assert listing(window).count() == 0
-    assert label(window, "total_value").text() == "unavailable"
-    assert not reason.isHidden()
+    before = (len(service.ranking_calls), len(service.series_calls), len(service.disk_share_calls))
+    requested = Window("launch", BOOT, launch_id=1)
+    window.set_window(requested)
+    assert window._active_window is requested
+    assert before == (len(service.ranking_calls), len(service.series_calls), len(service.disk_share_calls))
+    _assert_refused_overview(window, A22_LAUNCH_TEXT)
+    assert window.findChild(QAbstractButton, "scope_launch") is None
+    assert window.findChild(QLabel, "launch_reason") is None
+    assert label(window, "range_reason").text() == ""
+    assert label(window, "range_reason").isHidden()
 
 
-def test_over_365_day_range_control_uses_exact_a22_reason(qtbot) -> None:
-    totals = [app_total(1, "unit:/alpha.service", "Alpha", 100)]
-    window, service = build(qtbot, totals)
-
-    too_long = Window(
-        kind="range",
-        boot_id=BOOT,
-        start_mono_ns=0,
-        end_mono_ns=MAX_RANGE_NS + 1,
-    )
-    ranking_before = len(service.ranking_calls)
-    share_before = len(service.disk_share_calls)
-
-    window.set_window(too_long)
-
+def test_over_365_day_range_shows_the_reason_and_hides_the_control(qtbot) -> None:
+    total = app_total(1, "unit:/alpha.service", "Alpha", 200, peak_bps=100)
+    task, devices = series_points()
+    series = Series(1, SINCE_BOOT, "raw", task, devices, (), coverage())
+    window, service = build(qtbot, [total], series={1: series})
+    assert listing(window).count() == 1
+    assert window._total_chart.segments()
+    assert window._donut.shares() is not None
+    assert window._share_bars.fractions()
+    before = (len(service.ranking_calls), len(service.series_calls), len(service.disk_share_calls))
+    requested = Window("range", BOOT, 0, MAX_RANGE_NS + 1)
+    window.set_window(requested)
     control = window.findChild(QAbstractButton, "scope_range")
-    reason = label(window, "range_reason")
     assert control is not None
-    assert not control.isEnabled()
-    assert not control.isChecked()
-    assert reason.text() == A22_RANGE_TEXT
+    assert control.isHidden() and not control.isVisible()
+    assert not control.isEnabled() and not control.isChecked()
     assert A22_RANGE_REASON == A22_RANGE_TEXT
+    assert control.toolTip() == A22_RANGE_TEXT
     assert control.accessibleDescription() == A22_RANGE_TEXT
-    assert not reason.isHidden()
-    assert label(window, "detail_state").text() == A22_RANGE_REASON
-    # No stale numeric totals may survive under the disabled label.
-    assert listing(window).count() == 0
-    assert label(window, "total_value").text() == "unavailable"
-    assert len(service.ranking_calls) == ranking_before
-    assert len(service.disk_share_calls) == share_before
+    assert label(window, "range_reason").text() == A22_RANGE_TEXT
+    assert label(window, "range_reason").isVisible()
+    assert window._active_window is requested
+    assert before == (len(service.ranking_calls), len(service.series_calls), len(service.disk_share_calls))
+    _assert_refused_overview(window, A22_RANGE_TEXT)
 
 
 # --------------------------------------------------------------------------
@@ -1530,6 +1522,346 @@ def retained_file_result(window: Window):
         HookHits(0, 0, 0, 0, 0, 0), 100, 50, overflow, inner,
     )
     return FileViewResult(table, file_coverage, None)
+
+
+def _assert_refused_overview(window: AppIoWindow, reason: str) -> None:
+    assert window.detail_tabs.currentIndex() == 0
+    assert label(window, "detail_state").isVisible()
+    assert label(window, "detail_state").text() == reason
+    assert listing(window).count() == 0
+    assert window.selected_app_id() is None
+    assert window._totals == {}
+    assert kpi_texts(window) == ["unavailable"] * 5
+    assert window._total_chart.is_available() is False
+    assert window._total_chart.columns() == ()
+    assert window._total_chart.segments() == ()
+    assert all(lane.segments() == () for lane in window._device_lanes)
+    assert all(not lane.isVisible() for lane in window._device_lanes)
+    assert window._donut.shares() is None
+    assert window._share_bars.fractions() == ()
+    assert label(window, "residual_value").text() == UNAVAILABLE_RESIDUAL
+
+
+def _assert_refused_files(view: FilesView, reason: str) -> None:
+    assert view.state == "unavailable"
+    assert view.last_result is None and view.model.rowCount() == 0
+    assert [item.text() for item in view._footer_labels()] == ["unavailable"] * 8
+    assert [item.objectName() for item in view._footer_labels()] == [
+        "files_footer_state", "files_footer_observed", "files_footer_counted",
+        "files_footer_uncounted", "files_footer_unknown_owner", "files_footer_skipped",
+        "files_footer_weak", "files_footer_hooks",
+    ]
+    assert view._window is None
+    assert view._deferred_window is None
+    assert view._app_id is None
+    assert view._choices_loaded is False
+    assert view.app_selector.count() == 0
+    assert view.app_selector.currentIndex() == -1
+    assert view.app_selector.currentData() is None
+    assert view.app_selector.isHidden()
+    assert view.refresh_wanted() is False
+    assert view._outstanding is False
+    assert view._unavailable_reason is None
+    assert view.unavailable_text() == reason
+    assert view.state_label.text() == f"file history unavailable: {reason}"
+    assert not view.state_label.isHidden()
+
+
+def _refusal_query_counts(service: FakeQueryService, history: FakeFilesHistory):
+    return (
+        len(service.ranking_calls), len(service.series_calls), len(service.disk_share_calls),
+        len(history.ranking_calls), len(history.choice_calls), len(history.requests),
+    )
+
+
+def _populated_refusal_console(qtbot):
+    alpha = app_total(1, "unit:/alpha.service", "Alpha", 200, peak_bps=100)
+    key = "unit:retained-only.service"
+    history = FakeFilesHistory(ranking_rows=(alpha,),
+        local_applications=((key, "Retained only", 40),), registry_ids={key: 99})
+    window, service = build(qtbot, [alpha], files_view=FilesView(history))
+    view = window.files_view
+    assert len(history.requests) == 1
+    history.pending[-1].set_result(retained_file_result(SINCE_BOOT))
+    qtbot.waitUntil(lambda: view.model.rowCount() == 1)
+    assert view.last_result is not None and view.app_selector.count() == 2
+    assert view.app_selector.findData(99) >= 0
+    assert "40 B" in view.app_selector.itemText(view.app_selector.findData(99))
+    assert not view.app_selector.isHidden()
+    assert all(item.text() != "unavailable" for item in view._footer_labels())
+    view.request_refresh()
+    assert len(history.requests) == 2
+    assert not history.pending[-1].done() and view._outstanding is True
+    return window, service, history
+
+
+class _QueuedFileDeliveryWitness(QObject):
+    def __init__(self, view: FilesView) -> None:
+        super().__init__(view)
+        self.deliveries: list[object] = []
+        view._bridge.delivered.connect(self.observe, Qt.ConnectionType.QueuedConnection)
+
+    @pyqtSlot(object)
+    def observe(self, payload: object) -> None:
+        self.deliveries.append(payload)
+
+
+def _queue_success_without_pumping(view: FilesView, pending: Future, result):
+    witness = _QueuedFileDeliveryWitness(view)
+    worker = threading.Thread(target=pending.set_result, args=(result,), daemon=True)
+    worker.start()
+    worker.join(timeout=2)
+    assert not worker.is_alive() and pending.done()
+    assert witness.deliveries == []
+    assert view._outstanding is True
+    return witness
+
+
+def test_default_console_offers_only_since_boot(qtbot) -> None:
+    service = FakeQueryService([], {})
+    window = AppIoWindow(service)
+    qtbot.addWidget(window)
+    window.show()
+    boot = window.findChild(QAbstractButton, "scope_since_boot")
+    control = window.findChild(QAbstractButton, "scope_range")
+    assert boot is not None and boot.isVisible()
+    assert not boot.isEnabled() and not boot.isChecked()
+    assert window.findChild(QAbstractButton, "scope_launch") is None
+    assert window.findChild(QLabel, "launch_reason") is None
+    assert control is not None and control.isHidden()
+    assert not control.isEnabled() and not control.isChecked()
+    assert sorted(button.objectName() for button in window.findChildren(QAbstractButton)
+                  if button.objectName().startswith("scope_")) == [
+        "scope_range", "scope_since_boot",
+    ]
+    assert window._active_window is window._since_boot is None
+    assert label(window, "range_reason").text() == ""
+    assert label(window, "range_reason").isHidden()
+    window._on_since_boot_clicked()
+    window._on_range_clicked()
+    assert service.ranking_calls == service.series_calls == service.disk_share_calls == []
+    assert window._active_window is window._since_boot is None
+    assert window.has_frame is False
+
+
+def test_leaving_a_range_hides_the_control(qtbot) -> None:
+    supported = Window("range", BOOT, 0, MAX_RANGE_NS)
+    destinations = (SINCE_BOOT, Window("lifetime"),
+                    Window("range", BOOT, 0, MAX_RANGE_NS + 1),
+                    Window("launch", BOOT, launch_id=1))
+    for supplied_boot in (False, True):
+        for destination in destinations:
+            service = FakeQueryService([], {})
+            window = (AppIoWindow(service, BOOT, END) if supplied_boot
+                      else AppIoWindow(service))
+            qtbot.addWidget(window)
+            window.show()
+            boot = window.findChild(QAbstractButton, "scope_since_boot")
+            control = window.findChild(QAbstractButton, "scope_range")
+            assert boot is not None and control is not None
+            remembered = window._since_boot
+            window.set_window(supported)
+            assert control.isVisible() and control.isEnabled() and control.isChecked()
+            assert boot.isEnabled() is supplied_boot and not boot.isChecked()
+            assert window._since_boot is remembered
+            before = len(service.ranking_calls)
+            window._on_range_clicked()
+            assert len(service.ranking_calls) == before + 1
+            assert service.ranking_calls[-1][0] is supported
+
+            window.set_window(destination)
+
+            assert window._active_window is destination
+            assert window.findChild(QAbstractButton, "scope_range") is control
+            assert control.isHidden() and not control.isEnabled() and not control.isChecked()
+            over_long = destination.kind == "range"
+            reason = label(window, "range_reason")
+            assert reason.text() == (A22_RANGE_TEXT if over_long else "")
+            assert reason.isVisible() is over_long
+            assert control.toolTip() == (A22_RANGE_TEXT if over_long else "")
+            assert control.accessibleDescription() == (A22_RANGE_TEXT if over_long else "")
+            expected_boot = destination if destination.kind == "since_boot" else remembered
+            assert window._since_boot is expected_boot
+            assert boot.isEnabled() is (expected_boot is not None)
+            assert boot.isChecked() is (destination.kind == "since_boot")
+            calls = (len(service.ranking_calls), len(service.series_calls), len(service.disk_share_calls))
+            window._on_range_clicked()
+            assert calls == (len(service.ranking_calls), len(service.series_calls), len(service.disk_share_calls))
+
+            window.set_window(supported)
+            assert window.findChild(QAbstractButton, "scope_range") is control
+            assert control.isVisible() and control.isEnabled() and control.isChecked()
+            assert reason.text() == "" and reason.isHidden()
+            assert control.toolTip() == control.accessibleDescription() == ""
+            assert window._since_boot is expected_boot
+            assert boot.isEnabled() is (expected_boot is not None)
+            before = len(service.ranking_calls)
+            window._on_since_boot_clicked()
+            if expected_boot is None:
+                assert len(service.ranking_calls) == before
+                assert window._active_window is supported
+            else:
+                assert len(service.ranking_calls) == before + 1
+                assert service.ranking_calls[-1][0] is expected_boot
+                assert window._active_window is expected_boot
+                assert control.isHidden() and not control.isEnabled() and not control.isChecked()
+
+
+@pytest.mark.parametrize("signals_blocked", [False, True])
+def test_refused_window_clears_files_and_shows_the_reason(qtbot, signals_blocked) -> None:
+    window, service, history = _populated_refusal_console(qtbot)
+    view = window.files_view
+    window.detail_tabs.setCurrentIndex(1)
+    assert window.detail_tabs.currentIndex() == 1 and view.model.rowCount() == 1
+    assert view._outstanding
+    view.set_scope_ready(False)
+    assert view._outstanding
+    selections, subjects, states = [], [], []
+    view.app_selector.currentIndexChanged.connect(selections.append)
+    view.subject_changed.connect(subjects.append)
+    view.state_changed.connect(states.append)
+    view.app_selector.blockSignals(signals_blocked)
+    before = _refusal_query_counts(service, history)
+    generation = view._generation
+    policy = (view._scope_ready, view._transient, view._sort, view._direction,
+              view.search(), view._updating_scope, view._stalled_caption, view.footer_note.text())
+
+    window.set_window(Window("launch", BOOT, launch_id=1))
+
+    _assert_refused_overview(window, A22_LAUNCH_TEXT)
+    _assert_refused_files(view, A22_LAUNCH_TEXT)
+    assert view._generation == generation + 1
+    assert view.app_selector.signalsBlocked() is signals_blocked
+    assert selections == subjects == []
+    assert states == ["unavailable"]
+    assert policy == (view._scope_ready, view._transient, view._sort, view._direction,
+                      view.search(), view._updating_scope, view._stalled_caption, view.footer_note.text())
+    assert _refusal_query_counts(service, history) == before
+    assert window.files_message.objectName() == "files_message"
+    assert window.files_message.text() == A22_LAUNCH_TEXT
+    assert not window.files_message.isHidden()
+    window.detail_tabs.setCurrentIndex(1)
+    assert window.files_message.isVisible()
+
+
+def test_late_delivery_after_refusal_never_republishes(qtbot) -> None:
+    window, service, history = _populated_refusal_console(qtbot)
+    view = window.files_view
+    replacement = history.pending[-1]
+    witness = _queue_success_without_pumping(view, replacement, retained_file_result(SINCE_BOOT))
+    before = _refusal_query_counts(service, history)
+
+    window.set_window(Window("launch", BOOT, launch_id=1))
+
+    assert witness.deliveries == []
+    assert view.model.rowCount() == 0 and view.state == "unavailable"
+    qtbot.waitUntil(lambda: len(witness.deliveries) == 1)
+    assert witness.deliveries[0][1] is replacement
+    _assert_refused_files(view, A22_LAUNCH_TEXT)
+    _assert_refused_overview(window, A22_LAUNCH_TEXT)
+    assert _refusal_query_counts(service, history) == before
+
+
+def test_returning_to_the_refused_window_reloads_once(qtbot) -> None:
+    window, service, history = _populated_refusal_console(qtbot)
+    view = window.files_view
+    supported = window._active_window
+    assert isinstance(supported, Window)
+    view.set_scope_ready(False)
+    view.set_window(supported)
+    assert view._window is supported and view._deferred_window is supported
+    assert view.refresh_wanted()
+    window.set_window(Window("launch", BOOT, launch_id=1))
+    assert view._window is None
+    assert view._deferred_window is None
+    assert view._app_id is None
+    assert view._choices_loaded is False
+    assert view.refresh_wanted() is False
+    requests = len(history.requests)
+    view.set_scope_ready(True)
+    assert len(history.requests) == requests
+
+    window.set_window(supported)
+
+    assert window._active_window is supported and view._window is supported
+    assert len(history.requests) == requests + 1
+    assert history.requests[-1][1] is supported
+    history.pending[-1].set_result(retained_file_result(supported))
+    qtbot.waitUntil(lambda: view.model.rowCount() == 1)
+    assert view.state == "ready" and view.app_selector.count() == 2
+    assert view.refresh_wanted() is False
+    assert all(item.text() != "unavailable" for item in view._footer_labels())
+
+
+def test_embedded_direct_refusal_still_clears_files(qtbot) -> None:
+    alpha = app_total(1, "unit:/alpha.service", "Alpha", 200)
+    key = "unit:retained-only.service"
+    history = FakeFilesHistory(ranking_rows=(alpha,),
+        local_applications=((key, "Retained only", 40),), registry_ids={key: 99})
+    history.close = lambda: None
+    history.series = lambda *args: pytest.fail("refusal queried series")
+    history.disk_share = lambda *args: pytest.fail("refusal queried disk share")
+    shell = CollectorWindow(SimpleNamespace(close=lambda: None), history, SimpleNamespace())
+    shell._timer.stop()
+    shell._poll_timer.stop()
+    qtbot.addWidget(shell)
+    qtbot.addWidget(shell.settings)
+    shell.show()
+    window = shell.view
+    assert window is not None
+    assert window._active_window is window._since_boot is None
+    assert window._owns_files_scope is False and shell._displayed is None
+    view = window.files_view
+    view.set_window(SINCE_BOOT)
+    history.pending[-1].set_result(retained_file_result(SINCE_BOOT))
+    qtbot.waitUntil(lambda: view.model.rowCount() == 1)
+    assert view.app_selector.count() == 2
+    assert "40 B" in view.app_selector.itemText(view.app_selector.findData(99))
+    assert all(item.text() != "unavailable" for item in view._footer_labels())
+    view.request_refresh()
+    assert view._outstanding
+    view.set_scope_ready(False)
+    window.detail_tabs.setCurrentIndex(1)
+    witness = _queue_success_without_pumping(view, history.pending[-1], retained_file_result(SINCE_BOOT))
+    queries = (len(history.ranking_calls), len(history.choice_calls), len(history.requests))
+    shell_fields = (shell._target, shell._displayed, shell._pending)
+
+    window.set_window(Window("launch", BOOT, launch_id=1))
+
+    assert witness.deliveries == []
+    _assert_refused_files(view, A22_LAUNCH_TEXT)
+    _assert_refused_overview(window, A22_LAUNCH_TEXT)
+    assert view.isVisible() is False and shell._displayed is None
+    assert shell.files_message.text() == shell._files_status_text() == "waiting for the first sample"
+    assert shell.files_message.text() != A22_LAUNCH_TEXT
+    qtbot.waitUntil(lambda: len(witness.deliveries) == 1)
+    _assert_refused_files(view, A22_LAUNCH_TEXT)
+    _assert_refused_overview(window, A22_LAUNCH_TEXT)
+    assert queries == (len(history.ranking_calls), len(history.choice_calls), len(history.requests))
+    assert shell_fields == (shell._target, shell._displayed, shell._pending)
+    shell.shutdown()
+
+
+def test_supported_adoption_clears_the_refusal_message(qtbot) -> None:
+    window, service, history = _populated_refusal_console(qtbot)
+    supported = window._active_window
+    assert isinstance(supported, Window)
+    window.set_window(Window("launch", BOOT, launch_id=1))
+    assert window.files_message.text() == A22_LAUNCH_TEXT
+    assert not window.files_message.isHidden()
+    window.detail_tabs.setCurrentIndex(1)
+    before = _refusal_query_counts(service, history)
+
+    window.set_window(supported)
+
+    assert window.files_message.text() == ""
+    assert window.files_message.isHidden()
+    assert window.detail_tabs.currentIndex() == 1
+    assert window._active_window is supported
+    assert _refusal_query_counts(service, history) == tuple(count + 1 for count in before)
+    history.pending[-1].set_result(retained_file_result(supported))
+    qtbot.waitUntil(lambda: window.files_view.model.rowCount() == 1)
+    assert window.files_view.state == "ready"
 
 
 def retained_pending_files_view(qtbot):

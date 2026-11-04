@@ -42,7 +42,6 @@ from appio.ui import theme
 from appio.ui.charts import DeviceLane, DonutChart, DualSeriesChart, ShareBars
 from appio.ui.files_view import FilesView
 from appio.ui.formatting import (
-    A22_LAUNCH_REASON,
     A22_RANGE_REASON,
     UNAVAILABLE,
     format_bytes,
@@ -396,25 +395,15 @@ class AppIoWindow(QMainWindow):
 
         scope_row = QHBoxLayout()
         self._since_boot_control = self._scope_control("Since boot", "scope_since_boot")
-        self._launch_control = self._scope_control("Launch", "scope_launch")
         self._range_control = self._scope_control("Range", "scope_range")
         self._since_boot_control.setEnabled(False)
-        self._launch_control.setEnabled(False)
-        self._launch_control.setAccessibleDescription(A22_LAUNCH_REASON)
-        self._launch_control.setToolTip(A22_LAUNCH_REASON)
-        for control in (
-            self._since_boot_control,
-            self._launch_control,
-            self._range_control,
-        ):
+        self._range_control.setVisible(False)
+        self._range_control.setEnabled(False)
+        self._range_control.setChecked(False)
+        for control in (self._since_boot_control, self._range_control):
             scope_row.addWidget(control)
         scope_row.addStretch(1)
         outer.addLayout(scope_row)
-
-        self._launch_reason = QLabel(A22_LAUNCH_REASON)
-        self._launch_reason.setObjectName("launch_reason")
-        self._launch_reason.setWordWrap(True)
-        outer.addWidget(self._launch_reason)
 
         self._range_reason = QLabel("")
         self._range_reason.setObjectName("range_reason")
@@ -599,28 +588,33 @@ class AppIoWindow(QMainWindow):
             self._since_boot_control.setEnabled(True)
         self._active_window = window
         self._disabled_reason = reason
-
         self._since_boot_control.setChecked(
             reason is None and window.kind == "since_boot"
         )
-        self._range_control.setChecked(reason is None and window.kind == "range")
-        self._launch_control.setChecked(False)
-
-        range_disabled = reason == A22_RANGE_REASON
-        self._range_control.setEnabled(reason is None and window.kind == "range")
-        if range_disabled:
+        supported_range = reason is None and window.kind == "range"
+        over_long_range = reason == A22_RANGE_REASON
+        self._range_control.setVisible(supported_range)
+        self._range_control.setEnabled(supported_range)
+        self._range_control.setChecked(supported_range)
+        self._range_reason.setText(A22_RANGE_REASON if over_long_range else "")
+        self._range_reason.setVisible(over_long_range)
+        if over_long_range:
             self._range_control.setAccessibleDescription(A22_RANGE_REASON)
             self._range_control.setToolTip(A22_RANGE_REASON)
         else:
             self._range_control.setAccessibleDescription("")
             self._range_control.setToolTip("")
-
-        self._range_reason.setText(A22_RANGE_REASON if range_disabled else "")
-        self._range_reason.setVisible(range_disabled)
-
         if reason is not None:
             self._render_unavailable(reason)
+            self.detail_tabs.setCurrentIndex(0)
+            self.files_view.refuse(reason)
+            if self._owns_files_scope:
+                self.files_message.setText(reason)
+                self.files_message.setVisible(True)
             return
+        if self._owns_files_scope:
+            self.files_message.setText("")
+            self.files_message.setVisible(False)
         self.refresh()
         if self._owns_files_scope:
             self._sync_owned_files()
