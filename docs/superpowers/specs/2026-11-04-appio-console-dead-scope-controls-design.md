@@ -185,7 +185,7 @@ design; only the control that used to sit in front of them is gone.
 | Surface | Path | Behaviour |
 | --- | --- | --- |
 | Query layer | `tier.py:28`, `ipc_models.py:410`, `history_router.py:341` | Raises `WindowUnavailableError` with the exact message and `reason` token before any lookup |
-| Console shell | `collector_window.py:925-934` | `prepare()` refusal prints the exact `str(error)` in the shell's error line and re-raises; the previously rendered frame stays, as it does today |
+| Console shell | `collector_window.py:925-936` | `prepare()` refusal prints the exact `str(error)` in the shell's error line and re-raises; the previously rendered frame stays, as it does today |
 | Detail pane | `main_window.py` `set_window` → `_render_unavailable` | A launch window passed directly renders the exact text in `detail_state` with five `unavailable` KPIs and no rows |
 
 The detail-pane fallback's text is the visible content of a `QLabel`, which is what
@@ -212,21 +212,28 @@ Files; otherwise a direct refusal on the embedded console — exactly what
 `tests/p3/test_p3_acceptance.py:148` does — would leave the previous window's rows,
 selector totals and pending deliveries in place.
 
-`files_message` is written only by the Files owner. `AppIoWindow` writes it when it
-owns the scope (`self._owns_files_scope`, `src/appio/ui/main_window.py:360`, the
-standalone case). In the embedded console the shell owns that caption: its
-`_render_files_message` (`src/appio/ui/collector_window.py:719-728`) derives the text
-from `files_view.state` and `unavailable_text()`, so it prints the same reason on its
-next tick without a second writer. The shell's separate `prepare()` refusal (§6 row 2)
-is unchanged.
+**Which surface shows the reason.** The Overview status line is the one guaranteed
+visible surface, and a placement rule makes that true: a refused window selects the
+Overview tab, so the text cannot sit behind a Files tab that shows nothing. The Files
+surface carries the same reason only once the shell exposes it, because
+`_render_files_message` (`src/appio/ui/collector_window.py:720-730`) hides the whole
+Files view while no frame is displayed (`:730`). Before the first frame the reader
+therefore sees the reason in Overview — never a blank pane, never a stale table.
+
+`files_message` is written only by the Files owner: `AppIoWindow` when it owns the
+scope (`self._owns_files_scope`, `src/appio/ui/main_window.py:360`, the standalone
+case), and in the embedded console the shell, whose `_render_files_message` derives the
+caption from `files_view.state` and `unavailable_text()`. No second writer is
+introduced. The shell's separate `prepare()` refusal (§6 row 2) is unchanged.
 
 **`set_window`'s refused branch.**
 
 ```python
 if reason is not None:
     self._render_unavailable(reason)
-    self.files_view.refuse(reason)      # every refusal, regardless of owner
-    if self._owns_files_scope:          # the owner writes the caption
+    self.detail_tabs.setCurrentIndex(0)   # the pane that carries the text
+    self.files_view.refuse(reason)        # every refusal, regardless of owner
+    if self._owns_files_scope:            # the owner writes the caption
         self.files_message.setText(reason)
         self.files_message.setVisible(True)
     return
@@ -245,9 +252,13 @@ order, because each guards a different way old data could reappear:
 generation, so a delivery already in flight cannot publish (`_on_delivered` drops a
 stale generation at `:807`), and then `self._refresh_wanted = False`, because no
 replacement is owed for a refused scope.
-2. `self._window = None` and `self._deferred_window = None`. Without this a later
-   adoption of the *same* window computes `changed = window != self._window` as false
-   (`:639`) and issues no query, leaving Files permanently unavailable.
+2. `self._window = None` and `self._deferred_window = None`, so a later adoption of
+   the *same* window is a scope change rather than a deferred refresh. This state is
+   asserted directly (`_window is None`, `_deferred_window is None` right after
+   `refuse()`), because a request-count assertion cannot distinguish the two paths:
+   `set_app_id` sets `_refresh_wanted` when the cleared subject returns
+   (`src/appio/ui/files_view.py:673`) and `_sync_owned_files` calls `flush_refresh()`
+   (`src/appio/ui/main_window.py:673`), so exactly one request happens either way.
 3. `self._app_id = None`, `self._choices_loaded = False`, and the application
    selector is cleared and hidden inside a `blockSignals` guard, because its items
    embed the previous scope's byte totals (`:966-974`).
@@ -292,17 +303,19 @@ No new error state, label, or log line is added.
   and one in-flight delivery, `set_window(launch)` leaves the table empty, the
   selector hidden and empty, every footer at `unavailable`,
   `FilesView.state == "unavailable"`, `files_message` visible with the exact A22
-  text, and no query dispatched.
+  text, the Overview tab selected, and no query dispatched.
 - New `test_late_delivery_after_refusal_never_republishes`: a delivery settled before
   the refusal, delivered after `refuse()`, changes no row and no footer.
 - New `test_returning_to_the_refused_window_reloads_once`: supported W → launch → the
-  same W issues exactly one new file query and restores rows, proving `refuse()`
-  forgot the adopted scope (`src/appio/ui/files_view.py:639`).
+  same W restores rows, with the state assertions above proving `refuse()` forgot the
+  adopted scope and a mutation that omits the reset failing those assertions.
 - New `test_embedded_direct_refusal_still_clears_files`: an embedded console built with
   no boot arguments (`src/appio/ui/collector_window.py:630`) and a direct
   `view.set_window(launch)` — the shape `tests/p3/test_p3_acceptance.py:148` uses —
-  leaves the table empty, the selector hidden, every footer at `unavailable`, and one
-  pending delivery unable to republish.
+  leaves the table empty, the selector hidden, every footer at `unavailable`, one
+  pending delivery unable to republish, the Overview tab selected, and the exact text
+  readable in `detail_state` even though `files_view.isVisible()` is `False` before any
+  frame (`src/appio/ui/collector_window.py:730`).
 - New `test_supported_adoption_clears_the_refusal_message`: refusal followed by a
   supported window leaves `files_message` hidden with empty text.
 
@@ -340,7 +353,7 @@ Both rows keep: the exact message rendered, `detail_state == message`, and
 
 - `python -m pytest tests/test_ui.py tests/acceptance/test_p1_p2.py` passes.
 - The full suite's collected count: §7.1 rewrites two tests one-for-one, §7.2
-  extends one existing test and adds six new tests, and §7.3 renames one. Record the
+  extends one existing test and adds seven new tests, and §7.3 renames one. Record the
   observed before/after collected counts in the implementation report rather than
   relying on arithmetic.
 - Mutation checks: re-adding a disabled `scope_launch` button fails
@@ -350,7 +363,9 @@ Both rows keep: the exact message rendered, `detail_state == message`, and
   `test_default_console_offers_only_since_boot`; keeping the range control visible
   after a later non-range window fails `test_leaving_a_range_hides_the_control`;
   dropping the `files_view.refuse(...)` call fails
-  `test_refused_window_clears_files_and_shows_the_reason`.
+  `test_refused_window_clears_files_and_shows_the_reason`; omitting the `_window` reset
+  in `refuse()` fails the state assertions in
+  `test_returning_to_the_refused_window_reloads_once`.
 
 ## 8. Risks
 
