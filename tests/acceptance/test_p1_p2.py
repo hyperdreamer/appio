@@ -422,11 +422,11 @@ def test_unavailable_device_coverage_remains_none_and_renders_unavailable(fixtur
         assert label(window, "residual_value") == "Residual: unavailable - difference between accounting points"
 
 
-@pytest.mark.parametrize("kind,reason,message,control_name", [
-    ("launch", "launch_attribution", LAUNCH_REASON, "scope_launch"),
-    ("range", "unsupported_window", RANGE_REASON, "scope_range"),
+@pytest.mark.parametrize("kind,reason,message,control_state", [
+    ("launch", "launch_attribution", LAUNCH_REASON, "absent"),
+    ("range", "unsupported_window", RANGE_REASON, "hidden"),
 ])
-def test_disabled_windows_raise_exact_a22_errors_and_disable_controls(collected, qtbot, kind, reason, message, control_name):
+def test_disabled_windows_raise_exact_a22_errors_and_offer_no_control(collected, qtbot, kind, reason, message, control_state):
     aid = collected.app_id()
     launch_id = collected.store.connection.execute("SELECT launch_id FROM launch WHERE app_id=?", (aid,)).fetchone()[0]
     scope = (Window("launch", BOOT, launch_id=launch_id) if kind == "launch"
@@ -445,9 +445,15 @@ def test_disabled_windows_raise_exact_a22_errors_and_disable_controls(collected,
         assert (error.value.reason, str(error.value)) == (reason, message)
     window = show_chromium(qtbot, collected)
     window.set_window(scope)
-    control = window.findChild(QPushButton, control_name)
-    assert control is not None and not control.isEnabled()
-    assert control.toolTip() == message and control.accessibleDescription() == message
+    if control_state == "absent":
+        assert window.findChild(QPushButton, "scope_launch") is None
+    else:
+        assert control_state == "hidden"
+        control = window.findChild(QPushButton, "scope_range")
+        assert control is not None
+        assert control.isHidden()
+        assert not control.isEnabled()
+        assert not control.isChecked()
     assert label(window, "detail_state") == message
     assert label(window, "total_value") == "unavailable"
     assert snapshot(collected.store.connection) == before
