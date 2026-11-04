@@ -51,6 +51,8 @@ per-launch device and file attribution genuinely does not exist.
    persisted selection can still reach.
 5. No query, no frame, and no total changes behaviour; this is a control-surface
    change only.
+6. A refused window leaves no stale rows in either detail pane, so the refusal text
+   is visible whichever tab the reader is looking at.
 
 ## 3. Non-goals
 
@@ -141,7 +143,8 @@ because `_on_range_clicked` (`:1098-1107`) dereferences it and
 ### 5.4 What is kept
 
 - `A22_LAUNCH_REASON` in `src/appio/ui/formatting.py:12-14` and
-  `src/appio/contracts.py:104`, and `window_disabled_reason()`
+  `LAUNCH_WINDOW_MESSAGE` in `src/appio/contracts.py:103-105`, and
+  `window_disabled_reason()`
   (`src/appio/ui/formatting.py:78-89`), which is how `set_window` learns the reason.
 - `_render_unavailable(reason)`: a launch window passed directly to `set_window`
   still renders the exact A22 text in `detail_state`, five `unavailable` KPIs,
@@ -188,6 +191,38 @@ assistive technology reads; no separate accessible description is added, because
 removed chip was the only element that carried one. Tests assert the label exists,
 is visible, and equals the exact A22 string.
 
+### 6.1 A refused window clears both panes
+
+`_render_unavailable` (`src/appio/ui/main_window.py:1037-1053`) writes only
+`_detail_state`, which lives in the Overview page (`:521-524`), and `set_window`
+returns before `_sync_files` (`:621`). With the Files tab selected, a refused window
+would therefore leave the previous window's file rows on screen — a numeric series
+under a refused label, which A22's "no stale numeric series/totals" forbids. The
+removal of the always-visible chip label makes that failure reachable in a way no
+reader could explain.
+
+A refused window must clear the file pane as well:
+
+```python
+if reason is not None:
+    self._render_unavailable(reason)
+    self.files_view.refuse(reason)          # new public method
+    self.files_message.setText(reason)
+    self.files_message.setVisible(True)
+    return
+```
+
+`FilesView.refuse(reason)` is a thin public wrapper over the existing
+`_set_unavailable(None, reason)` (`src/appio/ui/files_view.py:1094-1102`), which
+already clears the model, resets the footers to `unavailable`, and shows the state
+label. The exact A22 text therefore appears in the Overview status line, the Files
+state line, and `files_message`, whichever tab is selected, and no row from a
+previous window survives.
+
+This is a defect the change exposes rather than a new feature: before this design
+the same stale rows could appear, hidden only by the chip's permanent sentence. The
+design records it because goal 4 cannot be met otherwise.
+
 No new error state, label, or log line is added.
 
 ## 7. Test strategy
@@ -208,14 +243,31 @@ No new error state, label, or log line is added.
   `scope_since_boot` disabled, no `scope_launch`, and `scope_range` hidden and
   disabled; `_on_since_boot_clicked()` and `_on_range_clicked()` remain safe
   (`tests/test_ui.py:1768-1769` already exercises both handlers).
+- New `test_leaving_a_range_hides_the_control`: from a displayed supported range,
+  `set_window` with `since_boot`, `lifetime`, an over-long range, and a launch window
+  each leaves `scope_range` hidden, disabled and unchecked. This pins the transition
+  direction, which entry-only assertions cannot catch.
+- New `test_refused_window_clears_files_and_shows_the_reason`: with the Files tab
+  selected (`tests/test_ui.py:1828` shows the `setCurrentIndex(1)` idiom) and a
+  populated table, `set_window(launch)` leaves the table empty, `files_message`
+  visible with the exact A22 text, `FilesView.state == "unavailable"`, and no
+  additional query.
 
 ### 7.3 Changed in `tests/acceptance/test_p1_p2.py`
 
 `test_disabled_windows_raise_exact_a22_errors_and_disable_controls` (`:429`) becomes
 `test_disabled_windows_raise_exact_a22_errors_and_offer_no_control`, and its
-`control_name` parameter becomes `absent_control_name`. Every query-raises-exact-text
-assertion and the detail/KPI assertions stay; the control assertions become "the
-named control is absent" and "the exact message is rendered".
+`control_name` parameter becomes `control_state`. Every query-raises-exact-text
+assertion and the detail/KPI assertions stay. The control assertion becomes one rule
+per row, because the two scopes now differ:
+
+| Parameter row | Control assertion |
+| --- | --- |
+| `launch` (`:426`) | `findChild(QPushButton, "scope_launch") is None` |
+| over-long `range` (`:427`) | the `scope_range` widget exists, is hidden, disabled, and unchecked |
+
+Both rows keep: the exact message rendered, `detail_state == message`, and
+`total_value == "unavailable"`.
 
 ### 7.4 Unchanged
 
@@ -234,13 +286,18 @@ named control is absent" and "the exact message is rendered".
 ### 7.5 Gates
 
 - `python -m pytest tests/test_ui.py tests/acceptance/test_p1_p2.py` passes.
-- The full suite passes with the same count minus the two tests merged in §7.1 and
-  plus the two added in §7.2.
+- The full suite collects exactly one more test than before: §7.1 rewrites two tests
+  one-for-one, §7.2 extends one existing test, and §7.2 adds three new tests, so the
+  net change is +3 collected, not +2 — state the observed before/after counts in the
+  implementation report rather than relying on arithmetic.
 - Mutation checks: re-adding a disabled `scope_launch` button fails
   `test_launch_scope_is_not_offered_and_detail_fallback_keeps_a22_text`; making
   `scope_range` visible unconditionally fails the empty-console and over-long-range
   assertions; removing the `setVisible(False)` from the empty console fails
-  `test_default_console_offers_only_since_boot`.
+  `test_default_console_offers_only_since_boot`; keeping the range control visible
+  after a later non-range window fails `test_leaving_a_range_hides_the_control`;
+  dropping the `files_view.refuse(...)` call fails
+  `test_refused_window_clears_files_and_shows_the_reason`.
 
 ## 8. Risks
 
@@ -260,11 +317,20 @@ named control is absent" and "the exact message is rendered".
 `:1033-1038` carries two consumer-state cells — the launch row (`:1035`) and the
 over-long-range row (`:1036`) — that require a disabled control.
 
-Amended by the user's ruling: those two cells' consumer state becomes "no control
-offered; the exact reason text remains available on the detail fallback". Every
-store outcome in those cells — the exact exception type, reason token, and message —
-is unchanged, as is the prose's prohibition on dispatching a disabled scope and on
-silently selecting or labelling a wider window.
+Amended by the user's ruling: the requirement becomes "no control offered for a
+scope that is never actionable; the exact reason text remains visible in the detail
+view". The amendment touches exactly three places, and every store outcome — the
+exception type, reason token, and message — stays byte-identical:
+
+| Location | Current text | Amended text |
+| --- | --- | --- |
+| Prose (`:1031`) | "MUST render a disabled, unselected chip/control with that text visible as its reason (also exposed to accessibility)" | "MUST NOT offer a control for a scope that is never actionable; MUST keep the exact text visible in the detail view" |
+| Launch cell (`:1035`) | "`Launch` control disabled and unselected; reason text exactly as the error message; queried detail state unavailable" | "No launch control; reason text exactly as the error message; queried detail state unavailable" |
+| Range cell (`:1036`) | "That range control disabled and unselected; …" | "No control for an over-long range; …" |
+| Decision table row (`:1063`) | "The requested control is disabled with the exact reason" | "No control is offered for the requested scope; the exact reason is shown and the scope is never widened" |
+
+The prose's prohibitions on dispatching a disabled scope and on silently selecting or
+labelling a wider window survive unchanged and now have nothing to dispatch.
 
 ### 9.2 Charts-spec sentence amendment
 
@@ -279,6 +345,9 @@ change, per §5.5.
 
 No decision of `2026-10-21-app-io-monitor-design.md`,
 `2026-11-01-appio-console-charts-design.md`, or
-`2026-11-03-silent-daemon-console-recovery-design.md` is replaced. The A06 launch
-recording rules, the tier tables, the retention rules, and the recovery state machine
-stand as ratified.
+`2026-11-03-silent-daemon-console-recovery-design.md` is replaced, with one
+qualification: the earlier design's sentence requiring a "chip with a stated reason
+(`launch_attribution`)" (`2026-10-21-app-io-monitor-design.md:392`) is superseded for
+the launch scope only, by the same user ruling as §9.1. The A06 launch recording
+rules, the tier tables, the retention rules, and the recovery state machine stand as
+ratified.
