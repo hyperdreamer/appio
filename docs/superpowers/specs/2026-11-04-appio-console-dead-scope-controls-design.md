@@ -302,8 +302,10 @@ No new error state, label, or log line is added.
   `setCurrentIndex(1)` idiom), a populated table, a populated application selector,
   and one in-flight delivery, `set_window(launch)` leaves the table empty, the
   selector hidden and empty, every footer at `unavailable`,
-  `FilesView.state == "unavailable"`, `files_message` visible with the exact A22
-  text, the Overview tab selected, and no query dispatched.
+  `FilesView.state == "unavailable"`, `files_message` carrying the exact A22 text and
+  not explicitly hidden (`not isHidden()`, because a widget on a non-current tab page
+  reports `isVisible() is False`), the Overview tab selected, and no query dispatched;
+  after selecting the Files tab, `files_message.isVisible()` is `True`.
 - New `test_late_delivery_after_refusal_never_republishes`: a delivery settled before
   the refusal, delivered after `refuse()`, changes no row and no footer.
 - New `test_returning_to_the_refused_window_reloads_once`: supported W → launch → the
