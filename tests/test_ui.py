@@ -1595,6 +1595,18 @@ def _populated_refusal_console(qtbot):
     return window, service, history
 
 
+REFUSAL_SCOPE_KINDS = ("launch", "over-long-range")
+
+
+def refused_scope(scope_kind: str) -> tuple[Window, str]:
+    """The two A22 refusals whose Files cleanup must be identical."""
+
+    if scope_kind == "launch":
+        return Window("launch", BOOT, launch_id=1), A22_LAUNCH_TEXT
+    assert scope_kind == "over-long-range"
+    return Window("range", BOOT, 0, MAX_RANGE_NS + 1), A22_RANGE_TEXT
+
+
 class _QueuedFileDeliveryWitness(QObject):
     def __init__(self, view: FilesView) -> None:
         super().__init__(view)
@@ -1708,8 +1720,14 @@ def test_leaving_a_range_hides_the_control(qtbot) -> None:
 
 
 @pytest.mark.parametrize("signals_blocked", [False, True])
-def test_refused_window_clears_files_and_shows_the_reason(qtbot, signals_blocked) -> None:
+@pytest.mark.parametrize("scope_kind", REFUSAL_SCOPE_KINDS)
+def test_refused_window_clears_files_and_shows_the_reason(
+    qtbot, signals_blocked, scope_kind
+) -> None:
     window, service, history = _populated_refusal_console(qtbot)
+    refused, reason = refused_scope(scope_kind)
+    assert A22_LAUNCH_REASON == A22_LAUNCH_TEXT
+    assert A22_RANGE_REASON == A22_RANGE_TEXT
     view = window.files_view
     window.detail_tabs.setCurrentIndex(1)
     assert window.detail_tabs.currentIndex() == 1 and view.model.rowCount() == 1
@@ -1726,10 +1744,10 @@ def test_refused_window_clears_files_and_shows_the_reason(qtbot, signals_blocked
     policy = (view._scope_ready, view._transient, view._sort, view._direction,
               view.search(), view._updating_scope, view._stalled_caption, view.footer_note.text())
 
-    window.set_window(Window("launch", BOOT, launch_id=1))
+    window.set_window(refused)
 
-    _assert_refused_overview(window, A22_LAUNCH_TEXT)
-    _assert_refused_files(view, A22_LAUNCH_TEXT)
+    _assert_refused_overview(window, reason)
+    _assert_refused_files(view, reason)
     assert view._generation == generation + 1
     assert view.app_selector.signalsBlocked() is signals_blocked
     assert selections == subjects == []
@@ -1738,28 +1756,129 @@ def test_refused_window_clears_files_and_shows_the_reason(qtbot, signals_blocked
                       view.search(), view._updating_scope, view._stalled_caption, view.footer_note.text())
     assert _refusal_query_counts(service, history) == before
     assert window.files_message.objectName() == "files_message"
+    assert window.files_message.text() == reason
+    assert not window.files_message.isHidden()
+    window.detail_tabs.setCurrentIndex(1)
+    assert window.files_message.isVisible()
+
+
+def test_refusal_clears_files_while_scope_is_transient(qtbot) -> None:
+    window, service, history = _populated_refusal_console(qtbot)
+    view = window.files_view
+    assert view.model.rowCount() == 1 and view.app_selector.count() == 2
+    assert all(item.text() != "unavailable" for item in view._footer_labels())
+    replacement = history.pending[-1]
+    witness = _queue_success_without_pumping(
+        view, replacement, retained_file_result(SINCE_BOOT)
+    )
+    view.set_transient_scope(True)
+    assert view._transient is True and view._outstanding
+    before = _refusal_query_counts(service, history)
+
+    window.set_window(Window("launch", BOOT, launch_id=1))
+
+    assert view._transient is True
+    _assert_refused_files(view, A22_LAUNCH_TEXT)
+    _assert_refused_overview(window, A22_LAUNCH_TEXT)
+    assert witness.deliveries == []
+    qtbot.waitUntil(lambda: len(witness.deliveries) == 1)
+    assert witness.deliveries[0][1] is replacement
+    assert view._transient is True
+    _assert_refused_files(view, A22_LAUNCH_TEXT)
+    _assert_refused_overview(window, A22_LAUNCH_TEXT)
+    assert _refusal_query_counts(service, history) == before
     assert window.files_message.text() == A22_LAUNCH_TEXT
     assert not window.files_message.isHidden()
     window.detail_tabs.setCurrentIndex(1)
     assert window.files_message.isVisible()
 
 
-def test_late_delivery_after_refusal_never_republishes(qtbot) -> None:
+@pytest.mark.parametrize("scope_kind", REFUSAL_SCOPE_KINDS)
+def test_late_delivery_after_refusal_never_republishes(qtbot, scope_kind) -> None:
     window, service, history = _populated_refusal_console(qtbot)
+    refused, reason = refused_scope(scope_kind)
     view = window.files_view
     replacement = history.pending[-1]
     witness = _queue_success_without_pumping(view, replacement, retained_file_result(SINCE_BOOT))
     before = _refusal_query_counts(service, history)
 
-    window.set_window(Window("launch", BOOT, launch_id=1))
+    window.set_window(refused)
 
     assert witness.deliveries == []
     assert view.model.rowCount() == 0 and view.state == "unavailable"
     qtbot.waitUntil(lambda: len(witness.deliveries) == 1)
     assert witness.deliveries[0][1] is replacement
+    _assert_refused_files(view, reason)
+    _assert_refused_overview(window, reason)
+    assert _refusal_query_counts(service, history) == before
+
+
+def test_refusal_finishes_every_duty_before_publishing_unavailable(qtbot) -> None:
+    window, service, history = _populated_refusal_console(qtbot)
+    view = window.files_view
+    # Seed a non-None deferred scope and a wanted refresh through the existing
+    # closed-admission seam, so the duty-2 and refresh-clear assertions are not
+    # vacuous at the moment "unavailable" is emitted.
+    view.set_scope_ready(False)
+    view.set_window(SINCE_BOOT)
+    assert view._deferred_window == SINCE_BOOT
+    assert view.refresh_wanted()
+    view.set_scope_ready(True)
+    assert view._outstanding and view.model.rowCount() == 1
+    assert view.app_selector.count() == 2
+    generation = view._generation
+    states: list[str] = []
+    selections: list[int] = []
+    subjects: list[int] = []
+    captured: list[tuple[object, ...]] = []
+
+    def capture(state: str) -> None:
+        states.append(state)
+        if state != "unavailable":
+            return
+        captured.append((
+            view._generation,
+            view._outstanding,
+            view.refresh_wanted(),
+            view._window,
+            view._deferred_window,
+            view._app_id,
+            view._choices_loaded,
+            view.app_selector.count(),
+            view.app_selector.currentIndex(),
+            view.app_selector.isHidden(),
+            view.model.rowCount(),
+            tuple(item.text() for item in view._footer_labels()),
+            view._state,
+        ))
+
+    view.app_selector.currentIndexChanged.connect(selections.append)
+    view.subject_changed.connect(subjects.append)
+    view.state_changed.connect(capture)
+    before = _refusal_query_counts(service, history)
+
+    window.set_window(Window("launch", BOOT, launch_id=1))
+
+    assert states == ["unavailable"]
+    assert captured == [(
+        generation + 1,
+        False,
+        False,
+        None,
+        None,
+        None,
+        False,
+        0,
+        -1,
+        True,
+        0,
+        ("unavailable",) * 8,
+        "unavailable",
+    )], captured
+    assert selections == subjects == []
+    assert _refusal_query_counts(service, history) == before
     _assert_refused_files(view, A22_LAUNCH_TEXT)
     _assert_refused_overview(window, A22_LAUNCH_TEXT)
-    assert _refusal_query_counts(service, history) == before
 
 
 def test_returning_to_the_refused_window_reloads_once(qtbot) -> None:
