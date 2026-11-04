@@ -67,7 +67,9 @@ per-launch device and file attribution genuinely does not exist.
   That is a separate defect on a host without the packaged helper
   (`packaging/arch/PKGBUILD:46` installs it at exactly that path); it is out of scope
   and keeps its present behaviour.
-- Any daemon, wire, schema, retention, tier, or Files behaviour.
+- Any daemon, wire, schema, retention, tier, or query behaviour. The one exception is
+  §6.1's refusal cleanup in `FilesView`: it clears a detail surface and dispatches no
+  query, so it changes no query behaviour and adopts no scope.
 
 ## 4. Decisions taken with the user
 
@@ -191,31 +193,40 @@ assistive technology reads; no separate accessible description is added, because
 removed chip was the only element that carried one. Tests assert the label exists,
 is visible, and equals the exact A22 string.
 
-### 6.1 A refused window clears the Files pane it owns
+### 6.1 A refused window clears the Files pane
 
 `_render_unavailable` (`src/appio/ui/main_window.py:1037-1053`) writes only
 `_detail_state`, which lives in the Overview page (`:521-524`), and a refused
-`set_window` returns at `:621` before `self._sync_owned_files()` (`:626`). With the
-Files tab selected, a refused window would therefore leave the previous window's
-file rows on screen — a numeric series under a refused label, which A22's "no stale
-numeric series/totals" forbids. The always-visible chip sentence used to hide that
-failure; removing it makes it reachable.
+`set_window` returns at `:623` (after `if reason is not None:` at `:621`) before
+`self.refresh()` and `self._sync_owned_files()` (`:626`). With the Files tab selected,
+a refused window would therefore leave the previous window's file rows on screen — a
+numeric series under a refused label, which A22's "no stale numeric series/totals"
+forbids. The always-visible chip sentence used to hide that failure; removing it makes
+it reachable.
 
-**Ownership.** Only the owner clears. `AppIoWindow` owns the Files scope when it was
-constructed with boot arguments (`self._owns_files_scope`,
-`src/appio/ui/main_window.py:360`), which is the standalone case. In the embedded
-console the shell owns Files (`src/appio/ui/collector_window.py:732`
-`_sync_files`), its own refusal path never reaches `set_window` (§6 row 2), and
-`_render_files_message` (`:719-728`) already derives its caption from
-`files_view.state` and `unavailable_text()`. No second owner is introduced.
+**A refusal is not an adoption.** The one-owner rule
+(`src/appio/ui/collector_window.py:732` `_sync_files`) governs which object adopts a
+window and dispatches its query. A refusal adopts nothing and dispatches nothing, so
+`files_view.refuse(reason)` runs on **every** refused window, whichever object owns
+Files; otherwise a direct refusal on the embedded console — exactly what
+`tests/p3/test_p3_acceptance.py:148` does — would leave the previous window's rows,
+selector totals and pending deliveries in place.
 
-**Standalone `set_window`.**
+`files_message` is written only by the Files owner. `AppIoWindow` writes it when it
+owns the scope (`self._owns_files_scope`, `src/appio/ui/main_window.py:360`, the
+standalone case). In the embedded console the shell owns that caption: its
+`_render_files_message` (`src/appio/ui/collector_window.py:719-728`) derives the text
+from `files_view.state` and `unavailable_text()`, so it prints the same reason on its
+next tick without a second writer. The shell's separate `prepare()` refusal (§6 row 2)
+is unchanged.
+
+**`set_window`'s refused branch.**
 
 ```python
 if reason is not None:
     self._render_unavailable(reason)
-    if self._owns_files_scope:
-        self.files_view.refuse(reason)      # new public method
+    self.files_view.refuse(reason)      # every refusal, regardless of owner
+    if self._owns_files_scope:          # the owner writes the caption
         self.files_message.setText(reason)
         self.files_message.setVisible(True)
     return
@@ -236,7 +247,7 @@ stale generation at `:807`), and then `self._refresh_wanted = False`, because no
 replacement is owed for a refused scope.
 2. `self._window = None` and `self._deferred_window = None`. Without this a later
    adoption of the *same* window computes `changed = window != self._window` as false
-   (`:638`) and issues no query, leaving Files permanently unavailable.
+   (`:639`) and issues no query, leaving Files permanently unavailable.
 3. `self._app_id = None`, `self._choices_loaded = False`, and the application
    selector is cleared and hidden inside a `blockSignals` guard, because its items
    embed the previous scope's byte totals (`:966-974`).
@@ -286,7 +297,12 @@ No new error state, label, or log line is added.
   the refusal, delivered after `refuse()`, changes no row and no footer.
 - New `test_returning_to_the_refused_window_reloads_once`: supported W → launch → the
   same W issues exactly one new file query and restores rows, proving `refuse()`
-  forgot the adopted scope (`src/appio/ui/files_view.py:638`).
+  forgot the adopted scope (`src/appio/ui/files_view.py:639`).
+- New `test_embedded_direct_refusal_still_clears_files`: an embedded console built with
+  no boot arguments (`src/appio/ui/collector_window.py:630`) and a direct
+  `view.set_window(launch)` — the shape `tests/p3/test_p3_acceptance.py:148` uses —
+  leaves the table empty, the selector hidden, every footer at `unavailable`, and one
+  pending delivery unable to republish.
 - New `test_supported_adoption_clears_the_refusal_message`: refusal followed by a
   supported window leaves `files_message` hidden with empty text.
 
