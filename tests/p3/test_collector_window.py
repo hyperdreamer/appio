@@ -2796,7 +2796,10 @@ def test_slow_probe_does_not_block_pump_or_pending_frame_application(qtbot):
         window.refresh()
         elapsed = time.monotonic() - started
         assert elapsed < 0.1
-        assert len(pumps) == 2
+        # Two refreshes pump at least twice; the pending-frame poll pumps too,
+        # which is how a multi-request frame progresses between refreshes. Every
+        # one of them must still run on the GUI thread, never on the probe worker.
+        assert len(pumps) >= 2 and set(pumps) == {threading.get_ident()}
         assert len(history.prepare_calls) == 1
         pending = window._pending
         history.become_ready(pending)

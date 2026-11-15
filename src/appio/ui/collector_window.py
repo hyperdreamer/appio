@@ -762,6 +762,12 @@ class CollectorWindow(QMainWindow):
                 and self._history_ready(self._displayed)
             ):
                 self.files_view.flush_refresh()
+                # A subject's own detail is fetched on demand, so it can land
+                # after its frame was applied. Re-render the displayed frame so a
+                # late part replaces "still loading" without waiting for the next
+                # scope tick.
+                if self._view is not None:
+                    self._view.refresh()
             if not self._busy:
                 self._submit_probe()
         except WindowUnavailableError as error:
@@ -1035,6 +1041,13 @@ class CollectorWindow(QMainWindow):
             return
         now = self._clock_ns()
         try:
+            # The transport only advances when something pumps it. The periodic
+            # refresh does, 5 s apart -- so a frame made of several requests used
+            # to outlive the daemon's commit interval and be discarded as a
+            # different snapshot. The poll owns the pump while a frame is pending.
+            if self._pump is not None:
+                with self.files_view.transient_scope():
+                    self._pump()
             applied = self.apply_ready_frame(now=now)
             if not applied and self._pending is None:
                 self._poll_timer.stop()
@@ -1651,7 +1664,11 @@ def run_interactive(args) -> int:
         pump=client.pump,
         refresh_interval_ms=max(1, int(round(args.interval * 1000))),
     )
-    wake.woke.connect(window.refresh)
+    # Scheduled through the event loop, never called from inside pump(): the
+    # client emits while it is still decoding frames, so a direct slot would
+    # re-enter pump(). A zero-delay timer is that hand-off -- every settled reply
+    # is one event-loop turn, not one poll interval.
+    wake.woke.connect(lambda: QTimer.singleShot(0, window.refresh))
     window.show()
     window.refresh()
     try:

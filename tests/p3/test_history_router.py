@@ -7,7 +7,7 @@ import threading
 
 import pytest
 
-from appio.contracts import Window, WindowUnavailableError
+from appio.contracts import HistoryPending, Window, WindowUnavailableError
 from appio.handover import HandoverOffer, baseline_seed, capture_handover
 from appio.history_router import DaemonAnswerError, HistoryRouter, HistorySegment
 from appio.iodclient import AppRegistry, ClientState
@@ -181,6 +181,196 @@ def test_old_mixed_totals_without_raw_corrections_are_unavailable(tmp_path):
     result(history, Window("lifetime"))
     assert "not_retained" in history.view_state
     assert not any(s.proven and s.collector_id == "local" for s in history.segments)
+
+
+def test_a_frame_prefetches_only_its_default_subject_and_loads_the_rest_on_demand(tmp_path):
+    """Falsifier: the frame prefetched two parts for every ranked app.
+
+    Two answers per app is 400+ round trips for a live boot. That frame outlived
+    the daemon's 10 s commit cadence, so the snapshot moved underneath it and the
+    whole frame was discarded as "answered a different scope or snapshot". The
+    ranking already carries every row's totals, so only the default subject's own
+    parts are needed to paint, and any other subject loads when it is selected.
+    """
+
+    remote, _ = source(tmp_path / "remote.db", "iod")
+    coverage = remote.connection.execute(
+        "SELECT coverage_json FROM app_boot_total WHERE app_id=17").fetchone()[0]
+    remote.connection.execute(
+        "INSERT INTO app VALUES(3,'exe:/usr/bin/other','other',NULL,0,0,'user')")
+    remote.connection.execute(
+        "INSERT INTO app_boot_total VALUES('boot',3,0,0,0,0,NULL,NULL,NULL,?)", (coverage,))
+    remote.connection.commit()
+    # A whole-boot scope ranks from the retained totals, so both apps are rows.
+    scope = Window("since_boot", BOOT, end_mono_ns=200 * NS)
+    service = QueryService(remote)
+    expected = service.ranking(scope, "total_bytes")
+    assert [row.app_key for row in expected] == ["exe:/usr/bin/shared", "exe:/usr/bin/other"]
+
+    history = router(AppIoStore(tmp_path / "empty.db"))
+    history.client.state = ClientState(verified=True, answering=True)
+    history.prepare(scope)
+    history._local_future.result(timeout=10)
+    ranking, ranking_future = history.client.pending[0]
+    assert ranking.kind == "ranking"
+    ranking_future.set_result({"kind": "ranking", "result": expected, "snapshot": "fixed"})
+    assert not history.ready(scope)
+    # Exactly one part in flight, and it belongs to the default subject.
+    assert [(request.kind, request.app_key) for request, _ in history.client.pending[1:]] == [
+        ("totals", "exe:/usr/bin/shared")]
+
+    def answer_next():
+        for request, future in reversed(history.client.pending):
+            if future.done():
+                continue
+            app_id = remote.connection.execute(
+                "SELECT app_id FROM app WHERE key=?", (request.app_key,)).fetchone()[0]
+            method = "disk_share" if request.kind == "totals" else "series"
+            future.set_result({"kind": request.kind, "result": getattr(service, method)(app_id, scope),
+                               "snapshot": "fixed"})
+            return request
+
+    for _ in range(4):
+        if history.ready(scope):
+            break
+        assert answer_next() is not None
+    assert history.ready(scope)
+    assert [row.app_key for row in history.ranking(scope, "total_bytes")] == [
+        "exe:/usr/bin/shared", "exe:/usr/bin/other"]
+
+    # A subject outside the prefetch is requested on demand, never fabricated.
+    other = history.registry.id_for("exe:/usr/bin/other")
+    with pytest.raises(HistoryPending):
+        history.series(other, scope)
+    requested, pending = history.client.pending[-1]
+    assert (requested.kind, requested.app_key) == ("series", "exe:/usr/bin/other")
+    app_id = remote.connection.execute(
+        "SELECT app_id FROM app WHERE key='exe:/usr/bin/other'").fetchone()[0]
+    pending.set_result({"kind": "series", "result": service.series(app_id, scope), "snapshot": "fixed"})
+    assert history.ready(scope)
+    assert history.series(other, scope).app_id == other
+
+
+def test_a_part_binds_the_window_and_may_trail_the_ranking_by_a_commit(tmp_path):
+    """Falsifier: every part had to equal the ranking's snapshot digest byte for byte.
+
+    That digest moves on any daemon commit -- F-lane and maintenance work included,
+    measured at 3 commits in 3 s on a live store -- so a three-request frame was
+    discarded as "a different scope or snapshot" roughly half the time and the
+    console never filled. Same window is the same scope; each part discloses its
+    own coverage, and a part answering another window is still refused.
+    """
+
+    local = AppIoStore(tmp_path / "empty.db")
+    remote, _ = source(tmp_path / "remote.db", "iod")
+    scope = Window("since_boot", BOOT, end_mono_ns=200 * NS)
+    service = QueryService(remote)
+    expected = service.ranking(scope, "total_bytes")
+
+    def answer(history, *, part_window=None):
+        ranking, ranking_future = history.client.pending[0]
+        ranking_future.set_result({"kind": "ranking", "result": expected, "snapshot": "s1"})
+        for _ in range(6):
+            if history.ready(scope):
+                return history
+            if not history.client.pending:
+                continue
+            request, future = [item for item in history.client.pending if not item[1].done()][0]
+            app_id = remote.connection.execute(
+                "SELECT app_id FROM app WHERE key=?", (request.app_key,)).fetchone()[0]
+            method = "disk_share" if request.kind == "totals" else "series"
+            value = getattr(service, method)(app_id, scope)
+            if part_window is not None:
+                value = replace(value, window=part_window)
+            future.set_result({"kind": request.kind, "result": value, "snapshot": "s2"})
+        return history
+
+    trailing = router(local)
+    trailing.client.state = ClientState(verified=True, answering=True)
+    trailing.prepare(scope)
+    trailing._local_future.result(timeout=10)
+    answer(trailing)
+    assert trailing.ready(scope)
+    assert len(trailing.ranking(scope, "total_bytes")) == 1
+    assert trailing.daemon_answer_error is None
+
+
+    elsewhere = Window("since_boot", BOOT, end_mono_ns=300 * NS)
+    contradictory = router(AppIoStore(tmp_path / "empty2.db"))
+    contradictory.client.state = ClientState(verified=True, answering=True)
+    contradictory.prepare(scope)
+    contradictory._local_future.result(timeout=10)
+    answer(contradictory, part_window=elsewhere)
+    assert contradictory.ready(scope)
+    assert contradictory.daemon_answer_error is not None
+    assert "different scope" in contradictory.daemon_answer_error.reason
+    assert contradictory.ranking(scope, "total_bytes") == []
+
+
+def test_a_subject_part_survives_a_replacement_frame_for_the_same_scope(tmp_path):
+    """Falsifier: a replacement frame for the same window discarded the in-flight
+    subject part, so selecting a row showed "still loading" forever -- the console
+    starts a new frame on every scope tick, which bumped the generation mid-part.
+    """
+
+    remote, _ = source(tmp_path / "remote.db", "iod")
+    coverage = remote.connection.execute(
+        "SELECT coverage_json FROM app_boot_total WHERE app_id=17").fetchone()[0]
+    remote.connection.execute(
+        "INSERT INTO app VALUES(3,'exe:/usr/bin/other','other',NULL,0,0,'user')")
+    remote.connection.execute(
+        "INSERT INTO app_boot_total VALUES('boot',3,0,0,0,0,NULL,NULL,NULL,?)", (coverage,))
+    remote.connection.commit()
+    scope = Window("since_boot", BOOT, end_mono_ns=200 * NS)
+    service = QueryService(remote)
+    expected = service.ranking(scope, "total_bytes")
+
+    def answer_parts(history):
+        for _ in range(4):
+            if history.ready(scope):
+                return
+            for request, future in reversed(history.client.pending):
+                if future.done():
+                    continue
+                app_id = remote.connection.execute(
+                    "SELECT app_id FROM app WHERE key=?", (request.app_key,)).fetchone()[0]
+                method = "disk_share" if request.kind == "totals" else "series"
+                future.set_result({"kind": request.kind,
+                                   "result": getattr(service, method)(app_id, scope),
+                                   "snapshot": "s1"})
+
+    history = router(AppIoStore(tmp_path / "empty.db"))
+    history.client.state = ClientState(verified=True, answering=True)
+    history.prepare(scope)
+    history._local_future.result(timeout=10)
+    ranking, ranking_future = history.client.pending[0]
+    ranking_future.set_result({"kind": "ranking", "result": expected, "snapshot": "s1"})
+    answer_parts(history)
+    assert history.ready(scope)
+
+    other = history.registry.id_for("exe:/usr/bin/other")
+    with pytest.raises(HistoryPending):
+        history.series(other, scope)
+    part_request, part_future = [item for item in history.client.pending if not item[1].done()][0]
+
+    # A replacement frame for the same window must not orphan that part.
+    history.prepare(scope)
+    history._local_future.result(timeout=10)
+    app_id = remote.connection.execute(
+        "SELECT app_id FROM app WHERE key=?", (part_request.app_key,)).fetchone()[0]
+    part_future.set_result({"kind": "series", "result": service.series(app_id, scope),
+                            "snapshot": "s1"})
+    # The part is stored by its own callback: no ready() call is needed, so the
+    # panel cannot stay "still loading" until a frame happens to be pending.
+    assert ("series", "exe:/usr/bin/other") in history._remote_parts
+    # The replacement frame's ranking then settles normally.
+    history.ready(scope)
+    replacement, replacement_future = [
+        item for item in history.client.pending if not item[1].done()][0]
+    assert replacement.kind == "ranking"
+    replacement_future.set_result({"kind": "ranking", "result": expected, "snapshot": "s3"})
+    answer_parts(history)
+    assert history.ready(scope)
 
 
 def test_old_scope_remote_response_never_populates_new_scope(tmp_path):

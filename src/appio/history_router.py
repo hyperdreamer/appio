@@ -27,8 +27,9 @@ from typing import Literal
 from types import SimpleNamespace
 
 from .contracts import (
-    AppTotal, Direction, DiskShare, FileCoverage, FileSort, FileTable, Series, Window, FILE_HOUR_NS,
-    WindowUnavailableError, SQLITE_INT_MAX, validate_enum, validate_search, validate_sqlite_integer,
+    AppTotal, Direction, DiskShare, FileCoverage, FileSort, FileTable, HistoryPending, Series, Window,
+    FILE_HOUR_NS, WindowUnavailableError, SQLITE_INT_MAX, validate_enum, validate_search,
+    validate_sqlite_integer,
 )
 from .durable import decode_handover
 from .file_runtime import FileAvailability
@@ -48,6 +49,14 @@ from .query import QueryService, _model_coverage, _reduce_coverage
 from .store import AppIoStore, _empty_coverage
 
 _COUNTERS = ("rchar", "wchar", "read_bytes", "write_bytes")
+
+#: Remote requests kept in flight while one frame is assembled. Protocol v1 answers
+#: one query per client at a time and refuses a second with ``query_busy``, so the
+#: router keeps exactly one outstanding; the frame is assembled by issuing the next
+#: request the moment the previous one settles (the client wakes its owner on every
+#: settled reply). A 211-app frame is 400+ round trips and must stay inside the
+#: daemon's 10 s commit cadence for one snapshot to bind it.
+MAX_INFLIGHT = 1
 _PEAKS = ("peak_read_bps", "peak_write_bps", "peak_total_bps")
 _METRICS = ("total_bytes", "read_bytes", "write_bytes", "rchar", "wchar")
 
@@ -135,7 +144,8 @@ class HistoryRouter:
         self._views = []
         self._ranking = []
         self._remote = None
-        self._pending = None
+        self._inflight: list[tuple[int, QueryRequest, Future]] = []
+        self._requested_parts: set[tuple[str, str]] = set()
         self._queue = []
         self._remote_parts = {}
         self._gap_ranges = []
@@ -783,6 +793,7 @@ class HistoryRouter:
         self._gap_ranges, self._known_gap_ranges, self._overlap_ranges = [], [], []
         self._has_local_history = False
         self._ranking, self._remote_parts, self._queue, self._cached_parts = [], {}, [], {}
+        self._requested_parts = set()
         self._remote = self._remote_snapshot = None
         self._not_retained = self._chronology_unproved = False
         self._daemon_answer_error = None
@@ -859,10 +870,86 @@ class HistoryRouter:
                 merged.append((boot, left, right))
         return merged
 
+    @property
+    def _pending(self):
+        """The oldest unsettled remote request, or None when nothing is in flight."""
+
+        return self._inflight[0] if self._inflight else None
+
     def _dispatch(self):
-        if self._pending is None and self._queue:
+        """Issue the next request as soon as the protocol allows it."""
+
+        while len(self._inflight) < MAX_INFLIGHT and self._queue:
             request = self._queue.pop(0)
-            self._pending = (self._generation, request, self.client.query(request))
+            self._inflight.append((self._generation, request, self.client.query(request)))
+
+    def _fail_remote(self, error: Exception) -> None:
+        """Drop remote evidence for this frame, keeping locally proved parts."""
+
+        self._remote = None
+        self._queue = []
+        self._inflight = [item for item in self._inflight if item[0] != self._generation]
+        if isinstance(error, (WindowUnavailableError, CancelledError)):
+            return
+        if isinstance(error, RemoteError):
+            kind = "remote_error"
+        elif isinstance(error, ClientUnavailable):
+            kind = "unavailable"
+        elif isinstance(error, RequestRejected):
+            kind = "rejected"
+        elif isinstance(error, ConnectionLost):
+            kind = "transport"
+        else:
+            kind = "internal"
+        reason = (error.reason if isinstance(error, IodClientError)
+                  else str(error).strip() or type(error).__name__)
+        self._daemon_answer_error = DaemonAnswerError(kind, reason)
+
+    def _apply_response(self, window: Window, request: QueryRequest, response: dict) -> None:
+        if request.kind == "ranking":
+            rows = response["result"]
+            if (window.kind == "lifetime" or self._has_local_history or self._overlap_ranges
+                    or any(row.total_bytes or row.rchar or row.wchar for row in self._ranking)):
+                raise ValueError("remote query cannot prove a mixed-store cutoff")
+            self._remote_snapshot = response.get("snapshot")
+            if self._remote_snapshot is None:
+                raise ValueError("remote history snapshot identity required")
+            if response.get("next_cursor") is not None:
+                raise ValueError("paginated remote ownership is not proved atomically")
+            if not rows:
+                raise ValueError("remote ownership evidence required")
+            # Incomplete coverage is an honest property of the
+            # daemon's retained observations (reaps, gaps, or
+            # inaccessible identities), not proof that the answer
+            # is unusable. Keep the rows and let their contracts
+            # disclose the uncertainty. Only an empty answer lacks
+            # enough evidence to distinguish "no apps" from a
+            # missing/unretained history window.
+            self._remote = [replace(row, app_id=self.registry.id_for(row.app_key)) for row in rows]
+            self._not_retained = self._not_retained or any(
+                row.coverage.unavailable_reason == "not_retained" for row in rows
+            )
+            # Only the subject the window selects by default is prefetched: the
+            # ranking carries every row's totals, so the other 200+ apps' parts
+            # are fetched when (and if) an operator selects them. Fetching all of
+            # them made one frame 400+ round trips, longer than the daemon's 10 s
+            # commit cadence, so the snapshot moved underneath every frame.
+            if self._remote:
+                subject = self._remote[0].app_key
+                self._requested_parts.update({("totals", subject), ("series", subject)})
+                self._queue.extend([QueryRequest("totals", window, subject),
+                                    QueryRequest("series", window, subject)])
+            return
+        value = response["result"]
+        if value.window != window:
+            raise ValueError("remote history answered a different scope")
+        # A part may trail the ranking by one commit: the daemon also commits
+        # F-lane and maintenance work, so its snapshot digest moves far more often
+        # than the sampler does (measured: 3 commits in 3 s on a live store). The
+        # window above is the scope check; each part carries its own coverage and
+        # tier, so a detail read a moment later is disclosed, never fabricated.
+        self._remote_parts[(request.kind, request.app_key)] = value
+        self._requested_parts.discard((request.kind, request.app_key))
 
     def _finish(self):
         self._ready = True
@@ -873,12 +960,19 @@ class HistoryRouter:
     def ready(self, window: Window) -> bool:
         if window != self._window:
             return False
-        if self._ready:
+        if self._ready and not self._inflight and not self._queue:
             return True
-        while self._pending is not None and self._pending[0] != self._generation and self._pending[2].done():
-            # Discard an obsolete response before waiting on this scope's disk work.
-            self._pending = None
-            self._dispatch()
+        # An obsolete generation can never populate this scope; drop it as soon as
+        # it settles instead of waiting on a request nobody will read. A subject's
+        # own part is the exception: it belongs to the window, not to one frame,
+        # so a replacement frame for the same scope must still receive it.
+        self._inflight = [
+            item for item in self._inflight
+            if item[0] == self._generation
+            or item[1].window == self._window
+            or not item[2].done()
+        ]
+        self._dispatch()
         try:
             local_ready = self._consume_local()
         except Exception:
@@ -886,67 +980,22 @@ class HistoryRouter:
             raise
         if not local_ready:
             return False
-        while self._pending is not None and self._pending[2].done():
-            generation, request, future = self._pending
-            self._pending = None
-            if generation == self._generation:
+        index = 0
+        while index < len(self._inflight):
+            generation, request, future = self._inflight[index]
+            if not future.done():
+                index += 1
+                continue
+            del self._inflight[index]
+            stale = generation != self._generation
+            if not stale or (request.kind != "ranking" and request.window == self._window):
                 try:
-                    response = future.result()
-                    if request.kind == "ranking":
-                        rows = response["result"]
-                        if (window.kind == "lifetime" or self._has_local_history or self._overlap_ranges
-                                or any(row.total_bytes or row.rchar or row.wchar for row in self._ranking)):
-                            raise ValueError("remote query cannot prove a mixed-store cutoff")
-                        self._remote_snapshot = response.get("snapshot")
-                        if self._remote_snapshot is None:
-                            raise ValueError("remote history snapshot identity required")
-                        if response.get("next_cursor") is not None:
-                            raise ValueError("paginated remote ownership is not proved atomically")
-                        if not rows:
-                            raise ValueError("remote ownership evidence required")
-                        # Incomplete coverage is an honest property of the
-                        # daemon's retained observations (reaps, gaps, or
-                        # inaccessible identities), not proof that the answer
-                        # is unusable. Keep the rows and let their contracts
-                        # disclose the uncertainty. Only an empty answer lacks
-                        # enough evidence to distinguish "no apps" from a
-                        # missing/unretained history window.
-                        self._remote = [replace(row, app_id=self.registry.id_for(row.app_key)) for row in rows]
-                        self._not_retained = self._not_retained or any(
-                            row.coverage.unavailable_reason == "not_retained" for row in rows
-                        )
-                        for row in self._remote:
-                            self._queue.extend([QueryRequest("totals", window, row.app_key),
-                                                QueryRequest("series", window, row.app_key)])
-                    else:
-                        value = response["result"]
-                        if value.window != window or response.get("snapshot") != self._remote_snapshot:
-                            raise ValueError("remote history answered a different scope or snapshot")
-                        self._remote_parts[(request.kind, request.app_key)] = value
-                except (WindowUnavailableError, CancelledError):
-                    self._remote = None
-                    self._queue = []
+                    self._apply_response(self._window if stale else window, request, future.result())
                 except Exception as error:
-                    # Keep only locally proved contributions. A client-side query
-                    # failure is diagnostic state, not evidence about retention.
-                    self._remote = None
-                    self._queue = []
-                    if isinstance(error, RemoteError):
-                        kind = "remote_error"
-                    elif isinstance(error, ClientUnavailable):
-                        kind = "unavailable"
-                    elif isinstance(error, RequestRejected):
-                        kind = "rejected"
-                    elif isinstance(error, ConnectionLost):
-                        kind = "transport"
-                    else:
-                        kind = "internal"
-                    reason = (error.reason if isinstance(error, IodClientError)
-                              else str(error).strip() or type(error).__name__)
-                    self._daemon_answer_error = DaemonAnswerError(kind, reason)
+                    self._fail_remote(error)
             self._dispatch()
         self._dispatch()
-        if self._pending is None and not self._queue:
+        if not self._inflight and not self._queue:
             self._finish()
         return self._ready
 
@@ -964,12 +1013,49 @@ class HistoryRouter:
         return sorted(rows, key=lambda row: (-getattr(row, "total_bytes" if metric == "total_bytes" else metric),
                                              row.app_key.encode("utf-8")))
 
+    def _request_part(self, kind: str, key: str, window: Window) -> None:
+        """Ask for one subject's part once, on this frame's snapshot.
+
+        The reply is stored by its own callback: a part belongs to the window, and
+        the console refreshes on a timer, so waiting for the next ``ready()`` call
+        would leave the panel "still loading" until a frame happened to be pending.
+        The request still occupies the transport slot until a ``ready()`` pass
+        collects it, so two queries are never in flight at once (``query_busy``).
+        """
+
+        marker = (kind, key)
+        if marker in self._requested_parts:
+            return
+        self._requested_parts.add(marker)
+        request = QueryRequest(kind, window, key)
+        future = self.client.query(request)
+        self._inflight.append((self._generation, request, future))
+
+        def settle(done):
+            try:
+                value = done.result()["result"]
+                if value.window != window:
+                    raise ValueError("remote history answered a different scope")
+            except Exception:
+                self._requested_parts.discard(marker)
+                return
+            self._remote_parts[(kind, key)] = value
+            self._requested_parts.discard(marker)
+
+        future.add_done_callback(settle)
+
     def _app_parts(self, app_id, window, method):
         self._require(window)
         key = self.registry.key_for(app_id)
         kind = "totals" if method == "disk_share" else "series"
         if self._remote is not None:
-            return [self._remote_parts[(kind, key)]]
+            part = self._remote_parts.get((kind, key))
+            if part is None:
+                self._request_part(kind, key, window)
+                raise HistoryPending(
+                    f"this application's {kind} is still loading from the collector"
+                )
+            return [part]
         if self._local_future is not None:
             value = self._cached_parts[(kind, key)]
             if isinstance(value, Exception):

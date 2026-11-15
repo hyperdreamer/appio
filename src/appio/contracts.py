@@ -40,6 +40,7 @@ __all__ = [
     "FileState",
     "FileTable",
     "HISTORICAL_BOOT_PREFIX_MESSAGE",
+    "HistoryPending",
     "HookHits",
     "HourlyFileSnapshot",
     "LAUNCH_WINDOW_MESSAGE",
@@ -157,6 +158,16 @@ class WindowUnavailableError(ValueError):
             raise ValueError("message must be a non-empty string")
         super().__init__(message)
         self.reason = reason
+
+
+class HistoryPending(RuntimeError):
+    """A frame part the caller asked for has not arrived yet.
+
+    The router renders the ranking as soon as the daemon answers, and fetches a
+    subject's own totals/series on demand. A caller that asks for a part still in
+    flight gets this instead of a fabricated empty result; the same read succeeds
+    once the reply that wakes the owner has been applied.
+    """
 
 
 class CounterOverflowError(OverflowError):
