@@ -49,6 +49,7 @@ __all__ = [
     "RAW_BUCKET_NS",
     "ResidualPoint",
     "SQLITE_INT_MAX",
+    "DEFAULT_SCAN_BUDGET",
     "SQLITE_INT_MIN",
     "Series",
     "SeriesPoint",
@@ -87,6 +88,11 @@ WindowKind = Literal["range", "since_boot", "launch", "lifetime"]
 
 SQLITE_INT_MAX = 9223372036854775807
 """Largest value a SQLite ``INTEGER`` column can hold."""
+
+#: Row budget for one historical query scope. A source tier whose retained row
+#: count exceeds it is escalated to a coarser retained tier rather than being
+#: rejected, so a long window stays answerable without scanning raw history.
+DEFAULT_SCAN_BUDGET = 50_000
 
 SQLITE_INT_MIN = -9223372036854775808
 """Smallest value a SQLite ``INTEGER`` column can hold."""

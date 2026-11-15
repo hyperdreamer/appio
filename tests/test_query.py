@@ -1138,3 +1138,98 @@ def test_public_parameter_validation_does_not_coerce_identifiers_or_search(query
             call(999, window)
     with pytest.raises(KeyError):
         service.file_table(999, window, "bytes_total", "asc", None)
+
+
+def _seed_boot_and_app(db):
+    db.execute("INSERT INTO boot VALUES('boot-A',1,0,0,1000.0,'gui')")
+    db.execute("INSERT INTO app VALUES(1,?,'Demo',NULL,1000.0,1000.0,'user')", (APP,))
+    db.execute("INSERT INTO collector_interval VALUES('gui','boot-A',1,0,10)")
+
+
+def _statement_count(db, window):
+    statements = []
+    db.set_trace_callback(statements.append)
+    try:
+        QueryService(db).ranking(window, "total_bytes")
+    finally:
+        db.set_trace_callback(None)
+    return len(statements)
+
+
+def test_raw_scope_over_the_scan_budget_escalates_and_reports_the_retained_tier(tmp_path):
+    # Falsifier: a raw window larger than the scan budget is still read raw, so the
+    # daemon answers query_timeout instead of using the retained rollups it holds.
+    db = open_database(tmp_path / "escalation.sqlite")
+    try:
+        _seed_boot_and_app(db)
+        for seq in range(4):
+            seed_raw(db, seq, seq * RAW_BUCKET_NS)
+        db.execute(
+            "INSERT INTO rollup_app VALUES('boot-A',1,0,60,9,11,20,30,NULL,NULL,NULL,?)",
+            (coverage_json(device_state="available"),),
+        )
+        db.commit()
+        window = Window("range", "boot-A", 0, 60_000_000_000)
+
+        tight = QueryService(db, scan_budget=3)
+        assert tight._scope(window)[0] == "rollup_60s"
+        result, = tight.ranking(window, "total_bytes")
+        assert result.coverage.tier == "rollup_60s"
+        assert (result.read_bytes, result.write_bytes) == (9, 11)
+
+        roomy = QueryService(db)
+        assert roomy._scope(window)[0] == "raw"
+        raw_result, = roomy.ranking(window, "total_bytes")
+        assert raw_result.coverage.tier == "raw"
+        assert (raw_result.read_bytes, raw_result.write_bytes) == (4 * 7, 4 * 3)
+    finally:
+        db.close()
+
+
+def test_scope_escalates_past_an_oversized_rollup_to_the_coarsest_retained_tier(tmp_path):
+    # Falsifier: escalation stops at the first rollup tier even when it is still
+    # over budget, so the window stays unanswerable.
+    db = open_database(tmp_path / "double-escalation.sqlite")
+    try:
+        _seed_boot_and_app(db)
+        for seq in range(4):
+            seed_raw(db, seq, seq * RAW_BUCKET_NS)
+        for bucket in range(2):
+            db.execute(
+                "INSERT INTO rollup_app VALUES('boot-A',1,?,60,1,1,1,1,NULL,NULL,NULL,?)",
+                (bucket * 60_000_000_000, coverage_json(device_state="available")),
+            )
+        db.execute(
+            "INSERT INTO rollup_app VALUES('boot-A',1,0,3600,9,11,20,30,NULL,NULL,NULL,?)",
+            (coverage_json(device_state="available"),),
+        )
+        db.commit()
+        window = Window("range", "boot-A", 0, 3_600_000_000_000)
+        assert QueryService(db, scan_budget=1)._scope(window)[0] == "rollup_3600s"
+    finally:
+        db.close()
+
+
+def test_ranking_statement_count_is_independent_of_device_rows(tmp_path):
+    # Falsifier: device_interval_start() asked the database once per device row, so
+    # the statement count grew with device evidence instead of staying bounded.
+    db = open_database(tmp_path / "statements.sqlite")
+    try:
+        _seed_boot_and_app(db)
+        seed_raw(db, 0, 0)
+        for index in range(2):
+            db.execute(
+                "INSERT INTO sample_dev VALUES('boot-A','gui',1,0,1,0,?,5,7)", (f"8:{index}",)
+            )
+        db.commit()
+        window = Window("range", "boot-A", 0, RAW_BUCKET_NS)
+        small = _statement_count(db, window)
+
+        for index in range(2, 40):
+            db.execute(
+                "INSERT INTO sample_dev VALUES('boot-A','gui',1,0,1,0,?,5,7)", (f"8:{index}",)
+            )
+        db.commit()
+        assert _statement_count(db, window) == small
+    finally:
+        db.close()

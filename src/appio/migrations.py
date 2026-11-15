@@ -9,6 +9,24 @@ from appio.contracts import validate_sqlite_integer
 from appio.schema import SCHEMA_SQL, SCHEMA_VERSION
 
 
+#: Ordered in-place upgrades for stores written by an earlier schema version.
+#: The key is the version being upgraded *from*; the statements must take the
+#: database exactly one version forward, inside the transaction that also bumps
+#: ``user_version``. v2 only adds covering indexes, so no row is rewritten.
+_UPGRADE_STATEMENTS: dict[int, tuple[str, ...]] = {
+    1: (
+        "CREATE INDEX sample_coverage_owner_time_idx "
+        "ON sample_coverage(boot_id, source, epoch, ts_mono_ns);",
+        "CREATE INDEX sample_receipt_idx "
+        "ON sample(boot_id, source, epoch, seq, app_id, ts_mono_ns);",
+        "CREATE INDEX rollup_app_boot_time_idx "
+        "ON rollup_app(boot_id, bucket_secs, bucket_start_mono_ns, app_id);",
+        "CREATE INDEX rollup_dev_boot_time_idx "
+        "ON rollup_dev(boot_id, bucket_secs, bucket_start_mono_ns, app_id, dev);",
+    ),
+}
+
+
 def _statements(script: str) -> Iterator[str]:
     """Split complete SQLite statements without breaking quoted semicolons."""
     buffer = []
@@ -71,11 +89,44 @@ def validate_schema(connection: sqlite3.Connection) -> None:
         for statement in _statements(SCHEMA_SQL):
             reference.execute(statement)
         if _schema_signature(connection) != _schema_signature(reference):
-            raise ValueError("database schema does not match schema version 1")
+            raise ValueError(
+                f"database schema does not match schema version {SCHEMA_VERSION}"
+            )
+
+
+def _upgrade(connection: sqlite3.Connection, version: int) -> None:
+    """Apply every recorded upgrade from ``version`` to the current schema.
+
+    Each step is one transaction that also records the new ``user_version``, so
+    an interrupted upgrade leaves the previous version intact instead of a
+    half-indexed database. A version with no recorded upgrade (including any
+    future or negative value) is refused before anything is written.
+    """
+    if version > SCHEMA_VERSION or version not in _UPGRADE_STATEMENTS:
+        raise ValueError(f"unsupported database schema version: {version}")
+    while version < SCHEMA_VERSION:
+        statements = _UPGRADE_STATEMENTS[version]
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            for statement in statements:
+                connection.execute(statement)
+            connection.execute(f"PRAGMA user_version = {version + 1}")
+            connection.execute("COMMIT")
+        except BaseException:
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
+            raise
+        version += 1
+    validate_schema(connection)
 
 
 def migrate_empty(connection: sqlite3.Connection) -> None:
-    """Create v1 once, or validate v1; reject unsupported/nonempty state unchanged.
+    """Create, upgrade or validate the schema; refuse anything else unchanged.
+
+    An empty database gets the signed DDL in its single transaction. A store
+    written by an earlier version is upgraded in place, one version at a time.
+    A current store is validated. Higher, negative and unknown versions are
+    refused without writes, as is a nonempty version-0 database.
 
     The signed DDL owns its single transaction. Preconditions are checked both
     before locking (fail closed without writes) and immediately after BEGIN
@@ -94,7 +145,8 @@ def migrate_empty(connection: sqlite3.Connection) -> None:
         validate_schema(connection)
         return
     if version != 0:
-        raise ValueError(f"unsupported database schema version: {version}")
+        _upgrade(connection, version)
+        return
     _require_empty(connection)
     try:
         for statement in _statements(SCHEMA_SQL):

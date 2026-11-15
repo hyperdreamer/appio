@@ -7,12 +7,15 @@ from dataclasses import dataclass
 import json
 import sqlite3
 import unicodedata
+from bisect import bisect_left
 from collections import defaultdict
+from functools import lru_cache
 from typing import Iterator
 
 from appio.contracts import (
     AppTotal,
     Coverage,
+    DEFAULT_SCAN_BUDGET,
     Direction,
     DeviceSeriesPoint,
     DeviceShareRow,
@@ -38,9 +41,9 @@ from appio.contracts import (
     validate_sqlite_integer,
     validate_window,
 )
-from appio.ownership import device_interval_start, intersects, ownership_exclusions, uncertain_intervals
+from appio.ownership import intersects, ownership_exclusions, uncertain_intervals
 from appio.reconcile import rate_bps
-from appio.tier import select_tier
+from appio.tier import TIER_ORDER, fit_tier, select_tier
 
 
 @dataclass(frozen=True)
@@ -139,8 +142,19 @@ def _nonnegative(value: object) -> int:
     return validate_sqlite_integer(value, "stored coverage")
 
 
+@lru_cache(maxsize=8192)
+def _cached_coverage(text: str) -> dict:
+    """Decode one stored coverage row per distinct text.
+
+    A writer emits the same coverage object for thousands of consecutive rows, so
+    a wide window re-decoded ~500 distinct objects 232k times. The cached value is
+    read-only: callers must not mutate it (``_decode_coverage`` stays the copy).
+    """
+    return _decode_coverage(text)
+
+
 def _reduce_coverage(target: dict, text: str) -> None:
-    row = _decode_coverage(text)
+    row = _cached_coverage(text)
     for key in _COUNTS:
         target[key] += row[key]
     for vector_name in ("reap_unapplied", "reap_unobserved"):
@@ -265,6 +279,48 @@ def _bounds(window: Window) -> tuple[str | None, int, int | None]:
     return None, 0, None
 
 
+class _IntervalStarts:
+    """Resolve a device row's preceding observation boundary without a query per row.
+
+    ``device_interval_start`` answers with the newest retained coverage timestamp
+    below one device timestamp, falling back to the collector interval's start.
+    The device loop used to ask that question once per device row; this loads the
+    same evidence for the whole boot in two statements and answers by bisection.
+    """
+
+    __slots__ = ("_timestamps", "_fallbacks")
+
+    def __init__(self, timestamps: dict[tuple[str, int], list[int]], fallbacks: dict[tuple[str, int], int]):
+        self._timestamps = timestamps
+        self._fallbacks = fallbacks
+
+    @classmethod
+    def load(cls, connection: sqlite3.Connection, boot_id: str) -> "_IntervalStarts":
+        timestamps: dict[tuple[str, int], list[int]] = defaultdict(list)
+        for source, epoch, ts in connection.execute(
+            "SELECT source,epoch,ts_mono_ns FROM sample_coverage WHERE boot_id=? "
+            "ORDER BY source,epoch,ts_mono_ns",
+            (boot_id,),
+        ):
+            timestamps[(source, epoch)].append(ts)
+        fallbacks = {
+            (source, epoch): start
+            for source, epoch, start in connection.execute(
+                "SELECT source,epoch,from_mono_ns FROM collector_interval WHERE boot_id=?",
+                (boot_id,),
+            )
+        }
+        return cls(dict(timestamps), fallbacks)
+
+    def start(self, source: str, epoch: int, timestamp: int) -> int | None:
+        values = self._timestamps.get((source, epoch))
+        if values:
+            index = bisect_left(values, timestamp) - 1
+            if index >= 0:
+                return values[index]
+        return self._fallbacks.get((source, epoch))
+
+
 class QueryService:
     """Run each public query against one SQLite read snapshot.
 
@@ -272,11 +328,14 @@ class QueryService:
     remains caller-owned and is never mutated by a query.
     """
 
-    def __init__(self, store_or_connection: object) -> None:
+    def __init__(self, store_or_connection: object, *, scan_budget: int = DEFAULT_SCAN_BUDGET) -> None:
         connection = getattr(store_or_connection, "connection", store_or_connection)
         if not isinstance(connection, sqlite3.Connection):
             raise ValueError("QueryService requires an AppIoStore or sqlite3.Connection")
         self.connection = connection
+        self.scan_budget = validate_sqlite_integer(scan_budget, "scan_budget")
+        if self.scan_budget <= 0:
+            raise ValueError("scan_budget must be positive")
 
     @contextmanager
     def _snapshot(self) -> Iterator[None]:
@@ -312,7 +371,46 @@ class QueryService:
 
     def _scope(self, window: Window) -> tuple[Tier, int | None]:
         cutoff = self._available_cutoff(window.boot_id) if window.boot_id is not None else None
-        return select_tier(window, cutoff), cutoff
+        tier = select_tier(window, cutoff)
+        return self._fit_tier(window, tier), cutoff
+
+    def _tier_row_count(self, boot_id: str, start: int, end: int, tier: Tier) -> int:
+        """Retained rows one tier would surface for ``window``, without reading them."""
+        if tier == "raw":
+            return self.connection.execute(
+                "SELECT count(*) FROM sample WHERE boot_id=? AND ts_mono_ns>=? AND ts_mono_ns<?",
+                (boot_id, start, end),
+            ).fetchone()[0]
+        width = 60_000_000_000 if tier == "rollup_60s" else 3_600_000_000_000
+        first, last = _ceil_bucket(start, width), (end // width) * width
+        if first >= last:
+            return 0
+        return self.connection.execute(
+            "SELECT count(*) FROM rollup_app WHERE boot_id=? AND bucket_secs=? "
+            "AND bucket_start_mono_ns>=? AND bucket_start_mono_ns<?",
+            (boot_id, width // 1_000_000_000, first, last),
+        ).fetchone()[0]
+
+    def _fit_tier(self, window: Window, tier: Tier) -> Tier:
+        """Escalate the duration-selected tier while its row count exceeds the budget.
+
+        ``select_tier`` is a duration rule: every window up to a day reads raw
+        rows. At one row per app per 10 s tick a live boot passes the scan budget
+        within an hour, so the finest tier that *fits* answers instead -- which is
+        what the retained rollups exist for. The chosen tier is reported with the
+        result, so the substitution is visible, never silent.
+        """
+        if tier not in TIER_ORDER:
+            return tier
+        boot_id, start, end = _bounds(window)
+        if boot_id is None or end is None:
+            return tier
+        counts: dict[Tier, int] = {}
+        for candidate in TIER_ORDER[TIER_ORDER.index(tier):]:
+            counts[candidate] = self._tier_row_count(boot_id, start, end, candidate)
+            if counts[candidate] <= self.scan_budget:
+                break
+        return fit_tier(tier, counts, self.scan_budget)
 
     def _require_app(self, app_id: int) -> None:
         app_id = validate_sqlite_integer(app_id, "app_id")
@@ -375,6 +473,55 @@ class QueryService:
             if reason == "overlap_uncertain":
                 reduced["overlap_uncertain_intervals"] += 1
         return not gaps
+
+    def _window_overlay(self, window: Window, width: int, totals_only: bool) -> tuple[bool, int, int]:
+        """Window-level completeness and gap counts, independent of any app.
+
+        Ranking calls this once per window instead of repeating the interval,
+        gap and alignment queries for every application row.
+        """
+        boot_id, start, end = _bounds(window)
+        base_complete = True
+        if window.kind != "lifetime":
+            if not totals_only and (start % width or end % width):
+                base_complete = False
+            if not self._intervals_cover(boot_id, start, end):
+                base_complete = False
+        if boot_id is None:
+            gaps = self.connection.execute("SELECT reason FROM gap").fetchall()
+        else:
+            gaps = self.connection.execute(
+                "SELECT reason FROM gap WHERE boot_id=? AND from_mono_ns<? AND to_mono_ns>?",
+                (boot_id, end, start),
+            ).fetchall()
+        overlap_uncertain = sum(1 for (reason,) in gaps if reason == "overlap_uncertain")
+        return base_complete and not gaps, len(gaps), overlap_uncertain
+
+    def _diagnostics_by_app(self, window: Window, width: int) -> tuple[dict[int, int], int]:
+        """Per-app and unattributed diagnostic counts for one window, in one query.
+
+        ``_diagnostics`` answers the same question for a single app; a ranking
+        needs every app, so counting them one app at a time is what made the
+        window query O(apps) statements.
+        """
+        boot_id, start, end = _bounds(window)
+        if boot_id is None:
+            rows = self.connection.execute(
+                "SELECT app_id, count(*) FROM store_diagnostic GROUP BY app_id"
+            ).fetchall()
+        elif end is None:
+            return {}, 0
+        else:
+            first = (start // width) * width
+            final = min(SQLITE_INT_MAX, _ceil_bucket(end, width) - 1)
+            rows = self.connection.execute(
+                "SELECT app_id, count(*) FROM store_diagnostic WHERE boot_id=? "
+                "AND ts_mono_ns>=? AND ts_mono_ns<=? GROUP BY app_id",
+                (boot_id, first, final),
+            ).fetchall()
+        per_app = {app_id: count for app_id, count in rows if app_id is not None}
+        unattributed = sum(count for app_id, count in rows if app_id is None)
+        return per_app, unattributed
 
     def _overlays(self, reduced: dict, window: Window, app_id: int | None, width: int, totals_only: bool = False) -> tuple[bool, str | None]:
         boot_id, start, end = _bounds(window)
@@ -518,8 +665,9 @@ class QueryService:
                     + ("AND app_id=? " if app_id is not None else "") + "ORDER BY app_id,ts_mono_ns,dev",
                     (boot_id, first, last, *((app_id,) if app_id is not None else ())),
                 ).fetchall()
+                starts = _IntervalStarts.load(self.connection, boot_id) if dev_rows else None
                 for aid, ts, dev, rb, wb, source, epoch, seq in dev_rows:
-                    interval_start = device_interval_start(self.connection, boot_id, source, epoch, ts)
+                    interval_start = starts.start(source, epoch, ts) if starts else None
                     if (source, epoch, seq, aid) in excluded_receipts or intersects(interval_start, ts, ts, excluded[source]):
                         continue
                     item = data[aid]
@@ -553,7 +701,7 @@ class QueryService:
                             old = bucket["peaks"][index]
                             bucket["peaks"][index] = value if old is None else max(old, value)
                     _reduce_coverage(item["coverage"], cov)
-                    bucket["spans"] = bucket["spans"] or bool(_decode_coverage(cov)["spans_suspend_intervals"])
+                    bucket["spans"] = bucket["spans"] or bool(_cached_coverage(cov)["spans_suspend_intervals"])
                     item["coverage"]["spans_suspend"] = item["coverage"]["spans_suspend"] or bucket["spans"]
                     item["evidence_buckets"].add(bucket_start)
                     item["evidence"] += 1
@@ -588,13 +736,29 @@ class QueryService:
             width = 60_000_000_000
         elif tier == "rollup_3600s":
             width = 3_600_000_000_000
+        # The window-level overlays are app-independent, and the per-app
+        # diagnostic count collapses into one grouped query. Ranking must not
+        # re-run the same window queries once per application: at a realistic
+        # app count that turned a single ranking into hundreds of statements.
+        base_complete, gap_intervals, overlap_uncertain = self._window_overlay(
+            window, width, tier == "totals_only"
+        )
+        per_app, unattributed = self._diagnostics_by_app(window, width)
         for aid, item in data.items():
             raw_cov = item["coverage"]
-            base_complete, reason = self._overlays(raw_cov, window, aid, width, tier == "totals_only")
-            if not item["evidence"]:
-                raw_cov["missing_evidence"] = True
-                base_complete, reason = False, "not_retained"
-            coverage = _model_coverage(raw_cov, tier, base_complete=base_complete, unavailable_reason=reason)
+            raw_cov["gap_intervals"] += gap_intervals
+            raw_cov["overlap_uncertain_intervals"] += overlap_uncertain
+            own_diagnostics = per_app.get(aid, 0) + unattributed
+            if own_diagnostics:
+                raw_cov["counter_overflow"] = 1
+            complete = base_complete and not own_diagnostics
+            if raw_cov["gap_intervals"] or raw_cov["overlap_uncertain_intervals"]:
+                complete = False
+            reason = None
+            if raw_cov.get("missing_evidence"):
+                complete = False
+                reason = raw_cov.get("unavailable_reason", "not_retained")
+            coverage = _model_coverage(raw_cov, tier, base_complete=complete, unavailable_reason=reason)
             peaks = list(item["peaks"])
             for bucket in item["buckets"].values():
                 for index, value in enumerate(bucket["peaks"]):

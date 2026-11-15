@@ -1,4 +1,4 @@
-"""Schema-v1 contracts, with the signed DDL as an independent executable oracle."""
+"""Schema contracts, with the signed DDL as an independent executable oracle."""
 
 from contextlib import closing
 from pathlib import Path
@@ -51,7 +51,8 @@ INDEX_NAMES = {
     "path_alias_basename_idx", "file_sample_app_time_idx", "file_sample_last_seen_idx",
     "file_coverage_app_time_idx", "store_diagnostic_time_idx",
     "collector_interval_time_idx", "rollup_app_time_idx", "rollup_dev_time_idx",
-    "gap_time_idx",
+    "gap_time_idx", "sample_coverage_owner_time_idx", "sample_receipt_idx",
+    "rollup_app_boot_time_idx", "rollup_dev_boot_time_idx",
 }
 JSON_COLUMNS = [
     ("launch", "coverage_json"), ("sample_coverage", "coverage_json"),
@@ -132,7 +133,7 @@ def test_fresh_migration_has_exact_strict_tables_keys_and_indexes(database):
         assert tuple(row[1] for row in sorted(info, key=lambda row: row[5]) if row[5]) == expected_key
     indexes = {row[0] for row in database.execute("SELECT name FROM sqlite_schema WHERE type='index' AND sql IS NOT NULL")}
     assert indexes == INDEX_NAMES
-    assert database.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 1
+    assert database.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 2
 
 
 def test_entire_manifest_matches_signed_ddl(database):
@@ -251,7 +252,7 @@ def test_open_database_creates_a_valid_file(tmp_path):
     with closing(open_database(path)) as connection:
         validate_schema(connection)
         assert connection.execute("PRAGMA foreign_keys").fetchone() == (1,)
-        assert connection.execute("PRAGMA user_version").fetchone() == (1,)
+        assert connection.execute("PRAGMA user_version").fetchone() == (SCHEMA_VERSION,)
     with closing(sqlite3.connect(path)) as connection:
         assert len([row for row in connection.execute("PRAGMA table_list") if row[5]]) == 27
 
@@ -266,7 +267,7 @@ def test_rejected_open_preserves_existing_database_byte_for_byte(tmp_path, state
         elif state == "view-only-zero":
             connection.execute("CREATE VIEW original AS SELECT 1")
         else:
-            connection.execute(f"PRAGMA user_version={'2' if state == 'higher-version' else '-1'}")
+            connection.execute(f"PRAGMA user_version={'3' if state == 'higher-version' else '-1'}")
         connection.commit()
     before = {file.name: file.read_bytes() for file in tmp_path.iterdir()}
     with pytest.raises(ValueError):
@@ -287,6 +288,72 @@ def test_version_one_is_validated_without_recreation_or_file_writes(tmp_path):
         assert connection.execute("SELECT boot_id FROM boot").fetchall() == [("b",)]
         assert not any(sql.lstrip().upper().startswith(("CREATE", "BEGIN", "COMMIT", "INSERT", "UPDATE", "DELETE")) for sql in trace)
     assert path.read_bytes() == before
+
+
+V2_ONLY_STATEMENTS = (
+    "CREATE INDEX sample_coverage_owner_time_idx ON sample_coverage(boot_id, source, epoch, ts_mono_ns);\n",
+    "CREATE INDEX sample_receipt_idx ON sample(boot_id, source, epoch, seq, app_id, ts_mono_ns);\n",
+    "CREATE INDEX rollup_app_boot_time_idx ON rollup_app(boot_id, bucket_secs, bucket_start_mono_ns, app_id);\n",
+    "CREATE INDEX rollup_dev_boot_time_idx ON rollup_dev(boot_id, bucket_secs, bucket_start_mono_ns, app_id, dev);\n",
+)
+
+
+def version_one_ddl():
+    """The signed DDL exactly as v1 wrote it: v2's indexes absent, user_version 1."""
+    ddl = signed_ddl()
+    for statement in V2_ONLY_STATEMENTS:
+        assert statement in ddl
+        ddl = ddl.replace(statement, "")
+    return ddl.replace("PRAGMA user_version = 2;", "PRAGMA user_version = 1;")
+
+
+def test_version_one_store_is_upgraded_in_place_and_keeps_its_rows(tmp_path):
+    path = tmp_path / "v1.sqlite"
+    with closing(sqlite3.connect(path)) as connection:
+        connection.executescript(version_one_ddl())
+        connection.execute("INSERT INTO boot VALUES ('b',1,0,0,0.0,'gui')")
+        connection.commit()
+        assert connection.execute("PRAGMA user_version").fetchone() == (1,)
+        assert not {"sample_coverage_owner_time_idx", "sample_receipt_idx"} & {
+            row[0] for row in connection.execute("SELECT name FROM sqlite_schema")
+        }
+
+    with closing(open_database(path)) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone() == (SCHEMA_VERSION,)
+        assert connection.execute("SELECT boot_id FROM boot").fetchall() == [("b",)]
+        indexes = {row[0] for row in connection.execute("SELECT name FROM sqlite_schema WHERE type='index'")}
+        assert {"sample_coverage_owner_time_idx", "sample_receipt_idx"} <= indexes
+
+    # A second open is validation only: the upgraded file must not change.
+    upgraded = path.read_bytes()
+    with closing(open_database(path)) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone() == (SCHEMA_VERSION,)
+    assert path.read_bytes() == upgraded
+
+
+def test_failed_upgrade_rolls_back_to_the_previous_version(tmp_path, monkeypatch):
+    # A half-applied upgrade would leave a database that is neither v1 nor v2.
+    # The index that succeeded must disappear with the step's transaction.
+    path = tmp_path / "v1.sqlite"
+    with closing(sqlite3.connect(path)) as connection:
+        connection.executescript(version_one_ddl())
+        connection.commit()
+    before = path.read_bytes()
+    monkeypatch.setitem(
+        migrations._UPGRADE_STATEMENTS,
+        1,
+        (
+            V2_ONLY_STATEMENTS[0].strip().rstrip(";"),
+            "CREATE INDEX deliberately_broken_idx ON table_that_does_not_exist(id);",
+        ),
+    )
+    with pytest.raises(sqlite3.OperationalError):
+        open_database(path)
+    assert path.read_bytes() == before
+    with closing(sqlite3.connect(path)) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone() == (1,)
+        names = {row[0] for row in connection.execute("SELECT name FROM sqlite_schema")}
+        assert "sample_coverage_owner_time_idx" not in names
 
 
 @pytest.mark.parametrize("original,replacement", [
@@ -313,10 +380,10 @@ def test_version_one_schema_drift_is_rejected_without_mutation(tmp_path, origina
 
 
 def test_validate_schema_rejects_wrong_version_and_extra_objects(database):
-    database.execute("PRAGMA user_version=2")
+    database.execute("PRAGMA user_version=3")
     with pytest.raises(ValueError):
         validate_schema(database)
-    database.execute("PRAGMA user_version=1")
+    database.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
     database.execute("CREATE TABLE unexpected (id INTEGER) STRICT")
     with pytest.raises(ValueError):
         validate_schema(database)
@@ -337,7 +404,10 @@ def test_caller_transaction_is_never_committed_or_rolled_back(autocommit):
 @pytest.mark.parametrize("autocommit", [sqlite3.LEGACY_TRANSACTION_CONTROL, True])
 def test_failed_ddl_rolls_back_every_table_and_version(tmp_path, monkeypatch, autocommit):
     path = tmp_path / "failed.sqlite"
-    broken = SCHEMA_SQL.replace("PRAGMA user_version = 1;", "PRAGMA user_version = 1;\nCREATE TABLE deliberate_partial (id INTEGER) STRICT;\nSELECT nonexistent_migration_function();")
+    broken = SCHEMA_SQL.replace(
+        f"PRAGMA user_version = {SCHEMA_VERSION};",
+        f"PRAGMA user_version = {SCHEMA_VERSION};\nCREATE TABLE deliberate_partial (id INTEGER) STRICT;\nSELECT nonexistent_migration_function();",
+    )
     assert broken != SCHEMA_SQL
     monkeypatch.setattr(migrations, "SCHEMA_SQL", broken)
     with closing(sqlite3.connect(path, autocommit=autocommit)) as connection:
@@ -369,7 +439,7 @@ def test_empty_preconditions_are_rechecked_after_acquiring_write_lock(tmp_path, 
                 if concurrent_change == "table":
                     writer.execute("CREATE TABLE competing_writer (id INTEGER)")
                 else:
-                    writer.execute("PRAGMA user_version=2")
+                    writer.execute("PRAGMA user_version=3")
                 writer.commit()
 
         connection.set_trace_callback(competing_write)
@@ -378,7 +448,7 @@ def test_empty_preconditions_are_rechecked_after_acquiring_write_lock(tmp_path, 
         assert not connection.in_transaction
         objects = connection.execute("SELECT name FROM sqlite_schema").fetchall()
         version = connection.execute("PRAGMA user_version").fetchone()[0]
-        expected = ([("competing_writer",)], 0) if concurrent_change == "table" else ([], 2)
+        expected = ([("competing_writer",)], 0) if concurrent_change == "table" else ([], 3)
         assert (objects, version) == expected
 
 

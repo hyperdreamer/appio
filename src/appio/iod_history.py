@@ -32,7 +32,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, fields, replace
 
 from appio.contracts import (
-    AppTotal, Coverage, DeviceSeriesPoint, DeviceShareRow, DiskShare, FileCoverage,
+    AppTotal, Coverage, DEFAULT_SCAN_BUDGET, DeviceSeriesPoint, DeviceShareRow, DiskShare, FileCoverage,
     FileRow, FileTable, HookHits, RAW_BUCKET_NS, ResidualPoint, Series, SeriesPoint,
     UnknownOwnerOverflow, Window, WindowUnavailableError, validate_enum, validate_search,
     validate_sqlite_integer, validate_window,
@@ -149,7 +149,7 @@ class QueryLimits:
     max_points: int = 4000
     max_file_rows: int = 500
     max_payload_bytes: int = 262144
-    max_scan_rows: int = 50000
+    max_scan_rows: int = DEFAULT_SCAN_BUDGET
     timeout_ns: int = 200000000
 
     def __post_init__(self):
@@ -231,8 +231,8 @@ class HistoryRpc:
     """
     def __init__(self, connection: sqlite3.Connection, *, limits: QueryLimits = QueryLimits(), clock_ns: Callable[[], int] = time.monotonic_ns):
         self.connection = connection
-        self.service = QueryService(connection)
         self.limits, self.clock_ns = limits, clock_ns
+        self.service = QueryService(connection, scan_budget=limits.max_scan_rows)
         self._secret = secrets.token_bytes(32)
         self._active = threading.Lock()
 

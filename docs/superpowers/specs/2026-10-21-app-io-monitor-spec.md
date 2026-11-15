@@ -737,8 +737,12 @@ CREATE INDEX collector_interval_time_idx ON collector_interval(boot_id, from_mon
 CREATE INDEX rollup_app_time_idx ON rollup_app(app_id, boot_id, bucket_secs, bucket_start_mono_ns);
 CREATE INDEX rollup_dev_time_idx ON rollup_dev(app_id, boot_id, bucket_secs, bucket_start_mono_ns, dev);
 CREATE INDEX gap_time_idx ON gap(boot_id, from_mono_ns, to_mono_ns, source, epoch);
+CREATE INDEX sample_coverage_owner_time_idx ON sample_coverage(boot_id, source, epoch, ts_mono_ns);
+CREATE INDEX sample_receipt_idx ON sample(boot_id, source, epoch, seq, app_id, ts_mono_ns);
+CREATE INDEX rollup_app_boot_time_idx ON rollup_app(boot_id, bucket_secs, bucket_start_mono_ns, app_id);
+CREATE INDEX rollup_dev_boot_time_idx ON rollup_dev(boot_id, bucket_secs, bucket_start_mono_ns, app_id, dev);
 
-PRAGMA user_version = 1;
+PRAGMA user_version = 2;
 COMMIT;
 ```
 
@@ -748,9 +752,11 @@ Composite-key observation tables use `WITHOUT ROWID` because their full composit
 
 The primary keys on `handover` and `clock_map` already provide their boot/cutoff and boot/segment lookup order, so no duplicate secondary indexes are created. The secondary indexes cover app/time filtering and the supported path basename / last-seen sort. Additional indexes MUST be justified by an observed query plan and included in quota measurements; no index may change the result order specified in section 8.
 
+The app/time indexes on `sample`, `sample_coverage` and `sample_dev` all lead with `app_id`, so they cannot serve a scope that is selected by boot and time alone. Two v2 indexes close that gap for the historical reader, justified by measured plans on a populated store: `sample_coverage_owner_time_idx` answers the device-interval-start probe (`max(ts_mono_ns)` per `boot_id`, `source`, `epoch` below a timestamp) with an index seek instead of a scan of every retained coverage row, and `sample_receipt_idx` answers the retained-receipt probe behind the raw coverage join with an equality prefix on the receipt and a range on `ts_mono_ns`. Both are ordered so the same columns still satisfy the ordering of their bounding scans, and neither changes a result order.
+
 ### 6.4 Empty-database migration
 
-For a new empty DB, a migration runner MUST enable foreign keys outside the transaction, execute the single `BEGIN IMMEDIATE` in section 6.2, and then confirm no user tables exist and `PRAGMA user_version = 0` before executing that block's first `CREATE TABLE`. It executes the remaining statements and sets `user_version=1` before the block's single commit. The runner MUST NOT wrap the block in another transaction or use an executor that implicitly commits between statements. Failed preconditions or DDL MUST roll back. If a nonempty database has `user_version=0`, startup MUST fail closed and preserve the file; it MUST NOT guess that the file is empty or rewrite it. If `user_version=1`, startup MUST validate required columns, constraints, tables, and indexes without recreating them. Any unsupported higher version MUST be rejected without mutation.
+For a new empty DB, a migration runner MUST enable foreign keys outside the transaction, execute the single `BEGIN IMMEDIATE` in section 6.2, and then confirm no user tables exist and `PRAGMA user_version = 0` before executing that block's first `CREATE TABLE`. It executes the remaining statements and sets `user_version=2` before the block's single commit. The runner MUST NOT wrap the block in another transaction or use an executor that implicitly commits between statements. Failed preconditions or DDL MUST roll back. If a nonempty database has `user_version=0`, startup MUST fail closed and preserve the file; it MUST NOT guess that the file is empty or rewrite it. If the database is already at the current version, startup MUST validate required columns, constraints, tables, and indexes without recreating them. A store written by a recorded earlier version MUST be upgraded in place: each step executes only the statements recorded for that version transition and raises `user_version` inside the same transaction, so an interrupted upgrade leaves the previous version and no partial index; the upgraded database is then validated like any current store. Any version with no recorded upgrade, including any future version, MUST be rejected without mutation.
 
 The database schema is created independently in each store. Integer `app_id`, `launch_id`, `path_id`, `gap_id`, `diagnostic_id`, and `boot_order` values are local and MUST NOT cross store boundaries as identity. External identity uses `AppKey`, `boot_id`, and stream identity.
 

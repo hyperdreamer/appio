@@ -1,10 +1,17 @@
-"""The schema-v1 DDL from the signed specification, section 6.2.
+"""The schema DDL from the signed specification, section 6.2 (now v2).
 
 Keep the transaction delimiters here: migration executes these statements one at
 a time and checks the empty-database preconditions after BEGIN IMMEDIATE.
+
+v2 adds two covering indexes that turn the historical reader's per-row and
+per-receipt lookups into index seeks: ``sample_coverage_owner_time_idx`` answers
+``max(ts_mono_ns) ... WHERE boot_id/source/epoch/ts<`` (device interval starts)
+and ``sample_receipt_idx`` answers the retained-receipt probe used by the raw
+coverage join. The v1 tables and every constraint are unchanged, so the upgrade
+is one ``CREATE INDEX`` per index and keeps all existing rows.
 """
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 SCHEMA_SQL = """\
 PRAGMA foreign_keys = ON;
@@ -357,7 +364,11 @@ CREATE INDEX collector_interval_time_idx ON collector_interval(boot_id, from_mon
 CREATE INDEX rollup_app_time_idx ON rollup_app(app_id, boot_id, bucket_secs, bucket_start_mono_ns);
 CREATE INDEX rollup_dev_time_idx ON rollup_dev(app_id, boot_id, bucket_secs, bucket_start_mono_ns, dev);
 CREATE INDEX gap_time_idx ON gap(boot_id, from_mono_ns, to_mono_ns, source, epoch);
+CREATE INDEX sample_coverage_owner_time_idx ON sample_coverage(boot_id, source, epoch, ts_mono_ns);
+CREATE INDEX sample_receipt_idx ON sample(boot_id, source, epoch, seq, app_id, ts_mono_ns);
+CREATE INDEX rollup_app_boot_time_idx ON rollup_app(boot_id, bucket_secs, bucket_start_mono_ns, app_id);
+CREATE INDEX rollup_dev_boot_time_idx ON rollup_dev(boot_id, bucket_secs, bucket_start_mono_ns, app_id, dev);
 
-PRAGMA user_version = 1;
+PRAGMA user_version = 2;
 COMMIT;
 """
