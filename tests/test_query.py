@@ -1233,3 +1233,51 @@ def test_ranking_statement_count_is_independent_of_device_rows(tmp_path):
         assert _statement_count(db, window) == small
     finally:
         db.close()
+
+
+def test_since_boot_ranking_reads_the_retained_boot_totals_not_a_raw_scan(tmp_path):
+    """A live boot's whole-window ranking must come from the retained summary.
+
+    Falsifier: the ranking scans every raw row of the boot -- ~372k after 5.8h,
+    growing at ~67k rows/hour -- which the daemon's 50k-row/200ms budget rejects,
+    so the console's default window renders "no applications observed".
+    """
+
+    db = open_database(tmp_path / "since.sqlite")
+    cutoff = 5_000_000_000
+    db.execute("INSERT INTO boot VALUES('boot-A',1,0,0,1000.0,'gui')")
+    db.execute("INSERT INTO app VALUES(1,?,'Demo',NULL,1000.0,1000.0,'user')", (APP,))
+    db.execute(
+        "INSERT INTO app_boot_total VALUES('boot-A',1,7,8,9,10,0,4,5,?)",
+        (coverage_json(device_state="available"),),
+    )
+    db.execute("INSERT INTO app_boot_dev_total VALUES('boot-A',1,'259:0',7,8)")
+    db.execute("INSERT INTO sampler_checkpoint VALUES('gui','boot-A',1,0,?,'{}')", (cutoff,))
+    # Raw rows that would answer with different numbers, and only after a full scan.
+    db.execute(
+        "INSERT INTO sample VALUES('boot-A','gui',1,0,1,0,0,0,NULL,NULL,1000.0,1,2,1,2,'normal',0,0)"
+    )
+    db.execute("INSERT INTO sample_coverage VALUES('boot-A','gui',1,0,1,0,?)", (coverage_json(),))
+    db.commit()
+    try:
+        service = QueryService(db)
+        statements = []
+        db.set_trace_callback(statements.append)
+        rows = service.ranking(Window("since_boot", "boot-A", end_mono_ns=cutoff), "total_bytes")
+        db.set_trace_callback(None)
+        assert [(row.read_bytes, row.write_bytes) for row in rows] == [(7, 8)]
+        assert rows[0].coverage.tier == "totals_only"
+        # The only raw touch left is the tier preflight count; a row-enumerating
+        # raw read (the projection _process_data would use) must be absent.
+        enumerated = [
+            statement for statement in statements
+            if "ts_mono_ns,rchar,wchar,read_bytes,write_bytes" in " ".join(statement.split())
+        ]
+        assert enumerated == []
+        assert not any(
+            "FROM sample WHERE" in " ".join(statement.split())
+            and "count(*)" not in statement
+            for statement in statements
+        )
+    finally:
+        db.close()

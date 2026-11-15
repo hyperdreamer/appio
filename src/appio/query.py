@@ -780,7 +780,17 @@ class QueryService:
         self._precheck(window)
         metric = validate_enum(metric, _METRICS, "metric")
         with self._snapshot():
-            tier, _ = self._scope(window)
+            tier, cutoff = self._scope(window)
+            # A whole-boot window is exactly what the retained boot totals describe,
+            # and the raw tier cannot answer it: a live boot accumulates ~67k raw
+            # rows an hour, far past the daemon's 50k-row/200ms budget. Series and
+            # file views keep their own tier; only the ranking reads the summary.
+            if (
+                window.kind == "since_boot"
+                and cutoff is not None
+                and window.end_mono_ns == cutoff
+            ):
+                tier = "totals_only"
             return self._rank_rows(window, tier, metric)
 
     def _query_app_data(self, app_id: int, window: Window, tier: Tier, require_device: bool):
