@@ -2,6 +2,7 @@
 from dataclasses import replace
 import json
 from pathlib import Path
+import sqlite3
 
 import pytest
 
@@ -428,3 +429,32 @@ def test_pruning_never_commits_a_callers_open_transaction(db):
     assert db.in_transaction
     db.rollback()
     assert db.execute("SELECT name FROM app").fetchone()[0] == "Demo"
+
+
+def test_deletion_checkpoint_tolerates_a_live_read_snapshot(db):
+    """A console query holds one WAL snapshot; deleting must not call that a failure.
+
+    Falsifier: the delete loop asks for TRUNCATE, which reports busy while a reader
+    exists, so a successful deletion is surfaced as ``retention_incomplete`` and the
+    daemon claims ``answering: false`` although it is collecting normally.
+    """
+
+    db.execute("PRAGMA journal_mode=WAL")
+    db.execute("INSERT INTO sample VALUES('boot-A','gui',1,0,1,0,0,0,NULL,NULL,1000.0,0,0,0,0,'normal',0,0)")
+    db.commit()
+    path = db.execute("PRAGMA database_list").fetchone()[2]
+    reader = sqlite3.connect(path)
+    reader.execute("BEGIN")
+    reader.execute("SELECT count(*) FROM sample").fetchone()
+    try:
+        # New WAL frames the open snapshot cannot release.
+        db.execute("INSERT INTO sample VALUES('boot-A','gui',1,1,1,0,1,1,NULL,NULL,1000.0,0,0,0,0,'normal',0,0)")
+        db.commit()
+        pruner = QuotaPruner(db, [path])
+        assert pruner._checkpoint(truncate=False) is True
+        assert pruner._checkpoint(truncate=True) is False
+    finally:
+        reader.execute("ROLLBACK")
+        reader.close()
+    # With the reader gone the quota boundary can truncate again.
+    assert QuotaPruner(db, [path])._checkpoint(truncate=True) is True

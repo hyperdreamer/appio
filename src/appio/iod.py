@@ -36,7 +36,7 @@ from .ipc_protocol import HEADER, FrameDecoder, ProtocolError, encode_frame
 from .ipc_queue import ClientQueue, SlowClientError
 from .ipc_security import PeerRejected, RefusalLog, authorize_client, read_peer, verify_runtime_paths
 from .live import LiveCollector, SystemClock
-from .quota import QuotaPruner
+from .quota import PruneResult, QuotaPruner
 
 NS = 1_000_000_000
 SAMPLE_NS = 10 * NS
@@ -44,6 +44,30 @@ TICK_NS = 2 * NS
 MAX_FLUSH_NS = 30 * NS
 MAINTENANCE_NS = 60 * NS
 _STORAGE_ERRORS = frozenset({"quota_exhausted", "retention_incomplete", "maintenance_failed"})
+
+#: Retention results that only mean "more work next cycle". A bounded batch hit
+#: is normal progress through a backlog, and a busy checkpoint now only comes
+#: from a live read snapshot. Neither says anything about the collector, so
+#: neither may be reported as ``answering: false`` -- the window would blank
+#: every time the console asked a question.
+_DEFERRED_RETENTION = frozenset({"checkpoint_busy", "batch_limit"})
+
+
+def storage_error_for(*, quota: PruneResult, retention: PruneResult) -> str | None:
+    """Classify one maintenance cycle into the daemon's storage-error field.
+
+    ``quota_exhausted`` is the only condition that pauses sampling. Retention that
+    is merely unfinished (a full batch, a busy checkpoint) is deferred work, not a
+    failure; only skipped units or an unmapped clock make the sweep unprovable.
+    """
+
+    if quota.sampling_paused:
+        return "quota_exhausted"
+    if retention.complete:
+        return None
+    if retention.reason in _DEFERRED_RETENTION and not retention.skipped:
+        return None
+    return "retention_incomplete"
 FRAME_TIMEOUT_NS = 2 * NS
 IO_BUDGET = 65536
 REQUEST_BUDGET = 8
@@ -792,8 +816,7 @@ class Daemon:
                 retention = self._pruner.expire(self.collector.boot_id, now)
                 quota = self._pruner.shrink_if_needed()
                 self._quota_paused = quota.sampling_paused
-                self._storage_error = ("quota_exhausted" if quota.sampling_paused else
-                                       "retention_incomplete" if not retention.complete else None)
+                self._storage_error = storage_error_for(quota=quota, retention=retention)
                 if self._storage_error:
                     self._failure(self._storage_error)
                 if self._quota_paused:

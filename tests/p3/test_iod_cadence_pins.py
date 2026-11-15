@@ -7,7 +7,7 @@ import sqlite3
 
 import pytest
 
-from appio.quota import PruneResult, QuotaPruner
+from appio.quota import PruneResult, QuotaPruner, SkippedUnit
 from test_iod import NS, pump, receive, request, runtime, total, write_io
 
 
@@ -206,3 +206,51 @@ def test_recovery_does_not_allocate_an_epoch_on_every_tick(runtime, monkeypatch,
     assert gaps <= 2
     assert r.daemon.committed_cursor == before
     assert total(r.paths.database) == (0, 0, 0, 0)
+
+
+@pytest.mark.parametrize("runtime", [{}], indirect=True)
+@pytest.mark.parametrize("reason", ["batch_limit", "checkpoint_busy"])
+def test_a_deferred_retention_sweep_never_reports_not_answering(runtime, monkeypatch, reason):
+    """Deferred retention work is progress, not a dead collector.
+
+    Falsifier: every incomplete sweep becomes ``retention_incomplete``, which is
+    ``last_error``, which the console renders as 'daemon status reports not
+    answering' and a blank window -- while samples keep committing on cadence.
+    """
+
+    r = runtime
+    r.daemon.start()
+    client = r.connect()[0]
+    monkeypatch.setattr(
+        QuotaPruner, "expire", lambda *args: PruneResult((), False, False, 4096, reason)
+    )
+    monkeypatch.setattr(
+        QuotaPruner, "shrink_if_needed", lambda *args: PruneResult((), True, False, 4096, None)
+    )
+    r.daemon._next_maintenance = r.clock()[0]
+    pump(r)
+    assert r.daemon.last_error is None
+    assert r.daemon._storage_error is None
+    request(client)
+    pump(r)
+    assert any(row["type"] == "status" and row["answering"] for row in receive(client))
+
+
+@pytest.mark.parametrize("runtime", [{}], indirect=True)
+def test_a_skipped_unit_still_reports_retention_incomplete(runtime, monkeypatch):
+    """The deferred rule must not swallow a sweep that cannot prove its deletions."""
+
+    r = runtime
+    r.daemon.start()
+    skipped = (SkippedUnit("core", ("boot-A", "gui", 1, 0, 1)),)
+    monkeypatch.setattr(
+        QuotaPruner,
+        "expire",
+        lambda *args: PruneResult((), False, False, 4096, "missing_materialization", skipped),
+    )
+    monkeypatch.setattr(
+        QuotaPruner, "shrink_if_needed", lambda *args: PruneResult((), True, False, 4096, None)
+    )
+    r.daemon._next_maintenance = r.clock()[0]
+    pump(r)
+    assert r.daemon.last_error == "retention_incomplete"

@@ -510,8 +510,21 @@ class QuotaPruner:
             self.connection.execute("UPDATE file_hour_state SET state_json=? WHERE boot_id=? AND ts_mono_ns=?",
                                     (canonical_json(state), boot, hour))
 
-    def _checkpoint(self) -> bool:
-        row = self.connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+    def _checkpoint(self, *, truncate: bool = True) -> bool:
+        """Checkpoint the WAL; ask for TRUNCATE only where file size is the point.
+
+        The retention delete loop must not request TRUNCATE. A history query holds
+        one WAL snapshot for its whole duration, and a live reader makes TRUNCATE
+        report busy, so a successful deletion would be surfaced as a maintenance
+        failure -- the daemon then reports ``answering: false`` while it is in fact
+        collecting and deleting. PASSIVE never waits on a reader and never reports
+        busy, which is what a per-deletion checkpoint needs. The quota boundary
+        still truncates, because there the physical size is the measurement.
+        """
+
+        statement = ("PRAGMA wal_checkpoint(TRUNCATE)" if truncate
+                     else "PRAGMA wal_checkpoint(PASSIVE)")
+        row = self.connection.execute(statement).fetchone()
         return row is not None and row[0] == 0
 
     def _garbage_collect_paths(self):
@@ -622,7 +635,7 @@ class QuotaPruner:
                 skipped.append(SkippedUnit(unit.kind, unit.primary_key))
                 continue
             deleted.append(stats)
-            if not self._checkpoint():
+            if not self._checkpoint(truncate=False):
                 return self._result(deleted, "checkpoint_busy", paused=True, skipped=skipped)
         # Advancing past skipped units prevents a permanently bad oldest batch
         # from starving later ready units. Wrap after a sweep so repaired units
@@ -635,7 +648,7 @@ class QuotaPruner:
         except BaseException:
             self.connection.execute("ROLLBACK")
             raise
-        if not self._checkpoint():
+        if not self._checkpoint(truncate=False):
             return self._result(deleted, "checkpoint_busy", paused=True, skipped=skipped)
         reason = "missing_materialization" if skipped else "batch_limit" if self._candidate_more else None
         return self._result(deleted, reason, skipped=skipped)
