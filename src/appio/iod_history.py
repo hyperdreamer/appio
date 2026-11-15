@@ -455,11 +455,13 @@ class HistoryRpc:
     def _reply(self, request, request_id, aid, snapshot, offset, budget):
         app_keys = {}
         def key_for(app_id):
+            # One query for the whole registry: a per-page lookup costs a round
+            # trip per row, and a ranking page is up to 500 rows under a 200ms budget.
             if app_id not in app_keys:
-                row = self.connection.execute("SELECT key FROM app WHERE app_id=?", (app_id,)).fetchone()
-                if row is None:
+                if not app_keys:
+                    app_keys.update(self.connection.execute("SELECT app_id, key FROM app"))
+                if app_id not in app_keys:
                     raise ValueError("missing stored app")
-                app_keys[app_id] = row[0]
             return app_keys[app_id]
         def domain(method, *args):
             budget.check()

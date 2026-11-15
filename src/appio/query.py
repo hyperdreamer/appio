@@ -380,9 +380,20 @@ class QueryService:
             select_tier(window, None)
 
     def _available_cutoff(self, boot_id: str) -> int | None:
+        """The durable end of collected evidence for ``boot_id``.
+
+        ``sampler_checkpoint`` records the committed high-water mark, so it
+        answers on its own. Only a store with no checkpoint at all -- a boot that
+        never completed a commit -- needs the sweep across every evidence table,
+        and the coverage max there scans a whole boot when no index covers it.
+        """
+        checkpoint = self.connection.execute(
+            "SELECT max(checkpoint_mono_ns) FROM sampler_checkpoint WHERE boot_id=?", (boot_id,)
+        ).fetchone()[0]
+        if checkpoint is not None:
+            return checkpoint
         values = []
         for sql, params in (
-            ("SELECT max(checkpoint_mono_ns) FROM sampler_checkpoint WHERE boot_id=?", (boot_id,)),
             ("SELECT max(to_mono_ns) FROM collector_interval WHERE boot_id=?", (boot_id,)),
             ("SELECT max(ts_mono_ns) FROM sample_coverage WHERE boot_id=?", (boot_id,)),
             ("SELECT max(ts_mono_ns) FROM store_diagnostic WHERE boot_id=?", (boot_id,)),
