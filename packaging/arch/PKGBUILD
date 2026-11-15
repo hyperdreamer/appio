@@ -14,7 +14,7 @@ makedepends=('clang' 'pkgconf' 'python-build' 'python-installer' 'python-setupto
 # would otherwise drop C sources for the BPF object under /usr/src/debug.
 options=('!strip' '!debug')
 source=("appio-$pkgver.tar.gz")
-sha256sums=('b90c6e3fd5fa9e29b0aa1dcf566fedcd7d999ece85c7e5cef3551f5c40a92a07')
+sha256sums=('71bb432d95559edc0ae942723c1e1de63419352cdf96cc06a5d01d7ec4c1ce3c')
 
 build() {
   cd "$srcdir/$pkgname-$pkgver"
