@@ -1288,3 +1288,40 @@ def test_since_boot_ranking_reads_the_retained_boot_totals_not_a_raw_scan(tmp_pa
         )
     finally:
         db.close()
+
+
+def test_whole_boot_ranking_never_counts_the_tier_it_discards(tmp_path):
+    """The scope lookup must not price a tier ``whole_boot_totals`` replaces.
+
+    Falsifier: the ranking counted the raw, 60s and 3600s tiers to choose one,
+    then overrode it with ``totals_only`` -- and the same lookup ran twice in the
+    daemon path. On a live 500k-row boot the raw count alone is ~54 ms of the
+    200 ms deadline spent on a number nothing reads, which is what pushed the
+    console's default window into ``query_timeout``.
+    """
+
+    db = open_database(tmp_path / "discard.sqlite")
+    try:
+        cutoff = 5_000_000_000
+        db.execute("INSERT INTO boot VALUES('boot-A',1,0,0,1000.0,'gui')")
+        db.execute("INSERT INTO app VALUES(1,?,'Demo',NULL,1000.0,1000.0,'user')", (APP,))
+        db.execute(
+            "INSERT INTO app_boot_total VALUES('boot-A',1,7,8,9,10,0,4,5,?)",
+            (coverage_json(device_state="available"),),
+        )
+        db.execute("INSERT INTO sampler_checkpoint VALUES('gui','boot-A',1,0,?,'{}')", (cutoff,))
+        seed_raw(db, 0, 0)
+        db.commit()
+        service = QueryService(db)
+        counts: list[str] = []
+        original = service._tier_row_count
+        service._tier_row_count = lambda *args: counts.append(args[-1]) or original(*args)
+        rows = service.ranking(Window("since_boot", "boot-A", end_mono_ns=cutoff), "total_bytes")
+        assert [(row.read_bytes, row.write_bytes) for row in rows] == [(7, 8)]
+        assert rows[0].coverage.tier == "totals_only"
+        assert counts == []
+        # A prefix is not the whole-boot scope: it still has to choose a tier.
+        service.ranking(Window("since_boot", "boot-A", end_mono_ns=cutoff - 1), "total_bytes")
+        assert counts, "a prefix window must still price its own tier"
+    finally:
+        db.close()

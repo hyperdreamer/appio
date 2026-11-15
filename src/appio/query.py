@@ -408,6 +408,22 @@ class QueryService:
         tier = select_tier(window, cutoff)
         return self._fit_tier(window, tier), cutoff
 
+    def _ranking_scope(self, window: Window) -> tuple[Tier, int | None]:
+        """The tier and cutoff a ranking reads.
+
+        A whole-boot ranking is answered from the committed boot totals, so it
+        never prices the duration tier: ``_available_cutoff`` is one indexed
+        lookup, while ``_fit_tier`` counts the raw tier's rows (~54 ms for a
+        500k-row boot) to choose a tier :func:`whole_boot_totals` then discards.
+        The daemon's preflight and :meth:`ranking` both call this, so the tier
+        counted is still exactly the tier read.
+        """
+
+        cutoff = self._available_cutoff(window.boot_id) if window.boot_id is not None else None
+        if whole_boot_totals(window, cutoff):
+            return "totals_only", cutoff
+        return self._fit_tier(window, select_tier(window, cutoff)), cutoff
+
     def _tier_row_count(self, boot_id: str, start: int, end: int, tier: Tier) -> int:
         """Retained rows one tier would surface for ``window``, without reading them."""
         if tier == "raw":
@@ -814,9 +830,7 @@ class QueryService:
         self._precheck(window)
         metric = validate_enum(metric, _METRICS, "metric")
         with self._snapshot():
-            tier, cutoff = self._scope(window)
-            if whole_boot_totals(window, cutoff):
-                tier = "totals_only"
+            tier, _ = self._ranking_scope(window)
             return self._rank_rows(window, tier, metric)
 
     def _query_app_data(self, app_id: int, window: Window, tier: Tier, require_device: bool):

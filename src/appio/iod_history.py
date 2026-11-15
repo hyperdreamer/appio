@@ -40,7 +40,7 @@ from appio.contracts import (
 from appio.identity import validate_app_key
 from appio.ipc_models import QueryRequest
 from appio.ipc_protocol import MAX_OUTBOUND, ProtocolError, encode_frame
-from appio.query import QueryService, whole_boot_totals
+from appio.query import QueryService
 
 __all__ = ["QueryLimits", "HistoryRpc", "to_wire", "from_wire"]
 
@@ -551,11 +551,13 @@ class HistoryRpc:
             self.connection.execute("SELECT 1 FROM app LIMIT 1").fetchone()
             snapshot = self._identity()
             offset = self._offset(request.cursor, self._scope_identity(request), snapshot)
-            tier, cutoff = self.service._scope(request.window)
             # The preflight must count the tier the service will actually read, or
             # it rejects a whole-boot ranking for the raw rows it will never scan.
-            if request.kind == "ranking" and whole_boot_totals(request.window, cutoff):
-                tier = "totals_only"
+            # A ranking and its preflight therefore share one scope lookup.
+            if request.kind == "ranking":
+                tier, cutoff = self.service._ranking_scope(request.window)
+            else:
+                tier, cutoff = self.service._scope(request.window)
             budget.check()
             aid = None
             if request.app_key is not None:

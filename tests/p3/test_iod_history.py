@@ -594,3 +594,46 @@ def test_whole_boot_ranking_is_preflighted_on_the_totals_it_reads(db):
     )
     assert prefix["type"] == "error", prefix
     assert prefix["reason"] == "query_too_large", prefix
+
+
+def test_whole_boot_ranking_counts_no_tier_in_the_preflight_or_the_query(db):
+    """A whole-boot ranking must not price a tier it never reads, twice.
+
+    Falsifier: the daemon measured the duration tier for the preflight, then
+    ``QueryService.ranking`` measured it again, and ``whole_boot_totals``
+    replaced the answer with ``totals_only`` both times. Two ~70 ms scope
+    lookups on a 23 h boot are what pushed the ranking past the 200 ms deadline.
+    """
+
+    db.execute(
+        "INSERT INTO app_boot_total VALUES(?,1,7,8,9,10,0,4,5,?)",
+        (BOOT, coverage_json(device_state="available")),
+    )
+    db.execute("INSERT INTO app_boot_dev_total VALUES(?,1,'259:0',7,8)", (BOOT,))
+    raw(db, count=12)
+    cutoff = QueryService(db)._available_cutoff(BOOT)
+    rpc = HistoryRpc(db, limits=QueryLimits(max_scan_rows=5))
+    counts: list[str] = []
+    original = rpc.service._tier_row_count
+    rpc.service._tier_row_count = lambda *args: counts.append(args[-1]) or original(*args)
+    whole = rpc.execute(
+        QueryRequest(
+            kind="ranking",
+            window=Window(kind="since_boot", boot_id=BOOT, end_mono_ns=cutoff + RAW_BUCKET_NS),
+            limit=50,
+        ),
+        request_id="whole-boot-counts",
+    )
+    headers = [(row.read_bytes, row.write_bytes) for row in decode(whole, "ranking")]
+    assert headers == [(7, 8)]
+    assert counts == []
+    # The prefix control proves the counter is wired: it must still price raw.
+    rpc.execute(
+        QueryRequest(
+            kind="ranking",
+            window=Window(kind="since_boot", boot_id=BOOT, end_mono_ns=cutoff - RAW_BUCKET_NS),
+            limit=50,
+        ),
+        request_id="prefix-counts",
+    )
+    assert counts, "a prefix ranking must still price its own tier"
