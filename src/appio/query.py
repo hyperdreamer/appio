@@ -321,6 +321,29 @@ class _IntervalStarts:
         return self._fallbacks.get((source, epoch))
 
 
+def whole_boot_totals(window: Window, cutoff: int | None) -> bool:
+    """True when ``window`` is exactly the retained whole-boot scope.
+
+    ``app_boot_total``/``app_boot_dev_total`` are the exact summary of that scope,
+    and the raw tier cannot answer it: a live boot accumulates ~67k raw rows an
+    hour, far past the daemon's 50k-row/200ms budget. The console asks for
+    ``[boot start, its own clock]``, which is up to one refresh interval past the
+    last committed sample; nothing exists beyond that cutoff, so an end at or
+    after it still describes the whole boot. A genuine prefix (an end *before*
+    the cutoff) is not this case and keeps its own tier rules.
+
+    Selection is shared with the daemon's preflight so the two cannot disagree:
+    a tier the preflight counts is the tier the query reads.
+    """
+
+    return bool(
+        window.kind == "since_boot"
+        and cutoff is not None
+        and window.end_mono_ns is not None
+        and window.end_mono_ns >= cutoff
+    )
+
+
 class QueryService:
     """Run each public query against one SQLite read snapshot.
 
@@ -781,15 +804,7 @@ class QueryService:
         metric = validate_enum(metric, _METRICS, "metric")
         with self._snapshot():
             tier, cutoff = self._scope(window)
-            # A whole-boot window is exactly what the retained boot totals describe,
-            # and the raw tier cannot answer it: a live boot accumulates ~67k raw
-            # rows an hour, far past the daemon's 50k-row/200ms budget. Series and
-            # file views keep their own tier; only the ranking reads the summary.
-            if (
-                window.kind == "since_boot"
-                and cutoff is not None
-                and window.end_mono_ns == cutoff
-            ):
+            if whole_boot_totals(window, cutoff):
                 tier = "totals_only"
             return self._rank_rows(window, tier, metric)
 

@@ -1267,6 +1267,13 @@ def test_since_boot_ranking_reads_the_retained_boot_totals_not_a_raw_scan(tmp_pa
         db.set_trace_callback(None)
         assert [(row.read_bytes, row.write_bytes) for row in rows] == [(7, 8)]
         assert rows[0].coverage.tier == "totals_only"
+        # The console asks for [boot start, its own clock]; the clock is up to one
+        # refresh interval past the last commit, and nothing exists beyond it.
+        later = service.ranking(
+            Window("since_boot", "boot-A", end_mono_ns=cutoff + 10_000_000_000), "total_bytes"
+        )
+        assert [(row.read_bytes, row.write_bytes) for row in later] == [(7, 8)]
+        assert later[0].coverage.tier == "totals_only"
         # The only raw touch left is the tier preflight count; a row-enumerating
         # raw read (the projection _process_data would use) must be absent.
         enumerated = [

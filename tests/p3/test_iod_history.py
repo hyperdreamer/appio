@@ -554,3 +554,43 @@ def test_protocol_producer_ranking_cursor_gap_is_explicit(db):
     request = validate_request(message)
     assert request.query.kind == "ranking"
     assert request.query.cursor == "opaque"
+
+
+def test_whole_boot_ranking_is_preflighted_on_the_totals_it_reads(db):
+    """The preflight must count the tier the service will actually read.
+
+    Falsifier: a live boot's raw rows exceed the scan budget, so the remote
+    preflight rejects the console's default window with query_too_large even
+    though the ranking answers from the retained boot totals and never reads
+    those raw rows.
+    """
+
+    db.execute(
+        "INSERT INTO app_boot_total VALUES(?,1,7,8,9,10,0,4,5,?)",
+        (BOOT, coverage_json(device_state="available")),
+    )
+    db.execute("INSERT INTO app_boot_dev_total VALUES(?,1,'259:0',7,8)", (BOOT,))
+    raw(db, count=12)
+    cutoff = QueryService(db)._available_cutoff(BOOT)
+    rpc = HistoryRpc(db, limits=QueryLimits(max_scan_rows=5))
+    whole = rpc.execute(
+        QueryRequest(
+            kind="ranking",
+            window=Window(kind="since_boot", boot_id=BOOT, end_mono_ns=cutoff + RAW_BUCKET_NS),
+            limit=50,
+        ),
+        request_id="whole-boot",
+    )
+    rows = decode(whole, "ranking")
+    assert [(row.read_bytes, row.write_bytes) for row in rows] == [(7, 8)]
+    # A window that really is a prefix keeps the raw tier and stays refused.
+    prefix = rpc.execute(
+        QueryRequest(
+            kind="ranking",
+            window=Window(kind="since_boot", boot_id=BOOT, end_mono_ns=cutoff - RAW_BUCKET_NS),
+            limit=50,
+        ),
+        request_id="prefix",
+    )
+    assert prefix["type"] == "error", prefix
+    assert prefix["reason"] == "query_too_large", prefix
