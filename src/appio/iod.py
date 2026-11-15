@@ -43,6 +43,14 @@ SAMPLE_NS = 10 * NS
 TICK_NS = 2 * NS
 MAX_FLUSH_NS = 30 * NS
 MAINTENANCE_NS = 60 * NS
+
+#: Longest the event loop sleeps with no buffered work. A finished worker job is
+#: not a readable socket, so without the wake below every answer waits out this
+#: timeout -- ~50 ms per query, and one console frame is 400+ queries.
+IDLE_SELECT_TIMEOUT_S = 0.05
+
+#: Selector data for the self-pipe that wakes the loop when a job completes.
+_WAKE = object()
 _STORAGE_ERRORS = frozenset({"quota_exhausted", "retention_incomplete", "maintenance_failed"})
 
 #: Retention results that only mean "more work next cycle". A bounded batch hit
@@ -278,6 +286,7 @@ class Daemon:
         self.last_error = None
         self._lock_fd = None
         self._listener = None
+        self._wake = None
         self._socket_identity = None
         self._ring = deque()
         self._ring_bytes = 0
@@ -356,6 +365,41 @@ class Daemon:
         listener.listen(MAX_CLIENTS)
         self.selector.register(listener, selectors.EVENT_READ, None)
 
+    def _open_wake(self):
+        """Create the self-pipe the query worker uses to wake the loop."""
+
+        reader, writer = socket.socketpair()
+        for end in (reader, writer):
+            end.setblocking(False)
+        self._wake = (reader, writer)
+        self.selector.register(reader, selectors.EVENT_READ, _WAKE)
+
+    def _notify_wake(self, _future=None):
+        """Signal an answer no socket event announces.
+
+        A worker future completing is invisible to ``select``, so a reply would
+        otherwise wait out the idle timeout before it was even enqueued.
+        """
+
+        wake = self._wake
+        if wake is None:
+            return
+        try:
+            wake[1].send(b"\0")
+        except (BlockingIOError, OSError):
+            pass  # A pending byte already guarantees one more pass.
+
+    def _drain_wake(self):
+        wake = self._wake
+        if wake is None:
+            return
+        while True:
+            try:
+                if not wake[0].recv(64):
+                    return
+            except (BlockingIOError, OSError):
+                return
+
     def _new_collector(self):
         if self.file_runtime is not None:
             self.file_runtime.close()
@@ -390,6 +434,7 @@ class Daemon:
             self._sidecars()
             self._new_collector()
             self._bind()
+            self._open_wake()
             self._ring.clear()
             self._ring_bytes = 0
             self._current = None
@@ -575,6 +620,7 @@ class Daemon:
             try:
                 client.job = self.query_worker.submit(request.query, request_id=request.request_id)
                 client.job_request_id = request.request_id
+                client.job.add_done_callback(self._notify_wake)
             except ProtocolError as error:
                 self._enqueue(client, _error(error.reason, request.request_id))
 
@@ -833,9 +879,15 @@ class Daemon:
         sample_deadline = (max(self._next_sample, self._next_recovery)
                            if self._quota_paused or self._recover else self._next_sample)
         deadlines = [self._next_tick, sample_deadline, *(client.partial_since + FRAME_TIMEOUT_NS for client in self.clients.values() if client.partial_since is not None)]
-        timeout = 0 if buffered else min(0.05, max(0, min(deadlines) - self.clock()[0]) / NS)
+        timeout = 0 if buffered else min(IDLE_SELECT_TIMEOUT_S, max(0, min(deadlines) - self.clock()[0]) / NS)
         events = self.selector.select(timeout)
-        ready = {key.fd: mask for key, mask in events if key.data is not None}
+        woke = False
+        for key, _ in events:
+            if key.data is _WAKE:
+                woke = True
+        if woke:
+            self._drain_wake()
+        ready = {key.fd: mask for key, mask in events if key.data is not None and key.data is not _WAKE}
         if any(key.data is None for key, _ in events):
             for _ in range(REQUEST_BUDGET):
                 try:
@@ -883,6 +935,14 @@ class Daemon:
                 pass
             self._listener.close()
             self._listener = None
+        if self._wake is not None:
+            for end in self._wake:
+                try:
+                    self.selector.unregister(end)
+                except (KeyError, ValueError):
+                    pass
+                end.close()
+            self._wake = None
         if self._socket_identity is not None:
             try:
                 found = self.filesystem.lstat(self.paths.socket)

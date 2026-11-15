@@ -487,6 +487,37 @@ def test_replay_and_unknown_boot_cursor_have_explicit_gap(runtime):
     assert rows[0]["previous"]["boot_id"] == "different-boot"
 
 
+def test_a_settled_query_job_wakes_the_loop_instead_of_the_idle_poll(runtime, monkeypatch):
+    """Falsifier: a completed worker future is not a readable socket, so every
+    answer waited out the idle select timeout before it was even enqueued -- one
+    poll per query, 400+ queries per console frame.
+    """
+
+    r = runtime
+    monkeypatch.setattr(iod, "IDLE_SELECT_TIMEOUT_S", 2.0)
+    r.daemon.selector = selectors.DefaultSelector()
+    r.daemon.start()
+    client = r.connect()[0]
+    request(client, "query", request_id="wake", query={"kind": "ranking", "window": {"kind": "lifetime"}})
+    r.daemon.step()  # readable socket: reads the request and submits the job
+    assert len(r.worker.jobs) == 1
+    _, _, future = r.worker.jobs[0]
+
+    def settle():
+        time.sleep(0.05)
+        future.set_result({"protocol": 1, "type": "result", "request_id": "wake", "kind": "ranking",
+                           "payload": [{"rows": [], "next_cursor": None, "snapshot": "s"}]})
+
+    thread = threading.Thread(target=settle)
+    thread.start()
+    started = time.monotonic()
+    r.daemon.step()  # blocks in select(2.0) unless the wake byte arrives
+    elapsed = time.monotonic() - started
+    thread.join(timeout=5)
+    assert elapsed < 1.0, f"the loop slept {elapsed:.2f}s on a settled job"
+    assert [row["request_id"] for row in receive(client)] == ["wake"]
+
+
 def test_query_has_one_inflight_per_client_and_exact_a22_errors(runtime):
     r = runtime
     r.daemon.start()
