@@ -175,6 +175,17 @@ class HistoryRouter:
     def local_read_in_flight(self) -> bool:
         return self._local_future is not None and not self._local_future.done()
 
+    @property
+    def pending_work(self) -> bool:
+        """True while a frame or a subject's own part still awaits a reply.
+
+        The console pumps the transport from its pending-frame poll; a subject's
+        part is requested outside a frame, so without this the reply waited for
+        the next refresh and could outlive the client's five second deadline.
+        """
+
+        return bool(self._inflight or self._queue)
+
     def _cancel_file_requests(self):
         for future in tuple(self._file_jobs):
             self._settle_file(future, self._generation, error=WindowUnavailableError(
@@ -992,7 +1003,15 @@ class HistoryRouter:
                 try:
                     self._apply_response(self._window if stale else window, request, future.result())
                 except Exception as error:
-                    self._fail_remote(error)
+                    if request.kind == "ranking":
+                        # A ranking answer that contradicts its own frame is a
+                        # frame failure: no remote evidence can be trusted.
+                        self._fail_remote(error)
+                    else:
+                        # A subject's part is detail, never frame evidence. A part
+                        # that answers another scope is simply re-requested; it
+                        # must not blank a ranking that is already consistent.
+                        self._requested_parts.discard((request.kind, request.app_key))
             self._dispatch()
         self._dispatch()
         if not self._inflight and not self._queue:

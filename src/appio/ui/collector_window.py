@@ -768,6 +768,9 @@ class CollectorWindow(QMainWindow):
                 # scope tick.
                 if self._view is not None:
                     self._view.refresh()
+                # A subject's detail requested by that render must keep the
+                # transport moving until its reply lands.
+                self._arm_poll()
             if not self._busy:
                 self._submit_probe()
         except WindowUnavailableError as error:
@@ -904,7 +907,8 @@ class CollectorWindow(QMainWindow):
         self._render_files_message()
 
     def _arm_poll(self) -> None:
-        if self._pending is not None and not self._poll_timer.isActive():
+        waiting = self._pending is not None or getattr(self.history, "pending_work", False)
+        if waiting and not self._poll_timer.isActive():
             self._poll_timer.start()
 
     def _submit_prepare(
@@ -1036,7 +1040,7 @@ class CollectorWindow(QMainWindow):
         self._poll_timer.stop()
 
     def _poll_history(self) -> None:
-        if self._closed or self._pending is None:
+        if self._closed or (self._pending is None and not getattr(self.history, "pending_work", False)):
             self._poll_timer.stop()
             return
         now = self._clock_ns()
@@ -1049,7 +1053,7 @@ class CollectorWindow(QMainWindow):
                 with self.files_view.transient_scope():
                     self._pump()
             applied = self.apply_ready_frame(now=now)
-            if not applied and self._pending is None:
+            if not applied and self._pending is None and not getattr(self.history, "pending_work", False):
                 self._poll_timer.stop()
         except WindowUnavailableError as error:
             self._show_error(str(error) or type(error).__name__)
