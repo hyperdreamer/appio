@@ -690,6 +690,23 @@ def test_query_before_a_verified_status_fails_closed():
     assert harness.connects == [], "no request may be written before a verified peer"
 
 
+def test_a_settled_query_reply_wakes_the_owner_without_a_state_change():
+    """Falsifier: a reply that changes no ClientState left the owner to find it on
+    its next poll, so a caller driving one request per pump issued one request per
+    timeout instead of one per reply -- 400+ requests became 40 s of polling.
+    """
+
+    harness = handshaken()
+    harness.client.pump()
+    before = harness.changes
+    future = harness.client.query(ranking_request())
+    request = harness.one_request("query")
+    harness.send(result_frame(request["request_id"]))
+    harness.client.pump()
+    assert future.result(timeout=0)["kind"] == "ranking"
+    assert harness.changes > before, "a settled reply must wake its owner"
+
+
 def test_historical_result_uses_the_shared_decoder_and_does_not_advance_the_cursor():
     harness = handshaken(cursor=StreamCursor(BOOT_A, 7, 12))
     harness.send(snapshot_frame(13))

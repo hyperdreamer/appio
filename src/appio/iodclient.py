@@ -726,6 +726,7 @@ class IodClient:
         self._subscribe_request_id = ""
         self._first_send_since_rx: int | None = None
         self._outage_gap_emitted = False
+        self._settled_pending = False
 
         self._pending: dict[str, _Pending] = {}
         self._cache: OrderedDict[tuple[str, str], _Cached] = OrderedDict()
@@ -808,6 +809,12 @@ class IodClient:
                 self._read(now)
             if self._sock is not None:
                 self._check_no_answer(now)
+        # A settled reply is work for the owner, but it is not a state change:
+        # without this wake a caller that drives one request per pump would wait
+        # for its own poll instead of issuing the next request immediately.
+        if self._settled_pending:
+            self._settled_pending = False
+            self._on_change()
         self._publish()
 
     def query(self, request: QueryRequest) -> Future[dict]:
@@ -1197,6 +1204,7 @@ class IodClient:
             value["app_key"] = self._apps.key_for(result.app_id)
         self._cache_put(pending.key, value, size)
         _settle(pending.future, value=dict(value))
+        self._settled_pending = True
 
     def _apply_error(self, message: Mapping[str, Any]) -> None:
         request_id = message.get("request_id")
@@ -1204,6 +1212,7 @@ class IodClient:
         error = RemoteError(str(message["reason"]), str(message["message"]))
         if pending is not None:
             _settle(pending.future, error=error)
+            self._settled_pending = True
             return
         self._last_error = error.reason
         self._stale_results += 1
@@ -1218,6 +1227,7 @@ class IodClient:
         ]
         for request_id, pending in expired:
             self._pending.pop(request_id, None)
+            self._settled_pending = True
             _settle(
                 pending.future,
                 error=RequestRejected(
@@ -1234,6 +1244,8 @@ class IodClient:
     def _fail_pending(self, error: Exception) -> None:
         pending = list(self._pending.values())
         self._pending.clear()
+        if pending:
+            self._settled_pending = True
         for entry in pending:
             _settle(entry.future, error=_clone(error))
 
