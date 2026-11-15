@@ -359,6 +359,7 @@ class QueryService:
         self.scan_budget = validate_sqlite_integer(scan_budget, "scan_budget")
         if self.scan_budget <= 0:
             raise ValueError("scan_budget must be positive")
+        self._pinned: tuple[Window, Tier, int | None] | None = None
 
     @contextmanager
     def _snapshot(self) -> Iterator[None]:
@@ -403,7 +404,30 @@ class QueryService:
                 values.append(value)
         return max(values) if values else None
 
+    @contextmanager
+    def _pinned_scope(self, window: Window, tier: Tier, cutoff: int | None) -> Iterator[None]:
+        """Reuse one request's scope for every query that request performs.
+
+        The daemon preflights the tier before it answers, and the query method
+        then looks its own scope up again; counting the tiers twice cost ~10 ms
+        of a 13 ms per-app answer, and one console frame is 400+ of those.
+        Pinning yields the same tier the preflight counted, so the two cannot
+        disagree, and it is confined to the caller's request: nothing is cached
+        between requests, where the store keeps changing.
+        """
+
+        if not isinstance(window, Window):
+            raise TypeError("window must be a Window")
+        previous = self._pinned
+        self._pinned = (window, tier, cutoff)
+        try:
+            yield
+        finally:
+            self._pinned = previous
+
     def _scope(self, window: Window) -> tuple[Tier, int | None]:
+        if self._pinned is not None and self._pinned[0] == window:
+            return self._pinned[1], self._pinned[2]
         cutoff = self._available_cutoff(window.boot_id) if window.boot_id is not None else None
         tier = select_tier(window, cutoff)
         return self._fit_tier(window, tier), cutoff
@@ -419,6 +443,8 @@ class QueryService:
         counted is still exactly the tier read.
         """
 
+        if self._pinned is not None and self._pinned[0] == window:
+            return self._pinned[1], self._pinned[2]
         cutoff = self._available_cutoff(window.boot_id) if window.boot_id is not None else None
         if whole_boot_totals(window, cutoff):
             return "totals_only", cutoff

@@ -596,6 +596,33 @@ def test_whole_boot_ranking_is_preflighted_on_the_totals_it_reads(db):
     assert prefix["reason"] == "query_too_large", prefix
 
 
+def test_one_request_prices_its_tier_once_for_every_query_kind(db):
+    """Falsifier: the preflight and the query each counted the duration tiers.
+
+    A console frame issues one ranking plus two queries per ranked app -- 400+
+    requests -- so a duplicated ~10 ms scope lookup per request is the difference
+    between a frame inside one daemon snapshot and a frame that is discarded.
+    """
+
+    raw(db, count=12)
+    rpc = HistoryRpc(db)
+    counts: list[str] = []
+    original = rpc.service._fit_tier
+    rpc.service._fit_tier = lambda *args: counts.append(args[1]) or original(*args)
+    scope = Window("range", BOOT, 0, 12 * RAW_BUCKET_NS)
+    for kind in ("totals", "series", "ranking"):
+        counts.clear()
+        key = None if kind == "ranking" else APP
+        reply = rpc.execute(QueryRequest(kind=kind, window=scope, app_key=key), request_id=kind)
+        assert reply["type"] == "result", reply
+        assert counts == ["raw"], f"{kind} priced its tier {len(counts)} times"
+    # The pin is per request, never cached between them: a second identical
+    # request must look the scope up again.
+    counts.clear()
+    rpc.execute(QueryRequest(kind="totals", window=scope, app_key=APP), request_id="again")
+    assert counts == ["raw"]
+
+
 def test_whole_boot_ranking_counts_no_tier_in_the_preflight_or_the_query(db):
     """A whole-boot ranking must not price a tier it never reads, twice.
 

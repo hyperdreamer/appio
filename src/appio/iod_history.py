@@ -566,7 +566,10 @@ class HistoryRpc:
                     raise _Rejected("unknown_app", "Application is not present in retained history.")
                 aid = row[0]
             self._preflight(request, tier, cutoff, aid, budget)
-            return self._reply(request, request_id, aid, snapshot, offset, budget)
+            # The query methods look their own scope up; pin the scope this
+            # request was preflighted on so they cannot count the tiers again.
+            with self.service._pinned_scope(request.window, tier, cutoff):
+                return self._reply(request, request_id, aid, snapshot, offset, budget)
         except WindowUnavailableError as exc:
             return self._error(request_id, exc.reason, str(exc))
         except _Rejected as exc:
