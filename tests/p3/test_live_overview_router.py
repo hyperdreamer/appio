@@ -7,15 +7,32 @@ neutral module stays free of the client, router, query service and Qt.
 
 from __future__ import annotations
 
+from concurrent.futures import Future
+from dataclasses import FrozenInstanceError, fields, replace
 import subprocess
 import sys
-from dataclasses import FrozenInstanceError, fields, replace
+import threading
 
 import pytest
 
 from appio.contracts import (
     DeviceShareRow,
+    FileCoverage,
+    FileTable,
+    HookHits,
+    UnknownOwnerOverflow,
     Window,
+    WindowUnavailableError,
+)
+from appio.history_router import (
+    HistoryRouter,
+    HistorySegment,
+    LocalFilesOutcome,
+    LocalFrameOutcome,
+    LocalPartOutcome,
+    LocalSettlement,
+    RemoteSettlement,
+    RequestToken,
 )
 from appio.history_types import (
     AcceptedIdentity,
@@ -32,11 +49,22 @@ from appio.history_types import (
     local_answer_digest,
     retention_scope,
 )
+from appio.handover import baseline_seed
+from appio.iodclient import AppRegistry, ClientState, RequestRejected
+from appio.ipc_models import QueryRequest
+from appio.procs import AppKeyInputs, IoReadOutcome, ProcessIdentity, StableProcRecord
+from appio.query import QueryService
+from appio.sampler import TickInput, aggregate_tick
+from appio.store import AppIoStore
 from live_overview_support import Clock, coverage, series, share, total
 
 KEY = "unit:alpha.service"
 OTHER_KEY = "unit:beta.service"
 DIGEST = "a" * 64
+NS = 1_000_000_000
+BOOT = "boot-a"
+ALPHA = "exe:/usr/bin/alpha"
+BETA = "exe:/usr/bin/beta"
 
 
 def _reject(label: str, call) -> None:
@@ -581,6 +609,456 @@ def test_live_records_validate_every_field_and_phase_combination() -> None:
     _reject("digest.series-infinite", lambda: local_answer_digest("series", KEY, since_boot, infinite_wall))
     _reject("digest.forged-coverage", lambda: local_answer_digest("totals", KEY, since_boot, replace(a, coverage=forged_coverage)))
 
+    # -- private router worker records (§3.4) ------------------------------- #
+    ranking_request = QueryRequest("ranking", since_boot)
+    detail_request = QueryRequest("totals", since_boot, KEY)
+    files_request = QueryRequest("files", since_boot, KEY)
+    registrations = (("local", "gui", 1),)
+    local_authority = ("local", registrations)
+    remote_authority = ("remote", 2, "boot-a", 1)
+    local_vector = LocalPositionVector((LocalPosition("local", "gui", 1, 1, 0),))
+    remote_position = RemotePosition("boot-a", 1, 0)
+
+    private_inventory = {
+        RequestToken: (
+            "token_id", "request", "origin", "scope", "owner", "owner_id", "slot_id",
+            "authority", "requested_source",
+        ),
+        LocalFrameOutcome: (
+            "worker_id", "request", "ranking", "segments", "boundaries", "gaps",
+            "known_gaps", "overlaps", "has_local_history", "not_retained",
+            "chronology_unproved", "file_available",
+        ),
+        LocalPartOutcome: ("worker_id", "request", "app_key", "value", "data_digest"),
+        LocalFilesOutcome: (
+            "worker_id", "request", "app_key", "table", "coverage", "served_gap_count",
+        ),
+        RemoteSettlement: ("future", "response", "error"),
+        LocalSettlement: ("worker_id", "outcome", "error", "local_bracket"),
+    }
+    for record, names in private_inventory.items():
+        assert tuple(field.name for field in fields(record)) == names, record.__name__
+        assert record.__dataclass_params__.frozen is True, record.__name__
+
+    detail_token = RequestToken(1, detail_request, "local", scope, "detail", 1, None,
+                                local_authority, local_vector)
+    assert detail_token.scope == scope
+    remote_token = RequestToken(2, ranking_request, "remote", None, "frame", 3, 9,
+                                remote_authority, remote_position)
+    local_frame_token = RequestToken(3, ranking_request, "local", None, "frame", 4, None,
+                                     local_authority, local_vector)
+    assert local_frame_token.origin == "local"
+    _assert_frozen(remote_token, "slot_id")
+    for label, kwargs in (
+        ("token_id.zero", {"token_id": 0}),
+        ("token_id.bool", {"token_id": True}),
+        ("token_id.negative", {"token_id": -1}),
+        ("request.not-query", {"request": {"kind": "ranking", "window": since_boot}}),
+        ("request.invalid-selector", {"request": QueryRequest("series", since_boot)}),
+        ("request.a22", {"request": QueryRequest("ranking", Window("launch", "boot-a", launch_id=1))}),
+        ("origin.enum", {"origin": "peer"}),
+        ("owner.enum", {"owner": "worker"}),
+        ("owner_id.zero", {"owner_id": 0}),
+        ("owner_id.bool", {"owner_id": False}),
+        ("detail.no-scope", {"request": detail_request, "owner": "detail", "scope": None}),
+        ("detail.no-subject", {"request": ranking_request, "owner": "detail", "scope": scope}),
+        ("detail.scope-subject", {"scope": retention_scope(OTHER_KEY, since_boot)}),
+        ("detail.scope-window", {"scope": retention_scope(KEY, range_w)}),
+        ("frame.scope", {"owner": "frame", "scope": scope}),
+        ("local.slot", {"slot_id": 1}),
+        ("remote.no-slot", {"origin": "remote", "slot_id": None,
+                            "requested_source": remote_position, "authority": remote_authority}),
+        ("authority.tag", {"authority": ("bogus", 1)}),
+        ("authority.remote-length", {"authority": ("remote", 1, "boot-a")}),
+        ("authority.remote-bool-generation", {"authority": ("remote", True, "boot-a", 1)}),
+        ("authority.remote-epoch", {"authority": ("remote", 1, "boot-a", 0)}),
+        ("authority.local-length", {"authority": ("local", registrations, 1)}),
+        ("authority.local-duplicate", {"authority": ("local", (("local", "gui", 1), ("local", "iod", 2)))}),
+        ("authority.local-unsorted", {"authority": ("local", (("z", "gui", 1), ("a", "iod", 2)))}),
+        ("authority.local-empty-name", {"authority": ("local", (("", "gui", 1),))}),
+        ("authority.local-epoch", {"authority": ("local", (("local", "gui", 0),))}),
+        ("source.remote-with-vector", {"origin": "remote", "slot_id": 1,
+                                      "requested_source": local_vector,
+                                      "authority": remote_authority}),
+        ("source.local-with-remote", {"requested_source": remote_position}),
+        ("source.mapping", {"requested_source": {"boot_id": "boot-a"}}),
+    ):
+        base = {
+            "token_id": 2,
+            "request": ranking_request,
+            "origin": "local",
+            "scope": None,
+            "owner": "frame",
+            "owner_id": 4,
+            "slot_id": None,
+            "authority": local_authority,
+            "requested_source": local_vector,
+        }
+        _reject(
+            f"request_token.{label}",
+            lambda kwargs=kwargs, base=base: RequestToken(**{**base, **kwargs}),
+        )
+    forged_vector = LocalPositionVector((LocalPosition("local", "gui", 1, 1, 0),))
+    object.__setattr__(forged_vector, "sources", ())
+    _reject(
+        "request_token.forged-source",
+        lambda: RequestToken(1, ranking_request, "local", None, "frame", 1, None,
+                             local_authority, forged_vector),
+    )
+    # A detail token is already valid before one field is varied. The former
+    # cases used a frame base, so they failed the "frame carries no scope" guard
+    # instead of the subject/Window scope equality their labels claimed.
+    detail_base = {
+        "token_id": 1,
+        "request": detail_request,
+        "origin": "local",
+        "scope": scope,
+        "owner": "detail",
+        "owner_id": 1,
+        "slot_id": None,
+        "authority": local_authority,
+        "requested_source": local_vector,
+    }
+    assert RequestToken(**detail_base) == detail_token
+    for label, kwargs in (
+        ("detail.scope-other-subject", {"scope": retention_scope(OTHER_KEY, since_boot)}),
+        ("detail.scope-other-window", {"scope": retention_scope(KEY, range_w)}),
+    ):
+        _reject(
+            f"request_token.{label}",
+            lambda kwargs=kwargs, base=detail_base: RequestToken(**{**base, **kwargs}),
+        )
+
+    # LocalFrameOutcome: all copied routing evidence, no eager detail handle.
+    frame_segments = (
+        HistorySegment("local", "gui", "boot-a", 0, 4 * NS, True),
+        HistorySegment("export", "iod", "boot-a", 4 * NS, 8 * NS, True),
+        HistorySegment("unproved", "unknown", "boot-a", 8 * NS, 10 * NS, False),
+    )
+    frame_boundaries = (("boot-a", 4 * NS, "gui", "iod"),)
+    frame_gaps = (("boot-a", 8 * NS, 10 * NS),)
+    # Known-gap evidence may overlap across sources; there is no global rule.
+    frame_known_gaps = (("boot-a", 8 * NS, 9 * NS + NS // 2), ("boot-a", 9 * NS, 10 * NS))
+    frame = LocalFrameOutcome(
+        2, ranking_request, (total(7, KEY), total(8, OTHER_KEY)), frame_segments,
+        frame_boundaries, frame_gaps, frame_known_gaps, (), False, False, False, True,
+    )
+    # Boundaries are a chronology: valid ordered evidence is the control, and a
+    # permutation or repeat of that same evidence is not another valid plan.
+    chrono_segments = (
+        HistorySegment("local", "gui", "boot-a", 0, 4 * NS, True),
+        HistorySegment("export", "iod", "boot-a", 4 * NS, 8 * NS, True),
+        HistorySegment("local", "gui", "boot-a", 8 * NS, 12 * NS, True),
+    )
+    chrono_boundaries = (("boot-a", 4 * NS, "gui", "iod"), ("boot-a", 8 * NS, "iod", "gui"))
+    chrono_frame = LocalFrameOutcome(
+        2, ranking_request, (total(7, KEY),), chrono_segments,
+        chrono_boundaries, (), (), (), False, False, False, True,
+    )
+    assert chrono_frame.boundaries == chrono_boundaries
+    assert frame.ranking[0].app_key == KEY
+    assert frame.known_gaps[0][2] > frame.known_gaps[1][1]
+    _assert_frozen(frame, "ranking")
+    for label, kwargs in (
+        ("worker_id.zero", {"worker_id": 0}),
+        ("worker_id.bool", {"worker_id": True}),
+        ("request.totals", {"request": QueryRequest("totals", since_boot, KEY)}),
+        ("request.subject", {"request": QueryRequest("ranking", since_boot, KEY)}),
+        ("ranking.list", {"ranking": [total(7, KEY)]}),
+        ("ranking.mutable-row", {"ranking": ([total(7, KEY)],)}),
+        ("ranking.duplicate", {"ranking": (total(7, KEY), total(8, KEY))}),
+        ("ranking.not-row", {"ranking": ({"app_key": KEY},)}),
+        ("segments.list", {"segments": list(frame_segments)}),
+        ("segments.not-segment", {"segments": (("local", "gui", "boot-a", 0, NS),)}),
+        ("segments.order", {"segments": (frame_segments[1], frame_segments[0])}),
+        # Nested segments promise real UTF-8 boot text; the pre-existing segment
+        # validator only checks identity truthiness, so these cross this boundary.
+        ("segments.boot-int", {
+            "segments": (HistorySegment("local", "gui", 123, 0, 4 * NS, True),),
+            "boundaries": (),
+        }),
+        ("segments.boot-tuple", {
+            "segments": (HistorySegment("local", "gui", ("x",), 0, 4 * NS, True),),
+            "boundaries": (),
+        }),
+        ("segments.boot-nul", {
+            "segments": (HistorySegment("local", "gui", "a\x00b", 0, 4 * NS, True),),
+            "boundaries": (),
+        }),
+        ("segments.boot-encoding", {
+            "segments": (HistorySegment("local", "gui", "a\ud800", 0, 4 * NS, True),),
+            "boundaries": (),
+        }),
+        ("boundaries.list", {"boundaries": list(frame_boundaries)}),
+        ("boundaries.length", {"boundaries": (("boot-a", 4 * NS, "gui"),)}),
+        ("boundaries.boot", {"boundaries": (("", 4 * NS, "gui", "iod"),)}),
+        ("boundaries.negative", {"boundaries": (("boot-a", -1, "gui", "iod"),)}),
+        ("boundaries.bool", {"boundaries": (("boot-a", True, "gui", "iod"),)}),
+        ("boundaries.owner-enum", {"boundaries": (("boot-a", 4 * NS, "gui", "root"),)}),
+        ("boundaries.same-owner", {"boundaries": (("boot-a", 4 * NS, "gui", "gui"),)}),
+        ("boundaries.unsupported", {"boundaries": (("boot-a", 2 * NS, "gui", "iod"),)}),
+        ("boundaries.other-boot", {"boundaries": (("other", 4 * NS, "gui", "iod"),)}),
+        ("boundaries.reversed", {
+            "segments": chrono_segments,
+            "boundaries": tuple(reversed(chrono_boundaries)),
+        }),
+        ("boundaries.duplicate", {
+            "segments": chrono_segments,
+            "boundaries": chrono_boundaries + (chrono_boundaries[-1],),
+        }),
+        ("boundaries.boot-order", {
+            "segments": (
+                HistorySegment("local", "gui", "boot-a", 0, 4 * NS, True),
+                HistorySegment("export", "iod", "boot-a", 4 * NS, 8 * NS, True),
+                HistorySegment("local", "gui", "boot-b", 8 * NS, 12 * NS, True),
+                HistorySegment("export", "iod", "boot-b", 12 * NS, 16 * NS, True),
+            ),
+            "boundaries": (("boot-b", 12 * NS, "gui", "iod"),
+                           ("boot-a", 4 * NS, "gui", "iod")),
+        }),
+        ("gaps.list", {"gaps": [("boot-a", 8 * NS, 10 * NS)]}),
+        ("gaps.length", {"gaps": (("boot-a", 8 * NS),)}),
+        ("gaps.boot", {"gaps": (("", 8 * NS, 10 * NS),)}),
+        ("gaps.reversed", {"gaps": (("boot-a", 10 * NS, 8 * NS),)}),
+        ("gaps.empty", {"gaps": (("boot-a", 8 * NS, 8 * NS),)}),
+        ("gaps.bool", {"gaps": (("boot-a", True, 10 * NS),)}),
+        ("known_gaps.list", {"known_gaps": [("boot-a", 8 * NS, 10 * NS)]}),
+        ("known_gaps.empty", {"known_gaps": (("boot-a", 8 * NS, 8 * NS),)}),
+        ("overlaps.list", {"overlaps": [("boot-a", 8 * NS, 10 * NS)]}),
+        ("overlaps.reversed", {"overlaps": (("boot-a", 10 * NS, 8 * NS),)}),
+        ("flag.int", {"has_local_history": 1}),
+        ("flag.str", {"not_retained": "no"}),
+        ("flag.bool-as-int", {"chronology_unproved": 0}),
+        ("flag.none", {"file_available": None}),
+    ):
+        base = {
+            "worker_id": 2,
+            "request": ranking_request,
+            "ranking": (total(7, KEY),),
+            "segments": frame_segments,
+            "boundaries": frame_boundaries,
+            "gaps": frame_gaps,
+            "known_gaps": frame_known_gaps,
+            "overlaps": (),
+            "has_local_history": False,
+            "not_retained": False,
+            "chronology_unproved": False,
+            "file_available": True,
+        }
+        _reject(
+            f"local_frame.{label}",
+            lambda kwargs=kwargs, base=base: LocalFrameOutcome(**{**base, **kwargs}),
+        )
+    forged_segment = HistorySegment("local", "gui", "boot-a", 0, 4 * NS, True)
+    object.__setattr__(forged_segment, "end_ns", 0)
+    _reject(
+        "local_frame.forged-segment",
+        lambda: LocalFrameOutcome(2, ranking_request, (total(7, KEY),), (forged_segment,),
+                                  (), (), (), (), False, False, False, True),
+    )
+    # A boundary needs both adjacent *proven* segments. Keep the intended gui/iod
+    # owners and vary only `proven`, so the proven-status requirement is the sole
+    # reason these values become admissible when it is removed.
+    for label, segments in (
+        ("boundary-unproven-outgoing", (
+            HistorySegment("local", "gui", "boot-a", 0, 4 * NS, False),
+            HistorySegment("export", "iod", "boot-a", 4 * NS, 8 * NS, True))),
+        ("boundary-unproven-incoming", (
+            HistorySegment("local", "gui", "boot-a", 0, 4 * NS, True),
+            HistorySegment("unproved", "iod", "boot-a", 4 * NS, 8 * NS, False))),
+    ):
+        _reject(
+            f"local_frame.{label}",
+            lambda segments=segments: LocalFrameOutcome(
+                2, ranking_request, (total(7, KEY),), segments,
+                (("boot-a", 4 * NS, "gui", "iod"),), (), (), (), False, False, False, True),
+        )
+
+    # LocalPartOutcome: one kind, one external subject, one canonical digest.
+    totals_value = share(7, since_boot)
+    part = LocalPartOutcome(
+        3, detail_request, KEY, totals_value,
+        local_answer_digest("totals", KEY, since_boot, totals_value),
+    )
+    assert part.value.window == since_boot
+    _assert_frozen(part, "data_digest")
+    series_value = series(7, since_boot)
+    for label, kwargs in (
+        ("worker_id.zero", {"worker_id": 0}),
+        ("request.ranking", {"request": ranking_request}),
+        ("request.files", {"request": files_request}),
+        ("request.missing-subject", {"request": QueryRequest("totals", since_boot)}),
+        ("key.mismatch", {"app_key": OTHER_KEY}),
+        # Recompute the digest for the deliberately mismatched external key, so
+        # the request association is the sole fault rather than a digest mismatch.
+        ("key.mismatch-valid-digest", {
+            "app_key": OTHER_KEY,
+            "data_digest": local_answer_digest("totals", OTHER_KEY, since_boot, totals_value),
+        }),
+        ("key.invalid", {"app_key": "exe:relative/path"}),
+        ("value.series", {"value": series_value}),
+        ("value.window", {"value": share(7, range_w)}),
+        ("digest.uppercase", {"data_digest": "A" * 64}),
+        ("digest.length", {"data_digest": "a" * 63}),
+        ("digest.nonhex", {"data_digest": "g" * 64}),
+        ("digest.wrong", {"data_digest": "b" * 64}),
+        ("digest.int", {"data_digest": 5}),
+    ):
+        base = {
+            "worker_id": 3,
+            "request": detail_request,
+            "app_key": KEY,
+            "value": totals_value,
+            "data_digest": local_answer_digest("totals", KEY, since_boot, totals_value),
+        }
+        _reject(
+            f"local_part.{label}",
+            lambda kwargs=kwargs, base=base: LocalPartOutcome(**{**base, **kwargs}),
+        )
+    series_request = QueryRequest("series", since_boot, KEY)
+    series_part = LocalPartOutcome(
+        4, series_request, KEY, series_value,
+        local_answer_digest("series", KEY, since_boot, series_value),
+    )
+    assert series_part.value.tier == "raw"
+    _reject(
+        "local_part.series-key-mismatch-valid-digest",
+        lambda: LocalPartOutcome(
+            4, series_request, OTHER_KEY, series_value,
+            local_answer_digest("series", OTHER_KEY, since_boot, series_value)),
+    )
+    forged_value_coverage = coverage()
+    object.__setattr__(forged_value_coverage.hook_hits, "vfs_read", -1)
+    _reject(
+        "local_part.forged-value",
+        lambda: LocalPartOutcome(3, detail_request, KEY,
+                                 replace(totals_value, coverage=forged_value_coverage),
+                                 "a" * 64),
+    )
+
+    # LocalFilesOutcome: typed table/coverage/served evidence, first page only.
+    overflow = UnknownOwnerOverflow(since_boot, "overflow_owner_unknown", 0, 0, 0, coverage())
+    file_table = FileTable(7, since_boot, (), "bytes_total", "desc", None, overflow, coverage())
+    file_coverage = FileCoverage(
+        7, since_boot, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        HookHits(0, 0, 0, 0, 0, 0), 0, 0, overflow, coverage(),
+    )
+    files_outcome = LocalFilesOutcome(4, files_request, KEY, file_table, file_coverage, 0)
+    assert files_outcome.coverage.served_interval == since_boot
+    assert LocalFilesOutcome(4, files_request, KEY, file_table, file_coverage, None).served_gap_count is None
+    _assert_frozen(files_outcome, "table")
+    unavailable_overflow = UnknownOwnerOverflow(
+        since_boot, "overflow_owner_unknown", 0, 0, 0, coverage(unavailable_reason="not_retained"))
+    unavailable_table = FileTable(
+        7, since_boot, (), "bytes_total", "desc", None, unavailable_overflow,
+        coverage(unavailable_reason="not_retained"))
+    unavailable_coverage = FileCoverage(
+        7, since_boot, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        HookHits(0, 0, 0, 0, 0, 0), 0, 0, unavailable_overflow,
+        coverage(unavailable_reason="not_retained"),
+    )
+    for label, kwargs in (
+        ("worker_id.zero", {"worker_id": 0}),
+        ("request.totals", {"request": detail_request}),
+        ("request.continuation", {"request": QueryRequest("files", since_boot, KEY, cursor="opaque")}),
+        ("key.mismatch", {"app_key": OTHER_KEY}),
+        ("table.type", {"table": {"app_id": 7}}),
+        ("table.window", {"table": replace(file_table, window=range_w)}),
+        ("table.sort", {"table": replace(file_table, sort="basename")}),
+        ("coverage.type", {"coverage": coverage()}),
+        ("coverage.window", {"coverage": replace(file_coverage, window=range_w)}),
+        ("coverage.app-id", {"coverage": replace(file_coverage, app_id=8)}),
+        ("coverage.tier", {"coverage": replace(file_coverage, coverage=coverage(tier="rollup_60s"))}),
+        ("coverage.gap", {"coverage": replace(file_coverage, coverage=coverage(gap_intervals=1))}),
+        ("coverage.unavailable", {"table": unavailable_table, "coverage": unavailable_coverage}),
+        ("served.negative", {"served_gap_count": -1}),
+        ("served.bool", {"served_gap_count": True}),
+    ):
+        base = {
+            "worker_id": 4,
+            "request": files_request,
+            "app_key": KEY,
+            "table": file_table,
+            "coverage": file_coverage,
+            "served_gap_count": 0,
+        }
+        _reject(
+            f"local_files.{label}",
+            lambda kwargs=kwargs, base=base: LocalFilesOutcome(**{**base, **kwargs}),
+        )
+    # Served evidence must lie inside the exact request. The positive control is
+    # an in-bounds subrange; the negative varies only its served end endpoint, so
+    # removing the served-bounds check is the sole reason it becomes admissible.
+    inside_served = Window("range", BOOT, 1_000_000_000, 15_000_000_000)
+    inside_overflow = UnknownOwnerOverflow(
+        inside_served, "overflow_owner_unknown", 0, 0, 0, coverage())
+    inside_table = FileTable(
+        7, since_boot, (), "bytes_total", "desc", None, inside_overflow, coverage())
+    inside_coverage = FileCoverage(
+        7, since_boot, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        HookHits(0, 0, 0, 0, 0, 0), 0, 0, inside_overflow, coverage(),
+    )
+    inside = LocalFilesOutcome(4, files_request, KEY, inside_table, inside_coverage, 0)
+    assert inside.coverage.served_interval == inside_served
+
+    wide_served = Window("range", BOOT, 1_000_000_000, 30_000_000_000)
+    wide_overflow = UnknownOwnerOverflow(
+        wide_served, "overflow_owner_unknown", 0, 0, 0, coverage())
+    wide_table = FileTable(
+        7, since_boot, (), "bytes_total", "desc", None, wide_overflow, coverage())
+    wide_coverage = FileCoverage(
+        7, since_boot, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        HookHits(0, 0, 0, 0, 0, 0), 0, 0, wide_overflow, coverage(),
+    )
+    assert wide_coverage.served_interval == wide_served
+    _reject(
+        "local_files.served-outside-request",
+        lambda: LocalFilesOutcome(4, files_request, KEY, wide_table, wide_coverage, 0),
+    )
+
+    # Settlement inputs carry exactly one terminal result or error.
+    finished = Future()
+    finished.set_result({"kind": "totals"})
+    remote_settlement = RemoteSettlement(finished, {"kind": "totals"})
+    assert remote_settlement.response is not None
+    failed_settlement = RemoteSettlement(finished, error=WindowUnavailableError(
+        "not_retained", "remote history is not retained"))
+    assert failed_settlement.response is None
+    _assert_frozen(remote_settlement, "response")
+    for label, kwargs in (
+        ("future.type", {"future": {"done": True}}),
+        ("both", {"response": {}, "error": RuntimeError("x")}),
+        ("neither", {"response": None, "error": None}),
+        ("response.list", {"response": []}),
+        ("error.base", {"response": None, "error": KeyboardInterrupt()}),
+    ):
+        base = {"future": finished, "response": {"kind": "totals"}, "error": None}
+        _reject(
+            f"remote_settlement.{label}",
+            lambda kwargs=kwargs, base=base: RemoteSettlement(**{**base, **kwargs}),
+        )
+
+    bracket = LocalBracket(local_vector, local_vector)
+    frame_settlement = LocalSettlement(2, outcome=frame, local_bracket=bracket)
+    assert frame_settlement.outcome is frame
+    assert LocalSettlement(3, error=RuntimeError("boom")).outcome is None
+    _assert_frozen(frame_settlement, "worker_id")
+    for label, kwargs in (
+        ("worker_id.zero", {"worker_id": 0}),
+        ("worker_id.bool", {"worker_id": True}),
+        ("both", {"outcome": frame, "error": RuntimeError("x")}),
+        ("neither", {"outcome": None, "error": None}),
+        ("outcome.type", {"outcome": {"worker_id": 2}}),
+        ("outcome.worker", {"outcome": part}),
+        ("error.base", {"outcome": None, "error": KeyboardInterrupt()}),
+        ("bracket.type", {"local_bracket": [local_vector, local_vector]}),
+    ):
+        base = {"worker_id": 2, "outcome": frame, "error": None, "local_bracket": None}
+        _reject(
+            f"local_settlement.{label}",
+            lambda kwargs=kwargs, base=base: LocalSettlement(**{**base, **kwargs}),
+        )
+
     # -- the neutral module stays free of client/router/query/Qt ----------- #
     probe = (
         "import sys\n"
@@ -595,3 +1073,422 @@ def test_live_records_validate_every_field_and_phase_combination() -> None:
         [sys.executable, "-c", probe], capture_output=True, text=True, timeout=120
     )
     assert result.returncode == 0, result.stderr
+
+
+class _IdleClient:
+    """A verified-not-answering stub: a local frame must issue no query."""
+
+    state = ClientState()
+
+    def query(self, request):  # pragma: no cover - a local frame never asks
+        raise AssertionError(f"unexpected daemon query: {request.kind}")
+
+
+def _committed_store(path, apps, *, owner="gui", start=100, end=110):
+    """One committed synthetic store with a per-app delta across one tick pair."""
+
+    store = AppIoStore(path)
+    store.start_boot(BOOT, 1, 0, 1000.0, owner)
+    for key, app_id, _amount in apps:
+        store.connection.execute(
+            "INSERT INTO app VALUES (?,?,?,NULL,0,0,'user')",
+            (app_id, key, key.partition(":")[2]),
+        )
+    store.connection.commit()
+    store.start_collector(owner, BOOT, start * NS)
+    state = None
+    for seq, at in ((0, start), (1, end)):
+        processes = tuple(
+            StableProcRecord(
+                ProcessIdentity(BOOT, 410 + index, 100), 1, 1000, key, "/fixture",
+                AppKeyInputs("/fixture", key.partition(":")[2]),
+                IoReadOutcome("readable", (100 + seq * amount,) * 4, None, None),
+            )
+            for index, (key, _app_id, amount) in enumerate(apps)
+        )
+        observation = TickInput(BOOT, owner, 1, seq, at * NS, (1000 + at) * NS, processes, ())
+        frame, state = baseline_seed(observation) if seq == 0 else aggregate_tick(state, observation)
+        store.record_tick(frame, state)
+    return store
+
+
+def _registered_paths(*sources):
+    return tuple(
+        (name, store.connection.execute("PRAGMA database_list").fetchone()[2], owner)
+        for name, store, owner in sources
+    )
+
+
+def test_local_detail_is_lazy_selected_subject_only(tmp_path, monkeypatch):
+    """A frame copy proves routing only; selection builds one kind and subject.
+
+    `_read_local` returns no part map and calls neither reducer sequence. A
+    selected detail resolves the external AppKey inside each private snapshot,
+    so store-local numeric IDs never come from the presentation registry. A real
+    computation barrier on the background lane also proves the frame lane keeps
+    executing while detail work is held inside its worker.
+    """
+
+    alpha_id, beta_id, export_alpha_id = 17, 18, 3
+    local = _committed_store(
+        tmp_path / "local.db", ((ALPHA, alpha_id, 20), (BETA, beta_id, 7)))
+    root = None
+    router = None
+    release = threading.Event()
+    try:
+        paths = _registered_paths(("local", local, "gui"))
+        scope = Window("range", BOOT, 100 * NS, 140 * NS)
+
+        computations: list[tuple[str, str | None, Window]] = []
+        local_ids: list[tuple[str, int]] = []
+        originals = {"totals": QueryService.disk_share, "series": QueryService.series}
+
+        def observe(kind, service, app_id, window):
+            row = service.connection.execute(
+                "SELECT key FROM app WHERE app_id=?", (app_id,)).fetchone()
+            computations.append((kind, row[0] if row is not None else None, window))
+            local_ids.append((kind, app_id))
+            return originals[kind](service, app_id, window)
+
+        monkeypatch.setattr(
+            QueryService, "disk_share",
+            lambda service, app_id, window: observe("totals", service, app_id, window))
+        monkeypatch.setattr(
+            QueryService, "series",
+            lambda service, app_id, window: observe("series", service, app_id, window))
+
+        frame = HistoryRouter._read_local(
+            paths, scope, worker_id=1, request=QueryRequest("ranking", scope))
+        assert isinstance(frame, LocalFrameOutcome)
+        assert not hasattr(frame, "parts")
+        assert computations == []
+        assert {row.app_key for row in frame.ranking} == {ALPHA, BETA}
+        assert all(row.app_id > 0 for row in frame.ranking)
+        assert [segment.collector_id for segment in frame.segments] == ["local", "unproved"]
+        assert frame.gaps == ((BOOT, 110 * NS, 140 * NS),)
+        assert frame.segments[0].proven is True
+        assert frame.segments[1].proven is False
+        assert frame.known_gaps == ()
+        assert frame.file_available is False
+
+        part = HistoryRouter._read_local_part(
+            paths, QueryRequest("totals", scope, ALPHA), worker_id=2, app_key=ALPHA)
+        assert isinstance(part, LocalPartOutcome)
+        assert part.worker_id == 2 and part.value.window == scope
+        assert (part.value.task_read_bytes, part.value.task_write_bytes) == (20, 20)
+        assert part.value.coverage.gap_intervals == 1
+        assert not part.value.coverage.complete
+        assert part.data_digest == local_answer_digest(
+            "totals", part.app_key, scope, part.value)
+        assert computations == [("totals", ALPHA, scope)]
+        assert local_ids == [("totals", alpha_id)]  # the private store's own id
+
+        series_part = HistoryRouter._read_local_part(
+            paths, QueryRequest("series", scope, ALPHA), worker_id=3, app_key=ALPHA)
+        assert isinstance(series_part, LocalPartOutcome)
+        assert series_part.value.tier == "raw"
+        assert sum(point.read_bytes for point in series_part.value.points) == 20
+        assert [kind for kind, _key, _window in computations] == ["totals", "series"]
+        assert all(key == ALPHA for _kind, key, _window in computations)
+
+        # Each private snapshot resolves the same AppKey to its own numeric id:
+        # the second store holds alpha as id 3, not the first store's 17.
+        root = _committed_store(
+            tmp_path / "root.db", ((ALPHA, export_alpha_id, 30),),
+            owner="iod", start=110, end=120)
+        merged_paths = paths + _registered_paths(("export", root, "iod"))
+        computations.clear()
+        local_ids.clear()
+        merged = HistoryRouter._read_local_part(
+            merged_paths, QueryRequest("totals", scope, ALPHA), worker_id=4, app_key=ALPHA)
+        assert isinstance(merged, LocalPartOutcome)
+        assert merged.value.task_read_bytes == 50
+        assert merged.value.coverage.gap_intervals == 1
+        assert local_ids == [("totals", alpha_id), ("totals", export_alpha_id)]
+        assert computations == [("totals", ALPHA, scope), ("totals", ALPHA, scope)]
+
+        # D03: a held detail computation must not serialize the frame lane.
+        computations.clear()
+        local_ids.clear()
+        router = HistoryRouter(QueryService(local), _IdleClient(), AppRegistry())
+        authority = ("local", (("local", "gui", 1),))
+        vector = LocalPositionVector((LocalPosition("local", "gui", 1, 1, 0),))
+        entered = threading.Event()
+        token = RequestToken(
+            11, QueryRequest("totals", scope, ALPHA), "local",
+            retention_scope(ALPHA, scope), "detail", 1, None, authority, vector,
+        )
+
+        def held_detail():
+            entered.set()
+            # A longer bound than the frame wait: if both lanes shared one
+            # worker this hold would outlive the frame assertion below.
+            assert release.wait(15), "the detail worker was never released"
+            return HistoryRouter._read_local_part(
+                paths, QueryRequest("totals", scope, ALPHA),
+                worker_id=token.token_id, app_key=ALPHA)
+
+        assert router._frame_executor is not router._background_executor
+        assert router._submit_background_worker(token, held_detail) is not None
+        assert entered.wait(5)
+        router.prepare(scope)
+        outcome = router._local_future.result(timeout=10)
+        assert isinstance(outcome, LocalFrameOutcome)
+        assert release.is_set() is False, "the frame waited for the held detail"
+        assert router.ready(scope)
+        assert router.pending_work
+        assert router._background_charge("detail") == 1
+
+        # Two charged detail Futures is the hard lane bound: with both live, a
+        # third admission must refuse rather than submit unbounded stale work.
+        second = RequestToken(
+            12, QueryRequest("totals", scope, ALPHA), "local",
+            retention_scope(ALPHA, scope), "detail", 2, None, authority, vector,
+        )
+
+        def held_second():
+            assert release.wait(15), "the second detail worker was never released"
+            return HistoryRouter._read_local_part(
+                paths, QueryRequest("totals", scope, ALPHA), worker_id=12, app_key=ALPHA)
+
+        assert router._submit_background_worker(second, held_second) is not None
+        third = RequestToken(
+            13, QueryRequest("totals", scope, ALPHA), "local",
+            retention_scope(ALPHA, scope), "detail", 3, None, authority, vector,
+        )
+        assert router._submit_background_worker(third, held_second) is None
+        assert router._background_charge("detail") == 2
+
+        release.set()
+        settled = [router._completed.get(timeout=10) for _ in range(2)]
+        assert {item[0].token_id for item in settled} == {token.token_id, second.token_id}
+        for settled_token, settlement in settled:
+            assert isinstance(settlement, LocalSettlement)
+            assert settlement.worker_id == settled_token.token_id
+            assert isinstance(settlement.outcome, LocalPartOutcome)
+            assert settlement.outcome.value.window == scope
+        # A done callback never releases charged capacity; only an owner drain does.
+        assert router._background_charge("detail") == 2
+        router._reap_background_worker(token.token_id)
+        router._reap_background_worker(second.token_id)
+        assert router._background_charge("detail") == 0
+
+        # One authoritative background ledger: the legacy local Files path and
+        # helper submissions reserve against the same Files/total charges. Eight
+        # Files charges include the helper, so a ninth Files request and another
+        # helper Files job must both refuse instead of running a second budget.
+        files_release = threading.Event()
+        files_started = threading.Event()
+        original_files = router._read_local_files
+
+        def held_files(*args, **kwargs):
+            files_started.set()
+            assert files_release.wait(15), "the Files worker was never released"
+            return original_files(*args, **kwargs)
+
+        monkeypatch.setattr(router, "_read_local_files", held_files)
+        presentation = router.registry.id_for(ALPHA)
+        files_futures = [
+            router.request_file_view(presentation, scope, "bytes_total", "desc", None)
+            for _ in range(4)
+        ]
+        assert files_started.wait(5)
+        helper_files = RequestToken(
+            21, QueryRequest("files", scope, ALPHA), "local", None, "files", 6, None,
+            authority, vector,
+        )
+
+        def held_helper_files():
+            assert files_release.wait(15), "the helper Files worker was never released"
+            raise WindowUnavailableError("file_source_unavailable", "held Files worker")
+
+        assert router._submit_background_worker(helper_files, held_helper_files) is not None
+        assert router._background_charge("files") == 5
+        for _ in range(3):
+            files_futures.append(
+                router.request_file_view(presentation, scope, "bytes_total", "desc", None))
+        assert router._background_charge("files") == 8
+        rejected = router.request_file_view(presentation, scope, "bytes_total", "desc", None)
+        with pytest.raises(RequestRejected) as refused:
+            rejected.result(timeout=5)
+        assert refused.value.reason == "query_busy"
+        # A fresh explicit helper id stays outside the implicit allocator's
+        # current range; the refusal below must come from capacity, not a
+        # colliding binding.
+        extra_files = RequestToken(
+            30, QueryRequest("files", scope, ALPHA), "local", None, "files", 7, None,
+            authority, vector,
+        )
+        assert router._submit_background_worker(extra_files, held_helper_files) is None
+
+        files_release.set()
+        for future in files_futures:
+            future.exception(timeout=15)
+        helper_token, helper_settlement = router._completed.get(timeout=15)
+        assert helper_token is helper_files
+        assert isinstance(helper_settlement, LocalSettlement)
+        assert isinstance(helper_settlement.error, WindowUnavailableError)
+        # Terminal Files charges stay charged until an owner reap: the same ledger
+        # that admitted them releases them, never a worker-thread done callback.
+        assert router._background_charge("files") == 8
+        router._reap_terminal_background_workers()
+        assert router._background_charge("files") == 0
+        assert not router._worker_jobs
+
+        # Close retires publication, never resource accounting. A running worker
+        # keeps its binding until it terminates and is reaped through this same
+        # owner path; its late outcome is dropped instead of published.
+        close_release = threading.Event()
+        close_started = threading.Event()
+
+        def held_close(worker_id):
+            def work():
+                close_started.set()
+                assert close_release.wait(15), "the close worker was never released"
+                return HistoryRouter._read_local_part(
+                    paths, QueryRequest("totals", scope, ALPHA),
+                    worker_id=worker_id, app_key=ALPHA)
+            return work
+
+        closing = RequestToken(
+            31, QueryRequest("totals", scope, ALPHA), "local",
+            retention_scope(ALPHA, scope), "detail", 9, None, authority, vector,
+        )
+        close_job = router._submit_background_worker(closing, held_close(closing.token_id))
+        assert close_job is not None
+        assert close_started.wait(5)
+        router.close()
+        assert close_job.running() is True
+        assert closing.token_id in router._worker_jobs
+        assert router._background_charge("detail") == 1
+        assert router.pending_work
+        close_release.set()
+        assert close_job.result(timeout=15) is None
+        assert router._background_charge("detail") == 1
+        assert router.pending_work
+        router._reap_background_worker(closing.token_id)
+        assert router._background_charge("detail") == 0
+        assert router._completed.empty()
+        assert router.pending_work is False
+    finally:
+        release.set()
+        if router is not None:
+            router.close()
+        if root is not None:
+            root.connection.close()
+        local.connection.close()
+
+
+def test_worker_ids_are_never_reused_across_helper_and_files_admission(tmp_path, monkeypatch):
+    """One collision-safe worker-id authority for helper and public Files work.
+
+    The implicit Files allocator must never hand out an id that an admitted
+    helper already owns. Each submitted Future then keeps exactly one charge,
+    the shared ceiling refuses the eleventh submission instead of silently
+    rebinding a running worker, and close() retains that worker's charge.
+    """
+
+    local = _committed_store(tmp_path / "local.db", ((ALPHA, 17, 20),))
+    router = None
+    release = threading.Event()
+    entered = threading.Event()
+    submitted: list[Future] = []
+    try:
+        paths = _registered_paths(("local", local, "gui"))
+        scope = Window("range", BOOT, 100 * NS, 140 * NS)
+        router = HistoryRouter(QueryService(local), _IdleClient(), AppRegistry())
+        authority = ("local", (("local", "gui", 1),))
+        vector = LocalPositionVector((LocalPosition("local", "gui", 1, 1, 0),))
+        router.prepare(scope)
+        assert isinstance(router._local_future.result(timeout=10), LocalFrameOutcome)
+        assert router.ready(scope)
+        assert router.pending_work is False
+
+        actual_submit = router._background_executor.submit
+
+        def counted_submit(work, /, *args, **kwargs):
+            future = actual_submit(work, *args, **kwargs)
+            submitted.append(future)
+            return future
+
+        monkeypatch.setattr(router._background_executor, "submit", counted_submit)
+
+        # The helper takes exactly the id the implicit Files allocator would
+        # otherwise return for the first legacy Files request.
+        helper_id = router._next_token_id
+        helper = RequestToken(
+            helper_id, QueryRequest("totals", scope, ALPHA), "local",
+            retention_scope(ALPHA, scope), "detail", 1, None, authority, vector,
+        )
+
+        def held_detail():
+            entered.set()
+            assert release.wait(15), "the helper worker was never released"
+            return HistoryRouter._read_local_part(
+                paths, QueryRequest("totals", scope, ALPHA),
+                worker_id=helper_id, app_key=ALPHA)
+
+        helper_job = router._submit_background_worker(helper, held_detail)
+        assert helper_job is not None and entered.wait(5)
+        assert router._worker_jobs[helper_id][0] == "detail"
+        assert router._background_charge("detail") == 1
+
+        presentation = router.registry.id_for(ALPHA)
+        router.request_file_view(presentation, scope, "bytes_total", "desc", None)
+
+        def held_helper_worker():
+            assert False, "a queued helper worker must never run in this control"
+
+        for worker_id in range(102, 109):
+            helper_files = RequestToken(
+                worker_id, QueryRequest("files", scope, ALPHA), "local", None,
+                "files", worker_id, None, authority, vector,
+            )
+            assert router._submit_background_worker(
+                helper_files, held_helper_worker) is not None
+
+        second = RequestToken(
+            100, QueryRequest("totals", scope, ALPHA), "local",
+            retention_scope(ALPHA, scope), "detail", 2, None, authority, vector,
+        )
+        assert router._submit_background_worker(second, held_detail) is not None
+
+        # The eleventh submission attempt must meet the ten-job ceiling. If an
+        # implicit id overwrote the first helper's binding, this token is
+        # admitted against a ledger that has already lost one real charge.
+        third = RequestToken(
+            101, QueryRequest("totals", scope, ALPHA), "local",
+            retention_scope(ALPHA, scope), "detail", 3, None, authority, vector,
+        )
+        eleventh = router._submit_background_worker(third, held_detail)
+
+        # Every actual executor submission owns one distinct live charge.
+        assert len(submitted) == len(router._worker_jobs) == 10, (
+            f"{len(submitted)} submitted Futures against "
+            f"{len(router._worker_jobs)} recorded charges")
+        assert eleventh is None
+        assert router._worker_jobs[helper_id][0] == "detail"
+        assert router._background_charge("detail") == 2
+        assert router._background_charge("files") == 8
+
+        # Close retires publication, never a running worker's resource. With an
+        # overwritten binding this ledger emptied while the worker still ran.
+        router.close()
+        assert helper_job.running() is True
+        assert router._worker_jobs[helper_id][0] == "detail"
+        assert len(router._worker_jobs) == 1
+        assert router._background_charge("detail") == 1
+        assert router.pending_work
+        release.set()
+        assert helper_job.result(timeout=15) is None
+        assert router._background_charge("detail") == 1
+        assert router.pending_work
+        router._reap_background_worker(helper_id)
+        assert router._background_charge("detail") == 0
+        assert router._completed.empty()
+        assert router.pending_work is False
+    finally:
+        release.set()
+        if router is not None:
+            router.close()
+        local.connection.close()
