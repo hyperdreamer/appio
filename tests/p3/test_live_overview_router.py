@@ -354,12 +354,20 @@ def test_live_records_validate_every_field_and_phase_combination() -> None:
     assert series_record.value.tier == "raw"
     _reject("record.totals-with-series", lambda: RetainedRecord(series_value, provenance))
     _reject("record.series-with-share", lambda: RetainedRecord(a, series_provenance))
-    _reject(
-        "record.ranking",
-        lambda: RetainedRecord(
-            a, AnswerProvenance("ranking", KEY, scope, since_boot, identity, 0, None, None)
-        ),
+    # The ranking negative first builds a *valid* ranking provenance: combining
+    # kind ranking with a totals identity fails in AnswerProvenance instead.
+    ranking_provenance = AnswerProvenance(
+        "ranking",
+        KEY,
+        scope,
+        since_boot,
+        AcceptedIdentity("ranking", KEY, since_boot, DIGEST),
+        1_000_000_000,
+        None,
+        None,
     )
+    assert ranking_provenance.kind == "ranking"
+    _reject("record.ranking", lambda: RetainedRecord(a, ranking_provenance))
     _reject(
         "record.window-mismatch",
         lambda: RetainedRecord(share(7, range_w), provenance),
@@ -367,6 +375,22 @@ def test_live_records_validate_every_field_and_phase_combination() -> None:
     _reject(
         "record.provenance-type",
         lambda: RetainedRecord(a, {"kind": "totals"}),  # type: ignore[arg-type]
+    )
+
+    # A forged grandchild inside an otherwise valid value is not trusted:
+    # contracts validate their children's *types* only. Each control changes
+    # exactly one nested field, so only the recursive walk can reject it.
+    forged_row = DeviceShareRow("boot-a", "8:0", 9, 5, 14)
+    object.__setattr__(forged_row, "rbytes", True)
+    _reject(
+        "record.forged-device-row",
+        lambda: RetainedRecord(replace(a, devices=(forged_row,)), provenance),
+    )
+    forged_grandchild = coverage()
+    object.__setattr__(forged_grandchild.hook_hits, "vfs_read", -1)
+    _reject(
+        "record.forged-hook-hits",
+        lambda: RetainedRecord(replace(a, coverage=forged_grandchild), provenance),
     )
 
     # -- PartState truth table --------------------------------------------- #
@@ -387,6 +411,14 @@ def test_live_records_validate_every_field_and_phase_combination() -> None:
     _reject("part.ok-reason", lambda: PartState("totals", KEY, scope, "ok", 1, since_boot, totals_record, "why"))
     _reject("part.ok-key", lambda: PartState("totals", OTHER_KEY, retention_scope(OTHER_KEY, since_boot), "ok", 1, since_boot, totals_record, None))
     _reject("part.ok-kind", lambda: PartState("series", KEY, scope, "ok", 1, since_boot, totals_record, None))
+    # Same scope, different since-boot endpoint: only the exact record/token
+    # Window comparison can reject this, because the scope tuple is equal.
+    newer_endpoint = Window("since_boot", "boot-a", end_mono_ns=30_000_000_000)
+    assert retention_scope(KEY, newer_endpoint) == scope
+    _reject(
+        "part.ok-endpoint",
+        lambda: PartState("totals", KEY, scope, "ok", 1, newer_endpoint, totals_record, None),
+    )
     _reject("part.ok-window", lambda: PartState("totals", KEY, scope, "ok", 1, range_w, totals_record, None))
     _reject("part.failed-no-reason", lambda: PartState("totals", KEY, scope, "failed", 1, since_boot, None, None))
     _reject("part.failed-empty-reason", lambda: PartState("totals", KEY, scope, "failed", 1, since_boot, None, ""))
@@ -414,8 +446,17 @@ def test_live_records_validate_every_field_and_phase_combination() -> None:
         ("generation.bool", {"generation": True}),
         ("window.forged", {"window": forged_window}),
         ("requested.type", {"requested_source": {"boot_id": "boot-a"}}),
-        ("requested.local-without-bracket", {"requested_source": tolerant}),
-        ("answered.local-without-bracket", {"requested_source": remote, "answered_source": tolerant}),
+        # Isolated from certification: no answered source and certified=False,
+        # so only the missing local-request bracket can reject this shape.
+        (
+            "requested.local-without-bracket",
+            {"requested_source": tolerant, "answered_source": None, "certified": False},
+        ),
+        # Remote-to-local fallback: only the missing local bracket can reject it.
+        (
+            "answered.local-fallback-without-bracket",
+            {"requested_source": remote, "answered_source": tolerant, "certified": False},
+        ),
         ("answered.remote-with-bracket", {"answered_source": remote, "local_bracket": bracket}),
         ("certified.not-bool", {"certified": 1}),
         ("certified.empty", {"answered_source": None}),
@@ -464,11 +505,21 @@ def test_live_records_validate_every_field_and_phase_combination() -> None:
         "series_metadata.forged-coverage",
         lambda: SeriesMetadata(7, KEY, since_boot, "raw", forged_coverage),
     )
+    forged_hook_hits = coverage()
+    object.__setattr__(forged_hook_hits.hook_hits, "vfs_read", -1)
+    _reject(
+        "series_metadata.forged-hook-hits",
+        lambda: SeriesMetadata(7, KEY, since_boot, "raw", forged_hook_hits),
+    )
 
     # -- canonical local-answer digest ------------------------------------- #
     base_digest = local_answer_digest("totals", KEY, since_boot, a)
     assert len(base_digest) == 64
     assert set(base_digest) <= set("0123456789abcdef")
+    # Independently encoded canonical vector: this literal was derived from a
+    # hand-built §2.1 payload (domain tag, every Window and contract field,
+    # app_id omitted), so it pins the tag and encoding, not just determinism.
+    assert base_digest == "70c6320069cb9128073ef4915deefd5056a58ae2ddced05fb718156e7c9fc5af"
     assert base_digest == local_answer_digest("totals", KEY, since_boot, a)
     assert base_digest != local_answer_digest("totals", KEY, range_w, share(7, range_w))
     assert base_digest != local_answer_digest("totals", KEY, since_boot, replace(a, device_read_bytes=None, device_write_bytes=None, device_total_bytes=None, residual_read=None, residual_write=None, residual_total=None))
@@ -489,6 +540,13 @@ def test_live_records_validate_every_field_and_phase_combination() -> None:
     ranking_digest = local_answer_digest("ranking", KEY, since_boot, ranking_value)
     assert ranking_digest == local_answer_digest("ranking", KEY, since_boot, replace(ranking_value, app_id=91))
     assert ranking_digest != local_answer_digest("ranking", KEY, since_boot, total(7, KEY, peak=5))
+    # Presentation identity is not external: app_id stays omitted, but every
+    # Window field (including launch_id) enters the encoded payload.
+    launch_a = Window("launch", "boot-a", launch_id=7)
+    launch_b = Window("launch", "boot-a", launch_id=8)
+    assert local_answer_digest("totals", KEY, launch_a, share(7, launch_a)) != local_answer_digest(
+        "totals", KEY, launch_b, share(7, launch_b)
+    )
     _reject("digest.ranking-key", lambda: local_answer_digest("ranking", KEY, since_boot, total(7, OTHER_KEY)))
     _reject("digest.ranking-share", lambda: local_answer_digest("ranking", KEY, since_boot, a))
 

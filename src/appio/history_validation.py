@@ -24,6 +24,8 @@ from dataclasses import fields, is_dataclass
 
 from .contracts import (
     LAUNCH_WINDOW_MESSAGE,
+    MAX_RANGE_NS,
+    RANGE_TOO_LONG_MESSAGE,
     AppTotal,
     Coverage,
     DiskShare,
@@ -232,6 +234,10 @@ def _normalize_request(request: QueryRequest) -> QueryRequest:
     if window.kind == "launch":
         raise WindowUnavailableError("launch_attribution", LAUNCH_WINDOW_MESSAGE)
     validate_window(window)
+    if window.kind == "range" and window.end_mono_ns - window.start_mono_ns > MAX_RANGE_NS:
+        # A22 precedence: the range refusal precedes subject/selector resolution
+        # and the exact MAX_RANGE_NS boundary stays valid, as the wire path has it.
+        raise WindowUnavailableError("unsupported_window", RANGE_TOO_LONG_MESSAGE)
 
     app_key = request.app_key
     if app_key is not None:
@@ -287,6 +293,8 @@ def _normalize_request(request: QueryRequest) -> QueryRequest:
     if cursor is not None:
         if not isinstance(cursor, str) or cursor == "":
             raise ValueError("query.cursor must be nonempty text or None")
+        if "\x00" in cursor:
+            raise ValueError("query.cursor must not contain NUL")
         try:
             cursor_bytes = len(cursor.encode("utf-8"))
         except UnicodeEncodeError as error:
@@ -314,11 +322,16 @@ def _normalize_request(request: QueryRequest) -> QueryRequest:
 # ---------------------------------------------------------------------------
 
 
-def _validate_ranking(value: object) -> None:
-    if not isinstance(value, (list, tuple)):
-        raise ValueError("a ranking result is a sequence of AppTotal rows")
+def _validate_ranking(value: object, *, allow_tuple: bool = False) -> None:
+    if allow_tuple:
+        if not isinstance(value, (list, tuple)):
+            raise ValueError("a ranking result is a sequence of AppTotal rows")
+    elif not isinstance(value, list):
+        # The public remote selector answers a JSON array; the tuple shape
+        # belongs only to an internal local worker outcome.
+        raise ValueError("a remote ranking result is a list of AppTotal rows")
     seen: set[str] = set()
-    for row in value:
+    for row in value:  # type: ignore[union-attr]
         if not isinstance(row, AppTotal):
             raise ValueError("a ranking result contains only AppTotal rows")
         _revalidate_tree(row)
@@ -397,7 +410,12 @@ def _validate_series(value: object, request: QueryRequest, app_key: str) -> None
 
 
 def _validate_served_bounds(served: Window | None, request: QueryRequest) -> None:
-    """A defined served range lies in the request's boot and requested bounds."""
+    """A served interval is either the requested Window or a bounded range in it.
+
+    §5.4 preserves the successful totals-only since-boot/lifetime forms: those
+    retain the exact requested Window and invent no endpoints. A bounded served
+    range must instead carry the request's boot and lie inside its bounds.
+    """
 
     if served is None:
         raise ValueError("file context must define its served interval")
@@ -406,8 +424,12 @@ def _validate_served_bounds(served: Window | None, request: QueryRequest) -> Non
     validate_window(served)
     window = request.window
     if window.kind == "lifetime":
-        # The lifetime compatibility carrier keeps the requested Window and
-        # invents no endpoints; no bounded containment is provable.
+        # The lifetime compatibility carrier is that same lifetime Window; an
+        # arbitrary range (on any boot) or a launch Window is another scope.
+        if served != window:
+            raise ValueError("a lifetime file context retains the requested lifetime window")
+        return
+    if served == window:
         return
     if served.kind != "range":
         raise ValueError("a bounded served interval is a range window")
@@ -432,6 +454,8 @@ def _validate_files(value: object, request: QueryRequest) -> None:
         raise ValueError("a files page must echo the requested direction")
     if value.search != request.search:
         raise ValueError("a files page must echo the normalized requested search")
+    if len(value.rows) > request.limit:
+        raise ValueError("a files page exceeds the requested page limit")
     _validate_served_bounds(value.unknown_owner_overflow.window, request)
 
 
@@ -504,7 +528,11 @@ def validate_query_result(
     echo = response.get("app_key", _MISSING)
 
     if normalized.kind == "coverage":
-        if snapshot is not None:
+        if normalized.coverage_kind == "file":
+            # File coverage joins the Files page sequence, whose owner needs a
+            # valid snapshot before any cache insertion or owner settlement.
+            _validate_snapshot(snapshot)
+        elif snapshot is not None:
             _validate_snapshot(snapshot)
         _validate_continuation(next_cursor, allow=False)
         _validate_coverage(result, normalized, echo)
@@ -530,6 +558,21 @@ def validate_query_result(
     _check_echo(echo, normalized.app_key)
     _validate_continuation(next_cursor, allow=True)
     _validate_files(result, normalized)
+
+
+def _validate_local_ranking(request: QueryRequest, value: object) -> None:
+    """Validate a local worker ranking row sequence, without a remote envelope.
+
+    ``LocalFrameOutcome.ranking`` is a tuple, so the local form keeps that shape;
+    the public remote selector accepts only its JSON array. Empty local ranking
+    is structurally valid, and the remote ownership restrictions stay in the
+    router.
+    """
+
+    normalized = _normalize_request(request)
+    if normalized.kind != "ranking":
+        raise ValueError("a local ranking value needs a ranking request")
+    _validate_ranking(value, allow_tuple=True)
 
 
 def _validate_local_series(request: QueryRequest, app_key: str, value: object) -> None:

@@ -12,8 +12,12 @@ from dataclasses import replace
 import pytest
 
 from appio.contracts import (
+    MAX_RANGE_NS,
+    RANGE_TOO_LONG_MESSAGE,
     DeviceSeriesPoint,
     FileCoverage,
+    FileRow,
+    FileTable,
     HookHits,
     ResidualPoint,
     Series,
@@ -25,12 +29,13 @@ from appio.contracts import (
 from appio.history_validation import (
     _normalize_request,
     _validate_local_coverage,
+    _validate_local_ranking,
     _validate_local_series,
     _validate_local_totals,
     validate_query_result,
 )
 from appio.ipc_models import QueryRequest
-from live_overview_support import coverage, share
+from live_overview_support import coverage, share, total
 
 KEY = "unit:alpha.service"
 OTHER_KEY = "unit:beta.service"
@@ -74,6 +79,41 @@ def _unknown_owner(window: Window, *, unavailable: bool = False) -> UnknownOwner
         overflow_bytes_r=0,
         overflow_bytes_w=0,
         coverage=coverage(unavailable_reason="not_retained") if unavailable else coverage(),
+    )
+
+
+def _file_row(path_id: int) -> FileRow:
+    return FileRow(
+        path_id=path_id,
+        basename=f"file-{path_id}.txt",
+        state="resolved",
+        identity_weak=False,
+        dev="8:0",
+        inode=1_000 + path_id,
+        generation=1,
+        reads=1,
+        writes=1,
+        bytes_r=17,
+        bytes_w=5,
+        bytes_total=22,
+        last_seen_boot_id=BOOT,
+        last_seen_mono_ns=1,
+    )
+
+
+def _file_table(window: Window, *, rows: int = 0,
+                served: Window | None = None) -> FileTable:
+    return FileTable(
+        app_id=7,
+        window=window,
+        rows=tuple(_file_row(path_id) for path_id in range(1, rows + 1)),
+        sort="bytes_total",
+        direction="desc",
+        search=None,
+        unknown_owner_overflow=_unknown_owner(
+            served if served is not None else window
+        ),
+        coverage=coverage(),
     )
 
 
@@ -277,6 +317,124 @@ def test_each_coverage_selector_accepts_only_its_contract_shape() -> None:
     lifetime_overflow = QueryRequest("coverage", lived, coverage_kind="unknown_owner")
     validate_query_result(lifetime_overflow, _response("coverage", _unknown_owner(lived)))
 
+    # -- supported whole-boot / lifetime served carriers (all selectors) ----- #
+    # A totals-only since-boot answer retains the exact requested Window and
+    # invents no endpoints; this is the producer's own carrier.
+    boot_window = Window("since_boot", BOOT, end_mono_ns=20_000_000_000)
+    inside = Window("range", BOOT, 2_000_000_000, 10_000_000_000)
+    boot_file_request = QueryRequest(
+        "coverage", boot_window, app_key=KEY, coverage_kind="file"
+    )
+    boot_file = _response("coverage", _file_coverage(boot_window), app_key=KEY)
+    validate_query_result(boot_file_request, boot_file)
+    validate_query_result(
+        boot_file_request,
+        {**boot_file, "result": _file_coverage(boot_window, served=inside)},
+    )
+    boot_overflow_request = QueryRequest(
+        "coverage", boot_window, coverage_kind="unknown_owner"
+    )
+    boot_overflow = _response("coverage", _unknown_owner(boot_window))
+    validate_query_result(boot_overflow_request, boot_overflow)
+    validate_query_result(
+        boot_overflow_request,
+        {**boot_overflow, "result": _unknown_owner(inside)},
+    )
+    boot_files_request = QueryRequest("files", boot_window, app_key=KEY)
+    boot_table = _response("files", _file_table(boot_window), app_key=KEY)
+    validate_query_result(boot_files_request, boot_table)
+    # A bounded served range must keep the request's boot and lie inside the
+    # requested since-boot bounds.
+    wrong_boot = Window("range", "boot-b", 2_000_000_000, 10_000_000_000)
+    beyond_boot = Window("range", BOOT, 2_000_000_000, 25_000_000_000)
+    for wrong in (wrong_boot, beyond_boot):
+        with pytest.raises(ValueError):
+            validate_query_result(
+                boot_file_request,
+                {**boot_file, "result": _file_coverage(boot_window, served=wrong)},
+            )
+        with pytest.raises(ValueError):
+            validate_query_result(
+                boot_overflow_request,
+                {**boot_overflow, "result": _unknown_owner(wrong)},
+            )
+        with pytest.raises(ValueError):
+            validate_query_result(
+                boot_files_request,
+                {**boot_table, "result": _file_table(boot_window, served=wrong)},
+            )
+
+    # The lifetime carrier must remain the requested lifetime Window: an
+    # arbitrary range (any boot) or a launch Window is another scope.
+    lifetime_file_request = QueryRequest(
+        "coverage", lived, app_key=KEY, coverage_kind="file"
+    )
+    lifetime_file = _response("coverage", _file_coverage(lived), app_key=KEY)
+    validate_query_result(lifetime_file_request, lifetime_file)
+    lifetime_files_request = QueryRequest("files", lived, app_key=KEY)
+    lifetime_table = _response("files", _file_table(lived), app_key=KEY)
+    validate_query_result(lifetime_files_request, lifetime_table)
+    for wrong in (
+        Window("range", BOOT, 2_000_000_000, 10_000_000_000),
+        Window("launch", BOOT, launch_id=7),
+    ):
+        with pytest.raises(ValueError):
+            validate_query_result(
+                lifetime_file_request,
+                {**lifetime_file, "result": _file_coverage(lived, served=wrong)},
+            )
+        with pytest.raises(ValueError):
+            validate_query_result(
+                lifetime_overflow,
+                _response("coverage", _unknown_owner(wrong)),
+            )
+        with pytest.raises(ValueError):
+            validate_query_result(
+                lifetime_files_request,
+                {**lifetime_table, "result": _file_table(lived, served=wrong)},
+            )
+
+    # File coverage joins the Files page sequence, so it needs a valid snapshot
+    # even though plain process coverage does not carry one at this boundary.
+    validate_query_result(file_request, file_valid)
+    with pytest.raises(ValueError):
+        validate_query_result(file_request, {**file_valid, "snapshot": None})
+    with pytest.raises(ValueError):
+        validate_query_result(file_request, {**file_valid, "snapshot": "g" * 64})
+    validate_query_result(scoped, {**scoped_valid, "snapshot": None})
+
+    # A remote Files page obeys the normalized request's page limit; the
+    # remote-only bound is exactly-at-limit, not a smaller page.
+    at_limit_request = QueryRequest("files", file_window, app_key=KEY, limit=2)
+    at_limit = _response("files", _file_table(file_window, rows=2), app_key=KEY)
+    validate_query_result(at_limit_request, at_limit)
+    validate_query_result(
+        at_limit_request, {**at_limit, "result": _file_table(file_window, rows=1)}
+    )
+    with pytest.raises(ValueError):
+        validate_query_result(
+            at_limit_request, {**at_limit, "result": _file_table(file_window, rows=3)}
+        )
+    one_request = QueryRequest("files", file_window, app_key=KEY, limit=1)
+    with pytest.raises(ValueError):
+        # The review's case: an otherwise valid two-row page for limit=1.
+        validate_query_result(one_request, at_limit)
+
+    # A remote ranking result is a JSON list; only the local worker outcome
+    # keeps the tuple shape, and an empty local ranking stays valid.
+    ranking_request = QueryRequest("ranking", lived, limit=50)
+    ranking_rows = [total(7, KEY), total(8, OTHER_KEY)]
+    ranking_response = _response("ranking", ranking_rows)
+    validate_query_result(ranking_request, ranking_response)
+    with pytest.raises(ValueError):
+        validate_query_result(
+            ranking_request, {**ranking_response, "result": tuple(ranking_rows)}
+        )
+    _validate_local_ranking(ranking_request, tuple(ranking_rows))
+    _validate_local_ranking(ranking_request, [])
+    with pytest.raises(ValueError):
+        _validate_local_ranking(ranking_request, ({"app_key": KEY},))
+
     # The private local helpers accept the actual value/key/request directly.
     _validate_local_coverage(request, None, {"unit:alpha.service": coverage()})
     _validate_local_coverage(scoped, KEY, coverage())
@@ -294,6 +452,27 @@ def test_each_coverage_selector_accepts_only_its_contract_shape() -> None:
         _normalize_request(QueryRequest("series", lived, app_key=KEY, coverage_kind="file"))
     with pytest.raises(WindowUnavailableError):
         _normalize_request(QueryRequest("coverage", Window("launch", BOOT, launch_id=7)))
+    # A22's overlong-range refusal precedes subject/selector resolution and the
+    # exact MAX_RANGE_NS boundary stays valid, as on the wire path.
+    overlong = Window("range", BOOT, 0, MAX_RANGE_NS + 1)
+    with pytest.raises(WindowUnavailableError) as refusal:
+        _normalize_request(QueryRequest("totals", overlong, app_key="not a key"))
+    assert refusal.value.reason == "unsupported_window"
+    assert str(refusal.value) == RANGE_TOO_LONG_MESSAGE
+    boundary = Window("range", BOOT, 0, MAX_RANGE_NS)
+    assert _normalize_request(QueryRequest("totals", boundary, app_key=KEY)) == QueryRequest(
+        "totals", boundary, app_key=KEY
+    )
+    # A cursor with NUL is rejected locally exactly as the wire path rejects it.
+    for kind, window in (("files", file_window), ("ranking", lived)):
+        with pytest.raises(ValueError):
+            _normalize_request(
+                QueryRequest(kind, window, app_key=KEY if kind == "files" else None,
+                             cursor="x\x00y")
+            )
+    assert _normalize_request(
+        QueryRequest("files", file_window, app_key=KEY, cursor="opaque")
+    ).cursor == "opaque"
     assert _normalize_request(request) == request
 
 
@@ -365,7 +544,7 @@ def test_series_accepts_simultaneous_devices_and_rejects_per_device_overlap_or_o
             ),
         )
     )
-    # Reversed bucket order.
+    # Reversed bucket order in every sequence at once.
     rejected(
         replace(
             value,
@@ -374,6 +553,11 @@ def test_series_accepts_simultaneous_devices_and_rejects_per_device_overlap_or_o
             residual_points=tuple(reversed(value.residual_points)),
         )
     )
+    # Corrupt task chronology alone; device/residual stay valid, so only the
+    # task sequence predicate can reject it.
+    rejected(replace(value, points=tuple(reversed(value.points))))
+    # Corrupt residual chronology alone.
+    rejected(replace(value, residual_points=tuple(reversed(value.residual_points))))
     # Task-bucket overlap is refused separately from device chronology.
     rejected(
         replace(
@@ -390,7 +574,9 @@ def test_series_accepts_simultaneous_devices_and_rejects_per_device_overlap_or_o
     )
     # Tier/coverage-tier disagreement.
     rejected(replace(value, coverage=coverage(tier="rollup_60s")))
-    # Tier duration disagreement, with otherwise well-ordered buckets.
+    # Tier duration alone: 60-second buckets with correctly spaced starts under
+    # the raw tier (10 s). Every sequence stays ordered and non-overlapping and
+    # tier/coverage agree, so only the duration predicate can reject it.
     rejected(
         replace(
             value,
@@ -401,12 +587,24 @@ def test_series_accepts_simultaneous_devices_and_rejects_per_device_overlap_or_o
             device_points=(
                 replace(value.device_points[0], bucket_secs=60),
                 replace(value.device_points[1], bucket_secs=60),
-                replace(value.device_points[2], bucket_secs=60),
-                replace(value.device_points[3], bucket_secs=60),
+                replace(
+                    value.device_points[2],
+                    bucket_start_mono_ns=60_000_000_000,
+                    bucket_secs=60,
+                ),
+                replace(
+                    value.device_points[3],
+                    bucket_start_mono_ns=60_000_000_000,
+                    bucket_secs=60,
+                ),
             ),
             residual_points=(
                 replace(value.residual_points[0], bucket_secs=60),
-                replace(value.residual_points[1], bucket_start_mono_ns=60_000_000_000, bucket_secs=60),
+                replace(
+                    value.residual_points[1],
+                    bucket_start_mono_ns=60_000_000_000,
+                    bucket_secs=60,
+                ),
             ),
         )
     )

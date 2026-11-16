@@ -134,23 +134,55 @@ def _window(value: object) -> Window:
 
 
 def _revalidate(record: object) -> object:
-    """Re-run a frozen record's own validation instead of trusting its fields."""
+    """Re-run one frozen record's own validation instead of trusting its fields."""
 
     type(record).__post_init__(record)  # type: ignore[attr-defined]
     return record
 
 
+def _revalidate_tree(value: object) -> None:
+    """Recursively re-enter every nested frozen record's ``__post_init__``.
+
+    Contract records only check the *types* of their nested children, so a
+    forged grandchild (a ``DeviceShareRow`` with a bool counter, a ``HookHits``
+    with a negative hit) survives the parent's own validation. A retained or
+    metadata record is an observation, so the whole value tree is validated
+    here, never trusted because an outer ``isinstance`` passed.
+    """
+
+    if isinstance(value, tuple):
+        for item in value:
+            _revalidate_tree(item)
+        return
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError("history values must be finite numbers")
+        return
+    if value is None or isinstance(value, (bool, int, str)):
+        return
+    if isinstance(value, (list, dict, set, frozenset)):
+        raise ValueError("history records carry tuples, not mutable collections")
+    if isinstance(value, type) or not hasattr(value, "__dataclass_fields__"):
+        raise ValueError(f"unsupported history value {type(value).__name__}")
+    _revalidate(value)
+    for field in fields(value):  # type: ignore[arg-type]
+        _revalidate_tree(getattr(value, field.name))
+
+
 def _record(record: object, expected: type, field: str) -> object:
     if not isinstance(record, expected):
         raise ValueError(f"{field} must be a {expected.__name__}")
-    return _revalidate(record)
+    _revalidate_tree(record)
+    return record
 
 
 def _source_position(value: object, field: str) -> "RemotePosition | LocalPositionVector":
     if isinstance(value, RemotePosition):
-        return _revalidate(value)  # type: ignore[return-value]
+        _revalidate_tree(value)
+        return value  # type: ignore[return-value]
     if isinstance(value, LocalPositionVector):
-        return _revalidate(value)  # type: ignore[return-value]
+        _revalidate_tree(value)
+        return value  # type: ignore[return-value]
     raise ValueError(f"{field} must be a RemotePosition or LocalPositionVector")
 
 
@@ -391,11 +423,11 @@ class RetainedRecord:
         if provenance.kind == "totals":  # type: ignore[attr-defined]
             if not isinstance(self.value, DiskShare):
                 raise ValueError("a totals record retains a DiskShare")
-            _revalidate(self.value)
+            _revalidate_tree(self.value)
         elif provenance.kind == "series":  # type: ignore[attr-defined]
             if not isinstance(self.value, Series):
                 raise ValueError("a series record retains a Series")
-            _revalidate(self.value)
+            _revalidate_tree(self.value)
         else:
             raise ValueError("a ranking cannot be stored as a retained detail record")
         if self.value.app_id <= 0:
@@ -502,6 +534,10 @@ class FrameProvenance:
 
         if isinstance(requested, LocalPositionVector) and bracket is None:
             raise ValueError("a local requested source requires its local bracket")
+        if isinstance(answered, LocalPositionVector) and bracket is None:
+            # A remote failure can fall back to local data; that local answer
+            # still needs its opening/closing bracket, not just a remote request.
+            raise ValueError("a local answered source requires its local bracket")
         if isinstance(answered, RemotePosition) and bracket is not None:
             raise ValueError("a remote answered source cannot carry a local bracket")
         if bracket is not None:
@@ -533,7 +569,7 @@ class SeriesMetadata:
         tier = _enum(self.tier, _TIERS, "series_metadata.tier")
         if not isinstance(self.coverage, Coverage):
             raise ValueError("series_metadata.coverage must be a Coverage")
-        _revalidate(self.coverage)
+        _revalidate_tree(self.coverage)
         if self.coverage.tier != tier:
             raise ValueError("series_metadata.tier must equal coverage.tier")
 
