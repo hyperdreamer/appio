@@ -138,7 +138,9 @@ class QueryTransportHarness:
         self.connection_generations: list[int] = []
         self.observed_historical_occupants: list[int] = []
         self.subjects: dict[int, str] = {}
-        self._jobs: dict[str, str] = {}
+        # Peer-side held jobs belong to the connection that carried them: a
+        # retired connection's jobs are not occupied by any successor.
+        self._jobs: dict[socket.socket, dict[str, str]] = {}
         self._futures: dict[str, Future[dict]] = {}
         self._peer_closed = False
         self.client = IodClient(
@@ -186,6 +188,9 @@ class QueryTransportHarness:
 
         if cursor is not _MISSING:
             self.cursor = cursor  # type: ignore[assignment]
+        # A retired connection's EOF must retire its held jobs before a
+        # replacement connection is observed as a fresh occupant set.
+        self._retire_detached()
         self.client.connect()
         self._drain()
         status = self._last_frame("status")
@@ -203,9 +208,46 @@ class QueryTransportHarness:
                 return frame
         return None
 
+    @staticmethod
+    def _connection_eof(server: socket.socket) -> bool:
+        """True only when the client end of *server* really closed."""
+
+        try:
+            if server.fileno() < 0:
+                return True
+            ready, _, _ = select.select([server], [], [], 0)
+        except (OSError, ValueError):  # pragma: no cover - closed fixture socket
+            return True
+        if not ready:
+            return False
+        try:
+            data = server.recv(1, socket.MSG_PEEK)
+        except (BlockingIOError, InterruptedError):
+            return False
+        except OSError:
+            return True
+        return data == b""
+
+    def _retire_detached(self) -> None:
+        """Retire jobs whose carrying connection observed real EOF/detach."""
+
+        for server in list(self._jobs):
+            if self._connection_eof(server):
+                self._jobs.pop(server, None)
+
+    def _jobs_for(self, server: socket.socket) -> dict[str, str]:
+        return self._jobs.setdefault(server, {})
+
+    def _job_server(self, request_id: str) -> socket.socket | None:
+        for server, jobs in self._jobs.items():
+            if request_id in jobs:
+                return server
+        return None
+
     def _drain(self) -> None:
         """Read every frame the client has already written to the peer."""
 
+        self._retire_detached()
         if self._peer_closed:
             return
         server = self.server
@@ -220,7 +262,10 @@ class QueryTransportHarness:
                 data = server.recv(65536)
             except (BlockingIOError, InterruptedError, OSError):
                 return
-            if not data:  # pragma: no cover - only after an unexpected detach
+            if not data:
+                # The client end really closed. The jobs carried by this
+                # connection are retired by _observe()'s EOF check before any
+                # occupancy is reported.
                 self._peer_closed = True
                 return
             try:
@@ -234,7 +279,7 @@ class QueryTransportHarness:
                     self.query_frames.append(frame)
                     self.query_kinds.append(frame["query"]["kind"])
                     if isinstance(request_id, str):
-                        self._jobs[request_id] = frame["query"]["kind"]
+                        self._jobs_for(server)[request_id] = frame["query"]["kind"]
 
     # -- public test surface ------------------------------------------------ #
 
@@ -252,7 +297,13 @@ class QueryTransportHarness:
     def only_future(self, kind: str) -> Future[dict]:
         """The single currently held wire Future for one query kind."""
 
-        held = [request_id for request_id, job_kind in self._jobs.items() if job_kind == kind]
+        self._retire_detached()
+        held = [
+            request_id
+            for jobs in self._jobs.values()
+            for request_id, job_kind in jobs.items()
+            if job_kind == kind
+        ]
         assert len(held) == 1, f"expected exactly one held {kind} job, saw {held}"
         return self._futures[held[0]]
 
@@ -268,9 +319,11 @@ class QueryTransportHarness:
 
         state = self.client.query_transport(future)
         request_id = state.request_id
-        assert request_id is not None and request_id in self._jobs, (
+        server = None if request_id is None else self._job_server(request_id)
+        assert request_id is not None and server is not None, (
             "reply requires a currently held wire request"
         )
+        assert server is self.server, "reply requires the live carrying connection"
         request = state.request
         message = {
             "protocol": 1,
@@ -279,8 +332,39 @@ class QueryTransportHarness:
             "kind": request.kind,
             "payload": self._payload(request, value, snapshot=snapshot, next_cursor=next_cursor),
         }
-        self.server.sendall(encode_frame(message))
-        self._jobs.pop(request_id, None)
+        server.sendall(encode_frame(message))
+        self._jobs_for(server).pop(request_id, None)
+        self.pump()
+
+    def reply_for(
+        self,
+        request_id: str,
+        request: QueryRequest,
+        value: object,
+        *,
+        snapshot: str,
+        next_cursor: str | None = None,
+    ) -> None:
+        """Fault injection: answer *request_id* regardless of the client binding.
+
+        This lets a test corrupt one binding field and still deliver the wire
+        envelope the real peer would have sent for the request it received. The
+        encoded payload is real; only the correlation lookup is by-passed.
+        """
+
+        server = self._job_server(request_id)
+        assert server is not None and server is self.server, (
+            "reply_for requires a currently held wire request"
+        )
+        message = {
+            "protocol": 1,
+            "type": "result",
+            "request_id": request_id,
+            "kind": request.kind,
+            "payload": self._payload(request, value, snapshot=snapshot, next_cursor=next_cursor),
+        }
+        server.sendall(encode_frame(message))
+        self._jobs_for(server).pop(request_id, None)
         self.pump()
 
     def error(self, future: Future[dict], reason: str, text: str) -> None:
@@ -288,11 +372,13 @@ class QueryTransportHarness:
 
         state = self.client.query_transport(future)
         request_id = state.request_id
-        assert request_id is not None and request_id in self._jobs, (
+        server = None if request_id is None else self._job_server(request_id)
+        assert request_id is not None and server is not None, (
             "error requires a currently held wire request"
         )
-        self.server.sendall(encode_frame(_error_frame(request_id, reason, text)))
-        self._jobs.pop(request_id, None)
+        assert server is self.server, "error requires the live carrying connection"
+        server.sendall(encode_frame(_error_frame(request_id, reason, text)))
+        self._jobs_for(server).pop(request_id, None)
         self.pump()
 
     def pump(self) -> None:
@@ -401,4 +487,7 @@ class QueryTransportHarness:
     # -- observation -------------------------------------------------------- #
 
     def _observe(self) -> None:
-        self.observed_historical_occupants.append(len(self._jobs))
+        self._retire_detached()
+        self.observed_historical_occupants.append(
+            sum(len(jobs) for jobs in self._jobs.values())
+        )

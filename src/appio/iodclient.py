@@ -319,8 +319,13 @@ class QueryTransportState:
                 f"transport.phase must be one of {', '.join(_TRANSPORT_PHASES)}, got {phase!r}"
             )
         request_id = self.request_id
-        if request_id is not None and (not isinstance(request_id, str) or request_id == ""):
-            raise ValueError("transport.request_id must be a nonempty string or None")
+        if request_id is not None:
+            if not isinstance(request_id, str) or request_id == "":
+                raise ValueError("transport.request_id must be a nonempty string or None")
+            try:
+                request_id.encode("utf-8")
+            except UnicodeEncodeError:
+                raise ValueError("transport.request_id must be UTF-8 encodable") from None
         issued_at = self.issued_at_ns
         if issued_at is not None:
             _nonnegative_integer(issued_at, "transport.issued_at_ns")
@@ -1037,7 +1042,24 @@ class IodClient:
             future.set_exception(ClientUnavailable("daemon_unavailable"))
             return future
         now = self._clock_ns()
+        generation = self._generation
         self._expire(now)
+        # A completion callback may have closed the client or retired the socket
+        # while the expiry settled. Re-verify authoritatively before admitting a
+        # send: _send() would otherwise silently strand the request on no socket
+        # while reporting an active wire issue to its owner.
+        if self._closed:
+            self._bind(future, normalized, "not_sent")
+            future.set_exception(ClientClosed("client_closed"))
+            return future
+        if (
+            self._generation != generation
+            or not (self._peer_verified and self._status_ok)
+            or self._sock is None
+        ):
+            self._bind(future, normalized, "not_sent")
+            future.set_exception(ClientUnavailable("daemon_unavailable"))
+            return future
         if len(self._pending) >= self.max_pending:
             self._refused += 1
             self._bind(future, normalized, "not_sent")
@@ -1178,8 +1200,14 @@ class IodClient:
         ``None`` rather than being invented from a later reply.
         """
 
+        authority = self._tracker.authority
         cursor = self._tracker.current
-        if cursor is None:
+        if authority is None or cursor is None:
+            # ``current`` survives begin_connection() as resume knowledge, and a
+            # re-verified status that proves no cursor leaves authority unset.
+            # That retained cursor is not evidence this connection can answer at.
+            return None
+        if (cursor.boot_id, cursor.iod_epoch) != authority:
             return None
         return RemotePosition(cursor.boot_id, cursor.iod_epoch, cursor.seq)
 
@@ -1214,7 +1242,9 @@ class IodClient:
         if self._closed:
             return
         self._closed = True
-        self._fail_pending(ClientClosed("client_closed"))
+        # Detach the carrying socket before any settlement callback can run, so
+        # a reentrant observer never sees a "lost" request on a still-open peer
+        # that has not seen EOF.
         self._discard(self._sock)
         self._sock = None
         self._decoder = None
@@ -1224,6 +1254,7 @@ class IodClient:
         self._peer_verified = False
         self._status_ok = False
         self._subscribed = False
+        self._fail_pending(ClientClosed("client_closed"))
         # The owner asked for this, so the link is not "failing": reporting the
         # last transport fault after a deliberate close would be a lie.
         self._last_error = None
@@ -1495,6 +1526,18 @@ class IodClient:
             self._stale_results += 1
             _settle(pending.future, error=ConnectionLost("stale_connection"))
             return
+        if not self._association_intact(request_id, pending):
+            # Pure selector validation proves the response shape for whatever
+            # request the binding currently names; it cannot prove that binding
+            # is still the one this envelope answers. A current contradiction is
+            # terminal and must never reach the cache.
+            pending.binding.phase = "terminal"
+            _settle(
+                pending.future,
+                error=RequestRejected("invalid_result", "invalid_result"),
+            )
+            self._settled_pending = True
+            return
         # Bound the decoded payload (the accounting part of the frame), so a
         # daemon that packs an oversized answer behind a small envelope is still
         # refused rather than cached.
@@ -1543,6 +1586,7 @@ class IodClient:
                 pending.future,
                 error=RequestRejected("invalid_result", "invalid_result"),
             )
+            self._settled_pending = True
             return
         pending.binding.phase = "terminal"
         pending.binding.answered_source = pending.binding.issued_source
@@ -1565,6 +1609,28 @@ class IodClient:
         _settle(pending.future, value=dict(value))
         self._settled_pending = True
 
+    def _association_intact(self, request_id: str, pending: _Pending) -> bool:
+        """True only when this pending entry still names the request it issued.
+
+        The retained issue evidence is the wire canonical request, the whole
+        issue cursor, and the generation the connection had at send time. The
+        bound Future must still be associated with this same mutable binding.
+        """
+
+        binding = pending.binding
+        if self._transports.get(pending.future) is not binding:
+            return False
+        if binding.request_id != request_id:
+            return False
+        if binding.generation != pending.generation:
+            return False
+        try:
+            if _cache_key(_query_wire(binding.request), binding.issued_source) != pending.key:
+                return False
+        except (TypeError, ValueError, ProtocolError):
+            return False
+        return True
+
     def _reap_tombstone(self, request_id: object) -> bool:
         """Consume an expired request's tombstone on its late terminal envelope.
 
@@ -1582,6 +1648,7 @@ class IodClient:
             return False
         if tombstone.generation == self._generation:
             tombstone.binding.phase = "terminal"
+        self._settled_pending = True
         return True
 
     def _apply_error(self, message: Mapping[str, Any]) -> None:
@@ -1612,6 +1679,12 @@ class IodClient:
             if now >= pending.deadline_ns
         ]
         for request_id, pending in expired:
+            # An earlier candidate's timeout callback may have retired the
+            # connection; _fail_pending already published this binding lost and
+            # removed it. Never turn that lost work back into an expired
+            # tombstone just because this list was captured before the callback.
+            if self._pending.get(request_id) is not pending:
+                continue
             self._pending.pop(request_id, None)
             # Keep the correlation tombstone past Future failure: the daemon job
             # is not proven terminated, and a late envelope must still be
@@ -1634,18 +1707,22 @@ class IodClient:
 
     def _fail_pending(self, error: Exception) -> None:
         pending = list(self._pending.values())
+        tombstones = list(self._tombstones.values())
         self._pending.clear()
+        self._tombstones.clear()
         if pending:
             self._settled_pending = True
+        # Publish every loss before the first reentrant callback runs: a sibling
+        # whose socket is already detached must never be observed as still wire-
+        # active by the first Future's completion callback.
         for entry in pending:
-            # Transport phase changes before the settling callback can run.
             entry.binding.phase = "lost"
-            _settle(entry.future, error=_clone(error))
         # The socket that could answer a tombstoned request is gone, so no late
-        # envelope can reach it; retire those bindings as lost and drop them.
-        for tombstone in self._tombstones.values():
+        # envelope can reach it; retire those bindings as lost as well.
+        for tombstone in tombstones:
             tombstone.binding.phase = "lost"
-        self._tombstones.clear()
+        for entry in pending:
+            _settle(entry.future, error=_clone(error))
 
     # -- gap provenance ---------------------------------------------------- #
 

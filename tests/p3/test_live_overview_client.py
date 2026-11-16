@@ -432,6 +432,14 @@ def test_each_coverage_selector_accepts_only_its_contract_shape() -> None:
         # The review's case: an otherwise valid two-row page for limit=1.
         validate_query_result(one_request, at_limit)
 
+    # A files page must echo the normalized requested search: the same table
+    # shape is valid for a search-less request and rejected for a searched one.
+    search_request = QueryRequest("files", file_window, app_key=KEY, search="needle")
+    search_table = _response("files", _file_table(file_window), app_key=KEY)
+    validate_query_result(at_limit_request, search_table)
+    with pytest.raises(ValueError):
+        validate_query_result(search_request, search_table)
+
     # A remote ranking result is a JSON list; only the local worker outcome
     # keeps the tuple shape, and an empty local ranking stays valid.
     ranking_request = QueryRequest("ranking", lived, limit=50)
@@ -441,6 +449,13 @@ def test_each_coverage_selector_accepts_only_its_contract_shape() -> None:
     with pytest.raises(ValueError):
         validate_query_result(
             ranking_request, {**ranking_response, "result": tuple(ranking_rows)}
+        )
+    # A ranking result may not repeat an external identity, even when every row
+    # is otherwise a valid AppTotal.
+    with pytest.raises(ValueError):
+        validate_query_result(
+            ranking_request,
+            _response("ranking", [total(7, KEY), total(8, KEY)]),
         )
     _validate_local_ranking(ranking_request, tuple(ranking_rows))
     _validate_local_ranking(ranking_request, [])
@@ -566,8 +581,18 @@ def test_series_accepts_simultaneous_devices_and_rejects_per_device_overlap_or_o
         )
     )
     # Corrupt task chronology alone; device/residual stay valid, so only the
-    # task sequence predicate can reject it.
+    # task sequence predicate can reject it. The strict-increase predicate owns
+    # its own diagnostic even though the positive-duration overlap predicate
+    # would also refuse an out-of-order start.
     rejected(replace(value, points=tuple(reversed(value.points))))
+    with pytest.raises(ValueError) as reversed_order:
+        validate_query_result(
+            request, {**response, "result": replace(value, points=tuple(reversed(value.points)))}
+        )
+    assert "series starts must strictly increase" in str(reversed_order.value)
+    with pytest.raises(ValueError) as reversed_order_local:
+        _validate_local_series(request, KEY, replace(value, points=tuple(reversed(value.points))))
+    assert "series starts must strictly increase" in str(reversed_order_local.value)
     # Corrupt residual chronology alone.
     rejected(replace(value, residual_points=tuple(reversed(value.residual_points))))
     # Task-bucket overlap is refused separately from device chronology.
@@ -657,6 +682,17 @@ def test_series_accepts_simultaneous_devices_and_rejects_per_device_overlap_or_o
         validate_query_result(totals_request, {**totals_response, "app_key": OTHER_KEY})
     with pytest.raises(ValueError):
         validate_query_result(totals_request, _response("totals", totals_value))
+    with pytest.raises(ValueError):
+        # The totals value must carry the exact requested Window, not merely a
+        # valid one: a differing end is a different answer.
+        validate_query_result(
+            totals_request,
+            _response(
+                "totals",
+                share(7, Window("range", BOOT, 0, 30_000_000_000)),
+                app_key=KEY,
+            ),
+        )
     with pytest.raises(ValueError):
         _validate_local_totals(totals_request, OTHER_KEY, totals_value)
 
@@ -748,6 +784,113 @@ def test_cache_and_refusal_futures_keep_immutable_request_association() -> None:
     with pytest.raises(ValueError):
         transport.client.reject_query_result(unrelated)
 
+    # A terminal (sent and consumed) Future may not retire the live connection:
+    # only currently carrying active/expired work owns that decision.
+    assert transport.client.retire_query_connection(first) is False
+    assert transport.client.query_transport(first).phase == "terminal"
+    assert transport.client.state.verified is True
+
+    # The envelope must answer the request the binding still names. Corrupting
+    # exactly one association field makes a current contradiction, which is a
+    # terminal invalid_result with no cache insertion.
+    def corrupt_and_deliver(mutate) -> None:
+        window = Window("range", BOOT, 0, 22 * NS)
+        future = transport.query(QueryRequest("totals", window, app_key=KEY))
+        state = transport.client.query_transport(future)
+        assert state.request_id is not None
+        pending = transport.client._pending[state.request_id]
+        mutate(pending)
+        entries = transport.client.cached_responses
+        transport.reply_for(
+            state.request_id, state.request, share(96, window), snapshot=SNAPSHOT
+        )
+        assert _reason(future) == "invalid_result"
+        assert transport.client.query_transport(future).phase == "terminal"
+        assert transport.client.cached_responses == entries
+
+    corrupt_and_deliver(lambda pending: setattr(pending.binding, "request_id", "q-other"))
+    corrupt_and_deliver(lambda pending: setattr(pending.binding, "generation", 99))
+    corrupt_and_deliver(
+        lambda pending: setattr(
+            pending.binding, "issued_source", RemotePosition(BOOT, 7, 99)
+        )
+    )
+    # The Future must still be associated with this exact binding object; a lost
+    # observation association is itself a current contradiction.
+    unbound_window = Window("range", BOOT, 0, 25 * NS)
+    unbound = transport.query(QueryRequest("totals", unbound_window, app_key=KEY))
+    unbound_state = transport.client.query_transport(unbound)
+    assert unbound_state.request_id is not None
+    unbound_pending = transport.client._pending[unbound_state.request_id]
+    entries = transport.client.cached_responses
+    del transport.client._transports[unbound_pending.future]
+    transport.reply_for(
+        unbound_state.request_id,
+        unbound_state.request,
+        share(99, unbound_window),
+        snapshot=SNAPSHOT,
+    )
+    assert _reason(unbound) == "invalid_result"
+    assert transport.client.cached_responses == entries
+    # The canonical wire request is part of the issue evidence too: a selector
+    # field that the pure validator does not inspect for this kind still breaks
+    # the association and must not enter the cache.
+    canonical_window = Window("range", BOOT, 0, 23 * NS)
+    canonical = transport.query(QueryRequest("series", canonical_window, app_key=KEY))
+    canonical_state = transport.client.query_transport(canonical)
+    assert canonical_state.request_id is not None
+    canonical_pending = transport.client._pending[canonical_state.request_id]
+    canonical_pending.binding.request = replace(canonical_state.request, limit=100)
+    entries = transport.client.cached_responses
+    transport.reply_for(
+        canonical_state.request_id,
+        canonical_state.request,
+        series(97, canonical_window),
+        snapshot=SNAPSHOT,
+    )
+    assert _reason(canonical) == "invalid_result"
+    assert transport.client.cached_responses == entries
+    # Valid control: the identical wire shape is accepted when the association
+    # is intact, so these negatives pin correlation rather than the payload.
+    control_window = Window("range", BOOT, 0, 24 * NS)
+    control = transport.query(QueryRequest("totals", control_window, app_key=KEY))
+    assert transport.client.query_transport(control).phase == "active"
+    entries = transport.client.cached_responses
+    transport.reply(control, share(98, control_window), snapshot=SNAPSHOT)
+    assert control.result(timeout=0)["app_key"] == KEY
+    assert transport.client.cached_responses == entries + 1
+
+    # A daemon that never became available or a deliberately closed client still
+    # binds its local refusal to the exact immutable request.
+    offline = QueryTransportHarness(cursor=RemotePosition(BOOT, 7, 3))
+    offline.disconnect()
+    unavailable = offline.query(request)
+    assert _reason(unavailable) == "daemon_unavailable"
+    unavailable_state = offline.client.query_transport(unavailable)
+    assert unavailable_state.phase == "not_sent"
+    assert unavailable_state.request == request
+    assert unavailable_state.request_id is None and unavailable_state.issued_at_ns is None
+    transport.client.close()
+    closed = transport.query(request)
+    assert _reason(closed) == "client_closed"
+    closed_state = transport.client.query_transport(closed)
+    assert closed_state.phase == "not_sent"
+    assert closed_state.request == request
+    assert closed_state.request_id is None and closed_state.issued_at_ns is None
+
+    # The observation record enforces its own UTF-8 text contract, with a
+    # positive id and a never-sent phase control.
+    with pytest.raises(ValueError):
+        replace(issued, request_id="\ud800")
+    assert replace(issued, request_id="q-ünïcode").request_id == "q-ünïcode"
+    assert replace(
+        issued,
+        phase="not_sent",
+        request_id=None,
+        issued_at_ns=None,
+        issued_source=None,
+    ).phase == "not_sent"
+
 
 def test_full_cursor_cache_key_and_original_answered_source() -> None:
     """The cache key carries the whole cursor; a hit never restamps its source."""
@@ -777,6 +920,50 @@ def test_full_cursor_cache_key_and_original_answered_source() -> None:
     assert len(transport.query_kinds) == envelopes, "an unchanged-cursor hit costs no round trip"
     assert hit.result(timeout=0)["app_key"] == KEY
 
+    # reject_query_result evicts exactly the entry version this Future produced
+    # and never a later replacement under the same key.
+    assert transport.client.cached_responses == 1
+    transport.client.reject_query_result(first)
+    assert transport.client.cached_responses == 0
+    assert len(transport.query_kinds) == envelopes
+    retried = transport.query(request)
+    retried_state = transport.client.query_transport(retried)
+    assert retried_state.phase == "active"
+    assert retried_state.issued_source == RemotePosition(BOOT, 7, 3)
+    assert len(transport.query_kinds) == envelopes + 1, "a rejection forces a real read"
+    transport.reply(retried, share(92, window), snapshot=SNAPSHOT)
+    assert transport.client.cached_responses == 1
+    transport.client.reject_query_result(first)
+    assert transport.client.cached_responses == 1, "an old version never evicts its successor"
+
+    # A corrupted cached value is revalidated on the hit, evicted, and the read
+    # becomes a real miss instead of serving unvalidated provenance.
+    from appio.iodclient import _cache_key, _query_wire
+
+    current_key = _cache_key(_query_wire(request), RemotePosition(BOOT, 7, 3))
+    transport.client._cache[current_key].value["result"] = share(
+        93, Window("range", BOOT, 0, 21 * NS)
+    )
+    envelopes = len(transport.query_kinds)
+    corrupted = transport.query(request)
+    corrupted_state = transport.client.query_transport(corrupted)
+    assert corrupted_state.phase == "active"
+    assert len(transport.query_kinds) == envelopes + 1
+    transport.reply(corrupted, share(93, window), snapshot=SNAPSHOT)
+    assert transport.client.cached_responses == 1
+
+    # A cached entry whose stored request no longer names this query is evicted
+    # even when its value/echo would validate for that other subject.
+    transport.client._cache[current_key].request = replace(request, app_key=OTHER_KEY)
+    transport.client._cache[current_key].value["app_key"] = OTHER_KEY
+    envelopes = len(transport.query_kinds)
+    misfiled = transport.query(request)
+    misfiled_state = transport.client.query_transport(misfiled)
+    assert misfiled_state.phase == "active"
+    assert len(transport.query_kinds) == envelopes + 1
+    transport.reply(misfiled, share(90, window), snapshot=SNAPSHOT)
+    assert transport.client.cached_responses == 1
+
     # The cursor sequence is part of the key: the next committed sequence is a
     # miss and issues a new source, never the previous answer's source.
     transport.stream(4)
@@ -784,24 +971,33 @@ def test_full_cursor_cache_key_and_original_answered_source() -> None:
     fresh_state = transport.client.query_transport(fresh)
     assert fresh_state.phase == "active"
     assert fresh_state.issued_source == RemotePosition(BOOT, 7, 4)
-    assert len(transport.query_kinds) == envelopes + 1
+    assert len(transport.query_kinds) == envelopes + 2
+
+    # The reply cursor may advance while the request is on the wire; the
+    # answered source stays the source captured once at issue.
+    transport.stream(5)
+    transport.reply(fresh, share(94, window), snapshot=SNAPSHOT)
+    answered = transport.client.query_transport(fresh)
+    assert answered.phase == "terminal"
+    assert answered.answered_source == RemotePosition(BOOT, 7, 4)
 
     # A structurally older cache payload planted under the newer cursor key
     # cannot certify the newer requested source: it is evicted and the read
     # misses instead of resurrecting the old provenance.
     transport.inject_stale_cached_answer(
-        request, share(93, window), answered_source=RemotePosition(BOOT, 7, 3)
+        request, share(95, window), answered_source=RemotePosition(BOOT, 7, 4)
     )
+    envelopes = len(transport.query_kinds)
     stale = transport.query(request)
     stale_state = transport.client.query_transport(stale)
     assert stale_state.phase == "active"
     assert stale_state.issued_at_ns is not None
-    assert stale_state.issued_source == RemotePosition(BOOT, 7, 4)
-    assert len(transport.query_kinds) == envelopes + 2
-    transport.reply(stale, share(94, window), snapshot=SNAPSHOT)
+    assert stale_state.issued_source == RemotePosition(BOOT, 7, 5)
+    assert len(transport.query_kinds) == envelopes + 1
+    transport.reply(stale, share(96, window), snapshot=SNAPSHOT)
     accepted = transport.client.query_transport(stale)
     assert accepted.phase == "terminal"
-    assert accepted.answered_source == RemotePosition(BOOT, 7, 4)
+    assert accepted.answered_source == RemotePosition(BOOT, 7, 5)
 
     # Preserved controls: whole-entry byte bound and failure exclusion.
     assert transport.client.cached_bytes <= transport.client.cache_bytes
@@ -815,6 +1011,65 @@ def test_full_cursor_cache_key_and_original_answered_source() -> None:
     retry = transport.query(QueryRequest("totals", other_window, app_key=KEY))
     assert transport.client.query_transport(retry).phase == "active"
     assert len(transport.query_kinds) == sent + 1, "a failed read sends a real retry"
+
+    # Request-specific retirement detaches that connection, marks its work lost
+    # and clears that connection's cache authority.
+    assert transport.client.cached_responses == before
+    assert transport.observed_historical_occupants[-1] == 1
+    assert transport.client.retire_query_connection(retry) is True
+    assert transport.client.query_transport(retry).phase == "lost"
+    assert transport.client._sock is None
+    assert transport.client.cached_responses == 0, "retirement clears that connection's cache"
+    # The peer's EOF is pending on the detached connection when the replacement
+    # is opened: the replacement observation retires those jobs rather than
+    # inheriting them as occupied.
+    transport.connect()
+    assert transport.client.state.verified is True
+    assert transport.observed_historical_occupants[-1] == 0, (
+        "a replacement connection inherits no retired jobs"
+    )
+    successor = transport.query(QueryRequest("totals", other_window, app_key=KEY))
+    assert transport.client.query_transport(successor).phase == "active"
+    assert transport.observed_historical_occupants[-1] == 1
+    # A real EOF on the current connection retires its held job as well.
+    assert transport.client.retire_query_connection(successor) is True
+    transport.pump()
+    assert transport.observed_historical_occupants[-1] == 0
+
+    # Expiry releases the owner's Future but not the peer job while the socket
+    # remains live; only a real detach retires it.
+    held = QueryTransportHarness(cursor=RemotePosition(BOOT, 7, 3))
+    held_future = held.query(QueryRequest("totals", window, app_key=KEY))
+    held.stream(4)
+    held.advance_ns(5 * NS)
+    held.pump()
+    assert held.client.query_transport(held_future).phase == "expired"
+    assert held.observed_historical_occupants[-1] == 1
+
+    # A fresh cursor-less connection has no position to prove, and a reverified
+    # cursor-less replacement must not inherit the previous connection's
+    # retained cursor as current issue evidence.
+    bare = QueryTransportHarness(cursor=None)
+    bare_future = bare.query(QueryRequest("totals", window, app_key=KEY))
+    bare_state = bare.client.query_transport(bare_future)
+    assert bare_state.phase == "active"
+    assert bare_state.issued_source is None
+    transport.connect(cursor=None)
+    replaced = transport.query(QueryRequest("totals", window, app_key=KEY))
+    replaced_state = transport.client.query_transport(replaced)
+    assert replaced_state.phase == "active"
+    assert replaced_state.issued_source is None
+    # A successful cursor-less answer invents no source, and its cache entry
+    # keeps that original null provenance rather than inheriting the old cursor.
+    transport.reply(replaced, share(97, window), snapshot=SNAPSHOT)
+    replaced_answer = transport.client.query_transport(replaced)
+    assert replaced_answer.phase == "terminal"
+    assert replaced_answer.answered_source is None
+    hit_again = transport.query(QueryRequest("totals", window, app_key=KEY))
+    hit_again_state = transport.client.query_transport(hit_again)
+    assert hit_again_state.phase == "terminal"
+    assert hit_again_state.issued_source is None
+    assert hit_again_state.answered_source is None
 
 
 def test_totals_and_series_decode_preserve_external_subject() -> None:

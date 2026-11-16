@@ -50,7 +50,7 @@ from appio.iod_history import to_wire
 from appio.ipc_models import Capabilities, QueryRequest, StreamCursor
 from appio.ipc_protocol import FrameDecoder, encode_frame
 from appio.ipc_security import Peer, PeerRejected
-from live_overview_support import coverage as live_coverage
+from live_overview_support import coverage as live_coverage, share
 
 NS = 1_000_000_000
 BOOT_A = "11111111-2222-4333-8444-555555555555"
@@ -710,6 +710,136 @@ def test_a_settled_query_reply_wakes_the_owner_without_a_state_change():
     harness.client.pump()
     assert future.result(timeout=0)["kind"] == "ranking"
     assert harness.changes > before, "a settled reply must wake its owner"
+
+    # Pre-cache selector validation can reject a correlated result. It is a
+    # terminal outcome too: ClientState is unchanged, so only the settlement
+    # wake tells the owner to observe the failure and release its slot.
+    window = Window(kind="since_boot", boot_id=BOOT_A, end_mono_ns=5 * NS)
+    invalid = harness.client.query(QueryRequest("totals", window, app_key="unit:alpha.service"))
+    invalid_request = harness.one_request("query")
+    wrong_window = Window(kind="since_boot", boot_id=BOOT_A, end_mono_ns=6 * NS)
+    harness.send(
+        {
+            "protocol": 1,
+            "type": "result",
+            "request_id": invalid_request["request_id"],
+            "kind": "totals",
+            "payload": {
+                "value": to_wire(share(41, wrong_window), app_keys={41: "unit:alpha.service"}),
+                "snapshot": SNAPSHOT,
+            },
+        }
+    )
+    before_invalid = harness.changes
+    harness.client.pump()
+    assert reason_of(invalid) == "invalid_result"
+    assert harness.client.query_transport(invalid).phase == "terminal"
+    assert harness.changes > before_invalid, "a rejected result must wake its owner"
+
+    # A late envelope for an expired request consumes its tombstone: the phase
+    # becomes terminal without a second settlement or a cache insertion, and the
+    # owner still needs one wake to reap the released slot.
+    expired = harness.client.query(
+        QueryRequest(
+            "ranking", Window(kind="since_boot", boot_id=BOOT_A, end_mono_ns=7 * NS)
+        )
+    )
+    expired_request = harness.one_request("query")
+    harness.send(snapshot_frame(0))
+    harness.client.pump()  # unrelated stream traffic keeps the socket answering
+    assert not expired.done()
+    harness.clock.advance(REQUEST_LIFETIME_NS / NS)
+    harness.client.pump()
+    assert reason_of(expired) == "query_timeout"
+    assert harness.client.query_transport(expired).phase == "expired"
+    cached = harness.client.cached_responses
+    before_late = harness.changes
+    harness.send(result_frame(expired_request["request_id"]))
+    harness.client.pump()
+    assert harness.client.query_transport(expired).phase == "terminal"
+    assert harness.client.cached_responses == cached, "a late answer is never cached"
+    assert harness.changes > before_late, "a consumed late envelope must wake its owner"
+
+
+def test_reentrant_timeout_callbacks_cannot_resurrect_detached_work():
+    """A timeout callback may retire the connection while siblings expire.
+
+    The expiry loop captured its candidates before any callback ran, so it must
+    re-validate each one against current pending membership: a sibling that the
+    first callback already published lost must never become an expired tombstone
+    on a socket that no longer exists.
+    """
+
+    harness = handshaken(cursor=StreamCursor(BOOT_A, 7, 1))
+    first = harness.client.query(ranking_request())
+    second = harness.client.query(coverage_request())
+    assert len(harness.requests(minimum=2)) == 2
+    first.add_done_callback(lambda done: harness.client.retire_query_connection(done))
+    harness.clock.advance(REQUEST_LIFETIME_NS / NS)
+    harness.client.pump()
+    assert reason_of(first) == "query_timeout"
+    assert harness.client.query_transport(first).phase == "lost"
+    assert harness.client.query_transport(second).phase == "lost"
+    assert harness.client.pending_requests == 0
+    assert harness.client.state.verified is False
+
+
+def test_query_is_not_admitted_after_an_expiry_callback_retired_the_socket():
+    """Expiry callbacks run inside query(); admission must re-verify afterwards."""
+
+    harness = handshaken(cursor=StreamCursor(BOOT_A, 7, 1))
+    first = harness.client.query(ranking_request())
+    assert len(harness.requests()) == 1
+    first.add_done_callback(lambda done: harness.client.retire_query_connection(done))
+    harness.clock.advance(REQUEST_LIFETIME_NS / NS)
+    second = harness.client.query(coverage_request())
+    assert reason_of(first) == "query_timeout"
+    state = harness.client.query_transport(second)
+    assert state.phase == "not_sent"
+    assert state.request_id is None and state.issued_at_ns is None
+    assert state.issued_source is None and state.answered_source is None
+    assert reason_of(second) == "daemon_unavailable"
+    assert harness.requests(deadline=0.05) == [], "a retired peer receives no fabricated send"
+
+
+def test_connection_loss_publishes_every_binding_lost_before_callbacks():
+    """The first completion callback must not see a detached sibling as active."""
+
+    harness = handshaken(cursor=StreamCursor(BOOT_A, 7, 1))
+    first = harness.client.query(ranking_request())
+    second = harness.client.query(coverage_request())
+    assert len(harness.requests(minimum=2)) == 2
+    observed: list[str] = []
+    first.add_done_callback(
+        lambda done: observed.append(harness.client.query_transport(second).phase)
+    )
+    harness.eof()
+    harness.client.pump()
+    assert observed == ["lost"], "a detached sibling is never observed as active"
+    assert harness.client.query_transport(first).phase == "lost"
+    assert harness.client.query_transport(second).phase == "lost"
+
+
+def test_close_detaches_the_socket_before_publishing_loss():
+    """A close callback observes a detached carrying socket, not a live one.
+
+    The binding loss and the socket lifetime must agree: publishing lost while the
+    carrying socket is still attached would let a reentrant observer mistake a
+    live peer that never saw EOF for a retirement decision.
+    """
+
+    harness = handshaken(cursor=StreamCursor(BOOT_A, 7, 1))
+    future = harness.client.query(ranking_request())
+    assert len(harness.requests()) == 1
+    observed: list[tuple[str, bool]] = []
+    future.add_done_callback(
+        lambda done: observed.append(
+            (harness.client.query_transport(done).phase, harness.client._sock is None)
+        )
+    )
+    harness.client.close()
+    assert observed == [("lost", True)], "detach before publishing loss"
+    assert harness.client.pending_requests == 0
 
 
 def test_historical_result_uses_the_shared_decoder_and_does_not_advance_the_cursor():
