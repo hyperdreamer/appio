@@ -18,10 +18,12 @@ even when excluding uncertain whole deltas has reduced every counter to zero.
 from __future__ import annotations
 
 from collections import defaultdict
+from collections.abc import Callable, Mapping
 from concurrent.futures import CancelledError, Future, InvalidStateError, ThreadPoolExecutor
 from dataclasses import dataclass, replace
 import json
 from pathlib import Path
+import queue
 import sqlite3
 from typing import Literal
 from types import SimpleNamespace
@@ -30,6 +32,26 @@ from .contracts import (
     AppTotal, Direction, DiskShare, FileCoverage, FileSort, FileTable, HistoryPending, Series, Window,
     FILE_HOUR_NS, WindowUnavailableError, SQLITE_INT_MAX, validate_enum, validate_search,
     validate_sqlite_integer,
+)
+from .history_types import (
+    LocalBracket,
+    LocalPositionVector,
+    RemotePosition,
+    RetentionScope,
+    SourcePosition,
+    _boot_text,
+    local_answer_digest,
+    retention_scope,
+    validate_scope,
+)
+from .history_validation import (
+    _canonical_app_key,
+    _normalize_request,
+    _revalidate_tree,
+    _validate_local_ranking,
+    _validate_local_series,
+    _validate_local_totals,
+    _validate_served_bounds,
 )
 from .durable import decode_handover
 from .file_runtime import FileAvailability
@@ -59,6 +81,18 @@ _COUNTERS = ("rchar", "wchar", "read_bytes", "write_bytes")
 MAX_INFLIGHT = 1
 _PEAKS = ("peak_read_bps", "peak_write_bps", "peak_total_bps")
 _METRICS = ("total_bytes", "read_bytes", "write_bytes", "rchar", "wchar")
+
+#: Charged local lanes (§3.3). A frame owns at most one Future on its own
+#: executor; the background executor carries at most two detail Futures and
+#: eight Files Futures, ten combined. A job stays charged from submission until
+#: the owner drains its terminal completion, retired jobs included.
+_DETAIL_CHARGE = 2
+_FILES_CHARGE = 8
+_BACKGROUND_CHARGE = 10
+
+_TOKEN_ORIGINS = ("remote", "local")
+_TOKEN_OWNERS = ("frame", "detail", "files")
+_POSITION_OWNERS = ("gui", "iod")
 
 
 @dataclass(frozen=True)
@@ -90,6 +124,96 @@ class HistorySegment:
         validate_sqlite_integer(self.end_ns, "segment.end_ns")
         if self.end_ns <= self.start_ns or type(self.proven) is not bool:
             raise ValueError("segment must be a nonempty half-open interval")
+
+
+def _private_int(value: object, field: str, *, minimum: int = 0) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{field} must be an integer, got {type(value).__name__}")
+    if value < minimum:
+        raise ValueError(f"{field} must be at least {minimum}, got {value}")
+    return value
+
+
+def _private_bool(value: object, field: str) -> bool:
+    if not isinstance(value, bool):
+        raise ValueError(f"{field} must be a boolean")
+    return value
+
+
+def _private_enum(value: object, allowed: tuple[str, ...], field: str) -> str:
+    if isinstance(value, bool) or not isinstance(value, str) or value not in allowed:
+        raise ValueError(f"{field} must be one of {', '.join(allowed)}, got {value!r}")
+    return value
+
+
+def _private_name(value: object, field: str) -> str:
+    if not isinstance(value, str) or value == "":
+        raise ValueError(f"{field} must be a non-empty string")
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError as error:
+        raise ValueError(f"{field} is not valid UTF-8 text") from error
+    return value
+
+
+def _private_interval(value: object, field: str) -> tuple[str, int, int]:
+    """One nonempty half-open ``(boot, start, end)`` evidence interval."""
+
+    if not isinstance(value, tuple) or len(value) != 3:
+        raise ValueError(f"{field} must be a (boot, start, end) tuple")
+    boot = _boot_text(value[0], f"{field}.boot_id")
+    start = _private_int(value[1], f"{field}.start_mono_ns")
+    end = _private_int(value[2], f"{field}.end_mono_ns")
+    if start >= end:
+        raise ValueError(f"{field} must be a nonempty half-open interval")
+    return (boot, start, end)
+
+
+def _private_registrations(value: object, field: str) -> tuple[tuple[str, str, int], ...]:
+    """The ordered local registration vector used as one authority."""
+
+    if not isinstance(value, tuple):
+        raise ValueError(f"{field} must be a tuple of registrations")
+    names: list[bytes] = []
+    for index, entry in enumerate(value):
+        if not isinstance(entry, tuple) or len(entry) != 3:
+            raise ValueError(f"{field}[{index}] must be a (name, owner, registration_epoch) tuple")
+        name = _private_name(entry[0], f"{field}[{index}].name")
+        _private_enum(entry[1], _POSITION_OWNERS, f"{field}[{index}].owner")
+        _private_int(entry[2], f"{field}[{index}].registration_epoch", minimum=1)
+        names.append(name.encode("utf-8"))
+    if len(set(names)) != len(names):
+        raise ValueError(f"{field} names must be unique")
+    if names != sorted(names):
+        raise ValueError(f"{field} must be ordered by name UTF-8 bytes")
+    return value
+
+
+def _private_authority(value: object) -> tuple:
+    """§3.2's tagged authority: a remote connection or a local registration list."""
+
+    if not isinstance(value, tuple) or not value:
+        raise ValueError("request_token.authority must be a tagged tuple")
+    if value[0] == "remote":
+        if len(value) != 4:
+            raise ValueError("a remote authority is (remote, generation, boot, epoch)")
+        _private_int(value[1], "request_token.authority.generation")
+        _boot_text(value[2], "request_token.authority.boot_id")
+        _private_int(value[3], "request_token.authority.iod_epoch", minimum=1)
+        return value
+    if value[0] == "local":
+        if len(value) != 2:
+            raise ValueError("a local authority is (local, registrations)")
+        _private_registrations(value[1], "request_token.authority.registrations")
+        return value
+    raise ValueError("request_token.authority must be tagged remote or local")
+
+
+def _private_source(value: object, field: str) -> SourcePosition:
+    if not isinstance(value, (RemotePosition, LocalPositionVector)):
+        raise ValueError(f"{field} must be a RemotePosition or LocalPositionVector")
+    _revalidate_tree(value)
+    return value
 
 
 def _peak(values):
@@ -128,6 +252,259 @@ class FileViewResult:
     served_gap_count: int | None
 
 
+# ---------------------------------------------------------------------------
+# Private typed worker records (§3.4)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class RequestToken:
+    """One admission: its normalized request, owner, authority and source."""
+
+    token_id: int
+    request: QueryRequest
+    origin: Literal["remote", "local"]
+    scope: RetentionScope | None
+    owner: Literal["frame", "detail", "files"]
+    owner_id: int
+    slot_id: int | None
+    authority: tuple
+    requested_source: SourcePosition
+
+    def __post_init__(self) -> None:
+        _private_int(self.token_id, "request_token.token_id", minimum=1)
+        request = _normalize_request(self.request)
+        origin = _private_enum(self.origin, _TOKEN_ORIGINS, "request_token.origin")
+        owner = _private_enum(self.owner, _TOKEN_OWNERS, "request_token.owner")
+        _private_int(self.owner_id, "request_token.owner_id", minimum=1)
+        if owner == "detail":
+            if self.scope is None:
+                raise ValueError("a detail token owns its retention scope")
+            scope = validate_scope(self.scope)
+            if request.app_key is None:
+                raise ValueError("a detail token requires its external subject")
+            if scope != retention_scope(request.app_key, request.window):
+                raise ValueError("a detail token scope must match its subject and window")
+        elif self.scope is not None:
+            raise ValueError("only a detail token carries a retention scope")
+        slot = self.slot_id
+        if origin == "remote":
+            _private_int(slot, "request_token.slot_id", minimum=1)
+        elif slot is not None:
+            raise ValueError("a local token carries no wire slot")
+        _private_authority(self.authority)
+        source = _private_source(self.requested_source, "request_token.requested_source")
+        if origin == "remote" and not isinstance(source, RemotePosition):
+            raise ValueError("a remote token requests a remote position")
+        if origin == "local" and not isinstance(source, LocalPositionVector):
+            raise ValueError("a local token requests a local position")
+
+
+@dataclass(frozen=True)
+class LocalFrameOutcome:
+    """Everything one frame copy proves, with no eager detail or handle."""
+
+    worker_id: int
+    request: QueryRequest
+    ranking: tuple[AppTotal, ...]
+    segments: tuple[HistorySegment, ...]
+    boundaries: tuple[tuple[str, int, str, str], ...]
+    gaps: tuple[tuple[str, int, int], ...]
+    known_gaps: tuple[tuple[str, int, int], ...]
+    overlaps: tuple[tuple[str, int, int], ...]
+    has_local_history: bool
+    not_retained: bool
+    chronology_unproved: bool
+    file_available: bool
+
+    def __post_init__(self) -> None:
+        _private_int(self.worker_id, "local_frame.worker_id", minimum=1)
+        request = _normalize_request(self.request)
+        if request.kind != "ranking" or request.app_key is not None:
+            raise ValueError("a local frame answers exactly one ranking request")
+        if not isinstance(self.ranking, tuple):
+            raise ValueError("local_frame.ranking must be an immutable tuple")
+        _validate_local_ranking(request, self.ranking)
+
+        if not isinstance(self.segments, tuple):
+            raise ValueError("local_frame.segments must be a tuple")
+        previous: dict[str, HistorySegment] = {}
+        for segment in self.segments:
+            if not isinstance(segment, HistorySegment):
+                raise ValueError("local_frame.segments contains only HistorySegment records")
+            _revalidate_tree(segment)
+            last = previous.get(segment.boot_id)
+            if last is not None and (segment.start_ns <= last.start_ns
+                                     or segment.start_ns < last.end_ns):
+                raise ValueError("local_frame.segments must keep planner chronology order")
+            previous[segment.boot_id] = segment
+
+        if not isinstance(self.boundaries, tuple):
+            raise ValueError("local_frame.boundaries must be a tuple")
+        for boundary in self.boundaries:
+            if not isinstance(boundary, tuple) or len(boundary) != 4:
+                raise ValueError("a boundary is (boot, at_ns, from_owner, to_owner)")
+            boot = _boot_text(boundary[0], "local_frame.boundaries.boot_id")
+            at_ns = _private_int(boundary[1], "local_frame.boundaries.at_ns")
+            outgoing = _private_enum(boundary[2], _POSITION_OWNERS, "local_frame.boundaries.from_owner")
+            incoming = _private_enum(boundary[3], _POSITION_OWNERS, "local_frame.boundaries.to_owner")
+            if outgoing == incoming:
+                raise ValueError("a boundary joins two different proven owners")
+            if not any(s.proven and s.boot_id == boot and s.owner == outgoing and s.end_ns == at_ns
+                       for s in self.segments):
+                raise ValueError("a boundary must follow a proven outgoing segment")
+            if not any(s.proven and s.boot_id == boot and s.owner == incoming and s.start_ns == at_ns
+                       for s in self.segments):
+                raise ValueError("a boundary must precede a proven incoming segment")
+
+        for name in ("gaps", "known_gaps", "overlaps"):
+            evidence = getattr(self, name)
+            if not isinstance(evidence, tuple):
+                raise ValueError(f"local_frame.{name} must be a tuple")
+            for interval in evidence:
+                _private_interval(interval, f"local_frame.{name}[]")
+        for name in ("has_local_history", "not_retained", "chronology_unproved", "file_available"):
+            _private_bool(getattr(self, name), f"local_frame.{name}")
+
+
+@dataclass(frozen=True)
+class LocalPartOutcome:
+    """One lazily computed subject part and its canonical local digest."""
+
+    worker_id: int
+    request: QueryRequest
+    app_key: str
+    value: DiskShare | Series
+    data_digest: str
+
+    def __post_init__(self) -> None:
+        _private_int(self.worker_id, "local_part.worker_id", minimum=1)
+        request = _normalize_request(self.request)
+        if request.kind not in ("totals", "series"):
+            raise ValueError("a local part answers totals or series only")
+        app_key = _canonical_app_key(self.app_key)
+        if app_key != request.app_key:
+            raise ValueError("a local part key must equal its request subject")
+        if request.kind == "totals":
+            if not isinstance(self.value, DiskShare):
+                raise ValueError("a totals part carries a DiskShare")
+            _validate_local_totals(request, app_key, self.value)
+        else:
+            if not isinstance(self.value, Series):
+                raise ValueError("a series part carries a Series")
+            _validate_local_series(request, app_key, self.value)
+        if not isinstance(self.data_digest, str) or len(self.data_digest) != 64 \
+                or set(self.data_digest) - set("0123456789abcdef"):
+            raise ValueError("a local part digest is 64 lowercase hexadecimal characters")
+        if self.data_digest != local_answer_digest(request.kind, app_key, request.window, self.value):
+            raise ValueError("a local part digest must match its accepted payload")
+
+
+@dataclass(frozen=True)
+class LocalFilesOutcome:
+    """One ownership-proved Files page plus its local served evidence."""
+
+    worker_id: int
+    request: QueryRequest
+    app_key: str
+    table: FileTable
+    coverage: FileCoverage
+    served_gap_count: int | None
+
+    def __post_init__(self) -> None:
+        _private_int(self.worker_id, "local_files.worker_id", minimum=1)
+        request = _normalize_request(self.request)
+        if request.kind != "files":
+            raise ValueError("a local Files outcome answers a files request")
+        if request.cursor is not None:
+            raise ValueError("a local Files outcome is a first page, never a continuation")
+        app_key = _canonical_app_key(self.app_key)
+        if app_key != request.app_key:
+            raise ValueError("a local Files key must equal its request subject")
+        if not isinstance(self.table, FileTable):
+            raise ValueError("local_files.table must be a FileTable")
+        _revalidate_tree(self.table)
+        if not isinstance(self.coverage, FileCoverage):
+            raise ValueError("local_files.coverage must be a FileCoverage")
+        _revalidate_tree(self.coverage)
+        if self.table.window != request.window or self.coverage.window != request.window:
+            raise ValueError("local Files evidence must carry the exact requested window")
+        if (self.table.sort, self.table.direction, self.table.search) != (
+                request.sort, request.direction, request.search):
+            raise ValueError("local Files evidence must echo the requested selector")
+        if len(self.table.rows) > request.limit:
+            raise ValueError("a local Files page exceeds the requested page limit")
+        if self.table.app_id != self.coverage.app_id:
+            raise ValueError("local Files coverage must match the table snapshot")
+        if self.table.coverage != self.coverage.coverage:
+            raise ValueError("local Files coverage must match the table coverage")
+        if self.table.unknown_owner_overflow != self.coverage.unknown_owner_overflow:
+            raise ValueError("local Files coverage must match the table unknown-owner evidence")
+        for evidence in (self.table.coverage, self.coverage.coverage):
+            if evidence.unavailable_reason is not None:
+                raise ValueError("a published local Files outcome is available")
+        served = self.coverage.served_interval
+        if served is None:
+            raise ValueError("local Files evidence requires a served interval")
+        _validate_served_bounds(served, request)
+        if self.served_gap_count is not None:
+            _private_int(self.served_gap_count, "local_files.served_gap_count")
+
+
+@dataclass(frozen=True)
+class RemoteSettlement:
+    """One terminal remote outcome, bound to the Future that supplied it."""
+
+    future: Future[dict]
+    response: Mapping[str, object] | None = None
+    error: Exception | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.future, Future):
+            raise ValueError("a remote settlement requires its bound Future")
+        if self.response is not None and not isinstance(self.response, Mapping):
+            raise ValueError("a remote settlement response must be a mapping")
+        if self.error is not None and not isinstance(self.error, Exception):
+            raise ValueError("a remote settlement error must be an Exception")
+        if (self.response is None) == (self.error is None):
+            raise ValueError("a remote settlement carries exactly one result or error")
+
+
+@dataclass(frozen=True)
+class LocalSettlement:
+    """One terminal local worker outcome for its exact admitted worker."""
+
+    worker_id: int
+    outcome: LocalFrameOutcome | LocalPartOutcome | LocalFilesOutcome | None = None
+    error: Exception | None = None
+    local_bracket: LocalBracket | None = None
+
+    def __post_init__(self) -> None:
+        _private_int(self.worker_id, "local_settlement.worker_id", minimum=1)
+        outcome = self.outcome
+        if (outcome is None) == (self.error is None):
+            raise ValueError("a local settlement carries exactly one result or error")
+        if outcome is not None:
+            if not isinstance(outcome, (LocalFrameOutcome, LocalPartOutcome, LocalFilesOutcome)):
+                raise ValueError("a local settlement carries a typed local outcome")
+            # Re-enter the outcome's own validation; the shared recursive walk
+            # cannot descend through QueryRequest (it is a dataclass without
+            # __post_init__), and every nested value is already validated here.
+            type(outcome).__post_init__(outcome)
+            if outcome.worker_id != self.worker_id:
+                raise ValueError("a local settlement must carry its admitted worker id")
+        if self.error is not None and not isinstance(self.error, Exception):
+            raise ValueError("a local settlement error must be an Exception")
+        if self.local_bracket is not None:
+            if not isinstance(self.local_bracket, LocalBracket):
+                raise ValueError("a local settlement bracket must be a LocalBracket")
+            _revalidate_tree(self.local_bracket)
+
+
+SettlementInput = RemoteSettlement | LocalSettlement
+LocalOutcome = LocalFrameOutcome | LocalPartOutcome | LocalFilesOutcome
+
+
 class HistoryRouter:
     def __init__(self, local: QueryService, client: IodClient, registry: AppRegistry):
         self.local, self.client, self.registry = local, client, registry
@@ -156,7 +533,20 @@ class HistoryRouter:
         self._chronology_unproved = False
         self.transport_issues: list[GapNotice] = []
         self._all_segments = ()
-        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="appio-history")
+        # Two independent execution lanes (§3.3): a frame copy may never queue
+        # behind lazy detail or Files work, and vice versa. `_executor` stays a
+        # compatibility alias for the frame lane used by existing fixtures.
+        self._frame_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="appio-frame")
+        self._background_executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="appio-detail-files")
+        self._executor = self._frame_executor
+        #: Immutable token-bound outcomes; only an owner drain may read this.
+        self._completed: queue.SimpleQueue = queue.SimpleQueue()
+        #: Charged background submissions, keyed by their admitted worker id.
+        self._worker_jobs: dict[int, tuple[str, Future | None]] = {}
+        self._next_token_id = 1
+        self._local_paths: tuple[tuple[str, str, str], ...] | None = None
+        self._local_request: QueryRequest | None = None
         self._local_future = None
         self._daemon_answer_error: DaemonAnswerError | None = None
         self._local_generation = None
@@ -166,6 +556,70 @@ class HistoryRouter:
         self._file_jobs = set()
         self._file_workers = set()
         self._file_status = FileAvailability(True, False)
+
+    def _allocate_token_id(self) -> int:
+        """A router-wide, never-reused positive token/worker id (§3.4)."""
+
+        token_id = self._next_token_id
+        self._next_token_id += 1
+        return token_id
+
+    def _background_charge(self, owner: str) -> int:
+        return sum(1 for charged_owner, _ in self._worker_jobs.values() if charged_owner == owner)
+
+    def _background_capacity(self, owner: str) -> bool:
+        """Whether one more charged background job of ``owner`` is admissible."""
+
+        if owner not in ("detail", "files"):
+            raise ValueError("the background lane carries detail and files workers only")
+        if self._closed or len(self._worker_jobs) >= _BACKGROUND_CHARGE:
+            return False
+        limit = _DETAIL_CHARGE if owner == "detail" else _FILES_CHARGE
+        return self._background_charge(owner) < limit
+
+    def _submit_background_worker(
+        self, token: RequestToken, work: Callable[[], LocalOutcome],
+    ) -> Future | None:
+        """Charge one background slot and submit an immutable-outcome worker.
+
+        The submission is charged until the owner drains its terminal
+        completion, never released by a done callback. The worker callback only
+        wraps the returned immutable outcome/error and enqueues it; it reads no
+        registered connection and mutates no router state.
+        """
+
+        if not isinstance(token, RequestToken):
+            raise ValueError("a background worker needs its admitted request token")
+        if token.origin != "local" or token.owner not in ("detail", "files"):
+            raise ValueError("only a local detail or Files token owns a background worker")
+        if token.token_id in self._worker_jobs:
+            raise ValueError("a request token admits one worker only")
+        if not self._background_capacity(token.owner):
+            return None
+        worker_id = token.token_id
+
+        def run() -> None:
+            try:
+                settlement: SettlementInput = LocalSettlement(worker_id, outcome=work())
+            except Exception as error:  # noqa: BLE001 - the owner reports it once
+                settlement = LocalSettlement(worker_id, error=error)
+            self._completed.put((token, settlement))
+
+        # Reserve the charge before submission so a fast completion cannot
+        # escape the capacity counter.
+        self._worker_jobs[worker_id] = (token.owner, None)
+        try:
+            future = self._background_executor.submit(run)
+        except RuntimeError:
+            self._worker_jobs.pop(worker_id, None)
+            raise
+        self._worker_jobs[worker_id] = (token.owner, future)
+        return future
+
+    def _reap_background_worker(self, worker_id: int) -> None:
+        """Release a charged background job after its terminal completion."""
+
+        self._worker_jobs.pop(worker_id, None)
 
     @property
     def daemon_answer_error(self) -> DaemonAnswerError | None:
@@ -177,14 +631,15 @@ class HistoryRouter:
 
     @property
     def pending_work(self) -> bool:
-        """True while a frame or a subject's own part still awaits a reply.
+        """True while a frame, a local worker or a detail still needs draining.
 
         The console pumps the transport from its pending-frame poll; a subject's
         part is requested outside a frame, so without this the reply waited for
         the next refresh and could outlive the client's five second deadline.
         """
 
-        return bool(self._inflight or self._queue)
+        return bool(self._inflight or self._queue or self._worker_jobs
+                    or not self._completed.empty())
 
     def _cancel_file_requests(self):
         for future in tuple(self._file_jobs):
@@ -285,14 +740,27 @@ class HistoryRouter:
         return proven_names == {supplying_name}
 
     @staticmethod
-    def _read_local_files(paths, window, key, app_id, sort, direction, search):
-        """Read one ownership-proved store on the bounded executor, never sum IDs.
+    def _read_local_files(paths, window, key, app_id, sort, direction, search, *,
+                          worker_id: int | None = None,
+                          request: QueryRequest | None = None) -> LocalFilesOutcome:
+        """Read one ownership-proved store on the background executor, never sum IDs.
 
         Process retraction cannot retract top-100 hourly F candidates. Prove
         ownership over each query's reported served interval, retaining its
         original window and coverage disclosure. Never use _materialize's
         unfiltered F tables or make process retention a prerequisite for F.
+
+        The returned immutable outcome keeps the existing fatal-vs-skippable
+        candidate/provenance proofs inside the worker. Owner settlement in
+        Tasks 6–7 revalidates and completes the outward Future; until then the
+        two optional bindings default to a compatibility derivation so existing
+        fixtures that call this private worker directly keep their shape.
         """
+        if request is None:
+            request = QueryRequest("files", window, key, sort=sort, direction=direction,
+                                   search=search)
+        if worker_id is None:
+            worker_id = 1
         sources = []
         try:
             for name, path, owner in paths:
@@ -352,7 +820,9 @@ class HistoryRouter:
                 raise unavailable
             if len(results) != 1:
                 raise WindowUnavailableError("file_source_unavailable", "File ownership cannot be represented by one store.")
-            return results[0]
+            result = results[0]
+            return LocalFilesOutcome(worker_id, request, key, result.table, result.coverage,
+                                     result.served_gap_count)
         finally:
             for _, service, _ in sources:
                 service.connection.close()
@@ -385,14 +855,16 @@ class HistoryRouter:
                 def read():
                     if not future.done():
                         return self._read_local_files(paths, window, key, app_id, sort, direction, search)
-                job = self._executor.submit(read)
+                job = self._background_executor.submit(read)
                 # Cancellation retires a UI response, not a running worker.
                 # Keep its admission slot until the executor really retires it.
                 self._file_workers.add(job)
                 job.add_done_callback(self._file_workers.discard)
                 def completed(job):
                     try:
-                        self._settle_file(future, generation, value=job.result())
+                        outcome = job.result()
+                        self._settle_file(future, generation, value=FileViewResult(
+                            outcome.table, outcome.coverage, outcome.served_gap_count))
                     except Exception as error:
                         self._settle_file(future, generation, error=error)
                 job.add_done_callback(completed)
@@ -508,7 +980,17 @@ class HistoryRouter:
         self._close_views()
         self._queue = []
         self._closed = True
-        self._executor.shutdown(wait=False, cancel_futures=True)
+        # Publication retirement: no queued or late worker outcome may reach a
+        # widget or a caller after close. Capacity is not an outward resource, so
+        # dropping the bookkeeping here cannot free a wire slot.
+        while True:
+            try:
+                self._completed.get_nowait()
+            except queue.Empty:
+                break
+        self._worker_jobs.clear()
+        self._frame_executor.shutdown(wait=False, cancel_futures=True)
+        self._background_executor.shutdown(wait=False, cancel_futures=True)
 
     def _plan(self, window):
         evidence, cuts, gaps = [], defaultdict(dict), set()
@@ -735,8 +1217,21 @@ class HistoryRouter:
                     copy.close()
 
     @staticmethod
-    def _read_local(paths, window):
-        """Run SQLite and cached detail construction entirely off the UI thread."""
+    def _read_local(paths, window, *, worker_id: int | None = None,
+                    request: QueryRequest | None = None) -> LocalFrameOutcome:
+        """Copy, plan, materialise and rank in one frame worker (§3.3).
+
+        Returns every routing/materialisation fact the owner needs and never
+        constructs a subject's detail or exposes a database handle. The
+        optional bindings default to a compatibility derivation so existing
+        fixtures that call this private worker directly keep their shape; the
+        owner passes its admitted token binding once settlement is wired.
+        """
+        if request is None:
+            request = QueryRequest("ranking", window)
+        if worker_id is None:
+            worker_id = 1
+        window = request.window
         sources = []
         worker = None
         try:
@@ -760,14 +1255,6 @@ class HistoryRouter:
                 for index, owner in enumerate(boundary[2:], 2)))
             worker._build_ranking(window)
             worker._ready = True
-            details = {}
-            for row in worker._ranking:
-                for kind, method in (("totals", worker.disk_share), ("series", worker.series)):
-                    try:
-                        details[(kind, row.app_key)] = method(row.app_id, window)
-                    except (ValueError, RuntimeError) as error:
-                        # An A22-disabled series is not a zero-filled timeline.
-                        details[(kind, row.app_key)] = error
             file_available = False
             for _, service, _ in sources:
                 try:
@@ -779,17 +1266,101 @@ class HistoryRouter:
                     # Optional file metadata must not suppress process history
                     # or prevent another source from proving file availability.
                     continue
-            return {"ranking": worker._ranking, "parts": details, "segments": worker.segments,
-                "boundaries": worker.boundaries, "gaps": worker._gap_ranges,
-                "overlaps": worker._overlap_ranges, "local_history": worker._has_local_history,
-                "not_retained": worker._not_retained,
-                "chronology_unproved": worker._chronology_unproved,
-                "file_available": file_available}
+            return LocalFrameOutcome(
+                worker_id=worker_id,
+                request=request,
+                ranking=tuple(worker._ranking),
+                segments=tuple(worker.segments),
+                boundaries=tuple(worker.boundaries),
+                gaps=tuple(worker._gap_ranges),
+                known_gaps=tuple(worker._known_gap_ranges),
+                overlaps=tuple(worker._overlap_ranges),
+                has_local_history=bool(worker._has_local_history),
+                not_retained=bool(worker._not_retained),
+                chronology_unproved=bool(worker._chronology_unproved),
+                file_available=bool(file_available),
+            )
         finally:
             if worker is not None:
                 worker.close()
             for _, service, _ in sources:
                 service.connection.close()
+
+    @staticmethod
+    def _open_local_worker(paths, window):
+        """Private copies plus a planner worker for one detail snapshot."""
+
+        sources = []
+        try:
+            for name, path, owner in paths:
+                source = sqlite3.connect(Path(path).as_uri() + "?mode=ro", uri=True, timeout=0.2)
+                copy = sqlite3.connect(":memory:")
+                try:
+                    source.backup(copy)
+                finally:
+                    source.close()
+                sources.append((name, QueryService(copy), owner))
+        except Exception:
+            for _, service, _ in sources:
+                service.connection.close()
+            raise
+        worker = HistoryRouter(sources[0][1], SimpleNamespace(state=None), AppRegistry())
+        worker._sources = {name: (service, owner) for name, service, owner in sources}
+        worker._window = window
+        return worker, sources
+
+    @staticmethod
+    def _close_local_worker(worker, sources) -> None:
+        if worker is not None:
+            worker.close()
+        for _, service, _ in sources:
+            service.connection.close()
+
+    @staticmethod
+    def _read_local_part(paths, request: QueryRequest, *, worker_id: int,
+                         app_key: str) -> LocalPartOutcome:
+        """Compute exactly one requested kind for one external subject (§3.3).
+
+        Each private snapshot resolves the AppKey to *its own* store-local id,
+        so a registry or another store's numeric id is never used as a database
+        key. Only the requested kind is computed, then the existing merge/tier/
+        peak/residual/coverage reducers combine the per-store answers.
+        """
+        normalized = _normalize_request(request)
+        if normalized.kind not in ("totals", "series"):
+            raise ValueError("a local part request is totals or series")
+        if normalized.app_key != app_key:
+            raise ValueError("a local part request must name its external subject")
+        worker, sources = HistoryRouter._open_local_worker(paths, normalized.window)
+        try:
+            worker._plan(normalized.window)
+            worker._materialize()
+            parts = []
+            # The materialised views carry the planner's whole-delta retraction;
+            # the raw copies do not. Detail reads must use the retracted snapshots
+            # and resolve the external key inside each of them.
+            for _name, service in worker._views:
+                row = service.connection.execute(
+                    "SELECT app_id FROM app WHERE key=?", (app_key,)).fetchone()
+                if row is None:
+                    continue
+                if normalized.kind == "totals":
+                    parts.append(service.disk_share(row[0], normalized.window))
+                else:
+                    parts.append(service.series(row[0], normalized.window))
+            if not parts:
+                raise KeyError(app_key)
+            coverage = worker._part_coverage(parts)
+            if normalized.kind == "totals":
+                value = HistoryRouter._merge_disk_shares(
+                    parts, parts[0].app_id, normalized.window, coverage)
+            else:
+                value = HistoryRouter._merge_series(
+                    parts, parts[0].app_id, normalized.window, coverage)
+            digest = local_answer_digest(normalized.kind, app_key, normalized.window, value)
+            return LocalPartOutcome(worker_id, normalized, app_key, value, digest)
+        finally:
+            HistoryRouter._close_local_worker(worker, sources)
 
     def prepare(self, window: Window) -> None:
         # Preparation may fail before a future exists to report unavailability.
@@ -820,7 +1391,12 @@ class HistoryRouter:
                 raise ValueError("asynchronous history requires a file-backed SQLite source")
             paths.append((name, path, owner))
         self._local_generation = self._generation
-        self._local_future = self._executor.submit(self._read_local, paths, window)
+        self._local_paths = tuple(paths)
+        self._local_request = QueryRequest("ranking", window)
+        # The frame lane holds exactly one charged Future. A completed but
+        # undrained predecessor stays observable through its own result before
+        # the frozen `not done()` gate admits a replacement.
+        self._local_future = self._frame_executor.submit(self._read_local, paths, window)
         state = self.client.state
         if state is not None and state.verified and state.answering:
             self._queue.append(QueryRequest("ranking", window))
@@ -835,21 +1411,29 @@ class HistoryRouter:
         if self._local_future is None or not self._local_future.done():
             return False
         try:
-            data = self._local_future.result()
+            outcome = self._local_future.result()
         except Exception:
             self._file_status = FileAvailability(False, False, "file_source_unavailable")
             raise
-        self.segments, self.boundaries = data["segments"], data["boundaries"]
-        self._gap_ranges, self._overlap_ranges = data["gaps"], data["overlaps"]
-        self._has_local_history = data["local_history"]
-        self._not_retained = self._not_retained or data["not_retained"]
-        self._chronology_unproved = data["chronology_unproved"]
+        if not isinstance(outcome, LocalFrameOutcome):
+            self._file_status = FileAvailability(False, False, "file_source_unavailable")
+            raise ValueError("a local frame worker must return a typed frame outcome")
+        if outcome.request != self._local_request:
+            self._file_status = FileAvailability(False, False, "file_source_unavailable")
+            raise ValueError("a local frame worker answered another request")
+        self.segments, self.boundaries = outcome.segments, outcome.boundaries
+        self._gap_ranges = list(outcome.gaps)
+        self._known_gap_ranges = list(outcome.known_gaps)
+        self._overlap_ranges = list(outcome.overlaps)
+        self._has_local_history = outcome.has_local_history
+        self._not_retained = self._not_retained or outcome.not_retained
+        self._chronology_unproved = outcome.chronology_unproved
         self._file_status = FileAvailability(
-            bool(data["file_available"]), False,
-            None if data["file_available"] else "file_source_unavailable",
+            outcome.file_available, False,
+            None if outcome.file_available else "file_source_unavailable",
         )
-        self._ranking = [replace(row, app_id=self.registry.id_for(row.app_key)) for row in data["ranking"]]
-        self._cached_parts = data["parts"]
+        self._ranking = [replace(row, app_id=self.registry.id_for(row.app_key))
+                         for row in outcome.ranking]
         self._local_generation = None
         return True
 
@@ -1076,9 +1660,21 @@ class HistoryRouter:
                 )
             return [part]
         if self._local_future is not None:
-            value = self._cached_parts[(kind, key)]
-            if isinstance(value, Exception):
-                raise value
+            marker = (kind, key)
+            value = self._cached_parts.get(marker)
+            if value is None:
+                # Lazy local detail: only a caller that actually selects this
+                # subject/kind pays for its private snapshot and reducer merge.
+                # Exact getters move to owner settlement in the next task; this
+                # compatibility bridge keeps their original synchronous contract
+                # until then.
+                if not self._local_paths:
+                    raise KeyError(app_id)
+                outcome = self._read_local_part(
+                    self._local_paths, QueryRequest(kind, window, key),
+                    worker_id=self._allocate_token_id(), app_key=key)
+                value = outcome.value
+                self._cached_parts[marker] = value
             return [value]
         parts = []
         for _, service in self._views:
@@ -1089,12 +1685,16 @@ class HistoryRouter:
             raise KeyError(app_id)
         return parts
 
-    def disk_share(self, app_id: int, window: Window) -> DiskShare:
-        parts = self._app_parts(app_id, window, "disk_share")
-        coverage = (self._combine_coverage([part.coverage for part in parts])
-                    if self._remote is None and self._local_future is None else parts[0].coverage)
+    def _part_coverage(self, parts):
+        coverage = self._combine_coverage([part.coverage for part in parts])
         if self._not_retained:
             coverage = replace(coverage, complete=False, unavailable_reason="not_retained")
+        return coverage
+
+    @staticmethod
+    def _merge_disk_shares(parts, app_id, window, coverage):
+        """Preserve the existing device merge and signed residual reducers."""
+
         devices = {}
         for part in parts:
             for row in part.devices:
@@ -1116,8 +1716,10 @@ class HistoryRouter:
             residual_write=None if write is None else task_write-write,
             residual_total=None if read is None else task_read+task_write-read-write, coverage=coverage)
 
-    def series(self, app_id: int, window: Window) -> Series:
-        parts = self._app_parts(app_id, window, "series")
+    @staticmethod
+    def _merge_series(parts, app_id, window, coverage):
+        """Preserve the existing point/peak/residual merge reducers."""
+
         if len({part.tier for part in parts}) != 1:
             raise RuntimeError("mixed retention tiers cannot represent one series")
         points, devices, residuals = {}, {}, {}
@@ -1144,7 +1746,20 @@ class HistoryRouter:
             points=tuple(points[key] for key in sorted(points)),
             device_points=tuple(devices[key] for key in sorted(devices)),
             residual_points=tuple(residuals[key] for key in sorted(residuals)),
-            coverage=(self._combine_coverage([part.coverage for part in parts])
-                      if self._remote is None and self._local_future is None else
-                      replace(parts[0].coverage, complete=False, unavailable_reason="not_retained")
-                      if self._not_retained else parts[0].coverage))
+            coverage=coverage)
+
+    def disk_share(self, app_id: int, window: Window) -> DiskShare:
+        parts = self._app_parts(app_id, window, "disk_share")
+        coverage = (self._combine_coverage([part.coverage for part in parts])
+                    if self._remote is None and self._local_future is None else parts[0].coverage)
+        if self._not_retained:
+            coverage = replace(coverage, complete=False, unavailable_reason="not_retained")
+        return HistoryRouter._merge_disk_shares(parts, app_id, window, coverage)
+
+    def series(self, app_id: int, window: Window) -> Series:
+        parts = self._app_parts(app_id, window, "series")
+        coverage = (self._combine_coverage([part.coverage for part in parts])
+                    if self._remote is None and self._local_future is None else
+                    replace(parts[0].coverage, complete=False, unavailable_reason="not_retained")
+                    if self._not_retained else parts[0].coverage)
+        return HistoryRouter._merge_series(parts, app_id, window, coverage)
