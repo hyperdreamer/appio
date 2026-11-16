@@ -132,6 +132,7 @@ class QueryTransportHarness:
         self.changes = 0
         self.servers: list[socket.socket] = []
         self.decoders: list[FrameDecoder] = []
+        self._peer_decoders: dict[socket.socket, FrameDecoder] = {}
         self.received: list[dict[str, Any]] = []
         self.query_frames: list[dict[str, Any]] = []
         self.query_kinds: list[str] = []
@@ -172,8 +173,10 @@ class QueryTransportHarness:
         client_end, server_end = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
         client_end.setblocking(False)
         server_end.settimeout(2.0)
+        decoder = FrameDecoder()
         self.servers.append(server_end)
-        self.decoders.append(FrameDecoder())
+        self.decoders.append(decoder)
+        self._peer_decoders[server_end] = decoder
         self._peer_closed = False
         return client_end
 
@@ -208,31 +211,56 @@ class QueryTransportHarness:
                 return frame
         return None
 
-    @staticmethod
-    def _connection_eof(server: socket.socket) -> bool:
-        """True only when the client end of *server* really closed."""
+    def _drain_peer(self, server: socket.socket) -> bool:
+        """Consume *server*'s buffered output; True when its client end closed.
 
-        try:
-            if server.fileno() < 0:
+        A closed connection is only observable once every buffered byte has
+        been consumed. A single-byte peek returns that byte rather than EOF, so
+        a retired peer with unread output would keep its jobs counted.
+        """
+
+        if server.fileno() < 0:
+            return True
+        decoder = self._peer_decoders[server]
+        while True:
+            try:
+                ready, _, _ = select.select([server], [], [], 0)
+            except (OSError, ValueError):  # pragma: no cover - closed fixture socket
                 return True
-            ready, _, _ = select.select([server], [], [], 0)
-        except (OSError, ValueError):  # pragma: no cover - closed fixture socket
-            return True
-        if not ready:
-            return False
-        try:
-            data = server.recv(1, socket.MSG_PEEK)
-        except (BlockingIOError, InterruptedError):
-            return False
-        except OSError:
-            return True
-        return data == b""
+            if not ready:
+                return False
+            try:
+                data = server.recv(65536)
+            except (BlockingIOError, InterruptedError):
+                return False
+            except OSError:
+                return True
+            if not data:
+                return True
+            try:
+                frames = decoder.feed(data)
+            except ProtocolError:  # pragma: no cover - the client never sends garbage
+                return False
+            for frame in frames:
+                self.received.append(frame)
+                if frame.get("type") != "query":
+                    continue
+                request_id = frame.get("request_id")
+                self.query_frames.append(frame)
+                self.query_kinds.append(frame["query"]["kind"])
+                if isinstance(request_id, str):
+                    self._jobs_for(server)[request_id] = frame["query"]["kind"]
 
     def _retire_detached(self) -> None:
-        """Retire jobs whose carrying connection observed real EOF/detach."""
+        """Retire jobs whose carrying connection observed real EOF/detach.
+
+        Each carrying peer is drained through its buffered output first, so a
+        closed connection that still holds unread client bytes is retired here
+        instead of surviving into a replacement connection's occupancy.
+        """
 
         for server in list(self._jobs):
-            if self._connection_eof(server):
+            if self._drain_peer(server):
                 self._jobs.pop(server, None)
 
     def _jobs_for(self, server: socket.socket) -> dict[str, str]:
@@ -250,36 +278,10 @@ class QueryTransportHarness:
         self._retire_detached()
         if self._peer_closed:
             return
-        server = self.server
-        while True:
-            try:
-                ready, _, _ = select.select([server], [], [], 0)
-            except (OSError, ValueError):  # pragma: no cover - closed peer fixture
-                return
-            if not ready:
-                return
-            try:
-                data = server.recv(65536)
-            except (BlockingIOError, InterruptedError, OSError):
-                return
-            if not data:
-                # The client end really closed. The jobs carried by this
-                # connection are retired by _observe()'s EOF check before any
-                # occupancy is reported.
-                self._peer_closed = True
-                return
-            try:
-                frames = self.decoders[-1].feed(data)
-            except ProtocolError:  # pragma: no cover - the client never sends garbage
-                return
-            for frame in frames:
-                self.received.append(frame)
-                if frame.get("type") == "query":
-                    request_id = frame.get("request_id")
-                    self.query_frames.append(frame)
-                    self.query_kinds.append(frame["query"]["kind"])
-                    if isinstance(request_id, str):
-                        self._jobs_for(server)[request_id] = frame["query"]["kind"]
+        if self._drain_peer(self.server):
+            # The client end really closed. The jobs carried by this connection
+            # were retired above, before any occupancy is reported.
+            self._peer_closed = True
 
     # -- public test surface ------------------------------------------------ #
 
@@ -488,6 +490,13 @@ class QueryTransportHarness:
 
     def _observe(self) -> None:
         self._retire_detached()
+        # The client closes a connection before it opens a replacement, so a
+        # superseded peer that was drained through EOF can carry no job. This
+        # pins drain-before-occupancy: a peek that stops at the first unread
+        # byte would leave the retired peer's job counted here.
+        assert not any(
+            jobs for server, jobs in self._jobs.items() if server is not self.server
+        ), "a drained superseded connection must contribute no historical job"
         self.observed_historical_occupants.append(
             sum(len(jobs) for jobs in self._jobs.values())
         )
