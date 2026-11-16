@@ -592,7 +592,12 @@ class HistoryRouter:
         """A router-wide, never-reused positive token/worker id (§3.4)."""
 
         token_id = self._next_token_id
-        self._next_token_id += 1
+        # An explicitly admitted helper id can already occupy a number that the
+        # sequence has not reached yet. A generated id never takes a live
+        # binding, and the counter only moves forward.
+        while token_id in self._worker_jobs:
+            token_id += 1
+        self._next_token_id = token_id + 1
         return token_id
 
     def _background_charge(self, owner: str) -> int:
@@ -641,8 +646,20 @@ class HistoryRouter:
         except RuntimeError:
             self._reap_background_worker(worker_id)
             raise
-        self._worker_jobs[worker_id] = (token.owner, future)
+        self._bind_background_worker(worker_id, token.owner, future)
         return future
+
+    def _bind_background_worker(self, worker_id: int, owner: str,
+                                future: Future) -> None:
+        """Attach a submitted Future to the one reservation that charged it.
+
+        A live helper binding is never overwritten: the id authority above and
+        this binding check keep every submitted Future under its own charge.
+        """
+
+        if self._worker_jobs.get(worker_id) != (owner, None):
+            raise RuntimeError("a charged background slot was rebound")
+        self._worker_jobs[worker_id] = (owner, future)
 
     def _reserve_background_worker(self, owner: str, *,
                                    worker_id: int | None = None) -> int | None:
@@ -663,11 +680,19 @@ class HistoryRouter:
             worker_id = self._allocate_token_id()
         elif worker_id in self._worker_jobs:
             return None
+        else:
+            # Explicit helper ids join the same never-reused sequence, so a
+            # later implicit allocation may never hand this number out again.
+            self._next_token_id = max(self._next_token_id, worker_id + 1)
         self._worker_jobs[worker_id] = (owner, None)
         return worker_id
 
     def _reap_terminal_background_workers(self) -> None:
-        """Owner-thread reaping of every terminal-but-undrained charge."""
+        """Owner-thread reaping of every terminal-but-undrained charge.
+
+        A running Future is a live resource, never a terminal charge, so close()
+        preserves it here; only cancellation or completion leaves the ledger.
+        """
 
         for worker_id, (_owner, future) in tuple(self._worker_jobs.items()):
             if future is not None and future.done():
@@ -960,7 +985,7 @@ class HistoryRouter:
                 except RuntimeError:
                     self._reap_background_worker(worker_id)
                     raise
-                self._worker_jobs[worker_id] = ("files", job)
+                self._bind_background_worker(worker_id, "files", job)
                 def completed(job):
                     try:
                         outcome = job.result()

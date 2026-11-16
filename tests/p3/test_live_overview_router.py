@@ -1312,8 +1312,11 @@ def test_local_detail_is_lazy_selected_subject_only(tmp_path, monkeypatch):
         with pytest.raises(RequestRejected) as refused:
             rejected.result(timeout=5)
         assert refused.value.reason == "query_busy"
+        # A fresh explicit helper id stays outside the implicit allocator's
+        # current range; the refusal below must come from capacity, not a
+        # colliding binding.
         extra_files = RequestToken(
-            22, QueryRequest("files", scope, ALPHA), "local", None, "files", 7, None,
+            30, QueryRequest("files", scope, ALPHA), "local", None, "files", 7, None,
             authority, vector,
         )
         assert router._submit_background_worker(extra_files, held_helper_files) is None
@@ -1373,4 +1376,119 @@ def test_local_detail_is_lazy_selected_subject_only(tmp_path, monkeypatch):
             router.close()
         if root is not None:
             root.connection.close()
+        local.connection.close()
+
+
+def test_worker_ids_are_never_reused_across_helper_and_files_admission(tmp_path, monkeypatch):
+    """One collision-safe worker-id authority for helper and public Files work.
+
+    The implicit Files allocator must never hand out an id that an admitted
+    helper already owns. Each submitted Future then keeps exactly one charge,
+    the shared ceiling refuses the eleventh submission instead of silently
+    rebinding a running worker, and close() retains that worker's charge.
+    """
+
+    local = _committed_store(tmp_path / "local.db", ((ALPHA, 17, 20),))
+    router = None
+    release = threading.Event()
+    entered = threading.Event()
+    submitted: list[Future] = []
+    try:
+        paths = _registered_paths(("local", local, "gui"))
+        scope = Window("range", BOOT, 100 * NS, 140 * NS)
+        router = HistoryRouter(QueryService(local), _IdleClient(), AppRegistry())
+        authority = ("local", (("local", "gui", 1),))
+        vector = LocalPositionVector((LocalPosition("local", "gui", 1, 1, 0),))
+        router.prepare(scope)
+        assert isinstance(router._local_future.result(timeout=10), LocalFrameOutcome)
+        assert router.ready(scope)
+        assert router.pending_work is False
+
+        actual_submit = router._background_executor.submit
+
+        def counted_submit(work, /, *args, **kwargs):
+            future = actual_submit(work, *args, **kwargs)
+            submitted.append(future)
+            return future
+
+        monkeypatch.setattr(router._background_executor, "submit", counted_submit)
+
+        # The helper takes exactly the id the implicit Files allocator would
+        # otherwise return for the first legacy Files request.
+        helper_id = router._next_token_id
+        helper = RequestToken(
+            helper_id, QueryRequest("totals", scope, ALPHA), "local",
+            retention_scope(ALPHA, scope), "detail", 1, None, authority, vector,
+        )
+
+        def held_detail():
+            entered.set()
+            assert release.wait(15), "the helper worker was never released"
+            return HistoryRouter._read_local_part(
+                paths, QueryRequest("totals", scope, ALPHA),
+                worker_id=helper_id, app_key=ALPHA)
+
+        helper_job = router._submit_background_worker(helper, held_detail)
+        assert helper_job is not None and entered.wait(5)
+        assert router._worker_jobs[helper_id][0] == "detail"
+        assert router._background_charge("detail") == 1
+
+        presentation = router.registry.id_for(ALPHA)
+        router.request_file_view(presentation, scope, "bytes_total", "desc", None)
+
+        def held_helper_worker():
+            assert False, "a queued helper worker must never run in this control"
+
+        for worker_id in range(102, 109):
+            helper_files = RequestToken(
+                worker_id, QueryRequest("files", scope, ALPHA), "local", None,
+                "files", worker_id, None, authority, vector,
+            )
+            assert router._submit_background_worker(
+                helper_files, held_helper_worker) is not None
+
+        second = RequestToken(
+            100, QueryRequest("totals", scope, ALPHA), "local",
+            retention_scope(ALPHA, scope), "detail", 2, None, authority, vector,
+        )
+        assert router._submit_background_worker(second, held_detail) is not None
+
+        # The eleventh submission attempt must meet the ten-job ceiling. If an
+        # implicit id overwrote the first helper's binding, this token is
+        # admitted against a ledger that has already lost one real charge.
+        third = RequestToken(
+            101, QueryRequest("totals", scope, ALPHA), "local",
+            retention_scope(ALPHA, scope), "detail", 3, None, authority, vector,
+        )
+        eleventh = router._submit_background_worker(third, held_detail)
+
+        # Every actual executor submission owns one distinct live charge.
+        assert len(submitted) == len(router._worker_jobs) == 10, (
+            f"{len(submitted)} submitted Futures against "
+            f"{len(router._worker_jobs)} recorded charges")
+        assert eleventh is None
+        assert router._worker_jobs[helper_id][0] == "detail"
+        assert router._background_charge("detail") == 2
+        assert router._background_charge("files") == 8
+
+        # Close retires publication, never a running worker's resource. With an
+        # overwritten binding this ledger emptied while the worker still ran.
+        router.close()
+        assert helper_job.running() is True
+        assert router._worker_jobs[helper_id][0] == "detail"
+        assert len(router._worker_jobs) == 1
+        assert router._background_charge("detail") == 1
+        assert router.pending_work
+        release.set()
+        assert helper_job.result(timeout=15) is None
+        assert router._background_charge("detail") == 1
+        assert router.pending_work
+        router._reap_background_worker(helper_id)
+        assert router._background_charge("detail") == 0
+        assert router._completed.empty()
+        assert router.pending_work is False
+    finally:
+        release.set()
+        if router is not None:
+            router.close()
         local.connection.close()
