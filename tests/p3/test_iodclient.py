@@ -46,14 +46,19 @@ from appio.iodclient import (
     RemoteError,
     RequestRejected,
 )
+from appio.iod_history import to_wire
 from appio.ipc_models import Capabilities, QueryRequest, StreamCursor
 from appio.ipc_protocol import FrameDecoder, encode_frame
 from appio.ipc_security import Peer, PeerRejected
+from live_overview_support import coverage as live_coverage
 
 NS = 1_000_000_000
 BOOT_A = "11111111-2222-4333-8444-555555555555"
 BOOT_B = "99999999-8888-4777-8666-555555555555"
 CAPS = {"proc_all": True, "dev_stat": True, "file_io": True, "bpf_loaded": True}
+#: A valid accepted identity; the shared selector validator requires 64
+#: lowercase hexadecimal characters, not an opaque fixture string.
+SNAPSHOT = "a" * 64
 
 
 # --------------------------------------------------------------------------- #
@@ -121,7 +126,7 @@ def gap_frame(*, previous, current, reason="cursor_not_retained", start=None, en
     }
 
 
-def result_frame(request_id, *, kind="ranking", snapshot="snap-1", rows=()):
+def result_frame(request_id, *, kind="ranking", snapshot=SNAPSHOT, rows=()):
     payload = [{"rows": list(rows), "next_cursor": None, "snapshot": snapshot}]
     return {
         "protocol": 1,
@@ -132,7 +137,7 @@ def result_frame(request_id, *, kind="ranking", snapshot="snap-1", rows=()):
     }
 
 
-def coverage_result(request_id, *, value=None, snapshot="snap-1"):
+def coverage_result(request_id, *, value=None, snapshot=SNAPSHOT):
     """A coverage reply whose payload is a plain object, so size is controllable."""
 
     return {
@@ -718,7 +723,7 @@ def test_historical_result_uses_the_shared_decoder_and_does_not_advance_the_curs
     value = future.result(timeout=0)
     assert value["kind"] == "ranking"
     assert value["result"] == []
-    assert value["snapshot"] == "snap-1"
+    assert value["snapshot"] == SNAPSHOT
     assert value["next_cursor"] is None
     assert harness.client.state.cursor == StreamCursor(BOOT_A, 7, 13)
 
@@ -820,22 +825,29 @@ def test_cache_is_keyed_by_request_and_committed_generation_and_evicted_whole():
 
 
 def test_cache_budget_evicts_whole_entries_and_never_exceeds_its_bound():
-    harness = handshaken(cursor=StreamCursor(BOOT_A, 7, 1), cache_bytes=600)
+    budget = 2000
+    harness = handshaken(cursor=StreamCursor(BOOT_A, 7, 1), cache_bytes=budget)
+    mapping = {"unit:alpha.service": live_coverage()}
+    value = to_wire(mapping, app_keys={})
+    entry_bytes = len(
+        json.dumps(
+            {"value": value, "snapshot": SNAPSHOT},
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    )
+    assert entry_bytes > budget // 3, "each entry is larger than a third of the budget"
+    assert entry_bytes < budget, "one entry must still fit"
     for index in range(4):
-        future = harness.client.query(
-            coverage_request(end_seconds=5 + index, coverage_kind="unknown_owner")
-        )
+        future = harness.client.query(coverage_request(end_seconds=5 + index))
         request = harness.one_request("query")
-        harness.send(
-            coverage_result(
-                request["request_id"],
-                value={"pad": f"{index}-" + "y" * 200},
-            )
-        )
+        harness.send(coverage_result(request["request_id"], value=value))
         harness.client.pump()
-        assert future.result(timeout=0)["result"]["pad"] == f"{index}-" + "y" * 200
-    assert harness.client.cached_responses <= 2, "each entry is larger than a third of the budget"
-    assert harness.client.cached_bytes <= 600
+        assert future.result(timeout=0)["result"] == mapping
+    assert harness.client.cached_responses <= 2, "whole entries keep the byte bound"
+    assert harness.client.cached_bytes <= budget
+    assert harness.client.cached_bytes >= entry_bytes
 
 
 def test_close_fails_pending_queries_and_stops_reconnecting():
@@ -898,20 +910,36 @@ def test_close_clears_a_previous_transport_fault():
 # --------------------------------------------------------------------------- #
 
 
-def test_cancelled_query_does_not_break_the_pump_and_still_warms_the_cache():
-    """A GUI cancels a query when the operator navigates; that must stay safe."""
+def test_cancelled_query_does_not_break_the_pump_and_releases_without_cache():
+    """A GUI cancels a query when the operator navigates; that must stay safe.
+
+    Amendment A14/A15: cancellation is not a terminal daemon outcome, so the
+    transport stays active. The consumed envelope still releases its real wire
+    slot, but a cancelled Future's answer never enters the cache.
+    """
 
     harness = handshaken(cursor=StreamCursor(BOOT_A, 7, 1))
     future = harness.client.query(ranking_request())
     request = harness.one_request("query")
+    assert harness.client.query_transport(future).phase == "active"
     assert future.cancel() is True
+    assert harness.client.query_transport(future).phase == "active", (
+        "cancelling a Future does not free the wire slot"
+    )
     harness.send(result_frame(request["request_id"]))
     harness.client.pump()  # must not raise InvalidStateError
     assert harness.client.pending_requests == 0
     assert future.cancelled() is True
-    assert harness.client.cached_responses == 1, "the answer is still worth keeping"
+    assert harness.client.query_transport(future).phase == "terminal"
+    assert harness.client.cached_responses == 0, "a cancelled answer is not inserted"
+    # The next identical read is therefore a real query, whose answer can be
+    # accepted and cached for its own current owner.
     again = harness.client.query(ranking_request())
+    again_request = harness.one_request("query")
+    harness.send(result_frame(again_request["request_id"]))
+    harness.client.pump()
     assert again.result(timeout=0)["kind"] == "ranking"
+    assert harness.client.cached_responses == 1
 
 
 # --------------------------------------------------------------------------- #

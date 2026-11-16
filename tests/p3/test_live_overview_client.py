@@ -7,6 +7,7 @@ router routes.
 
 from __future__ import annotations
 
+from concurrent.futures import Future
 from dataclasses import replace
 
 import pytest
@@ -26,6 +27,7 @@ from appio.contracts import (
     Window,
     WindowUnavailableError,
 )
+from appio.history_types import RemotePosition
 from appio.history_validation import (
     _normalize_request,
     _validate_local_coverage,
@@ -34,14 +36,24 @@ from appio.history_validation import (
     _validate_local_totals,
     validate_query_result,
 )
+from appio.iodclient import IodClientError
 from appio.ipc_models import QueryRequest
-from live_overview_support import coverage, share, total
+from live_overview_support import coverage, series, share, total
+from live_overview_transport import QueryTransportHarness
 
 KEY = "unit:alpha.service"
 OTHER_KEY = "unit:beta.service"
 SNAPSHOT = "a" * 64
 BOOT = "boot-a"
 RAW_SECS = 10
+NS = 1_000_000_000
+
+
+def _reason(future) -> str:
+    assert future.done(), "the future must settle without blocking the caller"
+    with pytest.raises(IodClientError) as caught:  # noqa: PT011 - reason is asserted below
+        future.result(timeout=0)
+    return caught.value.reason
 
 _MISSING = object()
 
@@ -647,3 +659,205 @@ def test_series_accepts_simultaneous_devices_and_rejects_per_device_overlap_or_o
         validate_query_result(totals_request, _response("totals", totals_value))
     with pytest.raises(ValueError):
         _validate_local_totals(totals_request, OTHER_KEY, totals_value)
+
+
+# ---------------------------------------------------------------------------
+# Transport association, cursor-complete caching and decoded subjects (Task 3)
+# ---------------------------------------------------------------------------
+
+
+def test_cache_and_refusal_futures_keep_immutable_request_association() -> None:
+    """Every returned Future, including immediate outcomes, stays query-bound."""
+
+    transport = QueryTransportHarness(cursor=RemotePosition(BOOT, 7, 3))
+    window = Window("range", BOOT, 0, 20 * NS)
+    request = QueryRequest("series", window, app_key=KEY, limit=100)
+
+    first = transport.query(request)
+    issued = transport.client.query_transport(first)
+    assert issued.phase == "active"
+    assert issued.request == request
+    assert issued.connection_generation == transport.client.generation
+    assert issued.request_id is not None
+    assert issued.issued_at_ns == transport.clock.ns
+    assert issued.issued_source == RemotePosition(BOOT, 7, 3)
+    assert issued.answered_source is None
+
+    observed: list[object] = []
+
+    def _capture(done: Future) -> None:
+        observed.append(transport.client.query_transport(done))
+
+    first.add_done_callback(_capture)
+    transport.reply(first, series(91, window), snapshot=SNAPSHOT)
+    assert [state.phase for state in observed] == ["terminal"]
+    assert observed[0].request == request
+    assert observed[0].request_id == issued.request_id
+    assert observed[0].issued_at_ns == issued.issued_at_ns
+    assert observed[0].answered_source == issued.issued_source
+    assert first.result(timeout=0)["app_key"] == KEY
+
+    # An immediate cache hit is bound before any callback runs, consumes no
+    # wire slot and keeps the original answered source without a new issue.
+    envelopes = len(transport.query_kinds)
+    hit = transport.query(request)
+    assert hit.done()
+    hit_capture: list[object] = []
+    hit.add_done_callback(lambda done: hit_capture.append(transport.client.query_transport(done)))
+    hit_state = transport.client.query_transport(hit)
+    assert hit_state.phase == "terminal"
+    assert hit_state.request == request
+    assert hit_state.request_id is None and hit_state.issued_at_ns is None
+    assert hit_state.issued_source is None
+    assert hit_state.answered_source == RemotePosition(BOOT, 7, 3)
+    assert [state.phase for state in hit_capture] == ["terminal"]
+    assert hit_capture[0].request == request
+    assert len(transport.query_kinds) == envelopes
+    assert transport.client.pending_requests == 0
+    assert transport.observed_historical_occupants[-1] == 0
+
+    # A selector-inapplicable request is a local refusal: it keeps its exact
+    # immutable request and is never adopted under some other selector.
+    malformed = QueryRequest("series", window, app_key=KEY, search="x")
+    refused = transport.query(malformed)
+    assert _reason(refused) == "invalid_selector"
+    refused_state = transport.client.query_transport(refused)
+    assert refused_state.phase == "not_sent"
+    assert refused_state.request == malformed
+    assert refused_state.request.kind == "series"
+    assert refused_state.request_id is None and refused_state.issued_at_ns is None
+    assert refused_state.issued_source is None and refused_state.answered_source is None
+
+    # A22's disabled launch window is refused locally too, before any wire
+    # request, and the association still names the submitted selector.
+    launch = QueryRequest("ranking", Window("launch", BOOT, launch_id=7))
+    refused_launch = transport.query(launch)
+    assert _reason(refused_launch) == "launch_attribution"
+    launch_state = transport.client.query_transport(refused_launch)
+    assert launch_state.phase == "not_sent"
+    assert launch_state.request == launch
+    assert launch_state.request_id is None and launch_state.issued_at_ns is None
+    assert len(transport.query_kinds) == envelopes
+
+    # An unrelated Future was never bound by this client.
+    unrelated = Future()
+    with pytest.raises(ValueError):
+        transport.client.query_transport(unrelated)
+    with pytest.raises(ValueError):
+        transport.client.retire_query_connection(unrelated)
+    with pytest.raises(ValueError):
+        transport.client.reject_query_result(unrelated)
+
+
+def test_full_cursor_cache_key_and_original_answered_source() -> None:
+    """The cache key carries the whole cursor; a hit never restamps its source."""
+
+    transport = QueryTransportHarness(cursor=RemotePosition(BOOT, 7, 3))
+    window = Window("range", BOOT, 0, 20 * NS)
+    request = QueryRequest("totals", window, app_key=KEY)
+
+    first = transport.query(request)
+    issued = transport.client.query_transport(first)
+    assert issued.phase == "active"
+    assert issued.issued_source == RemotePosition(BOOT, 7, 3)
+    transport.reply(first, share(91, window), snapshot=SNAPSHOT)
+    assert transport.client.query_transport(first).phase == "terminal"
+    settled = transport.client.query_transport(first)
+    assert settled.request == issued.request
+    assert settled.request_id == issued.request_id
+    assert settled.issued_at_ns == issued.issued_at_ns
+    assert settled.answered_source == RemotePosition(BOOT, 7, 3)
+
+    envelopes = len(transport.query_kinds)
+    hit = transport.query(request)
+    hit_state = transport.client.query_transport(hit)
+    assert hit_state.phase == "terminal"
+    assert hit_state.request_id is None and hit_state.issued_at_ns is None
+    assert hit_state.answered_source == RemotePosition(BOOT, 7, 3)
+    assert len(transport.query_kinds) == envelopes, "an unchanged-cursor hit costs no round trip"
+    assert hit.result(timeout=0)["app_key"] == KEY
+
+    # The cursor sequence is part of the key: the next committed sequence is a
+    # miss and issues a new source, never the previous answer's source.
+    transport.stream(4)
+    fresh = transport.query(request)
+    fresh_state = transport.client.query_transport(fresh)
+    assert fresh_state.phase == "active"
+    assert fresh_state.issued_source == RemotePosition(BOOT, 7, 4)
+    assert len(transport.query_kinds) == envelopes + 1
+
+    # A structurally older cache payload planted under the newer cursor key
+    # cannot certify the newer requested source: it is evicted and the read
+    # misses instead of resurrecting the old provenance.
+    transport.inject_stale_cached_answer(
+        request, share(93, window), answered_source=RemotePosition(BOOT, 7, 3)
+    )
+    stale = transport.query(request)
+    stale_state = transport.client.query_transport(stale)
+    assert stale_state.phase == "active"
+    assert stale_state.issued_at_ns is not None
+    assert stale_state.issued_source == RemotePosition(BOOT, 7, 4)
+    assert len(transport.query_kinds) == envelopes + 2
+    transport.reply(stale, share(94, window), snapshot=SNAPSHOT)
+    accepted = transport.client.query_transport(stale)
+    assert accepted.phase == "terminal"
+    assert accepted.answered_source == RemotePosition(BOOT, 7, 4)
+
+    # Preserved controls: whole-entry byte bound and failure exclusion.
+    assert transport.client.cached_bytes <= transport.client.cache_bytes
+    before = transport.client.cached_responses
+    other_window = Window("range", BOOT, 0, 21 * NS)
+    failing = transport.query(QueryRequest("totals", other_window, app_key=KEY))
+    transport.error(failing, "history_unavailable", "the daemon is busy")
+    assert _reason(failing) == "history_unavailable"
+    assert transport.client.cached_responses == before, "a failure is never cached"
+    sent = len(transport.query_kinds)
+    retry = transport.query(QueryRequest("totals", other_window, app_key=KEY))
+    assert transport.client.query_transport(retry).phase == "active"
+    assert len(transport.query_kinds) == sent + 1, "a failed read sends a real retry"
+
+
+def test_totals_and_series_decode_preserve_external_subject() -> None:
+    """Decoded totals/series keep their external subject, not a wire/peer id."""
+
+    transport = QueryTransportHarness(cursor=RemotePosition(BOOT, 7, 3))
+    window = Window("range", BOOT, 0, 20 * NS)
+    peer_totals_id = 91
+    peer_series_id = 92
+    router_totals_id = 5
+    router_series_id = 6
+
+    totals_future = transport.query(QueryRequest("totals", window, app_key=KEY))
+    transport.reply(totals_future, share(peer_totals_id, window), snapshot=SNAPSHOT)
+    totals = totals_future.result(timeout=0)
+    assert totals["kind"] == "totals"
+    assert totals["app_key"] == KEY
+    assert totals["result"].window == window
+    assert totals["result"].app_id not in (peer_totals_id, router_totals_id)
+
+    series_future = transport.query(QueryRequest("series", window, app_key=OTHER_KEY))
+    transport.reply(series_future, series(peer_series_id, window), snapshot=SNAPSHOT)
+    answer = series_future.result(timeout=0)
+    assert answer["kind"] == "series"
+    assert answer["app_key"] == OTHER_KEY
+    assert answer["result"].window == window
+    assert answer["result"].app_id not in (peer_series_id, router_series_id)
+    assert answer["result"].app_id != totals["result"].app_id
+
+    # A wrong wire subject for an otherwise valid value is rejected at the
+    # external-key boundary, before any presentation remap could hide it. A
+    # distinct window keeps these arms off the earlier accepted answer's cache.
+    accepted_entries = transport.client.cached_responses
+    wrong_window = Window("range", BOOT, 0, 21 * NS)
+    transport.register_subject(peer_totals_id, OTHER_KEY)
+    wrong_totals = transport.query(QueryRequest("totals", wrong_window, app_key=KEY))
+    transport.reply(wrong_totals, share(peer_totals_id, wrong_window), snapshot=SNAPSHOT)
+    assert _reason(wrong_totals) == "invalid_result"
+    assert transport.client.query_transport(wrong_totals).phase == "terminal"
+    assert transport.client.cached_responses == accepted_entries
+
+    transport.register_subject(peer_series_id, KEY)
+    wrong_series = transport.query(QueryRequest("series", wrong_window, app_key=OTHER_KEY))
+    transport.reply(wrong_series, series(peer_series_id, wrong_window), snapshot=SNAPSHOT)
+    assert _reason(wrong_series) == "invalid_result"
+    assert transport.client.cached_responses == accepted_entries
