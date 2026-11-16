@@ -50,7 +50,7 @@ from appio.history_types import (
     retention_scope,
 )
 from appio.handover import baseline_seed
-from appio.iodclient import AppRegistry, ClientState
+from appio.iodclient import AppRegistry, ClientState, RequestRejected
 from appio.ipc_models import QueryRequest
 from appio.procs import AppKeyInputs, IoReadOutcome, ProcessIdentity, StableProcRecord
 from appio.query import QueryService
@@ -661,7 +661,7 @@ def test_live_records_validate_every_field_and_phase_combination() -> None:
         ("owner_id.zero", {"owner_id": 0}),
         ("owner_id.bool", {"owner_id": False}),
         ("detail.no-scope", {"request": detail_request, "owner": "detail", "scope": None}),
-        ("detail.no-subject", {"request": ranking_request, "owner": "detail"}),
+        ("detail.no-subject", {"request": ranking_request, "owner": "detail", "scope": scope}),
         ("detail.scope-subject", {"scope": retention_scope(OTHER_KEY, since_boot)}),
         ("detail.scope-window", {"scope": retention_scope(KEY, range_w)}),
         ("frame.scope", {"owner": "frame", "scope": scope}),
@@ -705,6 +705,29 @@ def test_live_records_validate_every_field_and_phase_combination() -> None:
         lambda: RequestToken(1, ranking_request, "local", None, "frame", 1, None,
                              local_authority, forged_vector),
     )
+    # A detail token is already valid before one field is varied. The former
+    # cases used a frame base, so they failed the "frame carries no scope" guard
+    # instead of the subject/Window scope equality their labels claimed.
+    detail_base = {
+        "token_id": 1,
+        "request": detail_request,
+        "origin": "local",
+        "scope": scope,
+        "owner": "detail",
+        "owner_id": 1,
+        "slot_id": None,
+        "authority": local_authority,
+        "requested_source": local_vector,
+    }
+    assert RequestToken(**detail_base) == detail_token
+    for label, kwargs in (
+        ("detail.scope-other-subject", {"scope": retention_scope(OTHER_KEY, since_boot)}),
+        ("detail.scope-other-window", {"scope": retention_scope(KEY, range_w)}),
+    ):
+        _reject(
+            f"request_token.{label}",
+            lambda kwargs=kwargs, base=detail_base: RequestToken(**{**base, **kwargs}),
+        )
 
     # LocalFrameOutcome: all copied routing evidence, no eager detail handle.
     frame_segments = (
@@ -720,6 +743,19 @@ def test_live_records_validate_every_field_and_phase_combination() -> None:
         2, ranking_request, (total(7, KEY), total(8, OTHER_KEY)), frame_segments,
         frame_boundaries, frame_gaps, frame_known_gaps, (), False, False, False, True,
     )
+    # Boundaries are a chronology: valid ordered evidence is the control, and a
+    # permutation or repeat of that same evidence is not another valid plan.
+    chrono_segments = (
+        HistorySegment("local", "gui", "boot-a", 0, 4 * NS, True),
+        HistorySegment("export", "iod", "boot-a", 4 * NS, 8 * NS, True),
+        HistorySegment("local", "gui", "boot-a", 8 * NS, 12 * NS, True),
+    )
+    chrono_boundaries = (("boot-a", 4 * NS, "gui", "iod"), ("boot-a", 8 * NS, "iod", "gui"))
+    chrono_frame = LocalFrameOutcome(
+        2, ranking_request, (total(7, KEY),), chrono_segments,
+        chrono_boundaries, (), (), (), False, False, False, True,
+    )
+    assert chrono_frame.boundaries == chrono_boundaries
     assert frame.ranking[0].app_key == KEY
     assert frame.known_gaps[0][2] > frame.known_gaps[1][1]
     _assert_frozen(frame, "ranking")
@@ -735,6 +771,24 @@ def test_live_records_validate_every_field_and_phase_combination() -> None:
         ("segments.list", {"segments": list(frame_segments)}),
         ("segments.not-segment", {"segments": (("local", "gui", "boot-a", 0, NS),)}),
         ("segments.order", {"segments": (frame_segments[1], frame_segments[0])}),
+        # Nested segments promise real UTF-8 boot text; the pre-existing segment
+        # validator only checks identity truthiness, so these cross this boundary.
+        ("segments.boot-int", {
+            "segments": (HistorySegment("local", "gui", 123, 0, 4 * NS, True),),
+            "boundaries": (),
+        }),
+        ("segments.boot-tuple", {
+            "segments": (HistorySegment("local", "gui", ("x",), 0, 4 * NS, True),),
+            "boundaries": (),
+        }),
+        ("segments.boot-nul", {
+            "segments": (HistorySegment("local", "gui", "a\x00b", 0, 4 * NS, True),),
+            "boundaries": (),
+        }),
+        ("segments.boot-encoding", {
+            "segments": (HistorySegment("local", "gui", "a\ud800", 0, 4 * NS, True),),
+            "boundaries": (),
+        }),
         ("boundaries.list", {"boundaries": list(frame_boundaries)}),
         ("boundaries.length", {"boundaries": (("boot-a", 4 * NS, "gui"),)}),
         ("boundaries.boot", {"boundaries": (("", 4 * NS, "gui", "iod"),)}),
@@ -744,6 +798,24 @@ def test_live_records_validate_every_field_and_phase_combination() -> None:
         ("boundaries.same-owner", {"boundaries": (("boot-a", 4 * NS, "gui", "gui"),)}),
         ("boundaries.unsupported", {"boundaries": (("boot-a", 2 * NS, "gui", "iod"),)}),
         ("boundaries.other-boot", {"boundaries": (("other", 4 * NS, "gui", "iod"),)}),
+        ("boundaries.reversed", {
+            "segments": chrono_segments,
+            "boundaries": tuple(reversed(chrono_boundaries)),
+        }),
+        ("boundaries.duplicate", {
+            "segments": chrono_segments,
+            "boundaries": chrono_boundaries + (chrono_boundaries[-1],),
+        }),
+        ("boundaries.boot-order", {
+            "segments": (
+                HistorySegment("local", "gui", "boot-a", 0, 4 * NS, True),
+                HistorySegment("export", "iod", "boot-a", 4 * NS, 8 * NS, True),
+                HistorySegment("local", "gui", "boot-b", 8 * NS, 12 * NS, True),
+                HistorySegment("export", "iod", "boot-b", 12 * NS, 16 * NS, True),
+            ),
+            "boundaries": (("boot-b", 12 * NS, "gui", "iod"),
+                           ("boot-a", 4 * NS, "gui", "iod")),
+        }),
         ("gaps.list", {"gaps": [("boot-a", 8 * NS, 10 * NS)]}),
         ("gaps.length", {"gaps": (("boot-a", 8 * NS),)}),
         ("gaps.boot", {"gaps": (("", 8 * NS, 10 * NS),)}),
@@ -784,15 +856,23 @@ def test_live_records_validate_every_field_and_phase_combination() -> None:
         lambda: LocalFrameOutcome(2, ranking_request, (total(7, KEY),), (forged_segment,),
                                   (), (), (), (), False, False, False, True),
     )
-    # A boundary needs both adjacent *proven* segments; one unproven side fails.
-    _reject(
-        "local_frame.boundary-unproven",
-        lambda: LocalFrameOutcome(
-            2, ranking_request, (total(7, KEY),),
-            (HistorySegment("local", "gui", "boot-a", 0, 4 * NS, True),
-             HistorySegment("unproved", "unknown", "boot-a", 4 * NS, 8 * NS, False)),
-            (("boot-a", 4 * NS, "gui", "iod"),), (), (), (), False, False, False, True),
-    )
+    # A boundary needs both adjacent *proven* segments. Keep the intended gui/iod
+    # owners and vary only `proven`, so the proven-status requirement is the sole
+    # reason these values become admissible when it is removed.
+    for label, segments in (
+        ("boundary-unproven-outgoing", (
+            HistorySegment("local", "gui", "boot-a", 0, 4 * NS, False),
+            HistorySegment("export", "iod", "boot-a", 4 * NS, 8 * NS, True))),
+        ("boundary-unproven-incoming", (
+            HistorySegment("local", "gui", "boot-a", 0, 4 * NS, True),
+            HistorySegment("unproved", "iod", "boot-a", 4 * NS, 8 * NS, False))),
+    ):
+        _reject(
+            f"local_frame.{label}",
+            lambda segments=segments: LocalFrameOutcome(
+                2, ranking_request, (total(7, KEY),), segments,
+                (("boot-a", 4 * NS, "gui", "iod"),), (), (), (), False, False, False, True),
+        )
 
     # LocalPartOutcome: one kind, one external subject, one canonical digest.
     totals_value = share(7, since_boot)
@@ -809,6 +889,12 @@ def test_live_records_validate_every_field_and_phase_combination() -> None:
         ("request.files", {"request": files_request}),
         ("request.missing-subject", {"request": QueryRequest("totals", since_boot)}),
         ("key.mismatch", {"app_key": OTHER_KEY}),
+        # Recompute the digest for the deliberately mismatched external key, so
+        # the request association is the sole fault rather than a digest mismatch.
+        ("key.mismatch-valid-digest", {
+            "app_key": OTHER_KEY,
+            "data_digest": local_answer_digest("totals", OTHER_KEY, since_boot, totals_value),
+        }),
         ("key.invalid", {"app_key": "exe:relative/path"}),
         ("value.series", {"value": series_value}),
         ("value.window", {"value": share(7, range_w)}),
@@ -835,6 +921,12 @@ def test_live_records_validate_every_field_and_phase_combination() -> None:
         local_answer_digest("series", KEY, since_boot, series_value),
     )
     assert series_part.value.tier == "raw"
+    _reject(
+        "local_part.series-key-mismatch-valid-digest",
+        lambda: LocalPartOutcome(
+            4, series_request, OTHER_KEY, series_value,
+            local_answer_digest("series", OTHER_KEY, since_boot, series_value)),
+    )
     forged_value_coverage = coverage()
     object.__setattr__(forged_value_coverage.hook_hits, "vfs_read", -1)
     _reject(
@@ -894,6 +986,35 @@ def test_live_records_validate_every_field_and_phase_combination() -> None:
             f"local_files.{label}",
             lambda kwargs=kwargs, base=base: LocalFilesOutcome(**{**base, **kwargs}),
         )
+    # Served evidence must lie inside the exact request. The positive control is
+    # an in-bounds subrange; the negative varies only its served end endpoint, so
+    # removing the served-bounds check is the sole reason it becomes admissible.
+    inside_served = Window("range", BOOT, 1_000_000_000, 15_000_000_000)
+    inside_overflow = UnknownOwnerOverflow(
+        inside_served, "overflow_owner_unknown", 0, 0, 0, coverage())
+    inside_table = FileTable(
+        7, since_boot, (), "bytes_total", "desc", None, inside_overflow, coverage())
+    inside_coverage = FileCoverage(
+        7, since_boot, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        HookHits(0, 0, 0, 0, 0, 0), 0, 0, inside_overflow, coverage(),
+    )
+    inside = LocalFilesOutcome(4, files_request, KEY, inside_table, inside_coverage, 0)
+    assert inside.coverage.served_interval == inside_served
+
+    wide_served = Window("range", BOOT, 1_000_000_000, 30_000_000_000)
+    wide_overflow = UnknownOwnerOverflow(
+        wide_served, "overflow_owner_unknown", 0, 0, 0, coverage())
+    wide_table = FileTable(
+        7, since_boot, (), "bytes_total", "desc", None, wide_overflow, coverage())
+    wide_coverage = FileCoverage(
+        7, since_boot, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        HookHits(0, 0, 0, 0, 0, 0), 0, 0, wide_overflow, coverage(),
+    )
+    assert wide_coverage.served_interval == wide_served
+    _reject(
+        "local_files.served-outside-request",
+        lambda: LocalFilesOutcome(4, files_request, KEY, wide_table, wide_coverage, 0),
+    )
 
     # Settlement inputs carry exactly one terminal result or error.
     finished = Future()
@@ -1090,12 +1211,12 @@ def test_local_detail_is_lazy_selected_subject_only(tmp_path, monkeypatch):
         computations.clear()
         local_ids.clear()
         router = HistoryRouter(QueryService(local), _IdleClient(), AppRegistry())
+        authority = ("local", (("local", "gui", 1),))
+        vector = LocalPositionVector((LocalPosition("local", "gui", 1, 1, 0),))
         entered = threading.Event()
         token = RequestToken(
             11, QueryRequest("totals", scope, ALPHA), "local",
-            retention_scope(ALPHA, scope), "detail", 1, None,
-            ("local", (("local", "gui", 1),)),
-            LocalPositionVector((LocalPosition("local", "gui", 1, 1, 0),)),
+            retention_scope(ALPHA, scope), "detail", 1, None, authority, vector,
         )
 
         def held_detail():
@@ -1117,15 +1238,135 @@ def test_local_detail_is_lazy_selected_subject_only(tmp_path, monkeypatch):
         assert router.ready(scope)
         assert router.pending_work
         assert router._background_charge("detail") == 1
+
+        # Two charged detail Futures is the hard lane bound: with both live, a
+        # third admission must refuse rather than submit unbounded stale work.
+        second = RequestToken(
+            12, QueryRequest("totals", scope, ALPHA), "local",
+            retention_scope(ALPHA, scope), "detail", 2, None, authority, vector,
+        )
+
+        def held_second():
+            assert release.wait(15), "the second detail worker was never released"
+            return HistoryRouter._read_local_part(
+                paths, QueryRequest("totals", scope, ALPHA), worker_id=12, app_key=ALPHA)
+
+        assert router._submit_background_worker(second, held_second) is not None
+        third = RequestToken(
+            13, QueryRequest("totals", scope, ALPHA), "local",
+            retention_scope(ALPHA, scope), "detail", 3, None, authority, vector,
+        )
+        assert router._submit_background_worker(third, held_second) is None
+        assert router._background_charge("detail") == 2
+
         release.set()
-        settled_token, settlement = router._completed.get(timeout=5)
-        assert settled_token is token
-        assert isinstance(settlement, LocalSettlement)
-        assert settlement.worker_id == token.token_id
-        assert isinstance(settlement.outcome, LocalPartOutcome)
-        assert settlement.outcome.value.window == scope
+        settled = [router._completed.get(timeout=10) for _ in range(2)]
+        assert {item[0].token_id for item in settled} == {token.token_id, second.token_id}
+        for settled_token, settlement in settled:
+            assert isinstance(settlement, LocalSettlement)
+            assert settlement.worker_id == settled_token.token_id
+            assert isinstance(settlement.outcome, LocalPartOutcome)
+            assert settlement.outcome.value.window == scope
         # A done callback never releases charged capacity; only an owner drain does.
+        assert router._background_charge("detail") == 2
+        router._reap_background_worker(token.token_id)
+        router._reap_background_worker(second.token_id)
+        assert router._background_charge("detail") == 0
+
+        # One authoritative background ledger: the legacy local Files path and
+        # helper submissions reserve against the same Files/total charges. Eight
+        # Files charges include the helper, so a ninth Files request and another
+        # helper Files job must both refuse instead of running a second budget.
+        files_release = threading.Event()
+        files_started = threading.Event()
+        original_files = router._read_local_files
+
+        def held_files(*args, **kwargs):
+            files_started.set()
+            assert files_release.wait(15), "the Files worker was never released"
+            return original_files(*args, **kwargs)
+
+        monkeypatch.setattr(router, "_read_local_files", held_files)
+        presentation = router.registry.id_for(ALPHA)
+        files_futures = [
+            router.request_file_view(presentation, scope, "bytes_total", "desc", None)
+            for _ in range(4)
+        ]
+        assert files_started.wait(5)
+        helper_files = RequestToken(
+            21, QueryRequest("files", scope, ALPHA), "local", None, "files", 6, None,
+            authority, vector,
+        )
+
+        def held_helper_files():
+            assert files_release.wait(15), "the helper Files worker was never released"
+            raise WindowUnavailableError("file_source_unavailable", "held Files worker")
+
+        assert router._submit_background_worker(helper_files, held_helper_files) is not None
+        assert router._background_charge("files") == 5
+        for _ in range(3):
+            files_futures.append(
+                router.request_file_view(presentation, scope, "bytes_total", "desc", None))
+        assert router._background_charge("files") == 8
+        rejected = router.request_file_view(presentation, scope, "bytes_total", "desc", None)
+        with pytest.raises(RequestRejected) as refused:
+            rejected.result(timeout=5)
+        assert refused.value.reason == "query_busy"
+        extra_files = RequestToken(
+            22, QueryRequest("files", scope, ALPHA), "local", None, "files", 7, None,
+            authority, vector,
+        )
+        assert router._submit_background_worker(extra_files, held_helper_files) is None
+
+        files_release.set()
+        for future in files_futures:
+            future.exception(timeout=15)
+        helper_token, helper_settlement = router._completed.get(timeout=15)
+        assert helper_token is helper_files
+        assert isinstance(helper_settlement, LocalSettlement)
+        assert isinstance(helper_settlement.error, WindowUnavailableError)
+        # Terminal Files charges stay charged until an owner reap: the same ledger
+        # that admitted them releases them, never a worker-thread done callback.
+        assert router._background_charge("files") == 8
+        router._reap_terminal_background_workers()
+        assert router._background_charge("files") == 0
+        assert not router._worker_jobs
+
+        # Close retires publication, never resource accounting. A running worker
+        # keeps its binding until it terminates and is reaped through this same
+        # owner path; its late outcome is dropped instead of published.
+        close_release = threading.Event()
+        close_started = threading.Event()
+
+        def held_close(worker_id):
+            def work():
+                close_started.set()
+                assert close_release.wait(15), "the close worker was never released"
+                return HistoryRouter._read_local_part(
+                    paths, QueryRequest("totals", scope, ALPHA),
+                    worker_id=worker_id, app_key=ALPHA)
+            return work
+
+        closing = RequestToken(
+            31, QueryRequest("totals", scope, ALPHA), "local",
+            retention_scope(ALPHA, scope), "detail", 9, None, authority, vector,
+        )
+        close_job = router._submit_background_worker(closing, held_close(closing.token_id))
+        assert close_job is not None
+        assert close_started.wait(5)
+        router.close()
+        assert close_job.running() is True
+        assert closing.token_id in router._worker_jobs
         assert router._background_charge("detail") == 1
+        assert router.pending_work
+        close_release.set()
+        assert close_job.result(timeout=15) is None
+        assert router._background_charge("detail") == 1
+        assert router.pending_work
+        router._reap_background_worker(closing.token_id)
+        assert router._background_charge("detail") == 0
+        assert router._completed.empty()
+        assert router.pending_work is False
     finally:
         release.set()
         if router is not None:

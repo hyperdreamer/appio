@@ -333,6 +333,11 @@ class LocalFrameOutcome:
             if not isinstance(segment, HistorySegment):
                 raise ValueError("local_frame.segments contains only HistorySegment records")
             _revalidate_tree(segment)
+            # The pre-existing segment validator checks identity truthiness, not
+            # text type/encoding, and the recursive walk visits primitives only.
+            # A frame outcome promises real UTF-8 boot identities, so validate
+            # every nested segment here rather than trusting re-entry alone.
+            _boot_text(segment.boot_id, "local_frame.segments.boot_id")
             last = previous.get(segment.boot_id)
             if last is not None and (segment.start_ns <= last.start_ns
                                      or segment.start_ns < last.end_ns):
@@ -341,6 +346,12 @@ class LocalFrameOutcome:
 
         if not isinstance(self.boundaries, tuple):
             raise ValueError("local_frame.boundaries must be a tuple")
+        boot_rank: dict[str, int] = {}
+        for segment in self.segments:
+            boot_rank.setdefault(segment.boot_id, len(boot_rank))
+        seen_transitions: set[tuple[str, int, str, str]] = set()
+        last_boot_rank = -1
+        last_at: dict[str, int] = {}
         for boundary in self.boundaries:
             if not isinstance(boundary, tuple) or len(boundary) != 4:
                 raise ValueError("a boundary is (boot, at_ns, from_owner, to_owner)")
@@ -350,6 +361,23 @@ class LocalFrameOutcome:
             incoming = _private_enum(boundary[3], _POSITION_OWNERS, "local_frame.boundaries.to_owner")
             if outgoing == incoming:
                 raise ValueError("a boundary joins two different proven owners")
+            # Boundaries are a chronology, not an unordered evidence set: keep
+            # planner boot order, strictly increasing in-boot instants and one
+            # record per real transition. Never sort malformed order into valid.
+            if boot not in boot_rank:
+                raise ValueError("a boundary must belong to a copied boot")
+            rank = boot_rank[boot]
+            if rank < last_boot_rank:
+                raise ValueError("local_frame.boundaries must keep boot chronology order")
+            last_boot_rank = rank
+            transition = (boot, at_ns, outgoing, incoming)
+            if transition in seen_transitions:
+                raise ValueError("local_frame.boundaries must not repeat a transition")
+            seen_transitions.add(transition)
+            previous_at = last_at.get(boot)
+            if previous_at is not None and at_ns <= previous_at:
+                raise ValueError("local_frame.boundaries must strictly increase within a boot")
+            last_at[boot] = at_ns
             if not any(s.proven and s.boot_id == boot and s.owner == outgoing and s.end_ns == at_ns
                        for s in self.segments):
                 raise ValueError("a boundary must follow a proven outgoing segment")
@@ -544,6 +572,10 @@ class HistoryRouter:
         self._completed: queue.SimpleQueue = queue.SimpleQueue()
         #: Charged background submissions, keyed by their admitted worker id.
         self._worker_jobs: dict[int, tuple[str, Future | None]] = {}
+        #: Legacy Files submissions carry no request token or queued settlement,
+        #: so only these terminal charges may be reaped at a later admission.
+        #: A helper token's binding stays until its settlement is drained.
+        self._legacy_files_workers: set[int] = set()
         self._next_token_id = 1
         self._local_paths: tuple[tuple[str, str, str], ...] | None = None
         self._local_request: QueryRequest | None = None
@@ -554,7 +586,6 @@ class HistoryRouter:
         self._remote_snapshot = None
         self._closed = False
         self._file_jobs = set()
-        self._file_workers = set()
         self._file_status = FileAvailability(True, False)
 
     def _allocate_token_id(self) -> int:
@@ -594,9 +625,9 @@ class HistoryRouter:
             raise ValueError("only a local detail or Files token owns a background worker")
         if token.token_id in self._worker_jobs:
             raise ValueError("a request token admits one worker only")
-        if not self._background_capacity(token.owner):
+        worker_id = self._reserve_background_worker(token.owner, worker_id=token.token_id)
+        if worker_id is None:
             return None
-        worker_id = token.token_id
 
         def run() -> None:
             try:
@@ -605,21 +636,82 @@ class HistoryRouter:
                 settlement = LocalSettlement(worker_id, error=error)
             self._completed.put((token, settlement))
 
-        # Reserve the charge before submission so a fast completion cannot
-        # escape the capacity counter.
-        self._worker_jobs[worker_id] = (token.owner, None)
         try:
             future = self._background_executor.submit(run)
         except RuntimeError:
-            self._worker_jobs.pop(worker_id, None)
+            self._reap_background_worker(worker_id)
             raise
         self._worker_jobs[worker_id] = (token.owner, future)
         return future
 
-    def _reap_background_worker(self, worker_id: int) -> None:
-        """Release a charged background job after its terminal completion."""
+    def _reserve_background_worker(self, owner: str, *,
+                                   worker_id: int | None = None) -> int | None:
+        """Reserve one charged background slot before any executor submission.
 
-        self._worker_jobs.pop(worker_id, None)
+        Every Future submitted to the shared background executor -- lazy detail,
+        helper Files work and the legacy local Files path -- reserves here first,
+        so one authoritative ledger enforces the two/eight/ten bounds. A binding
+        stays charged until the owner-thread path reaps it; a done callback never
+        releases capacity. ``worker_id`` is the admitted token id for helper work
+        and an allocated id for the legacy Files path that has no token yet.
+        """
+
+        self._reap_terminal_legacy_files()
+        if not self._background_capacity(owner):
+            return None
+        if worker_id is None:
+            worker_id = self._allocate_token_id()
+        elif worker_id in self._worker_jobs:
+            return None
+        self._worker_jobs[worker_id] = (owner, None)
+        return worker_id
+
+    def _reap_terminal_background_workers(self) -> None:
+        """Owner-thread reaping of every terminal-but-undrained charge."""
+
+        for worker_id, (_owner, future) in tuple(self._worker_jobs.items()):
+            if future is not None and future.done():
+                self._reap_background_worker(worker_id)
+
+    def _reap_terminal_legacy_files(self) -> None:
+        """Reap completed legacy Files charges, which have no queued settlement.
+
+        A helper token's terminal job must keep its binding until its enqueued
+        settlement is drained, so admission-time reaping stays narrow.
+        """
+
+        for worker_id in tuple(self._legacy_files_workers):
+            entry = self._worker_jobs.get(worker_id)
+            if entry is not None and entry[1] is not None and entry[1].done():
+                self._reap_background_worker(worker_id)
+
+    def _discard_completed(self, worker_id: int) -> None:
+        """Drop queued settlements for one reaped worker without publishing."""
+
+        kept: list[tuple[RequestToken, SettlementInput]] = []
+        while True:
+            try:
+                item = self._completed.get_nowait()
+            except queue.Empty:
+                break
+            if item[0].token_id != worker_id:
+                kept.append(item)
+        for item in kept:
+            self._completed.put(item)
+
+    def _reap_background_worker(self, worker_id: int) -> None:
+        """Release a charged background job after its terminal completion.
+
+        Publication retirement never erases a resource: a closed router still
+        reaps through this same owner path, and any queued outcome for that
+        worker is dropped instead of reaching a widget or caller.
+        """
+
+        if self._worker_jobs.pop(worker_id, None) is None:
+            return
+        self._legacy_files_workers.discard(worker_id)
+        if self._closed:
+            self._discard_completed(worker_id)
 
     @property
     def daemon_answer_error(self) -> DaemonAnswerError | None:
@@ -835,7 +927,7 @@ class HistoryRouter:
         validate_enum(direction, ("asc", "desc"), "direction")
         validate_search(search)
         future, generation = Future(), self._generation
-        if len(self._file_jobs) >= 8 or len(self._file_workers) >= 8:
+        if len(self._file_jobs) >= 8:
             future.set_exception(RequestRejected("query_busy", "File history queue is full."))
             return future
         self._file_jobs.add(future)
@@ -852,14 +944,23 @@ class HistoryRouter:
                     if not path or service.connection.in_transaction:
                         raise WindowUnavailableError("file_source_unavailable", "File history needs a committed store.")
                     paths.append((name, path, owner))
+                # The legacy Files path shares the background executor, so it must
+                # reserve the same authoritative charge before submitting. Its
+                # binding is retained until an owner reap, not a done callback.
+                worker_id = self._reserve_background_worker("files")
+                if worker_id is None:
+                    future.set_exception(RequestRejected("query_busy", "File history queue is full."))
+                    return future
+                self._legacy_files_workers.add(worker_id)
                 def read():
                     if not future.done():
                         return self._read_local_files(paths, window, key, app_id, sort, direction, search)
-                job = self._background_executor.submit(read)
-                # Cancellation retires a UI response, not a running worker.
-                # Keep its admission slot until the executor really retires it.
-                self._file_workers.add(job)
-                job.add_done_callback(self._file_workers.discard)
+                try:
+                    job = self._background_executor.submit(read)
+                except RuntimeError:
+                    self._reap_background_worker(worker_id)
+                    raise
+                self._worker_jobs[worker_id] = ("files", job)
                 def completed(job):
                     try:
                         outcome = job.result()
@@ -981,16 +1082,18 @@ class HistoryRouter:
         self._queue = []
         self._closed = True
         # Publication retirement: no queued or late worker outcome may reach a
-        # widget or a caller after close. Capacity is not an outward resource, so
-        # dropping the bookkeeping here cannot free a wire slot.
+        # widget or a caller after close. Capacity is a resource, not an outward
+        # publication, so it is never erased here: a running worker keeps its
+        # charge until it terminates and its owner path reaps it. Cancelled
+        # queued jobs are terminal and are reaped through that same path below.
         while True:
             try:
                 self._completed.get_nowait()
             except queue.Empty:
                 break
-        self._worker_jobs.clear()
         self._frame_executor.shutdown(wait=False, cancel_futures=True)
         self._background_executor.shutdown(wait=False, cancel_futures=True)
+        self._reap_terminal_background_workers()
 
     def _plan(self, window):
         evidence, cuts, gaps = [], defaultdict(dict), set()
