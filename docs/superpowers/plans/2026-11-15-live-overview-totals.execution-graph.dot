@@ -1,0 +1,53 @@
+digraph execution {
+  rankdir=LR;
+  node [shape=box, style=rounded];
+  subgraph cluster_acceptance { label="acceptance";
+    T014 [label="T-014 Prove integrated router, transport, and source liveness [capable]"];
+    T015 [label="T-015 Prove retained independence, typed refusal lifecycle, and all status rows [capable]"];
+    T016 [label="T-016 Prove append costs and finish the exact acceptance gates [capable]"];
+  }
+  subgraph cluster_charts { label="charts";
+    T010 [label="T-010 Maintain bucket-anchored append caches and per-run curves [capable]"];
+  }
+  subgraph cluster_foundation { label="foundation";
+    T001 [label="T-001 Define neutral retained-answer and source records [advanced]"];
+    T002 [label="T-002 Establish shared pure selector validation [advanced]"];
+  }
+  subgraph cluster_presentation { label="presentation";
+    T008 [label="T-008 Extend the pure model with measured provenance and series metadata [advanced]"];
+    T009 [label="T-009 Adopt retained capability and exact-only identity/reset semantics [capable]"];
+    T011 [label="T-011 Establish typed refusal, measurement observation, and independent age [advanced]"];
+    T013 [label="T-013 Use series metadata for append identities and finish integration fixtures [advanced]"];
+  }
+  subgraph cluster_router { label="router";
+    T004 [label="T-004 Split typed local workers and independent execution capacity [capable]"];
+    T005 [label="T-005 Observe registered local positions and bind copy brackets [advanced]"];
+    T006 [label="T-006 Implement authority retirement and the sole frame/detail writer [capable]"];
+    T007 [label="T-007 Integrate Files deliveries into scheduling and settlement [capable]"];
+  }
+  subgraph cluster_shell { label="shell";
+    T012 [label="T-012 Wire source-driven shell preparation, continued drain, and one composer [capable]"];
+  }
+  subgraph cluster_transport { label="transport";
+    T003 [label="T-003 Bind client Futures to transport and validated cache entries [capable]"];
+  }
+  T001 -> T002;
+  T002 -> T003;
+  T002 -> T004;
+  T003 -> T005;
+  T004 -> T005;
+  T005 -> T006;
+  T006 -> T007;
+  T007 -> T008;
+  T008 -> T009;
+  T009 -> T010;
+  T009 -> T011;
+  T010 -> T012;
+  T011 -> T012;
+  T010 -> T013;
+  T011 -> T013;
+  T012 -> T014;
+  T013 -> T014;
+  T014 -> T015;
+  T015 -> T016;
+}

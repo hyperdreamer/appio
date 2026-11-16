@@ -1,0 +1,430 @@
+# appio live Overview lane execution manifest — derived from the signed plan.
+# Seven lanes; every task maps exactly once to a source-plan task.
+schema_version: 1
+epoch: 1
+source_plan:
+  path: "docs/superpowers/plans/2026-11-15-live-overview-totals.md"
+  sha256: "8b24e6bbaaeb14a19a25b21a19ec28af5fac6d13bf0005231eb70777f95c3b1c"
+  commit: "2a0dcc57283aac6c546ca77deef33608df72390a"
+  tasks: 16
+source_documents:
+  - path: "docs/superpowers/specs/2026-11-15-live-overview-totals-spec.md"
+    sha256: "526acaf2ce14aa8c13de530457d43efe5ff4583682d3c0a701a4a3931ae5c948"
+  - path: "docs/superpowers/specs/2026-11-15-live-overview-totals-design.md"
+    sha256: "8d6941b545ba15c9338f94df63d9d5c6b0b861e7cc7f14f8e85e2a675a6d70d9"
+derivation:
+  lane_from: "the plan per-task Lane line"
+  depends_on_from: "the plan per-task Depends on line plus every same-lane predecessor edge"
+  ownership_from: "the plan per-task Files allowlist, repository-relative POSIX paths"
+  validation_from: "the test modules each task owns, run as argv with no shell metacharacters"
+  exclusive_resources_policy: "none; every task uses offscreen Qt, injected clocks and synthetic stores, and runs no real service, helper or host transition"
+  interface_policy: "signature digest is sha256 over the whitespace-normalized signature"
+  signature_normalization: "Collapse ASCII whitespace runs to one space; trim; SHA-256 over UTF-8 signature bytes without trailing newline."
+lanes:
+  - id: acceptance
+    task_ids: [T-014, T-015, T-016]
+  - id: charts
+    task_ids: [T-010]
+  - id: foundation
+    task_ids: [T-001, T-002]
+  - id: presentation
+    task_ids: [T-008, T-009, T-011, T-013]
+  - id: router
+    task_ids: [T-004, T-005, T-006, T-007]
+  - id: shell
+    task_ids: [T-012]
+  - id: transport
+    task_ids: [T-003]
+interfaces:
+  - id: appio.history.records.v1
+    producer: T-001
+    signature: "RetentionScope | AcceptedIdentity | RemotePosition | LocalPosition | LocalPositionVector | LocalBracket | SourcePosition | AnswerProvenance | RetainedRecord | PartState | FrameProvenance | SeriesMetadata"
+    signature_sha256: "46c4e13f2b1f05e6b4c80217836c4d796d73cc4ca8031ef5ca3d4f0eb9bfbb47"
+  - id: appio.history.validation.v1
+    producer: T-002
+    signature: "validate_query_result(request: QueryRequest, response: Mapping[str, object]) -> None"
+    signature_sha256: "458aa3f71f7eaa712d3c59ea25ba1eba4e79b5b4324a62a70b6fdb153b66bab8"
+  - id: appio.client.query_transport.v1
+    producer: T-003
+    signature: "query_transport(future: Future[dict]) -> QueryTransportState; retire_query_connection(future: Future[dict]) -> bool; reject_query_result(future: Future[dict]) -> None"
+    signature_sha256: "c907ca978040f079f067c2a6e9a8ebe6f61cfcba7c0410bcfec825208c108865"
+  - id: appio.router.source_position.v1
+    producer: T-005
+    signature: "source_position() -> SourcePosition; local_position(source_name: str) -> LocalPosition; preparation_source(window: Window) -> SourcePosition | None; frame_provenance(window: Window) -> FrameProvenance | None"
+    signature_sha256: "71d6485f9137477f06a25afa20d8add675fe6a53855544d47cb96fe5bf702b98"
+  - id: appio.router.retained.v1
+    producer: T-006
+    signature: "select_detail(app_key: str | None, window: Window | None) -> None; request_detail(kind: PartKind, app_id: int, window: Window) -> PartState; part_state(kind: PartKind, app_key: str, scope: RetentionScope) -> PartState; retained(kind: PartKind, app_key: str, scope: RetentionScope, applied_endpoint: int | None) -> RetainedRecord | None; ranking_provenance(app_key: str, window: Window) -> AnswerProvenance | None"
+    signature_sha256: "1e27f98ff75548badf59c196c5dd9a74b803fe78af583488413e89a684824335"
+  - id: appio.ui.overview_provenance.v1
+    producer: T-008
+    signature: "OverviewModel metadata: requested_window | series_metadata | dependency provenance per §7.1"
+    signature_sha256: "641088398db9b3a0d4669f0e9dd07ba59832c81ba27a775d6c15380a4d3bff7e"
+  - id: appio.ui.chart.append.v1
+    producer: T-010
+    signature: "append_task_points(points: Sequence[SeriesPoint], *, identity: object) -> None; curves() -> tuple[ChartCurve, ...]; segments() -> tuple[ChartSegment, ...]"
+    signature_sha256: "35749b34369f4f3101a6ec4bb01e7f27617e4bc1f4815c1cadcfd4426eb14837"
+  - id: appio.ui.status.age.v1
+    producer: T-011
+    signature: "_compose_overview_status_choice(now_ns: int, age_now_ns: int) -> OverviewStatusChoice; oldest_answer_age(displayed_answers: Sequence[AnswerProvenance], now_ns: int) -> str | None"
+    signature_sha256: "492a67ceebb36870957a80973ada51891f44a100a3d16a9e5c902d30a7e63a94"
+tasks:
+  - id: T-001
+    plan_task: 1
+    title: "Define neutral retained-answer and source records"
+    implementer_tier: "advanced"
+    lane: foundation
+    sequence: 1
+    depends_on: []
+    owns:
+      - "src/appio/history_types.py"
+      - "tests/live_overview_support.py"
+      - "tests/p3/test_live_overview_router.py"
+    resources: []
+    produces: ["appio.history.records.v1"]
+    consumes: []
+    validation:
+      - argv: [python, -m, pytest, -q, tests/live_overview_support.py, tests/p3/test_live_overview_router.py]
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+          QT_QPA_PLATFORM: "offscreen"
+          PYTEST_QT_API: "pyqt6"
+  - id: T-002
+    plan_task: 2
+    title: "Establish shared pure selector validation"
+    implementer_tier: "advanced"
+    lane: foundation
+    sequence: 2
+    depends_on: ["T-001"]
+    owns:
+      - "src/appio/history_validation.py"
+      - "tests/p3/test_live_overview_client.py"
+    resources: []
+    produces: ["appio.history.validation.v1"]
+    consumes: ["appio.history.records.v1"]
+    validation:
+      - argv: [python, -m, pytest, -q, tests/p3/test_live_overview_client.py]
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+          QT_QPA_PLATFORM: "offscreen"
+          PYTEST_QT_API: "pyqt6"
+  - id: T-003
+    plan_task: 3
+    title: "Bind client Futures to transport and validated cache entries"
+    implementer_tier: "capable"
+    lane: transport
+    sequence: 1
+    depends_on: ["T-002"]
+    owns:
+      - "src/appio/iodclient.py:507-599"
+      - "src/appio/iodclient.py:642-910"
+      - "src/appio/iodclient.py:1014-1027"
+      - "src/appio/iodclient.py:1159-1310"
+      - "tests/live_overview_transport.py"
+      - "tests/p3/test_live_overview_client.py"
+      - "tests/p3/test_iodclient.py:59-250"
+    resources: []
+    produces: ["appio.client.query_transport.v1"]
+    consumes: ["appio.history.validation.v1"]
+    validation:
+      - argv: [python, -m, pytest, -q, tests/live_overview_transport.py, tests/p3/test_live_overview_client.py, tests/p3/test_iodclient.py:59-250]
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+          QT_QPA_PLATFORM: "offscreen"
+          PYTEST_QT_API: "pyqt6"
+  - id: T-004
+    plan_task: 4
+    title: "Split typed local workers and independent execution capacity"
+    implementer_tier: "capable"
+    lane: router
+    sequence: 1
+    depends_on: ["T-002"]
+    owns:
+      - "src/appio/history_router.py:17-169"
+      - "src/appio/history_router.py:288-402"
+      - "src/appio/history_router.py:501-512"
+      - "src/appio/history_router.py:668-868"
+      - "src/appio/history_router.py:1066-1150"
+      - "tests/p3/test_live_overview_router.py"
+    resources: []
+    produces: []
+    consumes: ["appio.history.records.v1"]
+    validation:
+      - argv: [python, -m, pytest, -q, tests/p3/test_live_overview_router.py]
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+          QT_QPA_PLATFORM: "offscreen"
+          PYTEST_QT_API: "pyqt6"
+  - id: T-005
+    plan_task: 5
+    title: "Observe registered local positions and bind copy brackets"
+    implementer_tier: "advanced"
+    lane: router
+    sequence: 2
+    depends_on: ["T-003", "T-004"]
+    owns:
+      - "src/appio/history_router.py:131-169"
+      - "src/appio/history_router.py:465-482"
+      - "src/appio/history_router.py:738-855"
+      - "tests/p3/test_live_overview_router.py"
+    resources: []
+    produces: ["appio.router.source_position.v1"]
+    consumes: ["appio.history.records.v1", "appio.client.query_transport.v1"]
+    validation:
+      - argv: [python, -m, pytest, -q, tests/p3/test_live_overview_router.py]
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+          QT_QPA_PLATFORM: "offscreen"
+          PYTEST_QT_API: "pyqt6"
+  - id: T-006
+    plan_task: 6
+    title: "Implement authority retirement and the sole frame/detail writer"
+    implementer_tier: "capable"
+    lane: router
+    sequence: 3
+    depends_on: ["T-005"]
+    owns:
+      - "src/appio/history_router.py:131-211"
+      - "src/appio/history_router.py:465-512"
+      - "src/appio/history_router.py:794-1150"
+      - "tests/p3/test_live_overview_router.py"
+      - "tests/p3/test_history_router.py:20-80"
+      - "tests/p3/test_history_router.py:254-326"
+    resources: []
+    produces: ["appio.router.retained.v1"]
+    consumes: ["appio.history.records.v1", "appio.history.validation.v1", "appio.client.query_transport.v1", "appio.router.source_position.v1"]
+    validation:
+      - argv: [python, -m, pytest, -q, tests/p3/test_live_overview_router.py, tests/p3/test_history_router.py:20-80, tests/p3/test_history_router.py:254-326]
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+          QT_QPA_PLATFORM: "offscreen"
+          PYTEST_QT_API: "pyqt6"
+  - id: T-007
+    plan_task: 7
+    title: "Integrate Files deliveries into scheduling and settlement"
+    implementer_tier: "capable"
+    lane: router
+    sequence: 4
+    depends_on: ["T-006"]
+    owns:
+      - "src/appio/history_router.py:175-237"
+      - "src/appio/history_router.py:288-475"
+      - "tests/p3/test_live_overview_router.py"
+      - "tests/p3/test_live_overview_client.py"
+      - "tests/p4/test_file_history_router.py"
+      - "tests/p4/test_files_tab_local_result.py"
+      - "tests/p4/test_files_tab_remote_result.py"
+    resources: []
+    produces: []
+    consumes: ["appio.history.validation.v1"]
+    validation:
+      - argv: [python, -m, pytest, -q, tests/p3/test_live_overview_router.py, tests/p3/test_live_overview_client.py, tests/p4/test_file_history_router.py, tests/p4/test_files_tab_local_result.py, tests/p4/test_files_tab_remote_result.py]
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+          QT_QPA_PLATFORM: "offscreen"
+          PYTEST_QT_API: "pyqt6"
+  - id: T-008
+    plan_task: 8
+    title: "Extend the pure model with measured provenance and series metadata"
+    implementer_tier: "advanced"
+    lane: presentation
+    sequence: 1
+    depends_on: ["T-007"]
+    owns:
+      - "src/appio/ui/render_model.py:1-35"
+      - "src/appio/ui/render_model.py:200-310"
+      - "src/appio/ui/render_model.py:407-636"
+      - "tests/test_ui.py:88-248"
+    resources: []
+    produces: ["appio.ui.overview_provenance.v1"]
+    consumes: ["appio.history.records.v1"]
+    validation:
+      - argv: [python, -m, pytest, -q, tests/test_ui.py:88-248]
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+          QT_QPA_PLATFORM: "offscreen"
+          PYTEST_QT_API: "pyqt6"
+  - id: T-009
+    plan_task: 9
+    title: "Adopt retained capability and exact-only identity/reset semantics"
+    implementer_tier: "capable"
+    lane: presentation
+    sequence: 2
+    depends_on: ["T-008"]
+    owns:
+      - "src/appio/ui/main_window.py:17-145"
+      - "src/appio/ui/main_window.py:332-387"
+      - "src/appio/ui/main_window.py:554-621"
+      - "src/appio/ui/main_window.py:671-716"
+      - "src/appio/ui/main_window.py:790-923"
+      - "src/appio/ui/main_window.py:1031-1084"
+      - "tests/test_ui.py"
+    resources: []
+    produces: []
+    consumes: ["appio.router.retained.v1", "appio.ui.overview_provenance.v1"]
+    validation:
+      - argv: [python, -m, pytest, -q, tests/test_ui.py]
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+          QT_QPA_PLATFORM: "offscreen"
+          PYTEST_QT_API: "pyqt6"
+  - id: T-010
+    plan_task: 10
+    title: "Maintain bucket-anchored append caches and per-run curves"
+    implementer_tier: "capable"
+    lane: charts
+    sequence: 1
+    depends_on: ["T-009"]
+    owns:
+      - "src/appio/ui/charts.py:99-339"
+      - "src/appio/ui/charts.py:339-691"
+      - "tests/test_charts.py:180-694"
+    resources: []
+    produces: ["appio.ui.chart.append.v1"]
+    consumes: []
+    validation:
+      - argv: [python, -m, pytest, -q, tests/test_charts.py:180-694]
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+          QT_QPA_PLATFORM: "offscreen"
+          PYTEST_QT_API: "pyqt6"
+  - id: T-011
+    plan_task: 11
+    title: "Establish typed refusal, measurement observation, and independent age"
+    implementer_tier: "advanced"
+    lane: presentation
+    sequence: 3
+    depends_on: ["T-009"]
+    owns:
+      - "src/appio/ui/render_model.py:1-35"
+      - "src/appio/ui/render_model.py:615-636"
+      - "src/appio/ui/main_window.py:332-387"
+      - "src/appio/ui/main_window.py:436-456"
+      - "src/appio/ui/main_window.py:554-654"
+      - "src/appio/ui/collector_window.py:517-586"
+      - "src/appio/ui/collector_window.py:588-655"
+      - "src/appio/ui/collector_window.py:914-971"
+      - "src/appio/ui/collector_window.py:995-1015"
+      - "src/appio/ui/collector_window.py:1448-1470"
+      - "tests/test_ui.py"
+      - "tests/p3/test_collector_window.py"
+    resources: []
+    produces: ["appio.ui.status.age.v1"]
+    consumes: ["appio.history.records.v1", "appio.ui.overview_provenance.v1"]
+    validation:
+      - argv: [python, -m, pytest, -q, tests/test_ui.py, tests/p3/test_collector_window.py]
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+          QT_QPA_PLATFORM: "offscreen"
+          PYTEST_QT_API: "pyqt6"
+  - id: T-012
+    plan_task: 12
+    title: "Wire source-driven shell preparation, continued drain, and one composer"
+    implementer_tier: "capable"
+    lane: shell
+    sequence: 1
+    depends_on: ["T-010", "T-011"]
+    owns:
+      - "src/appio/ui/collector_window.py:517-655"
+      - "src/appio/ui/collector_window.py:720-1081"
+      - "src/appio/ui/collector_window.py:1188-1250"
+      - "src/appio/ui/collector_window.py:1448-1470"
+      - "src/appio/ui/collector_window.py:1615-1682"
+      - "tests/p3/test_collector_window.py:80-171"
+    resources: []
+    produces: []
+    consumes: ["appio.router.source_position.v1", "appio.ui.status.age.v1"]
+    validation:
+      - argv: [python, -m, pytest, -q, tests/p3/test_collector_window.py:80-171]
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+          QT_QPA_PLATFORM: "offscreen"
+          PYTEST_QT_API: "pyqt6"
+  - id: T-013
+    plan_task: 13
+    title: "Use series metadata for append identities and finish integration fixtures"
+    implementer_tier: "advanced"
+    lane: presentation
+    sequence: 4
+    depends_on: ["T-010", "T-011"]
+    owns:
+      - "src/appio/ui/main_window.py:923-984"
+      - "tests/test_ui.py"
+      - "tests/live_overview_support.py"
+    resources: []
+    produces: []
+    consumes: ["appio.router.retained.v1", "appio.ui.overview_provenance.v1", "appio.ui.chart.append.v1"]
+    validation:
+      - argv: [python, -m, pytest, -q, tests/test_ui.py, tests/live_overview_support.py]
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+          QT_QPA_PLATFORM: "offscreen"
+          PYTEST_QT_API: "pyqt6"
+  - id: T-014
+    plan_task: 14
+    title: "Prove integrated router, transport, and source liveness"
+    implementer_tier: "capable"
+    lane: acceptance
+    sequence: 1
+    depends_on: ["T-012", "T-013"]
+    owns:
+      - "tests/p3/test_live_overview_router.py"
+      - "tests/p3/test_live_overview_client.py"
+      - "tests/p3/test_collector_window.py"
+      - "src/appio/history_types.py"
+      - "src/appio/history_validation.py"
+      - "src/appio/iodclient.py"
+      - "src/appio/history_router.py"
+      - "src/appio/ui/collector_window.py"
+      - "tests/live_overview_support.py"
+      - "tests/live_overview_transport.py"
+    resources: []
+    produces: []
+    consumes: ["appio.client.query_transport.v1", "appio.router.source_position.v1"]
+    validation:
+      - argv: [python, -m, pytest, -q, tests/p3/test_live_overview_router.py, tests/p3/test_live_overview_client.py, tests/p3/test_collector_window.py, tests/live_overview_support.py, tests/live_overview_transport.py]
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+          QT_QPA_PLATFORM: "offscreen"
+          PYTEST_QT_API: "pyqt6"
+  - id: T-015
+    plan_task: 15
+    title: "Prove retained independence, typed refusal lifecycle, and all status rows"
+    implementer_tier: "capable"
+    lane: acceptance
+    sequence: 2
+    depends_on: ["T-014"]
+    owns:
+      - "tests/test_ui.py"
+      - "tests/p3/test_collector_window.py"
+      - "src/appio/ui/render_model.py"
+      - "src/appio/ui/main_window.py"
+      - "src/appio/ui/collector_window.py"
+    resources: []
+    produces: []
+    consumes: ["appio.router.retained.v1", "appio.ui.overview_provenance.v1", "appio.ui.status.age.v1"]
+    validation:
+      - argv: [python, -m, pytest, -q, tests/test_ui.py, tests/p3/test_collector_window.py]
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+          QT_QPA_PLATFORM: "offscreen"
+          PYTEST_QT_API: "pyqt6"
+  - id: T-016
+    plan_task: 16
+    title: "Prove append costs and finish the exact acceptance gates"
+    implementer_tier: "capable"
+    lane: acceptance
+    sequence: 3
+    depends_on: ["T-015"]
+    owns:
+      - "tests/test_charts.py"
+      - "src/appio/ui/charts.py:99-691"
+    resources: []
+    produces: []
+    consumes: ["appio.ui.chart.append.v1"]
+    validation:
+      - argv: [python, -m, pytest, -q, tests/test_charts.py]
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+          QT_QPA_PLATFORM: "offscreen"
+          PYTEST_QT_API: "pyqt6"
