@@ -3,7 +3,7 @@
 - **Topic:** `sample-period-settings`
 - **Run:** `pm-run-20261117-153438-045b6e15`
 - **Date:** 2026-11-17
-- **Status:** revised after the round-1 design review (23 findings), awaiting re-review
+- **Status:** revised twice after design review (round 1: 3 blockers, 16 majors, 4 minors; round 2: 0 blockers, 8 majors, 3 minors), awaiting final verification
 
 ## 1. Background
 
@@ -16,8 +16,9 @@ to SQLite. Today that period is a module constant:
 | `MAX_FLUSH_NS = 30 * NS` — the commit ("overdue") window | `src/appio/iod.py:44` |
 | `Daemon(..., sample_ns=SAMPLE_NS, flush_ns=MAX_FLUSH_NS)` | `src/appio/iod.py:263-271` |
 | `flush_ns` must be strictly greater than `sample_ns`, enforced in the constructor | `src/appio/iod.py:267-270` |
-| `_flush_ns` gates two paths: an elapsed-time check inside `_sample` that raises `collection_overdue` | `src/appio/iod.py:824`, `:853` |
-| and a shutdown check that sets `_recover` when more than `_flush_ns` has passed since the last commit | `src/appio/iod.py:967` |
+| `_flush_ns` gates three paths: collection duration inside the sampling method, which logs `collection_overdue` | `src/appio/iod.py:824` |
+| an elapsed-since-commit check in `step()` before sampling, which sets `last_error` and `_recover` | `src/appio/iod.py:853` |
+| a shutdown check that sets `_recover` when more than `_flush_ns` has passed since the last commit | `src/appio/iod.py:967` |
 | The production entry point is module-level `main()`, which constructs `Daemon()` with defaults | `src/appio/iod.py:973-981` |
 | The shipped cadence is pinned by tests on production defaults; one asserts three raw observations across fifteen 2 s ticks | `tests/p3/test_iod_cadence_pins.py:16-33` |
 | A deployment tunable already lives in the unit as `Environment=` | `data/systemd/appio-iod.service` (`APPIO_QUOTA_BYTES`) |
@@ -31,7 +32,7 @@ to SQLite. Today that period is a module constant:
 | The collector's request vocabulary is read-only (`status`, `subscribe`, `query`) | `src/appio/ipc_models.py:77` |
 | The status reply is validated against an exact key set on both sides | `src/appio/ipc_models.py:603-630`; `src/appio/iod.py:531-536`; `src/appio/setup_service.py:349-352` |
 | `ServiceFacts` carries service and daemon facts but no period | `src/appio/collector_owner.py:35-62`; `src/appio/ui/collector_window.py:1512-1567` |
-| Note: `appio --interval` is the console's refresh *and* local-collection cadence, separate from the system service | `src/appio/__main__.py:33-37`, `:60-70`; `src/appio/ui/collector_window.py:1215-1221` |
+| Note: `appio --interval` is the console's refresh *and* local-collection cadence, separate from the system service; the refresh timer is composed from it | `src/appio/__main__.py:33-37`, `:60-70`; `src/appio/ui/collector_window.py:1215-1221`, `:1669` |
 
 So the measurement period is neither adjustable nor visible: an operator who wants
 finer or coarser measurement must patch a constant, and the console cannot report
@@ -56,13 +57,16 @@ Success criteria, each observable:
 5. Applying a value while collection is off writes the configuration and does **not**
    start or enable collection; applying while it is on restarts it.
 6. Applying the same value twice, the second time after a successful first apply,
-   writes nothing and does not restart. A second apply after a *failed* reload or
-   restart repairs the state instead of reporting `unchanged`.
+   writes nothing and does not restart. A second apply after a *failed* reload,
+   restart, or directory sync repairs the state instead of reporting `unchanged`,
+   and a unit that this operation left stopped is reported as such, never as
+   merely saved.
 7. A non-empty drop-in that is not canonical is refused and left byte-identical.
    (An exactly canonical file is treated as the helper's own; canonical bytes cannot
    prove authorship, so this is the honest rule — see D9.)
 8. Sustained operation at the supported minimum keeps retention ahead of production
-   on a 200+ application host, proven by a measured characterization run.
+   on a 200+ application host with an aged store, proven by a measured
+   characterization run that exercises actual pruning.
 
 ## 3. Non-goals
 
@@ -100,10 +104,11 @@ clamped.**
 **D3 — The commit window becomes `max(30 s, 3 x period)`
 (`flush_ns_for(sample_ns)`).** `flush_ns` must exceed `sample_ns`; a fixed 30 s window
 would make a legitimate 30 s cadence trip `collection_overdue` on the first scheduling
-jitter. Three periods keeps both overdue paths meaningful and leaves 2-10 s periods at
-least as forgiving as today. The shutdown path at `iod.py:967` requests recovery under
-the same derived threshold, and the design states that as intended: a shutdown after
-more than three missed cadences marks the run for recovery.
+jitter. Three periods keeps all three threshold uses meaningful
+(`iod.py:824`, `:853`, `:967`) and leaves 2-10 s periods at least as forgiving as
+today. The shutdown path at `iod.py:967` requests recovery under the same derived
+threshold, and the design states that as intended: a shutdown after more than three
+missed cadences marks the run for recovery.
 
 **D4 — The collector reports the period it is using.** The status reply gains
 `sample_ns` (positive integer, nanoseconds, at most 30 s). Both validators change:
@@ -142,16 +147,26 @@ directory modes. The design requires one addition there: after creating a direct
 `fsync` its parent, so a created `appio-iod.service.d/` survives a crash with the same
 guarantee as the file it will hold.
 
+Two refusal paths are distinct and must both be tested: a path missing from
+`FIXED_CONFIG_TARGETS` fails earlier, in `_require_fixed_path`, as
+`target:not_fixed_path`; a target present in that set but with no parser branch in
+`_require_expected_content` fails as `unexpected_content:not_a_config_target`. Both
+refuse before any bytes are written.
+
 **D6 — One argument-carrying verb, plumbed end to end.** Every layer that validates
 argv must accept it, or the feature is unreachable:
 
 1. **Installed shim** (`data/libexec/appio-setup`, must stay stdlib-only): its `VERBS`
    gains `set-sample-period`; the syntax check becomes
    `len(argv) == 2 and argv[1] in VERBS_WITHOUT_ARGUMENT` **or**
-   `len(argv) == 3 and argv[1] == "set-sample-period" and _CANONICAL_PERIOD.fullmatch(argv[2])`;
-   every other shape exits 2 with the existing usage message. The regex is duplicated
-   in the shim on purpose: the shim may not import `appio` before verifying the module
-   closure, and the duplication is one anchored pattern checked by the same tests.
+   `len(argv) == 3 and argv[1] == "set-sample-period" and _CANONICAL_PERIOD.fullmatch(argv[2])`,
+   where `_CANONICAL_PERIOD` is a **shape** pattern, `(?:0|[1-9][0-9]{0,7})`; every
+   other shape exits 2 with the existing usage message. The shim judges shape and
+   argv arity only: `1` and `31` are canonical shapes and must reach the boundary,
+   which owns the 2-30 range, or `sample_period_out_of_range` would be unreachable.
+   The pattern is duplicated in the shim on purpose: the shim may not import `appio`
+   before verifying the module closure, and the duplication is one anchored pattern
+   checked by the same tests.
 2. **Boundary** (`setup_boundary`): `VERBS` gains the verb; `Invocation` gains
    `period_seconds: int | None = None`; `parse_invocation` accepts three elements only
    for this verb and returns the parsed integer. A canonical value outside 2-30 raises
@@ -177,26 +192,43 @@ argv must accept it, or the feature is unreachable:
 
 The helper performs, under its existing lock:
 
+0. Capture `active_before` from `ActiveState` before touching anything.
 1. Read the target bytes (`None` when absent).
 2. Refuse a non-empty, non-canonical file with exit 2 `foreign_drop_in` and the path.
 3. `needs_write = existing != canonical_bytes`.
-4. Read the configured value from the manager:
-   `systemctl show -p Environment -p DropInPaths -p UnitFileState -p ActiveState
-   appio-iod.service` — the merged view, which is what the manager will start with.
-5. Write when `needs_write`.
-6. `systemctl daemon-reload` when `needs_write` or the configured value already differs
-   from `<n>`; failure exits 1 `daemon_reload_failed`.
+4. Read the manager's configuration view:
+   `systemctl show -p Environment -p EnvironmentFiles -p UnsetEnvironment
+   -p DropInPaths -p UnitFileState -p ActiveState appio-iod.service`.
+5. Write when `needs_write`. When the bytes are already canonical, `fsync` the
+   target's parent directory — and any ancestor directory this helper created —
+   before continuing, so an earlier publication that failed after `rename` is
+   completed rather than assumed.
+6. `systemctl daemon-reload` when `needs_write` or the merged `Environment=` already
+   differs from `<n>`; failure exits 1 `daemon_reload_failed`.
 7. `systemctl try-restart appio-iod.service` when the unit is active **and** any of:
-   `needs_write`, configured-before differs, or the running daemon reports a different
-   value. `try-restart` restarts only an active unit, so it cannot start collection and
-   the check-then-restart race disappears. Failure exits 1 `service_restart_failed`.
-8. Verify: the merged `Environment=` value equals `<n>`, and — when the unit is active
-   — the daemon's own status reply reports `sample_ns == n * NS`. A mismatch exits 1
-   `sample_period_not_in_effect` naming both observed values.
-9. Report `applied` when a write happened and verification passed; `unchanged` when no
-   write, no reload, and no restart were needed and verification passed on the first
-   observation; `applied_not_running` when the unit is inactive and the configuration
-   verified.
+   `needs_write`, the configured value differs, the daemon reports a different value,
+   or the daemon's value is unknown. `try-restart` restarts only an active unit, so it
+   cannot start collection and the check-then-restart race disappears. Failure exits 1
+   `service_restart_failed`.
+8. Verify: the merged `Environment=` equals `<n>`; when the unit is active, the
+   daemon's own status reply reports `sample_ns == n * NS`; when the unit is inactive,
+   `EnvironmentFiles` is empty and `UnsetEnvironment` does not name
+   `APPIO_SAMPLE_SECONDS`, because an unexpanded environment file or an unset directive
+   can change the value at exec time and a stopped unit cannot be observed. A failure
+   exits 1 `sample_period_unverifiable` (inactive) or `sample_period_overridden`
+   (active, naming both values and `DropInPaths`).
+9. Outcome, carried in the result document's `sample_period_state` and mutually
+   exclusive:
+   - `applied` — a write happened, verification passed, unit active;
+   - `applied_not_running` — a write happened, verification passed, the unit was
+     inactive before and after;
+   - `repair` — no write, but a reload or restart was performed and verification
+     passed;
+   - `unchanged` — no write, no reload, no restart, verification passed;
+   - `service_not_running` — the unit was active before and is inactive now: exit 1,
+     because this operation may have stopped it, and the switch is the repair path.
+   `sample_period` carries `<n>`; `sample_period_state` carries one of those five
+   strings; the existing `state` keeps its service-state meaning.
 
 The identical-bytes path therefore never *asserts* an old value: when the bytes match
 but the configured value, the running value, or a previous operation's completion is
@@ -216,11 +248,13 @@ operator can see which file won instead of guessing.
   Initial value: the last reported `sample_ns` converted to seconds, else 10.
   A refresh never overwrites an edited-but-unapplied value; the edit is preserved and
   the status line keeps reporting the collector's value independently.
-- Apply keeps a `pending_period`. Success is shown only when a probe reports
-  `sample_ns` equal to `pending_period`; a probe reporting any other value shows
-  `Requested N s, collector reports M s.` and clears nothing silently. A superseded
-  operation (another console applied a different value) surfaces as that same
-  mismatch, never as success.
+- Apply keeps `pending_period_seconds` (an integer number of seconds). Success is
+  shown only when a probe reports `sample_ns == pending_period_seconds * NS`; a probe
+  reporting any other value shows `Requested N s, collector reports M s.` and clears
+  nothing silently. A superseded operation (another console applied a different value)
+  surfaces as that same mismatch, never as success.
+- Object names: `sample_period_row`, `sample_period_spin`, `sample_period_apply`,
+  `sample_period_status`.
 - `ServiceFacts` gains `sample_ns: int | None` (validated positive int or None);
   `production_probe` passes the status reply's value through. The value is retained in
   the existing probe payload and invalidated on disconnect, restart, or a generation
@@ -291,9 +325,10 @@ expected content, directory durability), `setup_service` (handler: the D7 sequen
 the existing bounded runner and the existing lock), `setup_client` (payload argument
 and result decode). The result document keeps today's shape —
 `version`, `verb`, `uid`, `enabled`, `answering`, `pending_activation`, `state`,
-`export_path`, `export_cutoff`, `error` — and gains `sample_period` (int or null);
-`decode_body` validates it. Human-readable detail stays on stderr as the bounded first
-line; the machine payload is the JSON document, never a printed sentence.
+`export_path`, `export_cutoff`, `error` — and gains `sample_period` (int or null) and
+`sample_period_state` (the D7 string or null); `decode_body` validates both (integer in
+range, string in the closed set). Human-readable detail stays on stderr as the bounded
+first line; the machine payload is the JSON document, never a printed sentence.
 
 ### 5.3 Console
 
@@ -320,14 +355,17 @@ Option A — two peer rows, the period row a sibling of the root switch, no grou
 | Unit inactive or disabled | Write and reload only; `try-restart` cannot start it; row says saved, applies at next start |
 | Unit active | Write, reload, `try-restart`; a real gap appears in history (committed on SIGTERM) |
 | Bytes identical, configured value matches, daemon reports it | `unchanged`; no write, no reload, no restart |
-| Bytes identical, configured value matches, daemon reports another value | `try-restart`, then verify; repair, not `unchanged` |
-| Bytes identical after a failed reload/restart | repair on the next apply (D7 steps 6-8) |
+| Bytes identical, configured value matches, daemon reports another value | `try-restart`, then verify; `repair`, not `unchanged` |
+| Bytes identical, daemon value unknown while the unit is active | `try-restart`, then verify; evidence of a missing completion is not evidence of success |
+| Bytes identical after a failed reload or restart | repair on the next apply (D7 steps 5-9), including a parent-directory `fsync` |
+| Unit active before, inactive after | exit 1 `service_not_running`; this operation may have stopped it, and the switch is the repair path |
+| Inactive unit with `EnvironmentFiles=` set, or `UnsetEnvironment=` naming the variable | exit 1 `sample_period_unverifiable`, naming what was found; a stopped unit cannot be observed |
 | Helper argv arity wrong | shim exits 2, usage message |
 | Payload `1`, `31` | exit 2 `sample_period_out_of_range` |
 | Payload `abc`, `02`, `" 5"`, empty | exit 2 `invalid_verb_or_argument_count` |
 | Drop-in non-empty and non-canonical | exit 2 `foreign_drop_in`, bytes untouched |
 | Drop-in empty | replaced |
-| Another drop-in or `EnvironmentFile=` wins | exit 1 `sample_period_not_in_effect`, names observed value and `DropInPaths` |
+| Another drop-in or `EnvironmentFile=` wins | exit 1 `sample_period_overridden` (active) or `sample_period_unverifiable` (inactive), naming the observed value and `DropInPaths` |
 | `daemon-reload` fails | exit 1 `daemon_reload_failed`; file already written; retry repairs |
 | Restart fails | exit 1 `service_restart_failed`; retry repairs; console never shows success |
 | Write fails before rename | exit 1; old file intact, no partial target |
@@ -364,28 +402,46 @@ environment; the status validator accepts the field present and absent. The exis
 cadence pins must pass unchanged, and they prove the default path only, so a new
 production-startup test covers `main()` with no setting (criterion 1).
 
-**Helper** — shim argv forms (2 and 3 elements, both valid and forged); boundary
-payload table; dispatch with a payload, and a forged invocation without one; entry-point
-reason preservation for `sample_period_out_of_range`; payload/parse round-trip; target
-allowlist membership in both tables; foreign/empty/oversized/untrusted-target refusals
-with byte preservation; identical-bytes fast path; repair after injected reload and
-restart failures; `try-restart` never starting an inactive unit; precedence mismatch
-with `DropInPaths`; injected write/rename/directory-`fsync` failures; result document
-decode including the new field; exact exit codes.
+**Helper** — shim argv forms (2 and 3 elements, both valid and forged), including that
+`1` and `31` pass the shim's shape check and are classified by the boundary as
+`sample_period_out_of_range`, while `abc`, `02`, `" 5"` and empty fail at the shim;
+boundary payload table; dispatch with a payload, and a forged invocation without one;
+entry-point reason preservation for `sample_period_out_of_range`; payload/parse
+round-trip; target allowlist membership in both tables, with `target:not_fixed_path`
+and `unexpected_content:not_a_config_target` exercised as distinct refusals;
+foreign/empty/oversized/untrusted-target refusals with byte preservation; identical-bytes
+fast path; repair after injected reload and restart failures; retry after an injected
+directory-`fsync` failure, with the fault re-armed across repeated attempts so the
+retry must complete the durability confirmation; `try-restart` never starting an
+inactive unit; a unit active before and inactive after reported as
+`service_not_running`; precedence mismatch with `DropInPaths`; inactive unit with
+`EnvironmentFiles` or `UnsetEnvironment` reported unverifiable; injected write, rename
+and directory-`fsync` failures; result document decode for both new fields; each
+exit code.
 
-**Console** — row and object names; spin-box range, suffix, initial value from a
+**Console** — the four object names; spin-box range, suffix, initial value from a
 reported period, edit preservation across a refresh; deep link; each exact status
-string in D8; Apply disabled while pending; success only on a matching probe; mismatch,
-unavailable, and superseded outcomes; consent text and cancellation for the new verb;
-helper-missing failure surface; the existing switch assertions preserved plus the D11
-invariant.
+string in D8; Apply disabled while pending; success only on `sample_ns ==
+pending_period_seconds * NS`, tested with a real nanosecond value; mismatch, unavailable,
+and superseded outcomes; consent text and cancellation for the new verb; helper-missing
+failure surface; the existing switch assertions preserved plus the D11 invariant.
 
 **Root acceptance** — set 2 s and 30 s through the helper; observe committed interval
 spacing close to the request; confirm the status reply agrees; confirm the restart gap
 is recorded as a gap or partial interval; confirm an identical re-apply performs no
-write and no restart; confirm the 10-minute 30 s run raises neither overdue path
-(criterion 3); and measure sustained 2 s operation with 200+ applications for a
-non-growing unit backlog (criterion 8). Restore 10 s at the end.
+write and no restart; confirm the 10-minute 30 s run raises none of the three overdue
+thresholds (criterion 3), using a controlled clock below and above
+`flush_ns_for(period)` for each of `iod.py:824`, `:853` and `:967`, and asserting the
+recovery/epoch effect rather than only the absence of a log line; and measure
+sustained 2 s operation for criterion 8. Restore 10 s at the end.
+
+Criterion 8's measurement is defined concretely so it cannot pass vacuously: the store
+is pre-populated with at least two days of already-expired raw rows (so retention has
+eligible units from the first pass), the run lasts at least 30 minutes of wall clock,
+backlog is the count of eligible units, retirement throughput is
+`retired / measured_elapsed`, and the gate requires retirement throughput to exceed
+production throughput and the eligible backlog not to grow. A store below quota with no
+aged data would prove nothing and is not an acceptable fixture.
 
 ## 9. Risks
 
@@ -403,6 +459,14 @@ non-growing unit backlog (criterion 8). Restore 10 s at the end.
 ## 10. Resolved questions
 
 No open design questions. The operator approved the design, the 2-30 s range with a
-10 s default, and mockup A. The round-1 review's findings are addressed in D2, D4-D12
-and section 8; the only item that could still move the product is criterion 8's
-measured capacity gate, which is stated as an acceptance condition rather than hidden.
+10 s default, and mockup A. Round 1's findings are addressed in D2, D4-D12 and
+section 8. Round 2's findings are addressed as follows: shim shape versus boundary
+range (D6.1, F1); the restart predicate and a unit left stopped (D7 steps 7-9, F2);
+`EnvironmentFiles=`/`UnsetEnvironment=` on an inactive unit (D7 step 8, F3); parent
+directory `fsync` on a canonical-bytes retry (D7 step 5, F4); the
+`sample_period_state` field and five mutually exclusive outcomes (D7 step 9, F5);
+seconds versus nanoseconds in the pending comparison (D8, F6); all three threshold
+uses tested with a controlled clock (section 8, F7); an aged, materialized capacity
+fixture with a defined window and measured elapsed time (section 8, F8); the `:853`
+attribution and the timer-composition reference (section 1, F9); explicit object
+names (D8, F10); and the two distinct path-refusal reasons (D5, F11).
