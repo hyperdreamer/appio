@@ -912,6 +912,24 @@ def _device_available(share: DiskShare) -> bool:
     )
 
 
+def _timeline_identity(model: OverviewModel | None) -> tuple | None:
+    """Stable series identity from typed metadata, or None for legacy models."""
+
+    if model is None or model.series_metadata is None or model.app_key is None:
+        return None
+    requested = model.requested_window
+    measured = model.series_metadata.measured_window
+    if requested is None or measured.kind not in ("since_boot", "range"):
+        return None
+    start = 0 if measured.kind == "since_boot" else measured.start_mono_ns
+    return (
+        model.app_key,
+        retention_scope(model.app_key, requested),
+        start,
+        model.series_metadata.tier,
+    )
+
+
 def _device_unavailable_text(model: OverviewModel | None) -> str:
     """The device-attribution strip, distinct from the DEVICE KPI value."""
 
@@ -2014,10 +2032,13 @@ class AppIoWindow(QMainWindow):
             if previous is not None and previous.share is not None
             else None
         )
+        identity = _timeline_identity(model)
+        old_identity = _timeline_identity(previous)
         timeline_changed = (
             previous is None
             or previous.task_points != model.task_points
             or previous.series_unavailable != model.series_unavailable
+            or identity != old_identity
             or totals != old_totals
         )
         if timeline_changed:
@@ -2028,34 +2049,69 @@ class AppIoWindow(QMainWindow):
                     previous is None
                     or previous.series_unavailable is not None
                     or previous.task_points != model.task_points
+                    or identity != old_identity
                 )
                 if points_changed:
-                    self._total_chart.set_task_points(model.task_points)
+                    if identity is None:
+                        self._total_chart.set_task_points(model.task_points, identity=None)
+                    else:
+                        self._total_chart.append_task_points(
+                            model.task_points, identity=("task", *identity)
+                        )
                 if totals is not None:
                     self._total_chart.set_totals(*totals)
                 else:
                     self._total_chart.set_totals_unavailable()
 
+        lane_reason = model.device_lanes_unavailable or model.series_unavailable
+        old_lane_reason = (
+            previous.device_lanes_unavailable or previous.series_unavailable
+            if previous is not None else None
+        )
         lanes_changed = (
             previous is None
             or previous.device_lanes != model.device_lanes
-            or previous.series_unavailable != model.series_unavailable
+            or lane_reason != old_lane_reason
+            or identity != old_identity
         )
         if lanes_changed:
-            if model.series_unavailable is not None:
+            if lane_reason is not None:
                 for lane in self._device_lanes:
-                    lane.set_unavailable(model.series_unavailable)
+                    lane.set_unavailable(lane_reason)
                     lane.setVisible(False)
             else:
                 for index, lane in enumerate(self._device_lanes):
                     if index < len(model.device_lanes):
                         lane_model = model.device_lanes[index]
-                        lane.set_device(lane_model.dev)
-                        lane.set_device_points(lane_model.points)
-                        lane.set_totals(lane_model.read_bytes, lane_model.write_bytes)
+                        old_lane = (
+                            previous.device_lanes[index]
+                            if previous is not None and old_lane_reason is None
+                            and index < len(previous.device_lanes)
+                            else None
+                        )
+                        if old_lane is None or old_lane.dev != lane_model.dev:
+                            lane.set_device(lane_model.dev)
+                        if (
+                            old_lane is None
+                            or old_lane.points != lane_model.points
+                            or old_lane.dev != lane_model.dev
+                            or identity != old_identity
+                        ):
+                            if identity is None:
+                                lane.set_device_points(lane_model.points, identity=None)
+                            else:
+                                lane.append_device_points(
+                                    lane_model.points,
+                                    identity=("device", *identity, lane_model.dev),
+                                )
+                        if old_lane is None or (
+                            old_lane.read_bytes, old_lane.write_bytes
+                        ) != (lane_model.read_bytes, lane_model.write_bytes):
+                            lane.set_totals(lane_model.read_bytes, lane_model.write_bytes)
                         lane.setVisible(True)
                     else:
-                        lane.set_device_points(())
+                        if previous is None or index < len(previous.device_lanes):
+                            lane.set_device_points((), identity=None)
                         lane.setVisible(False)
         if previous is None or previous.more_devices != model.more_devices:
             self._more_devices.setText(f"and {model.more_devices} more")
