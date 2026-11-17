@@ -1037,3 +1037,28 @@ def test_unmergeable_finalizing_hour_is_quarantined_once_instead_of_retried(fram
     assert frames.db.execute("SELECT reason FROM gap").fetchall() == [("collector_gap",)]
     assert pending(frames) is None
     assert not frames.db.in_transaction
+
+
+def test_unavailable_source_records_gap_evidence_once_per_hour(frames):
+    """A dead source must not replay the gap write on every frame.
+
+    Falsifier: attempt ``_advance`` for every validated frame. The failing hour
+    stays in ``_hours``, so each frame re-serialized every stuck hour (~13 MB of
+    ``state_json`` on the author's host) and rolled the write back -- 1 MB/s of
+    writes, 86 GB/day, from a daemon otherwise idle.
+    """
+    failed = FileRuntime(frames.db, source_factory=lambda: BpfFileSource(
+        VectorLoader(hello_status=1, hello_error=-5)))
+    assert not failed.start().available
+    attempts = []
+    original = failed._advance
+
+    def counting(frame, context, contribution=None):
+        attempts.append(context.seq)
+        return original(frame, context, contribution)
+
+    failed._advance = counting
+    for step in (0, 10**9, 2 * 10**9, 3 * 10**9):
+        with pytest.raises(FileSourceError):
+            failed.consume(*frames.tick(step))
+    assert attempts == [0]

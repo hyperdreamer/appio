@@ -210,6 +210,9 @@ class FileRuntime:
         self._retry_attempts = 0
         self._retry_at = None
         self._recovering = False
+        #: Hours whose unavailable-source gap evidence was already attempted. A
+        #: stuck hour must not be re-serialized (and rolled back) every frame.
+        self._gap_attempted: set[tuple[str, int]] = set()
         self._availability = FileAvailability(False, False, "file_source_unavailable")
 
     @property
@@ -443,16 +446,23 @@ class FileRuntime:
             self._recovering = False
             self._retry_attempts = 0
             self._retry_at = None
+            self._gap_attempted.clear()
             return True
         except _F_ERRORS as failure:
             self._disable(failure)
             if validated:
-                try:
-                    self._advance(frame, context)
-                except _F_ERRORS:
-                    # Even failure to persist F gap evidence cannot leave the
-                    # shared writer in a transaction or claim measured zero.
-                    _LOG.warning("file_gap_persistence_failed")
+                key = (frame.boot_id, frame.observed_mono_ns // FILE_HOUR_NS * FILE_HOUR_NS)
+                # Gap evidence for an unavailable source is recorded once per hour.
+                # Replaying it every frame kept every stuck hour in _hours, so each
+                # frame re-serialized ~13 MB of state_json and rolled it back.
+                if key not in self._gap_attempted:
+                    self._gap_attempted.add(key)
+                    try:
+                        self._advance(frame, context)
+                    except _F_ERRORS:
+                        # Even failure to persist F gap evidence cannot leave the
+                        # shared writer in a transaction or claim measured zero.
+                        _LOG.warning("file_gap_persistence_failed")
             raise FileSourceError(getattr(failure, "errno", None), None, self.diagnostic or "file source unavailable") from failure
 
     def close(self):
