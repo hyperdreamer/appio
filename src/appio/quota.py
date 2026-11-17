@@ -771,17 +771,46 @@ class QuotaPruner:
         if self._scan_pending:
             return self._result([], "batch_limit")
         deleted, skipped = [], []
-        for start in range(0, len(units), DELETE_UNITS_PER_TRANSACTION):
-            chunk = units[start:start + DELETE_UNITS_PER_TRANSACTION]
+        start = 0
+        chunk_size = DELETE_UNITS_PER_TRANSACTION
+        recovering_full = False
+        retried_single = False
+        while start < len(units):
+            chunk = units[start:start + chunk_size]
+            previous_after = self._expiry_after
             # Advance before committing so a crash mid-batch cannot pin the sweep
             # on the same oldest units forever.
             self._expiry_after = chunk[-1].key
-            for unit, stats in zip(chunk, self._commit_deletes(chunk)):
+            try:
+                stats_by_unit = self._commit_deletes(chunk)
+            except sqlite3.OperationalError as error:
+                code = getattr(error, "sqlite_errorcode", None)
+                if code is None or (code & 0xff) != sqlite3.SQLITE_FULL:
+                    raise
+                # The transaction has rolled back. Retry its oldest units, not
+                # the cursor beyond the failed chunk; checkpointing also lets
+                # SQLite reuse WAL space before each smaller transaction.
+                self._expiry_after = previous_after
+                if len(chunk) == 1 and retried_single:
+                    raise
+                if not self._checkpoint(truncate=False):
+                    return self._result(deleted, "checkpoint_busy", paused=True, skipped=skipped)
+                # Even one unit may fit after reclaiming committed WAL frames.
+                # Retry it once; a second failure is a real, bounded error.
+                retried_single = len(chunk) == 1
+                chunk_size = max(1, len(chunk) // 2)
+                recovering_full = True
+                continue
+            retried_single = False
+            for unit, stats in zip(chunk, stats_by_unit):
                 if stats is None:
                     skipped.append(SkippedUnit(unit.kind, unit.primary_key))
                 else:
                     deleted.append(stats)
-        # One checkpoint per pass, not per chunk: unit deletion has no
+            start += len(chunk)
+            if recovering_full and not self._checkpoint(truncate=False):
+                return self._result(deleted, "checkpoint_busy", paused=True, skipped=skipped)
+        # One checkpoint per pass on the healthy path: unit deletion has no
         # remeasurement to serve, and a checkpoint between chunks publishes pages
         # the next chunk dirties again.
         if deleted and not self._checkpoint(truncate=False):
