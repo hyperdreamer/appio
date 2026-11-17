@@ -5097,3 +5097,120 @@ def test_age_uses_oldest_displayed_dependency_and_unknown_contributor(
     )
     for created in (view, lifetime_view, empty_view, zero_view):
         created.close()
+
+
+def test_main_window_uses_data_identity_for_task_and_device_appends(qtbot, monkeypatch) -> None:
+    """Chart identities follow typed series data, even when points do not change."""
+    from live_overview_support import series as fixture_series, share as fixture_share
+
+    view, _ = build(qtbot, [], {})
+    task_calls = []
+    device_calls = []
+    task_chart = view._total_chart
+    device_chart = view._device_lanes[0]
+
+    def spy(chart, method, calls):
+        original = getattr(chart, method)
+
+        def wrapped(points, *, identity=None):
+            calls.append((method, tuple(points), identity))
+            return original(points, identity=identity)
+
+        monkeypatch.setattr(chart, method, wrapped)
+
+    for method in ("set_task_points", "append_task_points"):
+        spy(task_chart, method, task_calls)
+    for method in ("set_device_points", "append_device_points"):
+        spy(device_chart, method, device_calls)
+
+    key = "unit:alpha.service"
+    requested = Window(kind="since_boot", boot_id="boot-a", end_mono_ns=180_000_000_000)
+
+    def model(window, *, app_key=key, tier="rollup_60s", dev="8:0", empty_device=False,
+              byte_delta=0, stamp=1_000_000_000):
+        source = fixture_series(1, window, tier=tier)
+        start = window.start_mono_ns or 0
+        points = tuple(p for p in source.points if p.bucket_start_mono_ns >= start)
+        if byte_delta:
+            points = points[:-1] + (replace(points[-1], read_bytes=points[-1].read_bytes + byte_delta),)
+        device_points = tuple(
+            replace(p, dev=dev) for p in source.device_points
+            if p.dev == "8:0" and p.bucket_start_mono_ns >= start and not empty_device
+        )
+        source = replace(source, points=points, device_points=device_points, residual_points=())
+        split = fixture_share(1, window)
+        split = replace(split, devices=(replace(split.devices[0], dev=dev),))
+        row = app_total(1, app_key, "Alpha", 22)
+        return build_overview(
+            1, window, row, source, split,
+            ranking_provenance=measured_provenance("ranking", app_key, window, first_seen=stamp),
+            series_provenance=measured_provenance("series", app_key, window, first_seen=stamp),
+            share_provenance=measured_provenance("totals", app_key, window, first_seen=stamp),
+        )
+
+    first = model(requested)
+    view._apply_overview(first)
+    scope = retention_scope(key, requested)
+    task_identity = ("task", key, scope, 0, "rollup_60s")
+    device_identity = ("device", key, scope, 0, "rollup_60s", "8:0")
+    assert first.series_metadata.tier == "rollup_60s"
+    assert first.share.coverage.tier == "raw"
+    assert task_calls[-1][0] == "append_task_points"
+    assert task_calls[-1][2] == task_identity
+    assert device_calls[-1][0] == "append_device_points"
+    assert device_calls[-1][2] == device_identity
+    assert all(isinstance(point, DeviceSeriesPoint) for point in device_calls[-1][1])
+
+    # A later endpoint and new data retain the token; provenance and text alone
+    # never force either chart to rebuild.
+    later = replace(requested, end_mono_ns=240_000_000_000)
+    advanced = model(later, byte_delta=1, stamp=3_000_000_000)
+    view._apply_overview(advanced)
+    assert task_calls[-1][2] == task_identity
+    assert device_calls[-1][2] == device_identity
+    before = (len(task_calls), len(device_calls))
+    view._apply_overview(replace(advanced, detail_line="arbitrary rollup text"))
+    assert (len(task_calls), len(device_calls)) == before
+    restamped = model(later, byte_delta=1, stamp=4_000_000_000)
+    view._apply_overview(restamped)
+    assert (len(task_calls), len(device_calls)) == before
+
+    # Equal points for another subject still reach both charts with new tokens.
+    other = "unit:beta.service"
+    view._apply_overview(model(later, app_key=other, byte_delta=1))
+    assert task_calls[-1][2] == ("task", other, retention_scope(other, later), 0, "rollup_60s")
+    assert device_calls[-1][2] == ("device", other, retention_scope(other, later), 0, "rollup_60s", "8:0")
+
+    # Scope and range start, then tier, each change the identity independently.
+    ranged = Window(kind="range", boot_id="boot-a", start_mono_ns=10_000_000_000,
+                    end_mono_ns=180_000_000_000)
+    view._apply_overview(model(ranged, app_key=other))
+    assert task_calls[-1][2] == ("task", other, retention_scope(other, ranged),
+                                  10_000_000_000, "rollup_60s")
+    shifted = replace(ranged, start_mono_ns=20_000_000_000)
+    shifted_model = model(shifted, app_key=other)
+    assert shifted_model.task_points == view._overview_model.task_points
+    view._apply_overview(shifted_model)
+    assert task_calls[-1][2] == ("task", other, retention_scope(other, shifted),
+                                  20_000_000_000, "rollup_60s")
+    raw = model(requested, tier="raw")
+    view._apply_overview(raw)
+    assert task_calls[-1][2][-1] == "raw"
+    assert device_calls[-1][2][-2:] == ("raw", "8:0")
+
+    # A reused lane with equal empty points must still receive the new device.
+    empty_a = model(requested, empty_device=True)
+    empty_b = model(requested, dev="8:16", empty_device=True)
+    view._apply_overview(empty_a)
+    assert empty_a.device_lanes[0].points == empty_b.device_lanes[0].points == ()
+    count = len(device_calls)
+    view._apply_overview(empty_b)
+    assert len(device_calls) == count + 1
+    assert device_calls[-1][2] == ("device", key, scope, 0, "rollup_60s", "8:16")
+
+    # Direct legacy models have no typed identity and use full setters.
+    legacy = replace(empty_b, requested_window=None, app_key=None, series_metadata=None,
+                     ranking_provenance=None, series_provenance=None, share_provenance=None)
+    view._apply_overview(legacy)
+    assert task_calls[-1][0] == "set_task_points" and task_calls[-1][2] is None
+    assert device_calls[-1][0] == "set_device_points" and device_calls[-1][2] is None

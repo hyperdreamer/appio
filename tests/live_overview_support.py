@@ -9,6 +9,8 @@ fields stay exactly the production contract fields.
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from contextlib import contextmanager
+import threading
 
 from appio.contracts import (
     AppTotal,
@@ -26,6 +28,10 @@ from appio.contracts import (
 
 __all__ = [
     "Clock",
+    "ExactOnlyQuery",
+    "IdentityExactOnlyQuery",
+    "LiveOverviewHarness",
+    "LocalPositionStores",
     "coverage",
     "series",
     "share",
@@ -249,3 +255,624 @@ def series(app_id: int, window: Window, *, tier: Tier = "raw") -> Series:
         residual_points=residual_points,
         coverage=coverage(tier=tier),
     )
+
+
+class ExactOnlyQuery:
+    """A structural exact service; the real UI supplies its retention adapter.
+
+    Each (kind, app id, window) has an independent result or exception.  No
+    retained capability is implemented here, including on the identity variant.
+    """
+
+    def __init__(self, rows: list[AppTotal] | None = None) -> None:
+        self.rows = list(rows) if rows is not None else [total(1, DEFAULT_KEY)]
+        self.results: dict[tuple[str, int, Window], object] = {}
+        self.ranking_error: BaseException | None = None
+        self.calls = {name: 0 for name in ("ranking", "series", "totals", "identity")}
+        self.events: list[tuple] = []
+
+    def set_share(self, window: Window, value: DiskShare) -> None:
+        self.results[("totals", value.app_id, window)] = value
+
+    def set_series(self, window: Window, value: Series) -> None:
+        self.results[("series", value.app_id, window)] = value
+
+    def set_pending(self, kind: str, app_id: int, window: Window) -> None:
+        from appio.contracts import HistoryPending
+
+        self.results[(kind, app_id, window)] = HistoryPending("still loading")
+
+    def set_error(self, kind: str, app_id: int, window: Window, error: BaseException) -> None:
+        self.results[(kind, app_id, window)] = error
+
+    def ranking(self, window: Window, metric: str) -> list[AppTotal]:
+        self.calls["ranking"] += 1
+        self.events.append(("ranking", window, metric))
+        if self.ranking_error is not None:
+            raise self.ranking_error
+        return list(self.rows)
+
+    def _exact(self, kind: str, app_id: int, window: Window):
+        self.calls[kind] += 1
+        self.events.append(("get", kind, app_id, window))
+        value = self.results.get((kind, app_id, window))
+        if isinstance(value, BaseException):
+            raise value
+        if value is None:
+            return series(app_id, window) if kind == "series" else share(app_id, window)
+        return value
+
+    def disk_share(self, app_id: int, window: Window) -> DiskShare:
+        return self._exact("totals", app_id, window)
+
+    def series(self, app_id: int, window: Window) -> Series:
+        return self._exact("series", app_id, window)
+
+
+class IdentityExactOnlyQuery(ExactOnlyQuery):
+    """The optional identity capability, with independently controlled values."""
+
+    def __init__(self, rows: list[AppTotal] | None = None) -> None:
+        super().__init__(rows)
+        self.identities: dict[tuple[str, str, Window], object] = {}
+
+    def exact_answer_identity(self, kind: str, app_key: str, window: Window) -> object:
+        self.calls["identity"] += 1
+        self.events.append(("identity", kind, app_key, window))
+        value = self.identities.get((kind, app_key, window))
+        if isinstance(value, BaseException):
+            raise value
+        return value
+
+
+class _Barrier:
+    """A one-shot worker barrier whose release is guaranteed on teardown."""
+
+    def __init__(self) -> None:
+        self.entered = threading.Event()
+        self.released = threading.Event()
+
+    def wait(self, timeout: float = 5.0) -> None:
+        if not self.entered.wait(timeout):
+            raise TimeoutError("worker did not reach the fixture barrier")
+
+    def release(self) -> None:
+        self.released.set()
+
+    def _pause(self) -> None:
+        self.entered.set()
+        if not self.released.wait(15):
+            raise TimeoutError("fixture barrier was not released")
+
+
+class LocalPositionStores:
+    """Two actual file-backed sources and independent, committed writers.
+
+    Registered observers are the persistent QueryService connections. Worker
+    barriers never replace an observer or manufacture a source position.
+    """
+
+    def __init__(self, directory=None) -> None:
+        import os
+        import sqlite3
+        import tempfile
+        from pathlib import Path
+        from appio.query import QueryService
+        from appio.store import AppIoStore
+
+        self._temporary = tempfile.TemporaryDirectory(prefix="overview-stores-", dir=directory or os.getcwd())
+        self.root = Path(self._temporary.name)
+        self.paths = {name: self.root / f"{name}.db" for name in ("local", "export")}
+        self.stores = {name: AppIoStore(path) for name, path in self.paths.items()}
+        for store in self.stores.values():
+            store.connection.execute("PRAGMA journal_mode=WAL")
+            store.start_boot("boot-a", 1, 0, 1000.0, "gui")
+            store.connection.commit()
+        self._seed_local()
+        self.services = {name: QueryService(store) for name, store in self.stores.items()}
+        self.writers = {
+            name: sqlite3.connect(path, timeout=2, check_same_thread=False)
+            for name, path in self.paths.items()
+        }
+        self.router = None
+        self._extra_connections: list[object] = []
+        self._barriers: list[_Barrier] = []
+        self._closed = False
+
+    def _seed_local(self) -> None:
+        from appio.handover import baseline_seed
+        from appio.procs import AppKeyInputs, IoReadOutcome, ProcessIdentity, StableProcRecord
+        from appio.sampler import TickInput, aggregate_tick
+
+        store = self.stores["local"]
+        keys = (DEFAULT_KEY, "unit:beta.service")
+        for index, key in enumerate(keys, 1):
+            store.connection.execute(
+                "INSERT INTO app VALUES (?,?,?,NULL,0,0,'user')",
+                (index, key, key.partition(":")[2]),
+            )
+        store.connection.commit()
+        store.start_collector("gui", "boot-a", 10 * 10**9)
+        state = None
+        for seq, second in ((0, 10), (1, 20)):
+            records = tuple(
+                StableProcRecord(
+                    ProcessIdentity("boot-a", 410 + index, 100), 1, 1000, key,
+                    "/fixture", AppKeyInputs("/fixture", key.partition(":")[2]),
+                    IoReadOutcome("readable", (100 + seq * (20 - index),) * 4, None, None),
+                )
+                for index, key in enumerate(keys)
+            )
+            tick = TickInput("boot-a", "gui", 1, seq, second * 10**9,
+                             (1000 + second) * 10**9, records, ())
+            frame, state = baseline_seed(tick) if seq == 0 else aggregate_tick(state, tick)
+            store.record_tick(frame, state)
+
+    def attach(self, router) -> None:
+        if self.router is not None:
+            raise RuntimeError("stores are already attached")
+        self.router = router
+        router.add_source(self.services["export"], collector_id="export", owner="gui")
+
+    def commit(self, name: str, sql: str, parameters: tuple = ()) -> int:
+        """Perform a real external update or deletion and commit it."""
+        connection = self.writers[name]
+        cursor = connection.execute(sql, parameters)
+        connection.commit()
+        return cursor.rowcount
+
+    def replace(self, name: str = "export", path=None, *, owner: str = "gui"):
+        """Install a new persistent observer through the production registry."""
+        import sqlite3
+        from appio.query import QueryService
+
+        if self.router is None or name == "local":
+            raise ValueError("replacement requires an attached imported source")
+        connection = sqlite3.connect(path or self.paths[name])
+        service = QueryService(connection)
+        try:
+            self.router.add_source(service, collector_id=name, owner=owner)
+        except BaseException:
+            connection.close()
+            raise
+        self._extra_connections.append(connection)
+        self.services[name] = service
+        return service
+
+    @contextmanager
+    def backup_complete(self, *, kind: str = "ranking"):
+        """Hold a real copied outcome before enqueue and the owner closing read."""
+        if self.router is None:
+            raise RuntimeError("attach the stores first")
+        router = self.router
+        name = "_read_local" if kind == "ranking" else "_read_local_part"
+        original = getattr(router, name)
+        barrier = _Barrier()
+        self._barriers.append(barrier)
+
+        def wrapped(*args, **kwargs):
+            result = original(*args, **kwargs)
+            if kind == "ranking" or args[1].kind == kind:
+                barrier._pause()
+            return result
+
+        setattr(router, name, wrapped)
+        try:
+            yield barrier
+        finally:
+            barrier.release()
+            setattr(router, name, original)
+            self._barriers.remove(barrier)
+
+    @contextmanager
+    def closing_read(self):
+        """Hold the owner immediately after its real closing vector read."""
+        if self.router is None:
+            raise RuntimeError("attach the stores first")
+        router = self.router
+        original = router._closing_vector
+        barrier = _Barrier()
+        self._barriers.append(barrier)
+
+        def wrapped(binding):
+            result = original(binding)
+            barrier._pause()
+            return result
+
+        router._closing_vector = wrapped
+        try:
+            yield barrier
+        finally:
+            barrier.release()
+            router._closing_vector = original
+            self._barriers.remove(barrier)
+
+    @contextmanager
+    def backup_in_progress(self):
+        """Pause SQLite's real paged backup from its progress callback.
+
+        The module-local proxy wraps only read-only worker source connections;
+        registered observers and their identity are untouched.
+        """
+        import appio.history_router as router_module
+        original = router_module.sqlite3
+        barrier = _Barrier()
+        self._barriers.append(barrier)
+
+        class Source:
+            def __init__(self, connection):
+                self.connection = connection
+
+            def __getattr__(self, name):
+                return getattr(self.connection, name)
+
+            def backup(self, target, **kwargs):
+                def progress(status, remaining, total_pages):
+                    if not barrier.entered.is_set():
+                        barrier._pause()
+                return self.connection.backup(target, pages=1, progress=progress, **kwargs)
+
+        class SqliteProxy:
+            def __getattr__(self, name):
+                return getattr(original, name)
+
+            def connect(self, database, *args, **kwargs):
+                connection = original.connect(database, *args, **kwargs)
+                if isinstance(database, str) and database.endswith("?mode=ro"):
+                    return Source(connection)
+                return connection
+
+        router_module.sqlite3 = SqliteProxy()
+        try:
+            yield barrier
+        finally:
+            barrier.release()
+            router_module.sqlite3 = original
+            self._barriers.remove(barrier)
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        for barrier in self._barriers:
+            barrier.release()
+        for connection in (*self.writers.values(), *self._extra_connections):
+            connection.close()
+        for store in self.stores.values():
+            store.connection.close()
+        self._temporary.cleanup()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
+
+
+class _DeliveryQueue:
+    """Hold actual queued local completions without blocking their workers."""
+
+    def __init__(self, target) -> None:
+        self.target = target
+        self.held: set[str] = set()
+        self.all_local = False
+        self.buffer: list[tuple] = []
+        self.lock = threading.Lock()
+        self.entered = threading.Event()
+
+    def put(self, item) -> None:
+        token, _ = item
+        with self.lock:
+            if token.origin == "local" and (self.all_local or token.request.kind in self.held):
+                self.buffer.append(item)
+                self.entered.set()
+                return
+        self.target.put(item)
+
+    def get_nowait(self):
+        return self.target.get_nowait()
+
+    def empty(self):
+        with self.lock:
+            return not self.buffer and self.target.empty()
+
+    def wait(self, timeout: float = 5.0) -> None:
+        if not self.entered.wait(timeout):
+            raise TimeoutError("local delivery did not reach the fixture barrier")
+
+    def release(self, kind: str | None = None) -> None:
+        with self.lock:
+            if kind is None:
+                self.all_local = False
+            else:
+                self.held.discard(kind)
+            ready, retained = [], []
+            for item in self.buffer:
+                token = item[0]
+                if self.all_local or token.request.kind in self.held:
+                    retained.append(item)
+                else:
+                    ready.append(item)
+            self.buffer = retained
+            for item in ready:
+                self.target.put(item)
+
+
+class LiveOverviewHarness:
+    """Drive the real offscreen shell, router, client and SQLite workers.
+
+    All publication uses production admission, wire decoding, owner draining and
+    readiness gates. Peer responses and worker ordering are test-controlled.
+    """
+
+    _KINDS = frozenset(("ranking", "series", "totals", "files", "coverage"))
+
+    def __init__(self, directory=None, *, qtbot=None) -> None:
+        from PyQt6.QtWidgets import QApplication
+        from appio.history_router import HistoryRouter
+        from appio.iodclient import AppRegistry
+        from appio.ui.collector_window import CollectorWindow
+        from appio.collector_owner import ServiceFacts, decide_owner
+        from live_overview_transport import QueryTransportHarness
+
+        class FixtureCoordinator:
+            def reconcile(self, facts):
+                return decide_owner(facts)
+
+            def tick_local(self):
+                return False
+
+            def close(self):
+                pass
+
+        class FixtureSetup:
+            def refresh(self):
+                return ServiceFacts(False, "inactive", False, False, False)
+
+            def invoke(self, verb):
+                from concurrent.futures import Future
+                return Future()
+
+        self.app = QApplication.instance() or QApplication([])
+        self.age_clock = Clock(ns=100 * 10**9)
+        self.recovery_clock = Clock(ns=100 * 10**9)
+        self.stores = LocalPositionStores(directory)
+        self.transport = QueryTransportHarness(clock=self.recovery_clock)
+        self.registry = AppRegistry()
+        for key in (DEFAULT_KEY, "unit:beta.service"):
+            app_id = self.registry.id_for(key)
+            self.transport.register_subject(app_id, key)
+        self.router = HistoryRouter(self.stores.services["local"], self.transport.client, self.registry)
+        self.stores.attach(self.router)
+        self.events: list[tuple] = []
+        self.worker_charges: list[tuple] = []
+        self._futures: dict[object, object] = {}
+        self._held: set[str] = set()
+        self.responses: dict[str, object] = {}
+        self._barriers: list[_Barrier] = []
+        self._closed = False
+        self._delivery = _DeliveryQueue(self.router._completed)
+        self.router._completed = self._delivery
+        collect_frame = self.router._collect_local_frame
+
+        def collect_when_deliverable():
+            future = self.router._local_future
+            with self._delivery.lock:
+                held = self._delivery.all_local or "ranking" in self._delivery.held
+            if held and future is not None and future.done():
+                self._delivery.entered.set()
+                return False
+            return collect_frame()
+
+        self.router._collect_local_frame = collect_when_deliverable
+        self._install_spies()
+        try:
+            self.shell = CollectorWindow(FixtureCoordinator(), self.router, FixtureSetup(),
+                                         clock_ns=self.recovery_clock, age_clock_ns=self.age_clock,
+                                         pump=self._service_peer)
+            self.shell._timer.stop()
+            self.shell._poll_timer.stop()
+            self.view = self.shell._ensure_view()
+            if qtbot is not None:
+                qtbot.addWidget(self.shell)
+            self._spy(self.shell, "_apply_frame", "apply")
+            self._spy(self.view, "refresh_measurements", "notify")
+        except BaseException:
+            self.close()
+            raise
+
+    def _spy(self, obj, method: str, name: str) -> None:
+        original = getattr(obj, method)
+
+        def wrapped(*args, **kwargs):
+            self.events.append((name, args, dict(kwargs)))
+            try:
+                return original(*args, **kwargs)
+            finally:
+                if name in ("reserve", "reap", "submit"):
+                    charges = tuple((worker_id, owner, future is not None,
+                                     future.done() if future is not None else False)
+                                    for worker_id, (owner, future)
+                                    in self.router._worker_jobs.items())
+                    self.worker_charges.append((name, charges))
+
+        setattr(obj, method, wrapped)
+
+    def _install_spies(self) -> None:
+        for method, name in (("prepare", "prepare"), ("request_detail", "request_detail"),
+                             ("ranking", "ranking"), ("series", "series"),
+                             ("disk_share", "totals"), ("_settle", "settle"),
+                             ("_notify", "router_notify"), ("_retire_frame_owner", "retire"),
+                             ("_submit_background_worker", "submit"),
+                             ("_reserve_background_worker", "reserve"),
+                             ("_reap_background_worker", "reap")):
+            self._spy(self.router, method, name)
+        original = self.transport.client.query
+
+        def query(request):
+            future = original(request)
+            self.events.append(("send", (request,), {}))
+            self._futures[future] = request
+            return future
+
+        self.transport.client.query = query
+
+    def _answer(self, request):
+        from appio.contracts import FileCoverage, FileTable, UnknownOwnerOverflow
+
+        configured = self.responses.get(request.kind)
+        if configured is not None:
+            return configured(request) if callable(configured) else configured
+        app_id = self.registry.id_for(request.app_key) if request.app_key else 1
+        if request.kind == "ranking":
+            return [total(1, DEFAULT_KEY), total(2, "unit:beta.service")]
+        if request.kind == "series":
+            return series(app_id, request.window)
+        if request.kind == "totals":
+            return share(app_id, request.window)
+        cov = coverage()
+        if request.kind == "coverage" and request.coverage_kind == "process":
+            return cov
+        overflow = UnknownOwnerOverflow(request.window, "overflow_owner_unknown", 0, 0, 0, cov)
+        if request.kind == "files":
+            return FileTable(app_id, request.window, (), request.sort, request.direction,
+                             request.search, overflow, cov)
+        if request.kind == "coverage":
+            return FileCoverage(app_id, request.window, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                                cov.hook_hits, 0, 0, overflow, cov)
+        raise ValueError(f"unsupported fixture response: {request.kind}")
+
+    def _service_peer(self) -> None:
+        from live_overview_transport import SNAPSHOT
+
+        self.transport.pump()
+        for future, request in tuple(self._futures.items()):
+            if future.done() or request.kind in self._held:
+                continue
+            state = self.transport.client.query_transport(future)
+            if state.request_id is None:
+                continue
+            self.transport._futures[state.request_id] = future
+            if self.transport._job_server(state.request_id) is not self.transport.server:
+                continue
+            value = self._answer(request)
+            if isinstance(value, BaseException):
+                self.transport.error(future, "unavailable", str(value))
+            else:
+                self.transport.reply(future, value, snapshot=SNAPSHOT)
+
+    def _stop_timers(self) -> None:
+        self.shell._timer.stop()
+        self.shell._poll_timer.stop()
+
+    def apply(self, window: Window) -> None:
+        if self.shell._pending != window:
+            raise ValueError("request the window before applying its ready frame")
+        self.shell.apply_ready_frame(now=self.recovery_clock(), context="ordinary")
+        self._stop_timers()
+
+    def ordinary_refresh(self) -> None:
+        self.shell.refresh()
+        self._stop_timers()
+
+    def poll(self) -> None:
+        self.shell._poll_history()
+        self._stop_timers()
+
+    def notify(self) -> None:
+        self.view.refresh_measurements()
+        self._stop_timers()
+
+    def request(self, window: Window) -> None:
+        self.shell.show_window(window)
+        self._stop_timers()
+
+    def advance_ns(self, delta: int, *, domain: str = "both") -> None:
+        if domain not in ("age", "recovery", "both"):
+            raise ValueError("clock domain must be age, recovery or both")
+        if domain in ("age", "both"):
+            self.age_clock.advance_ns(delta)
+        if domain in ("recovery", "both"):
+            self.recovery_clock.advance_ns(delta)
+
+    def hold(self, kind: str) -> None:
+        if kind not in self._KINDS:
+            raise ValueError(f"unknown held kind {kind!r}")
+        self._held.add(kind)
+        with self._delivery.lock:
+            self._delivery.entered.clear()
+            self._delivery.held.add(kind)
+
+    def release(self, kind: str) -> None:
+        if kind not in self._KINDS:
+            raise ValueError(f"unknown held kind {kind!r}")
+        self._held.discard(kind)
+        self._delivery.release(kind)
+        self._service_peer()
+
+    @contextmanager
+    def block_detail_computation(self):
+        """Pause inside the real reducer after its worker snapshots are opened."""
+        from appio.history_router import HistoryRouter
+        original = HistoryRouter._open_local_worker
+        barrier = _Barrier()
+        self._barriers.append(barrier)
+
+        def wrapped(paths, window):
+            worker, sources = original(paths, window)
+            try:
+                barrier._pause()
+            except BaseException:
+                HistoryRouter._close_local_worker(worker, sources)
+                raise
+            return worker, sources
+
+        HistoryRouter._open_local_worker = staticmethod(wrapped)
+        try:
+            yield barrier
+        finally:
+            barrier.release()
+            HistoryRouter._open_local_worker = staticmethod(original)
+            self._barriers.remove(barrier)
+
+    @contextmanager
+    def block_local_delivery(self):
+        """Hold queued local outcomes after worker computation has completed."""
+        with self._delivery.lock:
+            self._delivery.all_local = True
+            self._delivery.entered.clear()
+        try:
+            yield self._delivery
+        finally:
+            self._delivery.release()
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        for barrier in (*self._barriers, *self.stores._barriers):
+            barrier.release()
+        self._held.clear()
+        with self._delivery.lock:
+            self._delivery.held.clear()
+        self._delivery.release()
+        shell = getattr(self, "shell", None)
+        if shell is not None:
+            shell.shutdown()
+            shell.close()
+            shell.deleteLater()
+        else:
+            self.router.close()
+        self.router._frame_executor.shutdown(wait=True, cancel_futures=True)
+        self.router._background_executor.shutdown(wait=True, cancel_futures=True)
+        self.transport.client.close()
+        for server in self.transport.servers:
+            server.close()
+        self.stores.close()
+        self.app.processEvents()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
