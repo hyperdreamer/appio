@@ -156,7 +156,13 @@ class ChartSegment:
 
 
 class _Sample:
-    """One validated source bucket in chart-local form."""
+    """One validated source bucket in chart-local form.
+
+    Every source field is retained verbatim so full-sequence equality can
+    distinguish ``None`` from zero, a defined ``peak_total_bps`` from an
+    absent one, and a wall-clock stamp from its absence even though the
+    plotted geometry ignores those fields.
+    """
 
     __slots__ = (
         "start",
@@ -165,6 +171,9 @@ class _Sample:
         "write_bytes",
         "peak_read_bps",
         "peak_write_bps",
+        "peak_total_bps",
+        "wall_start_seconds",
+        "spans_suspend",
         "starts_run",
     )
 
@@ -176,6 +185,9 @@ class _Sample:
         write_bytes: int,
         peak_read_bps: int | None,
         peak_write_bps: int | None,
+        peak_total_bps: int | None,
+        wall_start_seconds: float | None,
+        spans_suspend: bool,
         starts_run: bool,
     ) -> None:
         self.start = start
@@ -184,23 +196,55 @@ class _Sample:
         self.write_bytes = write_bytes
         self.peak_read_bps = peak_read_bps
         self.peak_write_bps = peak_write_bps
+        self.peak_total_bps = peak_total_bps
+        self.wall_start_seconds = wall_start_seconds
+        self.spans_suspend = spans_suspend
         self.starts_run = starts_run
+
+
+def _point_sequence(points: object) -> tuple[object, ...]:
+    """Copy the incoming sequence once, before any retained state changes."""
+
+    if isinstance(points, (str, bytes)):
+        raise ValueError("points must be a sequence of chart points")
+    try:
+        return tuple(points)  # type: ignore[arg-type]
+    except TypeError:
+        raise ValueError("points must be a sequence of chart points") from None
+
+
+def _admit_task_point(point: object) -> SeriesPoint:
+    """Validate one incoming task point's frozen type.
+
+    This is the single admission primitive charged once per incoming point;
+    it deliberately sits on the shared validation path so an alternate
+    full-prefix reducer cannot bypass the cost observation.
+    """
+
+    if not isinstance(point, SeriesPoint):
+        raise ValueError("task time lanes require SeriesPoint values")
+    return point
+
+
+def _admit_device_point(point: object) -> DeviceSeriesPoint:
+    """Validate one incoming device point's frozen type."""
+
+    if not isinstance(point, DeviceSeriesPoint):
+        raise ValueError("device time lanes require DeviceSeriesPoint values")
+    return point
 
 
 def _task_samples(points: Sequence[SeriesPoint]) -> tuple[_Sample, ...]:
     samples: list[_Sample] = []
     previous_end: int | None = None
     previous_suspend = False
-    for point in points:
-        if not isinstance(point, SeriesPoint):
-            raise ValueError("set_task_points requires SeriesPoint values")
+    for incoming in _point_sequence(points):
+        point = _admit_task_point(incoming)
         start = point.bucket_start_mono_ns
         end = start + point.bucket_secs * _NANOSECONDS
         if previous_end is not None and start < previous_end:
             raise ValueError("series points must be ordered and non-overlapping")
-        starts_run = (
-            previous_end is None or start != previous_end or previous_suspend
-        )
+        starts_run = previous_end is None or start != previous_end or previous_suspend
         samples.append(
             _Sample(
                 start,
@@ -209,6 +253,9 @@ def _task_samples(points: Sequence[SeriesPoint]) -> tuple[_Sample, ...]:
                 point.write_bytes,
                 point.peak_read_bps,
                 point.peak_write_bps,
+                point.peak_total_bps,
+                point.wall_start_seconds,
+                point.spans_suspend,
                 starts_run,
             )
         )
@@ -220,9 +267,8 @@ def _task_samples(points: Sequence[SeriesPoint]) -> tuple[_Sample, ...]:
 def _device_samples(points: Sequence[DeviceSeriesPoint]) -> tuple[_Sample, ...]:
     samples: list[_Sample] = []
     previous_end: int | None = None
-    for point in points:
-        if not isinstance(point, DeviceSeriesPoint):
-            raise ValueError("set_device_points requires DeviceSeriesPoint values")
+    for incoming in _point_sequence(points):
+        point = _admit_device_point(incoming)
         start = point.bucket_start_mono_ns
         end = start + point.bucket_secs * _NANOSECONDS
         if previous_end is not None and start < previous_end:
@@ -236,6 +282,9 @@ def _device_samples(points: Sequence[DeviceSeriesPoint]) -> tuple[_Sample, ...]:
                 point.wbytes,
                 None,
                 None,
+                None,
+                None,
+                False,
                 previous_end is None or start != previous_end,
             )
         )
@@ -243,17 +292,288 @@ def _device_samples(points: Sequence[DeviceSeriesPoint]) -> tuple[_Sample, ...]:
     return tuple(samples)
 
 
-def _group_runs(samples: tuple[_Sample, ...]) -> tuple[tuple[int, ...], ...]:
-    runs: list[list[int]] = []
-    current: list[int] = []
-    for index, sample in enumerate(samples):
-        if sample.starts_run and current:
-            runs.append(current)
-            current = []
-        current.append(index)
-    if current:
-        runs.append(current)
-    return tuple(tuple(run) for run in runs)
+def _samples_equal_at(
+    left: tuple[_Sample, ...], right: tuple[_Sample, ...], index: int
+) -> bool:
+    """Full raw contract equality for one accepted bucket, without tolerance."""
+
+    first = left[index]
+    second = right[index]
+    return (
+        first.start == second.start
+        and first.end == second.end
+        and first.read_bytes == second.read_bytes
+        and first.write_bytes == second.write_bytes
+        and first.peak_read_bps == second.peak_read_bps
+        and first.peak_write_bps == second.peak_write_bps
+        and first.peak_total_bps == second.peak_total_bps
+        and first.wall_start_seconds == second.wall_start_seconds
+        and first.spans_suspend == second.spans_suspend
+    )
+
+
+def _matching_prefix(
+    old: tuple[_Sample, ...], new: tuple[_Sample, ...]
+) -> int:
+    """Return the length of the exact full-contract common prefix."""
+
+    limit = min(len(old), len(new))
+    index = 0
+    while index < limit and _samples_equal_at(old, new, index):
+        index += 1
+    return index
+
+
+def _defined_max(left: int | None, right: int | None) -> int | None:
+    """Combine two optional peaks: two ``None`` values stay undefined."""
+
+    if left is None:
+        return right
+    if right is None:
+        return left
+    return left if left >= right else right
+
+
+class _Group:
+    """One retained aggregate column.
+
+    Only two integer bounds are stored per column; there is deliberately no
+    member-index vector, so promotion cannot copy O(n) membership.
+    """
+
+    __slots__ = (
+        "first_index",
+        "last_index",
+        "start",
+        "end",
+        "read_bytes",
+        "write_bytes",
+        "peak_read_bps",
+        "peak_write_bps",
+        "starts_run",
+        "duration_ns",
+        "intervals",
+        "first_run",
+        "last_run",
+    )
+
+    def __init__(
+        self,
+        *,
+        first_index: int,
+        last_index: int,
+        start: int,
+        end: int,
+        read_bytes: int,
+        write_bytes: int,
+        peak_read_bps: int | None,
+        peak_write_bps: int | None,
+        starts_run: bool,
+        duration_ns: int,
+        intervals: tuple[tuple[int, int, int], ...],
+        first_run: int,
+        last_run: int,
+    ) -> None:
+        self.first_index = first_index
+        self.last_index = last_index
+        self.start = start
+        self.end = end
+        self.read_bytes = read_bytes
+        self.write_bytes = write_bytes
+        self.peak_read_bps = peak_read_bps
+        self.peak_write_bps = peak_write_bps
+        self.starts_run = starts_run
+        self.duration_ns = duration_ns
+        self.intervals = intervals
+        self.first_run = first_run
+        self.last_run = last_run
+
+
+def _aggregate_members(
+    samples: tuple[_Sample, ...], first: int, last: int, first_run: int
+) -> _Group:
+    """Build one group from its raw member bounds, in time order."""
+
+    sample = samples[first]
+    start = sample.start
+    end = sample.end
+    read_bytes = 0
+    write_bytes = 0
+    peak_read: int | None = None
+    peak_write: int | None = None
+    duration = 0
+    starts_run = False
+    run = first_run
+    intervals: list[tuple[int, int, int]] = []
+    for index in range(first, last + 1):
+        current = samples[index]
+        if index > first and current.starts_run:
+            run += 1
+        if current.start < start:
+            start = current.start
+        if current.end > end:
+            end = current.end
+        read_bytes += current.read_bytes
+        write_bytes += current.write_bytes
+        peak_read = _defined_max(peak_read, current.peak_read_bps)
+        peak_write = _defined_max(peak_write, current.peak_write_bps)
+        duration += current.end - current.start
+        starts_run = starts_run or current.starts_run
+        if (
+            intervals
+            and intervals[-1][0] == run
+            and intervals[-1][2] == current.start
+        ):
+            previous = intervals[-1]
+            intervals[-1] = (previous[0], previous[1], current.end)
+        else:
+            intervals.append((run, current.start, current.end))
+    return _Group(
+        first_index=first,
+        last_index=last,
+        start=start,
+        end=end,
+        read_bytes=read_bytes,
+        write_bytes=write_bytes,
+        peak_read_bps=peak_read,
+        peak_write_bps=peak_write,
+        starts_run=starts_run,
+        duration_ns=duration,
+        intervals=tuple(intervals),
+        first_run=first_run,
+        last_run=run,
+    )
+
+
+def _bound_pair(group: _Group) -> tuple[int, int]:
+    """Read one group's two-integer member bound, once per promotion pass."""
+
+    return (group.first_index, group.last_index)
+
+
+def _merge_groups(
+    left: _Group,
+    right: _Group,
+    first_index: int,
+    last_index: int,
+) -> _Group:
+    """Merge adjacent aggregates, coalescing only touching same-run seams."""
+
+    intervals = list(left.intervals)
+    for interval in right.intervals:
+        if (
+            intervals
+            and intervals[-1][0] == interval[0]
+            and intervals[-1][2] == interval[1]
+        ):
+            previous = intervals[-1]
+            intervals[-1] = (previous[0], previous[1], interval[2])
+        else:
+            intervals.append(interval)
+    return _Group(
+        first_index=first_index,
+        last_index=last_index,
+        start=min(left.start, right.start),
+        end=max(left.end, right.end),
+        read_bytes=left.read_bytes + right.read_bytes,
+        write_bytes=left.write_bytes + right.write_bytes,
+        peak_read_bps=_defined_max(left.peak_read_bps, right.peak_read_bps),
+        peak_write_bps=_defined_max(left.peak_write_bps, right.peak_write_bps),
+        starts_run=left.starts_run or right.starts_run,
+        duration_ns=left.duration_ns + right.duration_ns,
+        intervals=tuple(intervals),
+        first_run=left.first_run,
+        last_run=right.last_run,
+    )
+
+
+def _promote_groups(groups: list[_Group]) -> list[_Group]:
+    """Double the group size by merging adjacent pair aggregates."""
+
+    bounds = [_bound_pair(group) for group in groups]
+    promoted: list[_Group] = []
+    for position in range(0, len(groups), 2):
+        if position + 1 == len(groups):
+            promoted.append(groups[position])
+        else:
+            promoted.append(
+                _merge_groups(
+                    groups[position],
+                    groups[position + 1],
+                    bounds[position][0],
+                    bounds[position + 1][1],
+                )
+            )
+    return promoted
+
+
+def _group_size(count: int, width: int) -> int:
+    """Smallest power of two whose group count fits the integer pixel width."""
+
+    if count <= 0 or width <= 0 or width >= count:
+        return 1
+    group = 1
+    while (count + group - 1) // group > width:
+        group *= 2
+    return group
+
+
+def _build_groups(samples: tuple[_Sample, ...], width: int) -> tuple[_Group, ...]:
+    """Build index-anchored consecutive groups for the current width."""
+
+    count = len(samples)
+    if count == 0:
+        return ()
+    group_size = _group_size(count, width)
+    groups: list[_Group] = []
+    previous_run = -1
+    index = 0
+    while index < count:
+        first_run = (
+            0
+            if index == 0
+            else previous_run + (1 if samples[index].starts_run else 0)
+        )
+        built = _aggregate_members(
+            samples, index, min(index + group_size, count) - 1, first_run
+        )
+        groups.append(built)
+        previous_run = built.last_run
+        index = built.last_index + 1
+    return tuple(groups)
+
+
+@dataclass(frozen=True)
+class ChartCurve:
+    """One per-run, per-side stroke polyline in plot coordinates.
+
+    Vertices are time-ordered and nondecreasing in X; a repeated X is legal
+    for a subpixel run. This is a stroke, never a closed polygon.
+    """
+
+    side: Literal["read", "write"]
+    run_index: int
+    vertices: tuple[tuple[float, float], ...]
+
+    def __post_init__(self) -> None:
+        if self.side not in ("read", "write"):
+            raise ValueError("chart_curve.side must be 'read' or 'write'")
+        _require_int(self.run_index, "chart_curve.run_index", minimum=0)
+        if not isinstance(self.vertices, tuple):
+            raise ValueError("chart_curve.vertices must be a tuple")
+        if len(self.vertices) < 2:
+            raise ValueError("chart_curve.vertices must have at least two points")
+        points: list[tuple[float, float]] = []
+        for pair in self.vertices:
+            if not isinstance(pair, tuple) or len(pair) != 2:
+                raise ValueError("chart_curve.vertices must contain (x, y) pairs")
+            x = _require_finite(pair[0], "chart_curve.x")
+            y = _require_finite(pair[1], "chart_curve.y")
+            points.append((x, y))
+        for previous, current in zip(points, points[1:]):
+            if current[0] < previous[0]:
+                raise ValueError("chart_curve.vertices must be nondecreasing in X")
+        object.__setattr__(self, "vertices", tuple(points))
 
 
 def _rate_maximum(
@@ -296,44 +616,94 @@ def _mapped_y(
     return y
 
 
-def _step_polygon(
-    intervals: list[list[int]],
-    first_start: int,
-    span: int,
-    left: float,
-    x_span: float,
-    epsilon: float,
-    centre: float,
-    heights: Sequence[float],
-) -> tuple[tuple[float, float], ...]:
-    """Build one closed step-fill polygon covering just this run's support."""
+def _curve_geometry(
+    columns: tuple[ChartColumn, ...],
+    durations: tuple[int, ...],
+    groups: tuple[_Group, ...],
+    samples: tuple[_Sample, ...],
+    plot: tuple[float, float, float, float],
+) -> tuple[tuple[ChartCurve, ...], tuple[ChartSegment, ...]]:
+    """Build exact per-run inset strokes and closed fills from cached intervals."""
 
-    pieces: list[tuple[float, float, float]] = []
-    last = len(intervals) - 1
-    for index, (start, end, column_index) in enumerate(intervals):
-        start_x = left + (start - first_start) * x_span / span
-        end_x = left + (end - first_start) * x_span / span
-        if index == 0:
-            start_x += epsilon
-        if index == last:
-            end_x -= epsilon
-        pieces.append((start_x, end_x, heights[column_index]))
+    left, top, right, bottom = plot
+    if not columns or not samples:
+        return (), ()
+    first_start = samples[0].start
+    last_end = samples[-1].end
+    span = last_end - first_start
+    if span <= 0 or right <= left or bottom <= top:
+        return (), ()
+    x_span = right - left
+    centre = (top + bottom) / 2.0
+    half = (bottom - top) / 2.0
+    read_scale = _rate_maximum(columns, durations, "read_bytes")
+    write_scale = _rate_maximum(columns, durations, "write_bytes")
+    heights = {
+        "read": tuple(
+            _mapped_y(column.read_bytes, duration, read_scale, centre, -half, top, centre)
+            for column, duration in zip(columns, durations)
+        ),
+        "write": tuple(
+            _mapped_y(column.write_bytes, duration, write_scale, centre, half, centre, bottom)
+            for column, duration in zip(columns, durations)
+        ),
+    }
 
-    polygon: list[tuple[float, float]] = [(pieces[0][0], centre)]
-    current: float | None = None
-    for start_x, end_x, y in pieces:
-        if current is None:
-            polygon.append((start_x, y))
-        elif y != current:
-            polygon.append((start_x, current))
-            polygon.append((start_x, y))
-        else:
-            polygon.append((start_x, y))
-        polygon.append((end_x, y))
-        current = y
-    polygon.append((pieces[-1][1], centre))
-    polygon.append(polygon[0])
-    return tuple(polygon)
+    fragments: dict[int, list[tuple[int, int, int]]] = {}
+    for column_index, group in enumerate(groups):
+        for run_index, start, end in group.intervals:
+            fragments.setdefault(run_index, []).append((column_index, start, end))
+
+    curves: list[ChartCurve] = []
+    segments: list[ChartSegment] = []
+    for run_index in sorted(fragments):
+        members = fragments[run_index]
+        first_time = min(fragment[1] for fragment in members)
+        last_time = max(fragment[2] for fragment in members)
+        outer_start = left + (first_time - first_start) * x_span / span
+        outer_end = left + (last_time - first_start) * x_span / span
+        if outer_end <= outer_start:
+            continue
+        inset = min(0.25, (outer_end - outer_start) / 4.0)
+        low = outer_start + inset
+        high = outer_end - inset
+        for side in ("read", "write"):
+            side_heights = heights[side]
+            ordered = sorted(
+                (
+                    left
+                    + (((start + end) / 2.0) - first_start) * x_span / span,
+                    side_heights[column_index],
+                )
+                for column_index, start, end in members
+            )
+            if all(y == centre for _, y in ordered):
+                continue
+            if len(ordered) == 1:
+                y = ordered[0][1]
+                vertices: tuple[tuple[float, float], ...] = ((low, y), (high, y))
+            else:
+                xs = [x for x, _ in ordered]
+                ys = [y for _, y in ordered]
+                xs[0] = min(max(xs[0], low), high)
+                xs[-1] = min(xs[-1], high)
+                for position in range(1, len(xs)):
+                    xs[position] = max(xs[position - 1], min(xs[position], high))
+                vertices = tuple(zip(xs, ys))
+            curves.append(ChartCurve(side, run_index, vertices))
+            segments.append(
+                ChartSegment(
+                    side,
+                    run_index,
+                    (
+                        (vertices[0][0], centre),
+                        *vertices,
+                        (vertices[-1][0], centre),
+                        (vertices[0][0], centre),
+                    ),
+                )
+            )
+    return tuple(curves), tuple(segments)
 
 
 class SeriesChart(QWidget):
@@ -343,14 +713,18 @@ class SeriesChart(QWidget):
         super().__init__(parent)
         self._caption = _TOTAL_CAPTION
         self._samples: tuple[_Sample, ...] = ()
-        self._runs: tuple[tuple[int, ...], ...] = ()
+        self._identity: object | None = None
+        self._groups: tuple[_Group, ...] = ()
+        self._group_width = 1
+        self._columns: tuple[ChartColumn, ...] = ()
+        self._durations: tuple[int, ...] = ()
+        self._curves: tuple[ChartCurve, ...] = ()
+        self._segments: tuple[ChartSegment, ...] = ()
         self._available = True
         self._reason: str | None = None
         # Share totals and time-series samples have independent availability.
         # None is unavailable; (0, 0) is an explicitly measured zero.
         self._totals: tuple[int, int] | None = None
-        self._columns: tuple[ChartColumn, ...] = ()
-        self._segments: tuple[ChartSegment, ...] = ()
         self._plot: tuple[float, float, float, float] = (0.0, 0.0, 0.0, 0.0)
         self._geometry_size: tuple[int, int] | None = None
 
@@ -368,29 +742,176 @@ class SeriesChart(QWidget):
 
     # -- data ------------------------------------------------------------
 
-    def set_task_points(self, points: Sequence[SeriesPoint]) -> None:
+    def set_task_points(
+        self, points: Sequence[SeriesPoint], *, identity: object = None
+    ) -> None:
         """Replace the immutable source buckets and rebuild geometry once."""
 
-        samples = _task_samples(points)
+        self._install(_task_samples(points), identity)
+
+    def append_task_points(
+        self, points: Sequence[SeriesPoint], *, identity: object
+    ) -> None:
+        """Apply the complete newest sequence through the append decision table."""
+
+        self._append(_task_samples(points), identity)
+
+    def _install(self, samples: tuple[_Sample, ...], identity: object | None) -> None:
+        """Full rebuild: validate first, replace input/identity, repaint once."""
+
         self._samples = samples
-        self._runs = _group_runs(samples)
+        self._identity = identity
         self._available = True
         self._reason = None
+        self._rebuild_all()
         self._sync_message()
-        self._rebuild_geometry()
         self.update()
 
+    def _append(self, samples: tuple[_Sample, ...], identity: object | None) -> None:
+        """Apply spec §8.3's decision table in its exact top-down order."""
+
+        old = self._samples
+        count = len(old)
+        incoming = len(samples)
+        if not self._available:  # row 2
+            self._install(samples, identity)
+            return
+        if identity != self._identity:  # row 3
+            self._install(samples, identity)
+            return
+        if incoming == 0:  # row 4
+            if count == 0 and self._reason is None:
+                return
+            self._samples = ()
+            self._identity = identity
+            self._available = True
+            self._reason = None
+            self._rebuild_all()
+            self._sync_message()
+            self.update()
+            return
+        prefix = _matching_prefix(old, samples)
+        if count == 0:  # row 5
+            self._install(samples, identity)
+            return
+        if incoming == count and prefix == count and self._reason is None:  # row 6
+            return
+        if incoming == count and prefix == count - 1:  # row 7
+            self._change(samples, identity, replace_tail=True, start=count)
+            return
+        if incoming > count and prefix == count:  # row 8
+            self._change(samples, identity, replace_tail=False, start=count)
+            return
+        if incoming > count and prefix == count - 1:  # row 9
+            self._change(samples, identity, replace_tail=True, start=count)
+            return
+        if incoming < count:  # row 10
+            self._install(samples, identity)
+            return
+        self._install(samples, identity)  # row 11
+
+    def _change(
+        self,
+        samples: tuple[_Sample, ...],
+        identity: object | None,
+        *,
+        replace_tail: bool,
+        start: int,
+    ) -> None:
+        self._samples = samples
+        self._identity = identity
+        self._available = True
+        self._reason = None
+        if not self._geometry_active():
+            self._rebuild_all()
+        else:
+            width = int(math.floor(self._plot[2] - self._plot[0]))
+            groups = list(self._groups)
+            group_width = self._group_width
+            if replace_tail:
+                groups = self._replace_tail(groups, samples)
+            groups, group_width = self._append_members(
+                groups, samples, start, group_width, width
+            )
+            self._groups = tuple(groups)
+            self._group_width = group_width
+            self._refresh_geometry()
+        self._sync_message()
+        self.update()
+
+    @staticmethod
+    def _replace_tail(
+        groups: list[_Group], samples: tuple[_Sample, ...]
+    ) -> list[_Group]:
+        """Rebuild the old tail group from its members only."""
+
+        if not groups:
+            return groups
+        last = groups[-1]
+        previous_run = groups[-2].last_run if len(groups) > 1 else -1
+        first_index = last.first_index
+        first_run = (
+            0
+            if first_index == 0
+            else previous_run + (1 if samples[first_index].starts_run else 0)
+        )
+        groups[-1] = _aggregate_members(samples, first_index, last.last_index, first_run)
+        return groups
+
+    @staticmethod
+    def _append_members(
+        groups: list[_Group],
+        samples: tuple[_Sample, ...],
+        start: int,
+        group_width: int,
+        width: int,
+    ) -> tuple[list[_Group], int]:
+        """Visit only the open/new groups, promoting pairwise past the bound."""
+
+        index = start
+        incoming = len(samples)
+        while index < incoming:
+            if (
+                groups
+                and groups[-1].last_index - groups[-1].first_index + 1 < group_width
+            ):
+                open_group = groups[-1]
+                groups[-1] = _aggregate_members(
+                    samples, open_group.first_index, index, open_group.first_run
+                )
+            else:
+                previous_run = groups[-1].last_run if groups else -1
+                first_run = (
+                    0
+                    if index == 0
+                    else previous_run + (1 if samples[index].starts_run else 0)
+                )
+                groups.append(
+                    _aggregate_members(samples, index, index, first_run)
+                )
+            if len(groups) > width:
+                group_width *= 2
+                groups = _promote_groups(groups)
+            index += 1
+        return groups, group_width
+
     def set_unavailable(self, reason: str) -> None:
-        """Discard the drawn state and expose the exact reason."""
+        """Discard every drawn value and expose the exact reason."""
 
         reason = _require_text(reason, "reason")
         self._samples = ()
-        self._runs = ()
+        self._identity = None
+        self._groups = ()
+        self._group_width = 1
         self._available = False
         self._reason = reason
         self._totals = None
         self._columns = ()
+        self._durations = ()
+        self._curves = ()
         self._segments = ()
+        self._geometry_size = (self.width(), self.height())
+        self._plot = self.plot_rect()
         self._sync_message()
         self.update()
 
@@ -402,8 +923,14 @@ class SeriesChart(QWidget):
         self._ensure_geometry()
         return self._columns
 
+    def curves(self) -> tuple[ChartCurve, ...]:
+        """Return the exact per-run stroke polylines the next paint uses."""
+
+        self._ensure_geometry()
+        return self._curves
+
     def segments(self) -> tuple[ChartSegment, ...]:
-        """Return the exact closed polygons the next paint uses."""
+        """Return the exact closed fill polygons the next paint uses."""
 
         self._ensure_geometry()
         return self._segments
@@ -431,141 +958,52 @@ class SeriesChart(QWidget):
 
     # -- geometry --------------------------------------------------------
 
+    def _geometry_active(self) -> bool:
+        left, top, right, bottom = self._plot
+        return (
+            self._geometry_size == (self.width(), self.height())
+            and right > left
+            and bottom > top
+        )
+
     def _ensure_geometry(self) -> None:
         if self._geometry_size != (self.width(), self.height()):
-            self._rebuild_geometry()
+            self._rebuild_all()
 
-    def _rebuild_geometry(self) -> None:
+    def _rebuild_all(self) -> None:
         self._geometry_size = (self.width(), self.height())
-        left, top, right, bottom = self.plot_rect()
-        self._plot = (left, top, right, bottom)
+        self._plot = self.plot_rect()
+        self._groups = ()
+        self._group_width = 1
         self._columns = ()
+        self._durations = ()
+        self._curves = ()
         self._segments = ()
-
-        budget = int(math.floor(right - left))
-        samples = self._samples
-        if budget <= 0 or bottom <= top or not samples:
+        left, top, right, bottom = self._plot
+        if right <= left or bottom <= top or not self._samples:
             return
-        first_start = samples[0].start
-        last_end = samples[-1].end
-        span = last_end - first_start
-        if span <= 0:
-            return
+        width = int(math.floor(right - left))
+        self._group_width = _group_size(len(self._samples), width)
+        self._groups = _build_groups(self._samples, width)
+        self._refresh_geometry()
 
-        bins: list[list[int]]
-        if len(samples) <= budget:
-            bins = [[index] for index in range(len(samples))]
-        else:
-            buckets: list[list[int]] = [[] for _ in range(budget)]
-            for index, sample in enumerate(samples):
-                position = min(
-                    budget - 1, ((sample.start - first_start) * budget) // span
-                )
-                buckets[position].append(index)
-            bins = buckets
-
-        columns: list[ChartColumn] = []
-        durations: list[int] = []
-        column_of = [0] * len(samples)
-        for members in bins:
-            if not members:
-                continue
-            column_index = len(columns)
-            start = samples[members[0]].start
-            end = samples[members[0]].end
-            read_bytes = 0
-            write_bytes = 0
-            peak_read: int | None = None
-            peak_write: int | None = None
-            duration = 0
-            starts_run = False
-            for member in members:
-                sample = samples[member]
-                column_of[member] = column_index
-                start = min(start, sample.start)
-                end = max(end, sample.end)
-                read_bytes += sample.read_bytes
-                write_bytes += sample.write_bytes
-                if sample.peak_read_bps is not None and (
-                    peak_read is None or sample.peak_read_bps > peak_read
-                ):
-                    peak_read = sample.peak_read_bps
-                if sample.peak_write_bps is not None and (
-                    peak_write is None or sample.peak_write_bps > peak_write
-                ):
-                    peak_write = sample.peak_write_bps
-                duration += sample.end - sample.start
-                starts_run = starts_run or sample.starts_run
-            columns.append(
-                ChartColumn(
-                    start,
-                    end,
-                    read_bytes,
-                    write_bytes,
-                    peak_read,
-                    peak_write,
-                    starts_run,
-                )
+    def _refresh_geometry(self) -> None:
+        self._columns = tuple(
+            ChartColumn(
+                group.start,
+                group.end,
+                group.read_bytes,
+                group.write_bytes,
+                group.peak_read_bps,
+                group.peak_write_bps,
+                group.starts_run,
             )
-            durations.append(duration)
-        self._columns = tuple(columns)
-
-        centre = (top + bottom) / 2.0
-        half = (bottom - top) / 2.0
-        read_scale = _rate_maximum(columns, durations, "read_bytes")
-        write_scale = _rate_maximum(columns, durations, "write_bytes")
-        read_y = [
-            _mapped_y(column.read_bytes, duration, read_scale, centre, -half, top, centre)
-            for column, duration in zip(columns, durations)
-        ]
-        write_y = [
-            _mapped_y(
-                column.write_bytes, duration, write_scale, centre, half, centre, bottom
-            )
-            for column, duration in zip(columns, durations)
-        ]
-
-        x_span = right - left
-        sides: tuple[tuple[Literal["read", "write"], list[float]], ...] = (
-            ("read", read_y),
-            ("write", write_y),
+            for group in self._groups
         )
-        segments: list[ChartSegment] = []
-        for run_index, run_members in enumerate(self._runs):
-            run_start_x = (
-                left + (samples[run_members[0]].start - first_start) * x_span / span
-            )
-            run_end_x = left + (samples[run_members[-1]].end - first_start) * x_span / span
-            run_span = run_end_x - run_start_x
-            epsilon = min(0.25, run_span / 4.0) if run_span > 0 else 0.0
-            for side, heights in sides:
-                if all(heights[column_of[member]] == centre for member in run_members):
-                    continue
-                intervals: list[list[int]] = []
-                for member in run_members:
-                    sample = samples[member]
-                    column_index = column_of[member]
-                    if intervals and intervals[-1][2] == column_index:
-                        intervals[-1][1] = sample.end
-                    else:
-                        intervals.append([sample.start, sample.end, column_index])
-                segments.append(
-                    ChartSegment(
-                        side,
-                        run_index,
-                        _step_polygon(
-                            intervals,
-                            first_start,
-                            span,
-                            left,
-                            x_span,
-                            epsilon,
-                            centre,
-                            heights,
-                        ),
-                    )
-                )
-        self._segments = tuple(segments)
+        self._durations = tuple(group.duration_ns for group in self._groups)
+        self._curves, self._segments = _curve_geometry(
+            self._columns, self._durations, self._groups, self._samples, self._plot
+        )
 
     # -- message ---------------------------------------------------------
 
@@ -630,12 +1068,18 @@ class SeriesChart(QWidget):
                 painter.drawPolygon(
                     QPolygonF([QPointF(x, y) for x, y in segment.polygon])
                 )
+            for curve in self._curves:
+                color = theme.READ_COLOR if curve.side == "read" else theme.WRITE_COLOR
+                painter.setPen(QPen(color, theme.AXIS_PEN_WIDTH))
+                painter.drawPolyline(
+                    QPolygonF([QPointF(x, y) for x, y in curve.vertices])
+                )
         finally:
             painter.end()
 
     def resizeEvent(self, event: QResizeEvent) -> None:  # type: ignore[override]
         self._place_message()
-        self._rebuild_geometry()
+        self._rebuild_all()
         super().resizeEvent(event)
         self.update()
 
@@ -670,17 +1114,19 @@ class DeviceLane(DualSeriesChart):
         super().__init__(parent)
         self._caption = ""
 
-    def set_device_points(self, points: Sequence[DeviceSeriesPoint]) -> None:
+    def set_device_points(
+        self, points: Sequence[DeviceSeriesPoint], *, identity: object = None
+    ) -> None:
         """Replace the source buckets without inheriting task suspension."""
 
-        samples = _device_samples(points)
-        self._samples = samples
-        self._runs = _group_runs(samples)
-        self._available = True
-        self._reason = None
-        self._sync_message()
-        self._rebuild_geometry()
-        self.update()
+        self._install(_device_samples(points), identity)
+
+    def append_device_points(
+        self, points: Sequence[DeviceSeriesPoint], *, identity: object
+    ) -> None:
+        """Apply a complete device sequence through the same decision table."""
+
+        self._append(_device_samples(points), identity)
 
     def set_device(self, dev: str) -> None:
         """Set the raw device token caption; no name or mount is resolved."""
@@ -986,6 +1432,7 @@ class ShareBars(QWidget):
 
 __all__ = [
     "ChartColumn",
+    "ChartCurve",
     "ChartSegment",
     "DeviceLane",
     "DonutChart",
