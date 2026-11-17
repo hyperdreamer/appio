@@ -21,7 +21,17 @@ from appio.ownership import ownership_settled
 
 DAY_NS = 86_400_000_000_000
 DEFAULT_QUOTA_BYTES = 1_500_000_000
+#: Units retired per maintenance pass. The pass blocks the owner loop, so it must
+#: stay under FRAME_TIMEOUT_NS (2 s) or live clients lose their frames: measured
+#: 1.4 s at 256. Raising it does NOT raise throughput -- _candidates() fetches
+#: batch_size rows for every app in every tier, so the cost is ~2.7 ms/unit and
+#: the real ceiling is the selection query, not this number.
 DEFAULT_BATCH_SIZE = 256
+#: Units retired per transaction. Deleting one unit per transaction costs a
+#: durability fsync each, which is most of a 4 ms unit, and that rate cannot keep
+#: up with a 10 s sample of ~226 app rows: retention fell ~1130 units/minute
+#: behind and the store only ever stopped growing when the quota paused it.
+DELETE_UNITS_PER_TRANSACTION = 128
 #: Headroom a rewrite must leave under the ceiling. Compacting to the last free
 #: page puts the store straight back over the quota, so it rewrites itself again
 #: on the next pass: a store parked at its ceiling then spends its life copying
@@ -629,18 +639,29 @@ class QuotaPruner:
                            physical_store_bytes(self.database_paths), reason, tuple(skipped))
 
     def _commit_delete(self, unit):
+        results = self._commit_deletes((unit,))
+        return results[0]
+
+    def _commit_deletes(self, units):
+        """Delete units in one transaction; ``None`` marks an unmaterialized unit.
+
+        One transaction per unit cost ~4 ms dominated by the durability fsync, so
+        a pass capped at ``DEFAULT_BATCH_SIZE`` retired ~220 units a minute while
+        the collector produced ~1350: the retained tail grew without bound and the
+        store climbed back to its ceiling. A batch keeps every unit indivisible
+        (a unit's rows all go, or the batch rolls back) and pays one fsync for it.
+        """
         self.connection.execute("BEGIN IMMEDIATE")
         try:
-            if not self._materialized(unit):
-                self.connection.execute("ROLLBACK")
-                return None
-            stats = self._delete(unit)
+            results = []
+            for unit in units:
+                results.append(self._delete(unit) if self._materialized(unit) else None)
             self.connection.execute("COMMIT")
         except BaseException:
             if self.connection.in_transaction:
                 self.connection.execute("ROLLBACK")
             raise
-        return stats
+        return results
 
     def expire(self, now_boot_id: str, now_mono_ns: int) -> PruneResult:
         self._require_idle()
@@ -656,12 +677,16 @@ class QuotaPruner:
         if self._scan_pending:
             return self._result([], "batch_limit")
         deleted, skipped = [], []
-        for unit in units:
-            stats = self._commit_delete(unit)
-            if stats is None:
-                skipped.append(SkippedUnit(unit.kind, unit.primary_key))
-                continue
-            deleted.append(stats)
+        for start in range(0, len(units), DELETE_UNITS_PER_TRANSACTION):
+            chunk = units[start:start + DELETE_UNITS_PER_TRANSACTION]
+            # Advance before committing so a crash mid-batch cannot pin the sweep
+            # on the same oldest units forever.
+            self._expiry_after = chunk[-1].key
+            for unit, stats in zip(chunk, self._commit_deletes(chunk)):
+                if stats is None:
+                    skipped.append(SkippedUnit(unit.kind, unit.primary_key))
+                else:
+                    deleted.append(stats)
             if not self._checkpoint(truncate=False):
                 return self._result(deleted, "checkpoint_busy", paused=True, skipped=skipped)
         # Advancing past skipped units prevents a permanently bad oldest batch

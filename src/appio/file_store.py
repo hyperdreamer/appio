@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import asdict, replace
+import copy
 import json
 import sqlite3
 
@@ -25,6 +26,11 @@ from appio.files import (
 )
 
 FILE_COLUMNS = tuple(name for name in FILE_COUNTERS if name not in ("gap_intervals", "overlap_uncertain_intervals"))
+
+#: Bounded memo of validated coverage JSON: one frame's text is shared by every
+#: app in it, and a retention pass re-examines the same hours many times.
+_DECODED_COVERAGE: dict[str, dict] = {}
+_DECODED_COVERAGE_MAX = 512
 
 
 @contextmanager
@@ -59,7 +65,18 @@ def coverage_object(coverage: FileCoverageInput = ZERO_COVERAGE) -> dict:
 
 
 def _decode_coverage(text: str) -> dict:
-    """Validate every exact key and integer before reusing persisted coverage."""
+    """Validate every exact key and integer before reusing persisted coverage.
+
+    The same JSON is duplicated across every app in a frame and re-read for every
+    unit a retention pass touches, so validating it again dominates the pass: the
+    walk plus the canonical re-encode cost ~900 us against ~10 us to copy the
+    result. Cached decodes are handed back as independent copies because callers
+    (``_preserve_file_gap``) mutate what they decode.
+    """
+    cached = _DECODED_COVERAGE.get(text)
+    if cached is not None:
+        return copy.deepcopy(cached)
+
     def unique(pairs):
         obj = {}
         for key, value in pairs:
@@ -86,7 +103,10 @@ def _decode_coverage(text: str) -> dict:
     check(obj, model, "coverage")
     if canonical_json(obj) != text:
         raise ValueError("coverage_json is not canonical")
-    return obj
+    if len(_DECODED_COVERAGE) >= _DECODED_COVERAGE_MAX:
+        _DECODED_COVERAGE.clear()
+    _DECODED_COVERAGE[text] = obj
+    return copy.deepcopy(obj)
 
 
 def _merge_coverage_json(old_text: str | None, incoming: dict) -> str:
