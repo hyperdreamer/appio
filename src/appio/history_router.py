@@ -639,6 +639,22 @@ class _LocalCopyBinding:
                     "a local binding opening vector must match its registrations")
 
 
+class _FrameCopyPaths(tuple):
+    """One frame's registered copy paths, carrying their admission binding.
+
+    The frame worker keeps its two-argument ``(paths, window)`` shape so
+    fixtures that substitute ``_read_local`` stay valid, while the copy itself
+    receives the exact admitted worker id and normalized request. The copy can
+    then return an outcome under its own binding and the owner never relabels a
+    foreign result with its own identity (§3.4, §4.3).
+    """
+
+    def __new__(cls, binding: _LocalCopyBinding) -> _FrameCopyPaths:
+        self = super().__new__(cls, binding.paths)
+        self.binding = binding
+        return self
+
+
 class HistoryRouter:
     def __init__(self, local: QueryService, client: IodClient, registry: AppRegistry):
         self.local, self.client, self.registry = local, client, registry
@@ -649,6 +665,14 @@ class HistoryRouter:
         # query or frame generation never advances an epoch.
         self._next_registration_epoch = 1
         self._registrations: dict[str, _SourceRegistration] = {}
+        #: The first physical file each connection object was registered for.
+        #: Replacing the file at that pathname leaves the connection reading the
+        #: unlinked original, so a stat of the pathname describes another
+        #: database; one connection is never re-stamped with a replacement's
+        #: identity (§4.2). Retired entries stay so a removed source cannot be
+        #: re-added under the stale connection either.
+        self._connection_bindings: dict[int, tuple[sqlite3.Connection,
+                                                    tuple[int, int] | None]] = {}
         # Capture identity only when a source is registered, never in a Files
         # request on the UI thread. Worker connections stay read-only.
         self._source_paths: dict[str, str] = {}
@@ -691,7 +715,6 @@ class HistoryRouter:
         self._legacy_files_workers: set[int] = set()
         self._next_token_id = 1
         self._local_paths: tuple[tuple[str, str, str], ...] | None = None
-        self._local_request: QueryRequest | None = None
         self._local_future = None
         #: Immutable admission/closing evidence, keyed by the admitted worker id.
         #: The frame owns one entry; detail copies own one until their settlement.
@@ -750,13 +773,29 @@ class HistoryRouter:
         path = "" if row is None or row[2] is None else row[2]
         if path:
             path = os.path.abspath(path)
+        current = self._physical_identity(path)
+        # One connection keeps the physical file it was first registered for.
+        # An explicit add_source or a new QueryService around that same
+        # connection is not a rebinding: if the pathname now denotes another
+        # inode, the connection still reads the unlinked original and no copy
+        # of the replacement may be certified by its counters. Only a
+        # connection opened for the replacement file is a genuine rebinding.
+        known = self._connection_bindings.get(id(connection))
+        if known is not None and known[0] is connection:
+            physical = known[1]
+            if current != physical:
+                raise ValueError(
+                    f"history source {name!r} is no longer bound to its "
+                    "registered file")
+        else:
+            physical = current
         epoch = self._next_registration_epoch
         self._next_registration_epoch = epoch + 1
         registration = _SourceRegistration(
-            name, owner, epoch, service, connection, path,
-            self._physical_identity(path))
+            name, owner, epoch, service, connection, path, physical)
         self._registrations[name] = registration
         self._source_paths[name] = path
+        self._connection_bindings[id(connection)] = (connection, physical)
         return registration
 
     def _current_registration(self, name: str) -> _SourceRegistration:
@@ -849,6 +888,9 @@ class HistoryRouter:
         del self._sources[collector_id]
         self._registrations.pop(collector_id, None)
         self._source_paths.pop(collector_id, None)
+        # The retired connection's physical binding stays remembered: re-adding
+        # the same connection after a path replacement still addresses the old
+        # file and must be refused, not re-stamped (§4.2).
         self.invalidate()
 
     def _capture_local_binding(self, *, worker_id: int, token_id: int | None = None,
@@ -1673,11 +1715,17 @@ class HistoryRouter:
         """Copy, plan, materialise and rank in one frame worker (§3.3).
 
         Returns every routing/materialisation fact the owner needs and never
-        constructs a subject's detail or exposes a database handle. The
-        optional bindings default to a compatibility derivation so existing
-        fixtures that call this private worker directly keep their shape; the
-        owner passes its admitted token binding once settlement is wired.
+        constructs a subject's detail or exposes a database handle. The owner
+        passes its admitted binding with ``paths``; only a direct fixture call
+        with plain paths falls back to the compatibility worker id/request.
         """
+        if worker_id is None or request is None:
+            admission = getattr(paths, "binding", None)
+            if admission is not None:
+                if worker_id is None:
+                    worker_id = admission.worker_id
+                if request is None:
+                    request = admission.request
         if request is None:
             request = QueryRequest("ranking", window)
         if worker_id is None:
@@ -1844,13 +1892,13 @@ class HistoryRouter:
         self._local_generation = self._generation
         self._local_worker_id = worker_id
         self._local_paths = binding.paths
-        self._local_request = request
         # The frame lane holds exactly one charged Future. A completed but
         # undrained predecessor stays observable through its own result before
-        # the frozen `not done()` gate admits a replacement.
+        # the frozen `not done()` gate admits a replacement. The submission
+        # carries the admitted worker binding into the copy itself.
         try:
             self._local_future = self._frame_executor.submit(
-                self._read_local, binding.paths, window)
+                self._read_local, _FrameCopyPaths(binding), window)
         except Exception:
             # A refused submission publishes no admission evidence; the caller
             # receives the submit failure through the existing seam.
@@ -1882,7 +1930,7 @@ class HistoryRouter:
             raise ValueError("a local frame has no captured copy binding")
         if error is None:
             try:
-                outcome = self._admitted_frame_outcome(outcome, worker_id)
+                outcome = self._admitted_frame_outcome(outcome, binding)
             except Exception as caught:  # noqa: BLE001 - reported after the bracket
                 outcome, error = None, caught
         try:
@@ -1917,21 +1965,22 @@ class HistoryRouter:
         self._local_generation = None
         return True
 
-    def _admitted_frame_outcome(self, outcome: object, worker_id: int) -> LocalFrameOutcome:
+    def _admitted_frame_outcome(self, outcome: object,
+                                binding: _LocalCopyBinding) -> LocalFrameOutcome:
         """Validate a frame outcome against the owner's admitted binding.
 
-        ``_read_local`` keeps its historical ``(paths, window)`` call shape for
-        existing fixtures, so its compatibility default worker id is replaced by
-        the admitted id here. The original request must already be the admitted
-        one; a worker may never substitute another request.
+        The submitted copy receives the admitted worker id and request, so a
+        result under any other identity is foreign. It is rejected before the
+        owner reads a closing bracket or publishes any frame fact; a worker
+        result is never relabelled as this admission (§3.4, §4.3).
         """
 
         if not isinstance(outcome, LocalFrameOutcome):
             raise ValueError("a local frame worker must return a typed frame outcome")
-        if outcome.request != self._local_request:
+        if outcome.worker_id != binding.worker_id:
+            raise ValueError("a local frame worker answered another worker binding")
+        if outcome.request != binding.request:
             raise ValueError("a local frame worker answered another request")
-        if outcome.worker_id != worker_id:
-            return replace(outcome, worker_id=worker_id)
         return outcome
 
     def _build_ranking(self, window):
