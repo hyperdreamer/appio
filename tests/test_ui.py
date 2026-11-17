@@ -60,6 +60,7 @@ from appio.contracts import (
 from appio.history_types import (
     AcceptedIdentity,
     AnswerProvenance,
+    RetainedRecord,
     SeriesMetadata,
     retention_scope,
 )
@@ -79,13 +80,18 @@ from appio.ui.render_model import (
     MAX_DEVICE_LANES,
     DeviceLaneModel,
     Kpi,
+    MeasurementStatus,
     OverviewModel,
+    OverviewStatusChoice,
+    PresentationRefusal,
     RankingModel,
     RankingRow,
     SHARE_UNAVAILABLE_REASON,
+    _choose_overview_status,
     _coverage_text,
     build_overview,
     build_ranking,
+    oldest_answer_age,
     scope_text,
 )
 from appio.ui.theme import BAR_HEIGHT, READ_COLOR, TRACK_COLOR
@@ -4548,3 +4554,546 @@ def test_detail_notification_is_query_free_and_preserves_other_dependency(
         == "pending"
     )
     assert "still loading" not in failed.detail_line
+
+
+# --------------------------------------------------------------------------
+# 12.7 Age and the independent label (spec §9.1–§9.3, plan Task 11).
+# --------------------------------------------------------------------------
+
+WINDOW_40 = Window(kind="since_boot", boot_id=BOOT_A, end_mono_ns=40_000_000_000)
+
+
+def test_first_seen_age_uses_raw_thresholds_and_ceiling_in_every_unit() -> None:
+    from dataclasses import fields as dataclass_fields
+
+    # The pure records carry exactly these fields (spec §9.1): no second
+    # displayed-measurement counter, no widget and no query handle.
+    assert [field.name for field in dataclass_fields(MeasurementStatus)] == [
+        "has_displayed_values",
+        "ranking_empty",
+        "share_state",
+        "series_state",
+        "share_reason",
+        "series_reason",
+        "displayed_answers",
+    ]
+    assert [field.name for field in dataclass_fields(PresentationRefusal)] == [
+        "origin",
+        "window",
+        "reason",
+        "text",
+    ]
+    assert [field.name for field in dataclass_fields(OverviewStatusChoice)] == [
+        "row",
+        "text",
+        "age_text",
+    ]
+
+    p = measured_provenance(
+        "totals", SUBJECT_KEY, WINDOW_A, first_seen=1_000_000_000
+    )
+    assert p.accepted_identity is not None and p.first_seen_at_ns == 1_000_000_000
+
+    # The exact §9.3 oracle: raw-ns threshold, then integer ceiling per unit.
+    vectors = [
+        (0, "0 s"),
+        (1, "1 s"),
+        (999_999_999, "1 s"),
+        (89_999_000_000, "90 s"),
+        (90_000_000_000, "2 min"),
+        (5_399_940_000_000, "90 min"),
+        (5_400_000_000_000, "2 h"),
+    ]
+    for delta, text in vectors:
+        assert oldest_answer_age((p,), p.first_seen_at_ns + delta) == (
+            f"oldest answer {text} ago"
+        )
+    assert oldest_answer_age((), 0) is None
+    assert oldest_answer_age(
+        (replace(p, accepted_identity=None, first_seen_at_ns=None),), 0
+    ) == "age unknown"
+    assert oldest_answer_age((p,), 0) == "oldest answer 0 s ago"
+    # max(0, ...) defensively handles a test clock behind the stamp.
+    stamped_ahead = replace(p, first_seen_at_ns=5_000_000_000)
+    assert oldest_answer_age((stamped_ahead,), 0) == "oldest answer 0 s ago"
+    for now in (True, -1, 1.5, "0", None):
+        with pytest.raises(ValueError):
+            oldest_answer_age((p,), now)  # type: ignore[arg-type]
+    for answers in ((object(),), (p, "not provenance")):
+        with pytest.raises(ValueError):
+            oldest_answer_age(answers, 0)  # type: ignore[arg-type]
+
+    # MeasurementStatus: exact bools, phases, reasons only for failure, and the
+    # fixed distinct dependency order ranking, totals, series.
+    base = MeasurementStatus(False, False, "absent", "absent", None, None, ())
+    assert base.displayed_answers == ()
+    series_prov = measured_provenance(
+        "series", SUBJECT_KEY, WINDOW_A, first_seen=3_000_000_000
+    )
+    ranking_prov = measured_provenance(
+        "ranking", SUBJECT_KEY, WINDOW_A, first_seen=1_000_000_000
+    )
+    ordered = MeasurementStatus(
+        True, False, "ok", "ok", None, None,
+        (ranking_prov, p, series_prov),
+    )
+    assert ordered.displayed_answers == (ranking_prov, p, series_prov)
+    failed = MeasurementStatus(
+        False, False, "failed", "failed", "share_bad", "series_bad", ()
+    )
+    assert (failed.share_reason, failed.series_reason) == ("share_bad", "series_bad")
+    for invalid in (
+        (1, False, "absent", "absent", None, None, ()),
+        (False, "no", "absent", "absent", None, None, ()),
+        (False, False, "ready", "absent", None, None, ()),
+        (False, False, "failed", "absent", None, None, ()),
+        (False, False, "ok", "absent", "unexpected", None, ()),
+        (False, False, "absent", "failed", None, None, ()),
+        (False, False, "absent", "ok", None, "unexpected", ()),
+        (False, False, "absent", "absent", None, None, [p]),
+        (False, False, "absent", "absent", None, None, (p, object())),
+        (False, False, "absent", "absent", None, None, (p, p)),
+        (False, False, "absent", "absent", None, None, (p, ranking_prov)),
+        (False, False, "absent", "absent", None, None, (series_prov, p)),
+    ):
+        with pytest.raises(ValueError):
+            MeasurementStatus(*invalid)  # type: ignore[arg-type]
+
+    # PresentationRefusal: legal origin, exact Window and nonempty text.
+    refusal = PresentationRefusal(
+        "shell_prepare", WINDOW_A, "launch_attribution", A22_LAUNCH_TEXT
+    )
+    assert refusal.window == WINDOW_A and refusal.text == A22_LAUNCH_TEXT
+    for invalid in (
+        ("direct", WINDOW_A, "launch_attribution", A22_LAUNCH_TEXT),
+        ("direct_view", "not-a-window", "launch_attribution", A22_LAUNCH_TEXT),
+        ("direct_view", WINDOW_A, "", A22_LAUNCH_TEXT),
+        ("direct_view", WINDOW_A, None, A22_LAUNCH_TEXT),
+        ("direct_view", WINDOW_A, 7, A22_LAUNCH_TEXT),
+        ("direct_view", WINDOW_A, "launch_attribution", ""),
+        ("direct_view", WINDOW_A, "launch_attribution", None),
+        ("direct_view", WINDOW_A, "launch_attribution", 7),
+    ):
+        with pytest.raises(ValueError):
+            PresentationRefusal(*invalid)  # type: ignore[arg-type]
+
+    # OverviewStatusChoice: legal row IDs, row 6f iff the status text is empty,
+    # and only the exact §9.3 age label shapes.
+    for row in ("1", "2", "3", "4", "5a", "5b", "6a", "6b", "6c", "6d", "6e"):
+        assert OverviewStatusChoice(row, "status", None).row == row
+    hidden = OverviewStatusChoice("6f", "", None)
+    assert (hidden.row, hidden.text, hidden.age_text) == ("6f", "", None)
+    for age in (
+        "age unknown",
+        "oldest answer 0 s ago",
+        "oldest answer 90 s ago",
+        "oldest answer 2 min ago",
+        "oldest answer 2 h ago",
+    ):
+        assert OverviewStatusChoice("6b", "live", age).age_text == age
+    for invalid in (
+        ("6f", "nonempty", None),
+        ("6b", "", None),
+        ("7", "status", None),
+        ("5a", "status", 2),
+        ("6b", "live", "2 s"),
+        ("6b", "live", ""),
+        ("6b", "live", "oldest answer 2 seconds ago"),
+        ("6b", "live", "oldest answer -1 s ago"),
+        ("6b", "live", "oldest answer 02 s ago"),
+        ("6b", "live", "oldest answer  2 s ago"),
+    ):
+        with pytest.raises(ValueError):
+            OverviewStatusChoice(*invalid)  # type: ignore[arg-type]
+
+    # The one pure tree validates every input before choosing, and its row 6f
+    # carries the empty status text that hides the label.
+    absent = MeasurementStatus(False, False, "absent", "absent", None, None, ())
+    inputs = dict(
+        refusal=None,
+        prepare_error=None,
+        busy=False,
+        retry_after=None,
+        now_ns=40_000_000_000,
+        has_frame=True,
+        has_target=True,
+        has_sample=True,
+        any_work=False,
+        view_state="ready",
+        measurement=absent,
+        age_now_ns=40_000_000_000,
+    )
+    choice = _choose_overview_status(**inputs)
+    assert (choice.row, choice.text, choice.age_text) == ("6f", "", None)
+    for override in (
+        {"refusal": object()},
+        {"prepare_error": ""},
+        {"busy": 1},
+        {"retry_after": -1},
+        {"now_ns": True},
+        {"has_frame": "yes"},
+        {"has_target": 0},
+        {"has_sample": None},
+        {"any_work": 1},
+        {"view_state": ""},
+        {"measurement": object()},
+        {"age_now_ns": -1},
+    ):
+        with pytest.raises(ValueError):
+            _choose_overview_status(**{**inputs, **override})
+
+
+def test_accepted_identity_includes_exact_selector_despite_same_snapshot(
+    qtbot,
+) -> None:
+    # -- Remote exact answers: the same snapshot under another exact Window is
+    # a distinct accepted identity with its own first-seen stamp. -------------
+    clock = ExactOnlyClock(1_000_000_000)
+    service = IdentityExactOnlyQuery()
+    service.rows = [app_total(1, SUBJECT_KEY, "Alpha", 22, peak_bps=None)]
+    service.set_share(WINDOW_A, measured_share(WINDOW_A))
+    service.set_pending("series", 1, WINDOW_A)
+    identity_a = AcceptedIdentity("totals", SUBJECT_KEY, WINDOW_A, "b" * 64)
+    # The identical result payload at a different exact selector is a distinct
+    # identity even though its data digest (snapshot) is byte-identical.
+    identity_b = AcceptedIdentity("totals", SUBJECT_KEY, WINDOW_B, "b" * 64)
+    service.identities[("totals", SUBJECT_KEY, WINDOW_A)] = identity_a
+    service.identities[("totals", SUBJECT_KEY, WINDOW_B)] = identity_b
+    view = AppIoWindow(service, clock_ns=clock)
+    qtbot.addWidget(view)
+    view.show()
+    view.set_window(WINDOW_A)
+
+    first = view._overview_model.share_provenance
+    assert first.accepted_identity == identity_a
+    assert first.first_seen_at_ns == 1_000_000_000
+    status = view.measurement_status()
+    assert [answer.kind for answer in status.displayed_answers] == ["totals"]
+    assert oldest_answer_age(status.displayed_answers, clock.now_ns) == (
+        "oldest answer 0 s ago"
+    )
+
+    # Reapplying the accepted record without a query never restamps it.
+    view.refresh_measurements()
+    reapplied = view._overview_model.share_provenance
+    assert reapplied.accepted_identity == identity_a
+    assert reapplied.first_seen_at_ns == 1_000_000_000
+
+    # Re-observing the same exact selector at t=3 s reuses the 1 s stamp.
+    clock.advance_ns(2_000_000_000)
+    view.refresh()
+    repeated = view._overview_model.share_provenance
+    assert repeated.accepted_identity == identity_a
+    assert repeated.first_seen_at_ns == 1_000_000_000
+    assert clock.now_ns - repeated.first_seen_at_ns == 2_000_000_000
+
+    # The changed Window keeps the same snapshot digest yet creates a distinct
+    # identity, stamped at its own first acceptance (t=4 s).
+    clock.advance_ns(1_000_000_000)
+    service.set_share(WINDOW_B, measured_share(WINDOW_B))
+    service.set_pending("series", 1, WINDOW_B)
+    view.set_window(WINDOW_B)
+    assert identity_a != identity_b
+    assert identity_a.data_digest == identity_b.data_digest
+    changed = view._overview_model.share_provenance
+    assert changed.accepted_identity == identity_b
+    assert changed.accepted_identity.window == WINDOW_B
+    assert changed.first_seen_at_ns == 4_000_000_000
+
+    # While the forward Window's own detail is still pending, the accepted B
+    # record and both stamps survive an ordinary refresh and a notification.
+    clock.advance_ns(1_000_000_000)
+    service.set_pending("totals", 1, WINDOW_40)
+    service.set_pending("series", 1, WINDOW_40)
+    view.set_window(WINDOW_40)
+    pending = view._overview_model.share_provenance
+    assert pending.accepted_identity == identity_b
+    assert pending.first_seen_at_ns == 4_000_000_000
+    part = view._detail_service.part_state(
+        "totals", SUBJECT_KEY, retention_scope(SUBJECT_KEY, WINDOW_40)
+    )
+    assert part.state == "pending" and part.request_id is not None
+    view.refresh()
+    view.refresh_measurements()
+    still = view._overview_model.share_provenance
+    assert still.accepted_identity == identity_b
+    assert still.first_seen_at_ns == 4_000_000_000
+    assert view._detail_service.part_state(
+        "totals", SUBJECT_KEY, retention_scope(SUBJECT_KEY, WINDOW_40)
+    ).request_id == part.request_id
+
+    # -- Local retained answers: reapplication preserves the provenance stamp;
+    # a distinct exact selector with the same digest has a distinct stamp. ----
+    local = RecordingRetainedQuery()
+    local.rows = [app_total(1, SUBJECT_KEY, "Alpha", 22, peak_bps=None)]
+    record_a = RetainedRecord(
+        measured_share(WINDOW_A),
+        measured_provenance(
+            "totals", SUBJECT_KEY, WINDOW_A, first_seen=1_000_000_000
+        ),
+    )
+    record_c = RetainedRecord(
+        measured_share(WINDOW_40),
+        measured_provenance(
+            "totals", SUBJECT_KEY, WINDOW_40, first_seen=4_000_000_000
+        ),
+    )
+    local.records["totals"] = record_a
+    local_clock = ExactOnlyClock(10_000_000_000)
+    local_view = AppIoWindow(local, clock_ns=local_clock)
+    qtbot.addWidget(local_view)
+    local_view.show()
+    local_view.set_window(WINDOW_40)
+    local_first = local_view._overview_model.share_provenance
+    assert local_first.measured_window == WINDOW_A
+    assert local_first.first_seen_at_ns == 1_000_000_000
+    calls = dict(local.calls)
+    local_view.refresh_measurements()
+    local_again = local_view._overview_model.share_provenance
+    assert local_again.accepted_identity == local_first.accepted_identity
+    assert local_again.first_seen_at_ns == 1_000_000_000
+    assert local.calls == calls
+
+    local.records["totals"] = record_c
+    local_view.refresh_measurements()
+    local_changed = local_view._overview_model.share_provenance
+    assert local_changed.measured_window == WINDOW_40
+    assert local_changed.first_seen_at_ns == 4_000_000_000
+    assert (
+        local_changed.accepted_identity.data_digest
+        == local_first.accepted_identity.data_digest
+    )
+    assert local_changed.accepted_identity != local_first.accepted_identity
+    # Hide both offscreen windows before pytest-qt's post-test event pump; a
+    # queued paint on a window being torn down must not reach the delegate.
+    view.close()
+    local_view.close()
+
+
+def test_age_uses_oldest_displayed_dependency_and_unknown_contributor(
+    qtbot,
+) -> None:
+    # -- One real adapter-backed view: each dependency is accepted at its own
+    # instant so the oldest displayed stamp is unambiguous. ------------------
+    clock = ExactOnlyClock(1_000_000_000)
+    service = IdentityExactOnlyQuery()
+    service.rows = [app_total(1, SUBJECT_KEY, "Alpha", 22, peak_bps=500)]
+    service.set_pending("totals", 1, WINDOW_A)
+    service.set_pending("series", 1, WINDOW_A)
+    service.identities[("ranking", SUBJECT_KEY, WINDOW_A)] = AcceptedIdentity(
+        "ranking", SUBJECT_KEY, WINDOW_A, "a" * 64
+    )
+    service.identities[("totals", SUBJECT_KEY, WINDOW_A)] = AcceptedIdentity(
+        "totals", SUBJECT_KEY, WINDOW_A, "b" * 64
+    )
+    service.identities[("series", SUBJECT_KEY, WINDOW_A)] = AcceptedIdentity(
+        "series", SUBJECT_KEY, WINDOW_A, "c" * 64
+    )
+    view = AppIoWindow(service, clock_ns=clock)
+    qtbot.addWidget(view)
+    view.show()
+    view.set_window(WINDOW_A)
+
+    # Defined PEAK is a displayed measurement for age, but it does not make the
+    # panel claim displayed values (spec §9.1).
+    peak_only = view.measurement_status()
+    assert peak_only.has_displayed_values is False
+    assert [answer.kind for answer in peak_only.displayed_answers] == ["ranking"]
+    assert peak_only.share_state == "pending"
+    assert peak_only.series_state == "pending"
+    assert peak_only.ranking_empty is False
+    clock.advance_ns(9_000_000_000)
+    assert oldest_answer_age(peak_only.displayed_answers, clock.now_ns) == (
+        "oldest answer 9 s ago"
+    )
+    view.show_overview_age(
+        oldest_answer_age(peak_only.displayed_answers, clock.now_ns)
+    )
+    age_label = label(view, "overview_age")
+    assert age_label.text() == "oldest answer 9 s ago"
+    assert not age_label.isHidden()
+
+    # The share then the series accepted at t=2 s and t=3 s; the fixed order is
+    # ranking, totals, series and the oldest stamp stays the ranking's 1 s.
+    clock.advance_ns(-8_000_000_000)  # back to t=2 s for the share acceptance
+    service.set_share(WINDOW_A, measured_share(WINDOW_A))
+    view.refresh()
+    clock.advance_ns(1_000_000_000)
+    service.set_series(WINDOW_A, measured_series(WINDOW_A))
+    view.refresh()
+
+    mixed = view.measurement_status()
+    assert mixed.has_displayed_values is True
+    assert [answer.kind for answer in mixed.displayed_answers] == [
+        "ranking",
+        "totals",
+        "series",
+    ]
+    assert [answer.first_seen_at_ns for answer in mixed.displayed_answers] == [
+        1_000_000_000,
+        2_000_000_000,
+        3_000_000_000,
+    ]
+    clock.advance_ns(7_000_000_000)  # now t=10 s
+    assert oldest_answer_age(mixed.displayed_answers, clock.now_ns) == (
+        "oldest answer 9 s ago"
+    )
+
+    # Any identity-less displayed contributor makes age unknown, even while the
+    # other accepted dependencies carry exact stamps.
+    service.identities[("ranking", SUBJECT_KEY, WINDOW_A)] = None
+    view.refresh()
+    unknown = view.measurement_status()
+    assert [answer.kind for answer in unknown.displayed_answers] == [
+        "ranking",
+        "totals",
+        "series",
+    ]
+    assert unknown.displayed_answers[0].accepted_identity is None
+    assert oldest_answer_age(unknown.displayed_answers, clock.now_ns) == "age unknown"
+
+    # An undefined PEAK is not a displayed answer: the oldest contributing
+    # dependency is then the 2 s share, and the ranking leaves the tuple.
+    service.rows = [app_total(1, SUBJECT_KEY, "Alpha", 22, peak_bps=None)]
+    service.identities[("ranking", SUBJECT_KEY, WINDOW_A)] = AcceptedIdentity(
+        "ranking", SUBJECT_KEY, WINDOW_A, "a" * 64
+    )
+    view.refresh()
+    no_peak = view.measurement_status()
+    assert [answer.kind for answer in no_peak.displayed_answers] == [
+        "totals",
+        "series",
+    ]
+    assert oldest_answer_age(no_peak.displayed_answers, clock.now_ns) == (
+        "oldest answer 8 s ago"
+    )
+
+    # A current series failure clears its recorded dependency and removes it
+    # from the age tuple; the share's own stamp remains the oldest.
+    service.set_error("series", 1, WINDOW_A, RuntimeError("series_bad"))
+    view.refresh()
+    failed_series = view.measurement_status()
+    assert failed_series.series_state == "failed"
+    assert failed_series.series_reason == "series_bad"
+    assert [answer.kind for answer in failed_series.displayed_answers] == ["totals"]
+    assert oldest_answer_age(failed_series.displayed_answers, clock.now_ns) == (
+        "oldest answer 8 s ago"
+    )
+    assert view._overview_model.series_unavailable == "series_bad"
+
+    # With no displayed measurement at all the label is hidden and the age is
+    # absent; the status/coverage text is not a measurement.
+    service.set_error("totals", 1, WINDOW_A, RuntimeError("share_bad"))
+    view.refresh()
+    nothing = view.measurement_status()
+    assert nothing.has_displayed_values is False
+    assert nothing.displayed_answers == ()
+    assert view._overview_model.coverage_line != ""
+    assert view._overview_model.detail_line != ""
+    assert oldest_answer_age(nothing.displayed_answers, clock.now_ns) is None
+    view.show_overview_age(None)
+    assert age_label.text() == "" and age_label.isHidden()
+    with pytest.raises(ValueError):
+        view.show_overview_age("")
+    with pytest.raises(ValueError):
+        view.show_overview_age(7)  # type: ignore[arg-type]
+
+    # A current success with no accepted identity is displayed but unidentified:
+    # the exact text is "age unknown", never a guessed age.
+    clock.advance_ns(1_000_000_000)
+    service.set_share(WINDOW_A, measured_share(WINDOW_A))
+    service.identities[("totals", SUBJECT_KEY, WINDOW_A)] = None
+    view.refresh()
+    identity_less = view.measurement_status()
+    assert identity_less.has_displayed_values is True
+    assert [answer.kind for answer in identity_less.displayed_answers] == ["totals"]
+    assert identity_less.displayed_answers[0].accepted_identity is None
+    assert oldest_answer_age(identity_less.displayed_answers, clock.now_ns) == (
+        "age unknown"
+    )
+
+    # -- An unsupported lifetime chronology and an available-empty series are
+    # not displayed measurements either. ------------------------------------
+    lifetime = Window(kind="lifetime")
+    lifetime_clock = ExactOnlyClock(2_000_000_000)
+    lifetime_service = IdentityExactOnlyQuery()
+    lifetime_service.rows = [
+        app_total(1, SUBJECT_KEY, "Alpha", 22, peak_bps=None)
+    ]
+    lifetime_service.set_series(lifetime, measured_series(lifetime))
+    lifetime_service.set_pending("totals", 1, lifetime)
+    lifetime_service.identities[("series", SUBJECT_KEY, lifetime)] = AcceptedIdentity(
+        "series", SUBJECT_KEY, lifetime, "c" * 64
+    )
+    lifetime_view = AppIoWindow(lifetime_service, clock_ns=lifetime_clock)
+    qtbot.addWidget(lifetime_view)
+    lifetime_view.show()
+    lifetime_view.set_window(lifetime)
+    lifetime_model = lifetime_view._overview_model
+    assert lifetime_model.series_unavailable == "lifetime chronology unavailable"
+    assert lifetime_model.task_points == () and lifetime_model.device_lanes == ()
+    lifetime_status = lifetime_view.measurement_status()
+    assert lifetime_status.series_state == "ok"
+    assert lifetime_status.displayed_answers == ()
+    assert lifetime_status.has_displayed_values is False
+    assert oldest_answer_age(lifetime_status.displayed_answers, 2_000_000_000) is None
+
+    empty_clock = ExactOnlyClock(3_000_000_000)
+    empty_service = IdentityExactOnlyQuery()
+    empty_service.rows = [app_total(1, SUBJECT_KEY, "Alpha", 22, peak_bps=None)]
+    empty_service.set_series(
+        WINDOW_A,
+        Series(1, WINDOW_A, "raw", (), (), (), coverage()),
+    )
+    empty_service.set_pending("totals", 1, WINDOW_A)
+    empty_service.identities[("series", SUBJECT_KEY, WINDOW_A)] = AcceptedIdentity(
+        "series", SUBJECT_KEY, WINDOW_A, "c" * 64
+    )
+    empty_view = AppIoWindow(empty_service, clock_ns=empty_clock)
+    qtbot.addWidget(empty_view)
+    empty_view.show()
+    empty_view.set_window(WINDOW_A)
+    empty_model = empty_view._overview_model
+    assert empty_model.task_points == () and empty_model.device_lanes == ()
+    empty_status = empty_view.measurement_status()
+    assert empty_status.series_state == "ok"
+    assert empty_status.displayed_answers == ()
+    assert empty_status.has_displayed_values is False
+    assert oldest_answer_age(empty_status.displayed_answers, 3_000_000_000) is None
+
+    # A nonempty accepted task point is a displayed measurement even when every
+    # measured byte value is zero; an empty sequence is not.
+    zero_clock = ExactOnlyClock(4_000_000_000)
+    zero_service = IdentityExactOnlyQuery()
+    zero_service.rows = [app_total(1, SUBJECT_KEY, "Alpha", 22, peak_bps=None)]
+    zero_service.set_series(
+        WINDOW_A,
+        Series(
+            1,
+            WINDOW_A,
+            "raw",
+            (SeriesPoint(0, 10, None, 0, 0, None, None, None, False),),
+            (),
+            (),
+            coverage(),
+        ),
+    )
+    zero_service.set_pending("totals", 1, WINDOW_A)
+    zero_service.identities[("series", SUBJECT_KEY, WINDOW_A)] = AcceptedIdentity(
+        "series", SUBJECT_KEY, WINDOW_A, "c" * 64
+    )
+    zero_view = AppIoWindow(zero_service, clock_ns=zero_clock)
+    qtbot.addWidget(zero_view)
+    zero_view.show()
+    zero_view.set_window(WINDOW_A)
+    zero_model = zero_view._overview_model
+    assert [point.read_bytes for point in zero_model.task_points] == [0]
+    assert [point.write_bytes for point in zero_model.task_points] == [0]
+    zero_status = zero_view.measurement_status()
+    assert zero_status.has_displayed_values is True
+    assert [answer.kind for answer in zero_status.displayed_answers] == ["series"]
+    assert oldest_answer_age(zero_status.displayed_answers, 4_000_000_000) == (
+        "oldest answer 0 s ago"
+    )
+    for created in (view, lifetime_view, empty_view, zero_view):
+        created.close()

@@ -89,9 +89,12 @@ from appio.ui.render_model import (
     KPI_CAPTIONS,
     MAX_DEVICE_LANES,
     SHARE_UNAVAILABLE_REASON,
+    MeasurementStatus,
     OverviewModel,
+    PresentationRefusal,
     RankingModel,
     RankingRow,
+    _choose_overview_status,
     build_overview,
     build_ranking,
 )
@@ -1077,6 +1080,8 @@ class AppIoWindow(QMainWindow):
     #: Emitted after an ordinary selection/refresh admits pending detail work.
     #: The shell arms its poll on it; emitting never issues another query.
     measurement_work_requested = pyqtSignal()
+    #: Emitted synchronously for a typed direct refusal (or its adoption).
+    presentation_refusal_changed = pyqtSignal(object)
 
     def __init__(
         self,
@@ -1118,6 +1123,9 @@ class AppIoWindow(QMainWindow):
         self._ranking_model: RankingModel | None = None
         self._overview_model: OverviewModel | None = None
         self._has_frame = False
+        #: UI-local (standalone) presentation refusal; the embedded shell keeps
+        #: its own typed copy fed by ``presentation_refusal_changed``.
+        self._presentation_refusal: PresentationRefusal | None = None
         # A standalone window owns its Files scope; the shell owns an embedded
         # console's one scope and calls this window's `set_window` only.
         self._owns_files_scope = boot_id is not None
@@ -1208,6 +1216,14 @@ class AppIoWindow(QMainWindow):
         self.history_state.setWordWrap(True)
         self.history_state.setVisible(False)
         layout.addWidget(self.history_state)
+
+        # The age line is independent of the status line: it stays visible
+        # across busy/retry/refusal text and is hidden only by no measurement.
+        self.overview_age = QLabel("")
+        self.overview_age.setObjectName("overview_age")
+        self.overview_age.setWordWrap(True)
+        self.overview_age.setVisible(False)
+        layout.addWidget(self.overview_age)
 
         body = QWidget()
         body_layout = QVBoxLayout(body)
@@ -1418,13 +1434,33 @@ class AppIoWindow(QMainWindow):
             if self._owns_files_scope:
                 self.files_message.setText(reason)
                 self.files_message.setVisible(True)
+            # The frozen cleanup is complete; only then does the direct refusal
+            # become the typed presentation category. The connected shell hears
+            # it before any composition, and the age is hidden with the model.
+            token = (
+                "launch_attribution"
+                if window.kind == "launch"
+                else "unsupported_window"
+            )
+            record = PresentationRefusal("direct_view", window, token, reason)
+            if self._owns_files_scope:
+                self._presentation_refusal = record
+            self.presentation_refusal_changed.emit(record)
+            self.show_overview_age(None)
+            self._refresh_standalone_status()
             return
+        # A supported adoption clears either previous category before the new
+        # model is composed; the shell clears its mirrored widget from the
+        # typed signal, never by classifying label text.
+        self._presentation_refusal = None
+        self.presentation_refusal_changed.emit(None)
         if self._owns_files_scope:
             self.files_message.setText("")
             self.files_message.setVisible(False)
         self.refresh()
         if self._owns_files_scope:
             self._sync_owned_files()
+        self._refresh_standalone_status()
 
     def selected_app_id(self) -> int | None:
         """Return the shared subject's id, including a file-only subject."""
@@ -1455,6 +1491,149 @@ class AppIoWindow(QMainWindow):
         self._has_frame = False
         self._overview_body.setVisible(False)
         self.files_view.setVisible(False)
+
+    def show_overview_age(self, text: str | None) -> None:
+        """Set/clear the independent age line without touching data or status."""
+
+        if text is not None:
+            if not isinstance(text, str) or text == "":
+                raise ValueError("overview age text must be a nonempty string or None")
+            try:
+                text.encode("utf-8")
+            except UnicodeEncodeError as error:  # pragma: no cover - defensive
+                raise ValueError("overview age text must be UTF-8 encodable") from error
+        label = self.overview_age
+        if text is None:
+            if label.text() != "":
+                label.setText("")
+            if not label.isHidden():
+                label.setVisible(False)
+            return
+        if label.text() != text:
+            label.setText(text)
+        if label.isHidden():
+            label.setVisible(True)
+
+    def measurement_status(self) -> MeasurementStatus:
+        """Observe the displayed measurements and dependency slots; no queries.
+
+        ``displayed_answers`` names only dependencies that render a measured
+        value, in the fixed ranking, totals, series order. A defined PEAK is a
+        displayed answer for age while not making the panel claim measured
+        values; an unsupported lifetime series, an available-empty series,
+        failed/absent inputs and coverage/status text contribute nothing.
+        """
+
+        model = self._overview_model
+        window = model.requested_window if model is not None else None
+        if window is None:
+            window = self._active_window
+        key = model.app_key if model is not None else None
+        total = (
+            self._totals.get(self._subject_app_id)
+            if self._subject_app_id is not None
+            else None
+        )
+
+        ranking_empty = (
+            self._ranking_model is not None
+            and self._ranking_model.unavailable is None
+            and not self._ranking_model.rows
+        )
+
+        share_state: PartPhase = "absent"
+        series_state: PartPhase = "absent"
+        share_reason: str | None = None
+        series_reason: str | None = None
+        if key is not None and window is not None:
+            scope = retention_scope(key, window)
+            share_part = self._detail_service.part_state("totals", key, scope)
+            series_part = self._detail_service.part_state("series", key, scope)
+            share_state = share_part.state
+            series_state = series_part.state
+            if share_state == "failed":
+                share_reason = share_part.reason
+            if series_state == "failed":
+                series_reason = series_part.reason
+
+        answers: list[AnswerProvenance] = []
+        if model is not None:
+
+            def identity_less(
+                kind: str, measured: Window | None
+            ) -> AnswerProvenance | None:
+                if measured is None or model.app_key is None:
+                    return None
+                return AnswerProvenance(
+                    kind,  # type: ignore[arg-type]
+                    model.app_key,
+                    retention_scope(model.app_key, measured),
+                    measured,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+
+            # Fixed order: ranking (only when PEAK is defined), then the share,
+            # then a successful series that renders a task lane or device lanes.
+            if total is not None and total.peak_total_bps is not None:
+                ranking = model.ranking_provenance or identity_less(
+                    "ranking", model.requested_window
+                )
+                if ranking is not None:
+                    answers.append(ranking)
+            if model.share is not None:
+                share = model.share_provenance or identity_less(
+                    "totals", model.share.window
+                )
+                if share is not None:
+                    answers.append(share)
+            if model.series_metadata is not None and (
+                model.task_points or model.device_lanes
+            ):
+                series = model.series_provenance or identity_less(
+                    "series", model.series_metadata.measured_window
+                )
+                if series is not None:
+                    answers.append(series)
+
+        return MeasurementStatus(
+            model is not None and (model.share is not None or bool(model.task_points)),
+            ranking_empty,
+            share_state,
+            series_state,
+            share_reason,
+            series_reason,
+            tuple(answers),
+        )
+
+    def _refresh_standalone_status(self) -> None:
+        """Compose standalone status/age through the one pure decision tree.
+
+        An embedded view renders the shell-supplied status instead; its own
+        observation/refusal protocol is what Task 12's composer consumes.
+        """
+
+        if not self._owns_files_scope:
+            return
+        now = self._clock_ns()
+        choice = _choose_overview_status(
+            refusal=self._presentation_refusal,
+            prepare_error=None,
+            busy=False,
+            retry_after=None,
+            now_ns=now,
+            has_frame=self._has_frame,
+            has_target=self._active_window is not None,
+            has_sample=self._has_frame,
+            any_work=False,
+            view_state="ready",
+            measurement=self.measurement_status(),
+            age_now_ns=now,
+        )
+        self.show_overview_status(choice.text, keep_frame=True)
+        self.show_overview_age(choice.age_text)
 
     # -- Files scope ownership --------------------------------------------
 
@@ -1818,6 +1997,7 @@ class AppIoWindow(QMainWindow):
 
         self._apply_timeline(model, previous)
         self._apply_composition(model, previous)
+        self._refresh_standalone_status()
 
     def _apply_timeline(
         self, model: OverviewModel, previous: OverviewModel | None
@@ -1947,6 +2127,7 @@ class AppIoWindow(QMainWindow):
             self._list.blockSignals(blocked)
         self._render_empty_charts(reason, f"Residual: {UNAVAILABLE} - {RESIDUAL_NOTE}")
         self._detail_state.setText(reason)
+        self._refresh_standalone_status()
 
     def _render_empty(self) -> None:
         """Install the no-subject state without inventing a measurement."""
@@ -1964,6 +2145,7 @@ class AppIoWindow(QMainWindow):
             self._detail_state.setText(EMPTY_RANKING_TEXT)
         else:
             self._detail_state.setText(f"window: {window.kind}; {EMPTY_RANKING_TEXT}")
+        self._refresh_standalone_status()
 
     def _render_empty_charts(self, reason: str, residual: str) -> None:
         """The intersection of the unavailable and empty states."""

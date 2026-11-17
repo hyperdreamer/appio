@@ -3512,11 +3512,23 @@ def real_files_shell(qtbot, tmp_path, monkeypatch):
     history._local_future.result(timeout=5)
     assert window.apply_ready_frame()
     view = window.files_view
-    qtbot.waitUntil(lambda: view.last_result is not None, timeout=5000)
+
+    def pumped(predicate):
+        # Files pages, frame ranking and lazy detail all settle through the
+        # router's scheduler, which the console's own poll drains and pumps.
+        # Both timers are stopped in this fixture, so the wait drives exactly
+        # that production entry point instead of assuming a direct callback.
+        def probe():
+            window._poll_history()
+            return predicate()
+
+        return probe
+
+    qtbot.waitUntil(pumped(lambda: view.last_result is not None), timeout=5000)
     window.open_files_unavailable()
     view.set_sort("bytes_r", "asc")
     view.search_field.setText("alpha")
-    qtbot.waitUntil(lambda: not view._outstanding, timeout=5000)
+    qtbot.waitUntil(pumped(lambda: not view._outstanding), timeout=5000)
     assert view.model.rowCount() == 24
     view.table.setFixedHeight(100)
     qtbot.wait(10)
@@ -3554,10 +3566,12 @@ class HeldFileDelivery:
         history, view = shell.history, shell.view
         read = history._read_local_files
 
-        def held(*args):
+        def held(*args, **kwargs):
             self.started.set()
             assert self.release.wait(5), "file worker not released"
-            return read(*args)
+            # The scheduler admits its Files worker with its token binding, so
+            # the wrapper forwards the worker id/request keywords untouched.
+            return read(*args, **kwargs)
 
         def capture(generation, future):
             self.transient_at_settlement.append(view._transient)
@@ -3566,13 +3580,23 @@ class HeldFileDelivery:
 
         monkeypatch.setattr(history, "_read_local_files", held)
         monkeypatch.setattr(view, "_deliver", capture)
+        charged = set(history._worker_jobs)
         view.request_refresh()
         assert self.started.wait(1)
+        admitted = set(history._worker_jobs) - charged
+        self.worker_future = history._worker_jobs[next(iter(admitted))][1]
         self.future = next(iter(history._file_jobs))
         self.generation = view._generation
         self.history_generation = history._generation
         self.requests = len(view.requests)
         self.snapshot = files_snapshot(view)
+
+    def settle_worker(self):
+        """Release the held worker and wait for its terminal executor outcome."""
+
+        self.release.set()
+        assert self.worker_future is not None
+        self.worker_future.result(timeout=5)
 
     def win_cancellation(self, monkeypatch, *, synchronous=False):
         history, view = self.shell.history, self.shell.view
@@ -3580,15 +3604,23 @@ class HeldFileDelivery:
 
         def after_generation_bump():
             assert history._generation > self.history_generation
-            self.release.set()
+            # The worker wins the race: it has already finished before the
+            # cancellation runs. Its outcome waits in the router's completion
+            # queue, and the cancellation retires the delivery that a removed
+            # direct callback used to settle.
+            self.settle_worker()
+            cancel()
             assert self.delivered.wait(2), "worker did not settle before cancellation"
             if synchronous:
                 view._on_delivered(self.payloads[0])
-            cancel()
 
         monkeypatch.setattr(history, "_cancel_file_requests", after_generation_bump)
 
     def replay(self):
+        # A terminal worker is collected by the owner's drain, which is the
+        # scheduler's replacement for the removed per-job completion callback.
+        self.settle_worker()
+        self.shell.history.drain()
         assert self.delivered.wait(2)
         self.shell.view._on_delivered(self.payloads[0])
 
@@ -3769,6 +3801,34 @@ def test_late_retired_file_delivery_after_ready_is_dropped_and_requeried_once(
         assert len(shell.view.requests) == held.requests + 1
     finally:
         held.release.set()
+
+
+def test_files_page_admitted_after_application_settles_without_a_new_frame(
+    real_files_shell, qtbot
+):
+    """An applied frame still has to collect the Files work it admitted.
+
+    Every Files page is a scheduler slot, so nothing completes it straight from
+    a worker callback any more. Application keeps the poll armed while the
+    router holds work, and an apply call drains that work even with no pending
+    frame. Without the drain the page would stay outstanding and the table
+    would never leave its loading state.
+    """
+
+    shell = real_files_shell
+    window, history, view = shell.window, shell.history, shell.view
+    assert window._pending is None and window._displayed is not None
+    before = len(view.requests)
+    view.set_sort("bytes_w", "asc")
+    assert len(view.requests) == before + 1
+    assert view._outstanding and history.pending_work
+
+    # No replacement frame is due; only the router's settled page remains.
+    qtbot.waitUntil(
+        lambda: (window.apply_ready_frame(), not view._outstanding)[1], timeout=5000
+    )
+    assert view.last_result is not None
+    assert view.last_request.sort == "bytes_w"
 
 
 # Task 4 review regressions. Each M-number names the review ledger mutation
@@ -4452,3 +4512,115 @@ def test_task4_m089_invalid_file_result_preserves_inner_failure_reason(qtbot, mo
     assert window.files_view.unavailable_text() == (
         "not_retained: file history is not available for this window"
     )
+
+
+def test_typed_refusal_transitions_own_category_and_preserve_frame(qtbot):
+    from appio.ui.render_model import PresentationRefusal
+
+    window, _, history, _ = controlled_build(qtbot)
+    window._timer.stop()
+    now = [END - RAW_BUCKET_NS // 2]
+    window._clock_ns = lambda: now[0]
+    window._tick_target()
+    first = window._pending
+    assert first is not None
+    apply_scope(window, history, first)
+    assert window._displayed == first
+    ranking_reads = history.ranking_reads
+    launch = Window("launch", BOOT, launch_id=1)
+    launch_text = (
+        "Launch window disabled: device and file activity are not stored per launch."
+    )
+    refusal_error = WindowUnavailableError("launch_attribution", launch_text)
+
+    # A shell prepare precheck refusal is typed, keeps the last applied frame,
+    # creates no pending/floor/PrepareRetry and rethrows through the seam.
+    history.prepare_failures.extend([refusal_error, refusal_error])
+    with pytest.raises(WindowUnavailableError):
+        window.show_window(launch)
+    record = window._presentation_refusal
+    assert isinstance(record, PresentationRefusal)
+    assert (record.origin, record.window, record.reason) == (
+        "shell_prepare",
+        launch,
+        "launch_attribution",
+    )
+    assert record.text == str(refusal_error)
+    assert window.error_label.text() == str(refusal_error)
+    assert window._displayed == first
+    assert window._pending is None and window._pending_since is None
+    assert window._prepare_retry is None and window._retry_after is None
+    assert history.ranking_reads == ranking_reads
+    attempts = list(history.prepare_calls)
+    assert attempts[-1] == launch
+
+    # The ordinary deferred tick re-encounters the same typed refusal and
+    # preserves category, Window, text and frame; it never clears it.
+    with pytest.raises(WindowUnavailableError):
+        window._tick_target()
+    assert window._presentation_refusal == record
+    assert window.error_label.text() == str(refusal_error)
+    assert window._displayed == first
+    assert len(history.prepare_calls) == len(attempts) + 1
+    assert history.prepare_calls[-1] == launch
+
+    # An operational preparation failure supersedes only the shell_prepare
+    # refusal; the frozen seam owns the PrepareRetry/error widget.
+    supported = Window("since_boot", BOOT, end_mono_ns=END + RAW_BUCKET_NS)
+    history.prepare_failures.append(OSError("disk read failed"))
+    with pytest.raises(OSError, match="disk read failed"):
+        window.show_window(supported)
+    assert window._presentation_refusal is None
+    retry = window._prepare_retry
+    assert retry is not None and retry.owner == "explicit"
+    assert retry.window == supported
+    assert window._prepare_error == "appio: disk read failed"
+    assert window._displayed == first
+    assert window._retry_after is None
+
+    # The named retry is the only retry seam; acceptance clears the operational
+    # marker and its own mirrored error, not a detached label.
+    window.show_window(supported)
+    assert history.prepare_calls[-1] == supported
+    assert window._pending == supported and window._prepare_retry is None
+    assert window.error_label.text() == ""
+    apply_scope(window, history, supported)
+    assert window._displayed == supported
+
+    # A direct set_window refusal emits direct_view to the shell before the
+    # supported adoption; the shell's retained _displayed never recreates it.
+    view = window.view
+    assert view is not None
+    reads_before_direct = history.ranking_reads
+    view.set_window(launch)
+    direct = window._presentation_refusal
+    assert isinstance(direct, PresentationRefusal)
+    assert (direct.origin, direct.window, direct.reason, direct.text) == (
+        "direct_view",
+        launch,
+        "launch_attribution",
+        str(refusal_error),
+    )
+    assert view.overview_age.isHidden() is True
+    assert window._displayed == supported
+    assert history.ranking_reads == reads_before_direct
+
+    # A supported shell request does not clear a direct_view refusal; only the
+    # supported view adoption does.
+    adopted = Window("since_boot", BOOT, end_mono_ns=END + 2 * RAW_BUCKET_NS)
+    window.show_window(adopted)
+    assert window._pending == adopted
+    assert window._presentation_refusal == direct
+    apply_scope(window, history, adopted)
+    assert window._presentation_refusal is None
+    assert window._displayed == adopted
+
+    # The frozen no-target reset clears the typed presentation state too.
+    view.set_window(launch)
+    assert window._presentation_refusal is not None
+    window._deferred_target = None
+    window._deferred_origin = None
+    window._current_window = lambda *_args: None
+    window._tick_target()
+    assert window._presentation_refusal is None
+    assert window._displayed is None

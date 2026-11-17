@@ -69,6 +69,7 @@ from ..setup_boundary import CommandResult
 from ..setup_client import SetupClient, SetupReply
 from .files_view import STATE_UNAVAILABLE as FILES_STATE_UNAVAILABLE
 from .files_view import FilesView
+from .render_model import PresentationRefusal
 
 if TYPE_CHECKING:
     from .main_window import AppIoWindow
@@ -555,6 +556,14 @@ class CollectorWindow(QMainWindow):
         self._invalidated = False
         self._prepare_retry: PrepareRetry | None = None
         self._prepare_error: str | None = None
+        #: The shell's typed refusal category for its embedded Overview. The
+        #: view emits direct_view on a refusal/adoption; a shell prepare
+        #: precheck sets shell_prepare in the frozen seam.
+        self._presentation_refusal: PresentationRefusal | None = None
+        #: Which typed owner last wrote the shared setup-error widget: the
+        #: frozen PrepareRetry seam, a presentation refusal, or neither. Never
+        #: inferred from the text.
+        self._error_owner: Literal["prepare_retry", "presentation_refusal"] | None = None
         self._closed = False
         self.state_text = COLLECTOR_STATE_UNAVAILABLE
 
@@ -634,6 +643,9 @@ class CollectorWindow(QMainWindow):
         self.files_open_settings = self._view.files_open_settings
         self.history_state = self._view.history_state
         self.files_view.state_changed.connect(self._render_files_message)
+        self._view.presentation_refusal_changed.connect(
+            self._on_presentation_refusal_changed
+        )
         # The persistent console can be taller than a small desktop. Preserve
         # each panel's useful minimum size, but scroll instead of growing the
         # top-level shell beyond its requested 620-pixel height.
@@ -729,6 +741,28 @@ class CollectorWindow(QMainWindow):
         # replacement windows retain the previously displayed table.
         self.files_view.setVisible(self._displayed is not None)
 
+    def _on_presentation_refusal_changed(self, record: object) -> None:
+        """Consume the embedded view's typed refusal/adoption observation."""
+
+        if record is None:
+            self._presentation_refusal = None
+            if self._error_owner == "presentation_refusal":
+                self._clear_error()
+            return
+        if not isinstance(record, PresentationRefusal):
+            raise ValueError(
+                "presentation refusal must be a PresentationRefusal or None"
+            )
+        PresentationRefusal.__post_init__(record)
+        self._presentation_refusal = record
+        if (
+            record.origin == "direct_view"
+            and self._error_owner == "presentation_refusal"
+        ):
+            # A newly typed direct refusal replaces the prior refusal category;
+            # its shell error mirror is no longer the operative text.
+            self._clear_error()
+
     def _sync_files(self, *, request: bool = False) -> None:
         window = self._displayed
         if (window is None or self._pending is not None or self._prepare_retry is not None
@@ -774,7 +808,7 @@ class CollectorWindow(QMainWindow):
             if not self._busy:
                 self._submit_probe()
         except WindowUnavailableError as error:
-            self._show_error(str(error) or type(error).__name__)
+            self._show_refusal_error(error)
         except Exception as error:
             self._show_error(f"appio: {str(error) or type(error).__name__}")
 
@@ -817,6 +851,12 @@ class CollectorWindow(QMainWindow):
                 self._prepare_retry = None
                 self._prepare_error = None
                 self._clear_error()
+            # The frozen no-target presentation reset clears the typed refusal
+            # as well; no other recovery field gains a writer here.
+            if self._presentation_refusal is not None:
+                self._presentation_refusal = None
+                if self._error_owner == "presentation_refusal":
+                    self._clear_error()
             self._displayed = None
             self._pending_since = None
             self._invalidated = False
@@ -911,6 +951,18 @@ class CollectorWindow(QMainWindow):
         if waiting and not self._poll_timer.isActive():
             self._poll_timer.start()
 
+    def _drain_history(self) -> None:
+        """Collect settled router work on the owner thread; never query.
+
+        A ready frame is settled through ``ready``; Files pages and lazy detail
+        finish on the shared scheduler and are only published by an owner
+        drain. The shell's history service is structural, so a service that
+        reports no pending work has nothing to collect.
+        """
+
+        if getattr(self.history, "pending_work", False):
+            self.history.drain()
+
     def _submit_prepare(
         self, wanted: Window, origin: Literal["clock", "explicit"], *, now: int | None = None
     ) -> bool:
@@ -939,7 +991,21 @@ class CollectorWindow(QMainWindow):
             self._pending_since = None
             self._prepare_retry = None
             self._prepare_error = None
-            self._show_error(str(error) or type(error).__name__)
+            text = str(error) or type(error).__name__
+            record = PresentationRefusal(
+                "shell_prepare", wanted, error.reason, text
+            )
+            if (
+                self._presentation_refusal is not None
+                and self._presentation_refusal.origin == "direct_view"
+            ):
+                # A direct refusal stays until a supported view adoption and
+                # still wins row 1; its exact text remains decisive.
+                record = self._presentation_refusal
+            else:
+                self._presentation_refusal = record
+            self._show_error(record.text)
+            self._error_owner = "presentation_refusal"
             self._show_pending_status(now)
             self._poll_timer.stop()
             self._render_files_message()
@@ -947,9 +1013,17 @@ class CollectorWindow(QMainWindow):
         except Exception as error:
             self._pending = None
             self._pending_since = None
+            # An operational attempt supersedes only a shell_prepare refusal;
+            # a direct_view refusal stays until supported adoption.
+            if (
+                self._presentation_refusal is not None
+                and self._presentation_refusal.origin == "shell_prepare"
+            ):
+                self._presentation_refusal = None
             self._prepare_retry = PrepareRetry(wanted, origin, now)
             self._prepare_error = f"appio: {str(error) or type(error).__name__}"
             self._show_error(self._prepare_error)
+            self._error_owner = "prepare_retry"
             self._show_pending_status(now)
             self._poll_timer.stop()
             self._render_files_message()
@@ -963,7 +1037,16 @@ class CollectorWindow(QMainWindow):
         self._retry_after = None
         self._prepare_retry = None
         self._prepare_error = None
-        if retry_error is not None and self.error_label.text() == retry_error:
+        # A gated supported acceptance clears a prior shell_prepare refusal and
+        # only its own mirrored error widget. A direct_view refusal persists.
+        if (
+            self._presentation_refusal is not None
+            and self._presentation_refusal.origin == "shell_prepare"
+        ):
+            self._presentation_refusal = None
+            if self._error_owner == "presentation_refusal":
+                self._clear_error()
+        if retry_error is not None and self._error_owner == "prepare_retry":
             self._clear_error()
         self._show_pending_status(now)
         self._arm_poll()
@@ -972,6 +1055,11 @@ class CollectorWindow(QMainWindow):
     def apply_ready_frame(self, *, now: int | None = None) -> bool:
         if self._closed:
             return False
+        # Framework details, Files pages and lazy detail all settle through the
+        # router's one scheduler, so every apply/ordinary call drains it once
+        # even when no frame is pending. Settling never issues a query; a
+        # completed page must reach its owner before the next readiness read.
+        self._drain_history()
         if self._prepare_retry is not None and self._prepare_retry.owner == "explicit":
             return False
         now = self._clock_ns() if now is None else now
@@ -1002,7 +1090,7 @@ class CollectorWindow(QMainWindow):
         if retry is not None and (retry.owner != "explicit" or retry.window != window):
             self._prepare_retry = None
             self._prepare_error = None
-            if self.error_label.text().startswith("appio: "):
+            if self._error_owner == "prepare_retry":
                 self._clear_error()
 
         self.files_view.set_updating_scope(window)
@@ -1037,7 +1125,13 @@ class CollectorWindow(QMainWindow):
             with self.files_view.transient_scope():
                 self._refresh_after_apply = False
                 self.history.invalidate()
-        self._poll_timer.stop()
+        # Application does not end router work: the adoption above may have
+        # admitted Files pages or lazy detail. Stop the poll only when nothing
+        # is left to pump and drain, as the frozen stop rule requires.
+        if getattr(self.history, "pending_work", False):
+            self._arm_poll()
+        else:
+            self._poll_timer.stop()
 
     def _poll_history(self) -> None:
         if self._closed or (self._pending is None and not getattr(self.history, "pending_work", False)):
@@ -1056,7 +1150,7 @@ class CollectorWindow(QMainWindow):
             if not applied and self._pending is None and not getattr(self.history, "pending_work", False):
                 self._poll_timer.stop()
         except WindowUnavailableError as error:
-            self._show_error(str(error) or type(error).__name__)
+            self._show_refusal_error(error)
         except Exception as error:
             self._show_error(f"appio: {str(error) or type(error).__name__}")
 
@@ -1107,10 +1201,21 @@ class CollectorWindow(QMainWindow):
     def _show_error(self, message: str) -> None:
         self.error_label.setText(message)
         self.error_label.setVisible(True)
+        self._error_owner = None
+
+    def _show_refusal_error(self, error: WindowUnavailableError) -> None:
+        """Keep a typed refusal's exact text when the seam rethrows it."""
+
+        if self._presentation_refusal is not None:
+            self._show_error(self._presentation_refusal.text)
+            self._error_owner = "presentation_refusal"
+            return
+        self._show_error(str(error) or type(error).__name__)
 
     def _clear_error(self) -> None:
         self.error_label.setText("")
         self.error_label.setVisible(False)
+        self._error_owner = None
 
     def _current_window(self, now_ns: int | None = None) -> Window | None:
         client = getattr(self.history, "client", None)
@@ -1242,7 +1347,7 @@ class CollectorWindow(QMainWindow):
             ):
                 self.files_view.flush_refresh()
         except WindowUnavailableError as error:
-            self._show_error(str(error) or type(error).__name__)
+            self._show_refusal_error(error)
         except Exception as error:
             self._show_error(f"appio: {str(error) or type(error).__name__}")
 
@@ -1449,6 +1554,10 @@ class CollectorWindow(QMainWindow):
         if self._closed:
             return
         self._closed = True
+        # Closing is the frozen presentation reset: the typed refusal and its
+        # widget ownership leave with the shell.
+        self._presentation_refusal = None
+        self._error_owner = None
         for timer in (self._timer, self._poll_timer):
             timer.stop()
         for dialog in (self.consent, self.choice, self.restart_confirmation, self.settings):
