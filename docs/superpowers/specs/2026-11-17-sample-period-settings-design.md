@@ -3,7 +3,7 @@
 - **Topic:** `sample-period-settings`
 - **Run:** `pm-run-20261117-153438-045b6e15`
 - **Date:** 2026-11-17
-- **Status:** revised twice after design review (round 1: 3 blockers, 16 majors, 4 minors; round 2: 0 blockers, 8 majors, 3 minors), awaiting final verification
+- **Status:** review passed (round 1: 3 blockers / 16 majors / 4 minors; round 2: 0 blockers / 8 majors / 3 minors; round 3: 0 blockers / 1 major, closed by fixed outcome precedence)
 
 ## 1. Background
 
@@ -217,16 +217,19 @@ The helper performs, under its existing lock:
    can change the value at exec time and a stopped unit cannot be observed. A failure
    exits 1 `sample_period_unverifiable` (inactive) or `sample_period_overridden`
    (active, naming both values and `DropInPaths`).
-9. Outcome, carried in the result document's `sample_period_state` and mutually
-   exclusive:
-   - `applied` — a write happened, verification passed, unit active;
-   - `applied_not_running` — a write happened, verification passed, the unit was
-     inactive before and after;
-   - `repair` — no write, but a reload or restart was performed and verification
-     passed;
-   - `unchanged` — no write, no reload, no restart, verification passed;
-   - `service_not_running` — the unit was active before and is inactive now: exit 1,
-     because this operation may have stopped it, and the switch is the repair path.
+9. Outcome, carried in the result document's `sample_period_state`. Selection order is
+   fixed, because more than one row can look true after a race:
+   1. Re-read `ActiveState` after every step as `active_after`.
+   2. If `active_before` was active and `active_after` is not, the outcome is
+      `service_not_running` with exit 1. This row is evaluated **first** and
+      suppresses every other outcome, including a passing inactive verification: a
+      restart that raced a stop leaves the unit down, and no other claim is honest.
+   3. Otherwise a failed verification exits with the reason from step 8.
+   4. Otherwise, exactly one of: `applied` (a write happened, unit active);
+      `applied_not_running` (a write happened, unit inactive before and after);
+      `repair` (no write, a reload or restart was performed, unit active);
+      `unchanged` (no write, no reload, no restart, verification passed).
+
    `sample_period` carries `<n>`; `sample_period_state` carries one of those five
    strings; the existing `state` keeps its service-state meaning.
 
@@ -358,7 +361,7 @@ Option A — two peer rows, the period row a sibling of the root switch, no grou
 | Bytes identical, configured value matches, daemon reports another value | `try-restart`, then verify; `repair`, not `unchanged` |
 | Bytes identical, daemon value unknown while the unit is active | `try-restart`, then verify; evidence of a missing completion is not evidence of success |
 | Bytes identical after a failed reload or restart | repair on the next apply (D7 steps 5-9), including a parent-directory `fsync` |
-| Unit active before, inactive after | exit 1 `service_not_running`; this operation may have stopped it, and the switch is the repair path |
+| Unit active before, inactive after | exit 1 `service_not_running`, evaluated before every other outcome; the switch is the repair path |
 | Inactive unit with `EnvironmentFiles=` set, or `UnsetEnvironment=` naming the variable | exit 1 `sample_period_unverifiable`, naming what was found; a stopped unit cannot be observed |
 | Helper argv arity wrong | shim exits 2, usage message |
 | Payload `1`, `31` | exit 2 `sample_period_out_of_range` |
@@ -469,4 +472,7 @@ seconds versus nanoseconds in the pending comparison (D8, F6); all three thresho
 uses tested with a controlled clock (section 8, F7); an aged, materialized capacity
 fixture with a defined window and measured elapsed time (section 8, F8); the `:853`
 attribution and the timer-composition reference (section 1, F9); explicit object
-names (D8, F10); and the two distinct path-refusal reasons (D5, F11).
+names (D8, F10); and the two distinct path-refusal reasons (D5, F11). Round 3 reported
+zero blockers and one major: D7 step 9 now fixes the outcome precedence, evaluating
+`service_not_running` before every other outcome, so a restart that raced a stop cannot
+also claim `repair`.
