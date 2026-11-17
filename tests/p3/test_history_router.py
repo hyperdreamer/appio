@@ -1,16 +1,18 @@
 """History selection uses durable intervals, never matching local surrogate IDs."""
 from concurrent.futures import Future
 from dataclasses import replace
-from types import SimpleNamespace
 import sqlite3
 import threading
+import time
 
 import pytest
 
 from appio.contracts import HistoryPending, Window, WindowUnavailableError
 from appio.handover import HandoverOffer, baseline_seed, capture_handover
 from appio.history_router import DaemonAnswerError, HistoryRouter, HistorySegment
-from appio.iodclient import AppRegistry, ClientState
+from appio.history_types import RemotePosition, retention_scope
+from appio.iodclient import AppRegistry, ClientState, QueryTransportState
+from appio.ipc_models import StreamCursor
 from appio.procs import AppKeyInputs, IoReadOutcome, ProcessIdentity, StableProcRecord
 from appio.query import QueryService
 from appio.sampler import TickInput, aggregate_tick
@@ -18,18 +20,74 @@ from appio.store import AppIoStore
 
 NS = 1_000_000_000
 BOOT = "boot"
+#: A valid 64-lowercase-hex accepted identity for scripted remote answers.
+SNAPSHOT = "a" * 64
 
 
 class Client:
+    """A controlled client whose returned Futures carry transport association."""
+
     state = ClientState()
 
     def __init__(self):
         self.pending = []
+        self.generation = 0
+        self.rejected = []
+        self.retired = []
+
+    def _source(self):
+        state = self.state
+        if (state is None or not state.verified or not state.answering
+                or state.cursor is None):
+            return None
+        return RemotePosition(state.cursor.boot_id, state.cursor.iod_epoch,
+                              state.cursor.seq)
 
     def query(self, request):
         future = Future()
         self.pending.append((request, future))
         return future
+
+    def query_transport(self, future):
+        for index, (request, candidate) in enumerate(self.pending):
+            if candidate is future:
+                break
+        else:
+            raise ValueError("this Future is not bound to a client query")
+        source = self._source()
+        succeeded = future.done() and future.exception() is None
+        return QueryTransportState(
+            request=request,
+            connection_generation=self.generation,
+            request_id=f"q{self.generation}-{index}",
+            phase="terminal" if future.done() else "active",
+            issued_at_ns=0,
+            issued_source=source,
+            answered_source=source if succeeded else None,
+        )
+
+    def retire_query_connection(self, future):
+        for _request, candidate in self.pending:
+            if candidate is future:
+                if not future.done():
+                    self.retired.append(future)
+                    self.generation += 1
+                    return True
+                return False
+        raise ValueError("this Future is not bound to a client query")
+
+    def reject_query_result(self, future):
+        if not any(candidate is future for _request, candidate in self.pending):
+            raise ValueError("this Future is not bound to a client query")
+        self.rejected.append(future)
+
+
+def answering_remote(history, *, seq=1):
+    """Give the controlled client a verified answering connection with a cursor."""
+
+    history.client.state = ClientState(
+        verified=True, answering=True, cursor=StreamCursor(BOOT, 1, seq))
+    return history.client
 
 
 def source(path, owner="gui", *, boot=BOOT, app_id=17, key="/usr/bin/shared",
@@ -68,6 +126,20 @@ def result(router, scope):
     return router.ranking(scope, "total_bytes")
 
 
+def detail(router, app_id, method, scope, *, key):
+    """Select, admit and drain one local detail until it is accepted."""
+
+    router.select_detail(key, scope)
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        try:
+            return getattr(router, method)(app_id, scope)
+        except HistoryPending:
+            router.drain()
+            time.sleep(0.005)
+    raise AssertionError(f"detail {method} for {key!r} did not settle")
+
+
 def test_local_settled_totals_remain_answerable_and_ids_are_presentational(tmp_path):
     store, _ = source(tmp_path / "gui.db")
     history = router(store)
@@ -102,10 +174,10 @@ def test_same_surrogate_in_two_stores_is_not_same_app(tmp_path):
     assert {row.app_key for row in rows} == {"exe:/bin/first", "exe:/bin/second"}
     assert len({row.app_id for row in rows}) == 2
     for row in rows:
-        share = history.disk_share(row.app_id, window())
+        share = detail(history, row.app_id, "disk_share", window(), key=row.app_key)
         assert share.task_read_bytes == 20
         assert share.device_read_bytes is share.residual_read is None
-        series = history.series(row.app_id, window())
+        series = detail(history, row.app_id, "series", window(), key=row.app_key)
         assert sum(point.read_bytes for point in series.points) == 20
 
 
@@ -186,140 +258,141 @@ def test_old_mixed_totals_without_raw_corrections_are_unavailable(tmp_path):
 def test_a_frame_prefetches_only_its_default_subject_and_loads_the_rest_on_demand(tmp_path):
     """Falsifier: the frame prefetched two parts for every ranked app.
 
-    Two answers per app is 400+ round trips for a live boot. That frame outlived
-    the daemon's 10 s commit cadence, so the snapshot moved underneath it and the
-    whole frame was discarded as "answered a different scope or snapshot". The
-    ranking already carries every row's totals, so only the default subject's own
-    parts are needed to paint, and any other subject loads when it is selected.
+    A frame copy proves ranking and ownership only; the selected subject's part
+    is the only automatic detail consumer, so an unselected row is requested on
+    demand and never fabricated.
     """
 
-    remote, _ = source(tmp_path / "remote.db", "iod")
-    coverage = remote.connection.execute(
+    remote_store, _ = source(tmp_path / "remote.db", "iod")
+    coverage_json = remote_store.connection.execute(
         "SELECT coverage_json FROM app_boot_total WHERE app_id=17").fetchone()[0]
-    remote.connection.execute(
+    remote_store.connection.execute(
         "INSERT INTO app VALUES(3,'exe:/usr/bin/other','other',NULL,0,0,'user')")
-    remote.connection.execute(
-        "INSERT INTO app_boot_total VALUES('boot',3,0,0,0,0,NULL,NULL,NULL,?)", (coverage,))
-    remote.connection.commit()
+    remote_store.connection.execute(
+        "INSERT INTO app_boot_total VALUES('boot',3,0,0,0,0,NULL,NULL,NULL,?)", (coverage_json,))
+    remote_store.connection.commit()
     # A whole-boot scope ranks from the retained totals, so both apps are rows.
     scope = Window("since_boot", BOOT, end_mono_ns=200 * NS)
-    service = QueryService(remote)
+    service = QueryService(remote_store)
     expected = service.ranking(scope, "total_bytes")
     assert [row.app_key for row in expected] == ["exe:/usr/bin/shared", "exe:/usr/bin/other"]
 
     history = router(AppIoStore(tmp_path / "empty.db"))
-    history.client.state = ClientState(verified=True, answering=True)
+    client = answering_remote(history)
     history.prepare(scope)
     history._local_future.result(timeout=10)
-    ranking, ranking_future = history.client.pending[0]
+    ranking, ranking_future = client.pending[0]
     assert ranking.kind == "ranking"
-    ranking_future.set_result({"kind": "ranking", "result": expected, "snapshot": "fixed"})
-    assert not history.ready(scope)
-    # Exactly one part in flight, and it belongs to the default subject.
-    assert [(request.kind, request.app_key) for request, _ in history.client.pending[1:]] == [
-        ("totals", "exe:/usr/bin/shared")]
-
-    def answer_next():
-        for request, future in reversed(history.client.pending):
-            if future.done():
-                continue
-            app_id = remote.connection.execute(
-                "SELECT app_id FROM app WHERE key=?", (request.app_key,)).fetchone()[0]
-            method = "disk_share" if request.kind == "totals" else "series"
-            future.set_result({"kind": request.kind, "result": getattr(service, method)(app_id, scope),
-                               "snapshot": "fixed"})
-            return request
-
-    for _ in range(4):
-        if history.ready(scope):
-            break
-        assert answer_next() is not None
+    ranking_future.set_result({"kind": "ranking", "result": expected, "snapshot": SNAPSHOT,
+                               "next_cursor": None})
     assert history.ready(scope)
+    # A frame prefetches no subject detail at all.
+    assert [request.kind for request, _ in client.pending[1:]] == []
     assert [row.app_key for row in history.ranking(scope, "total_bytes")] == [
         "exe:/usr/bin/shared", "exe:/usr/bin/other"]
 
-    # A subject outside the prefetch is requested on demand, never fabricated.
-    other = history.registry.id_for("exe:/usr/bin/other")
+    # A subject outside the default selection is requested on demand.
+    other_key = "exe:/usr/bin/other"
+    other = history.registry.id_for(other_key)
+    history.select_detail(other_key, scope)
     with pytest.raises(HistoryPending):
         history.series(other, scope)
-    requested, pending = history.client.pending[-1]
-    assert (requested.kind, requested.app_key) == ("series", "exe:/usr/bin/other")
-    app_id = remote.connection.execute(
-        "SELECT app_id FROM app WHERE key='exe:/usr/bin/other'").fetchone()[0]
-    pending.set_result({"kind": "series", "result": service.series(app_id, scope), "snapshot": "fixed"})
-    assert history.ready(scope)
+    requested, pending = client.pending[-1]
+    assert (requested.kind, requested.app_key) == ("series", other_key)
+    app_id = remote_store.connection.execute(
+        "SELECT app_id FROM app WHERE key=?", (other_key,)).fetchone()[0]
+    pending.set_result({"kind": "series", "result": service.series(app_id, scope),
+                        "snapshot": SNAPSHOT, "next_cursor": None, "app_key": other_key})
+    assert history.drain() is True
     assert history.series(other, scope).app_id == other
+    # No further prefetch was admitted for the unselected ranked row.
+    assert [request.kind for request, _ in client.pending].count("series") == 1
 
 
 def test_a_part_binds_its_window_and_never_blanks_the_ranking(tmp_path):
     """Falsifier: a subject's part was treated as evidence about the whole frame.
 
-    A part answering another window (the scope ticked while the operator was
-    selecting) raised like a contradictory ranking, dropped every remote row and
-    reset the subject to the first app -- which is why only the first entry ever
-    showed a detail. The part must be dropped and re-requested; the ranking stands.
+    A part answering another window is a current failure for its own slot only:
+    the frame ranking stands, no owner record publishes, and the reason is the
+    explicit invalid_result boundary token.
     """
 
     local = AppIoStore(tmp_path / "empty.db")
-    remote, _ = source(tmp_path / "remote.db", "iod")
+    remote_store, _ = source(tmp_path / "remote.db", "iod")
     scope = Window("since_boot", BOOT, end_mono_ns=200 * NS)
     elsewhere = Window("since_boot", BOOT, end_mono_ns=300 * NS)
-    service = QueryService(remote)
+    service = QueryService(remote_store)
     expected = service.ranking(scope, "total_bytes")
+    key = expected[0].app_key
 
-    def answer(history, *, part_window=None, snapshot="s2"):
-        ranking, ranking_future = history.client.pending[0]
-        ranking_future.set_result({"kind": "ranking", "result": expected, "snapshot": "s1"})
-        for _ in range(6):
-            if history.ready(scope):
-                return history
-            if not history.client.pending:
-                continue
-            request, future = [item for item in history.client.pending if not item[1].done()][0]
-            app_id = remote.connection.execute(
-                "SELECT app_id FROM app WHERE key=?", (request.app_key,)).fetchone()[0]
-            method = "disk_share" if request.kind == "totals" else "series"
-            value = getattr(service, method)(app_id, scope)
-            if part_window is not None:
-                value = replace(value, window=part_window)
-            future.set_result({"kind": request.kind, "result": value, "snapshot": snapshot})
-        return history
+    def answer(history, client, *, part_window=None):
+        history.prepare(scope)
+        history._local_future.result(timeout=10)
+        ranking, ranking_future = client.pending[0]
+        assert ranking.kind == "ranking"
+        ranking_future.set_result({"kind": "ranking", "result": expected,
+                                   "snapshot": SNAPSHOT, "next_cursor": None})
+        assert history.ready(scope)
+        presentation = history.registry.id_for(key)
+        history.select_detail(key, scope)
+        assert history.request_detail("totals", presentation, scope).state == "pending"
+        request, future = [item for item in client.pending if not item[1].done()][-1]
+        assert (request.kind, request.app_key) == ("totals", key)
+        app_id = remote_store.connection.execute(
+            "SELECT app_id FROM app WHERE key=?", (key,)).fetchone()[0]
+        value = service.disk_share(app_id, scope)
+        if part_window is not None:
+            value = replace(value, window=part_window)
+        future.set_result({"kind": "totals", "result": value, "snapshot": SNAPSHOT,
+                           "next_cursor": None, "app_key": key})
+        return presentation
 
     trailing = router(local)
-    trailing.client.state = ClientState(verified=True, answering=True)
-    trailing.prepare(scope)
-    trailing._local_future.result(timeout=10)
-    answer(trailing)
+    client = answering_remote(trailing)
+    presentation = answer(trailing, client)
+    assert trailing.drain() is True
+    slot = trailing.part_state("totals", key, retention_scope(key, scope))
+    assert slot.state == "ok"
+    assert trailing.retained("totals", key, retention_scope(key, scope),
+                             scope.end_mono_ns) is not None
     assert trailing.ready(scope)
     assert len(trailing.ranking(scope, "total_bytes")) == 1
     assert trailing.daemon_answer_error is None
 
-    # A part that answers another window is dropped, and the ranking survives.
+    # A part that answers another window fails its own slot; ranking survives.
     contradictory = router(AppIoStore(tmp_path / "empty2.db"))
-    contradictory.client.state = ClientState(verified=True, answering=True)
-    contradictory.prepare(scope)
-    contradictory._local_future.result(timeout=10)
-    answer(contradictory, part_window=elsewhere)
+    client = answering_remote(contradictory)
+    answer(contradictory, client, part_window=elsewhere)
+    assert contradictory.drain() is True
+    failed = contradictory.part_state("totals", key, retention_scope(key, scope))
+    assert failed.state == "failed" and failed.reason == "invalid_result"
+    assert contradictory.retained("totals", key, retention_scope(key, scope),
+                                  scope.end_mono_ns) is None
     assert contradictory.ready(scope)
     assert contradictory.daemon_answer_error is None
     assert len(contradictory.ranking(scope, "total_bytes")) == 1
-    assert ("series", "exe:/usr/bin/shared") not in contradictory._remote_parts
-    assert ("series", "exe:/usr/bin/shared") not in contradictory._requested_parts
 
 
 def test_old_scope_remote_response_never_populates_new_scope(tmp_path):
     local, _ = source(tmp_path / "local.db")
     history = router(local)
-    history.client.state = ClientState(verified=True, answering=True)
+    client = answering_remote(history)
     first, second = window(), window(100, 150)
     history.prepare(first)
     assert not history.ready(first)
-    request, pending = history.client.pending[0]
+    request, pending = client.pending[0]
+    assert request.window == first
     history.prepare(second)
-    pending.set_result({"kind": "ranking", "result": QueryService(local).ranking(first, "total_bytes"),
-                        "next_cursor": None})
+    # The single wire occupant is not preempted; the replacement ranking waits.
+    assert len(client.pending) == 1
+    pending.set_result({"kind": "ranking",
+                        "result": QueryService(local).ranking(first, "total_bytes"),
+                        "snapshot": SNAPSHOT, "next_cursor": None})
     assert not history.ready(second)
-    assert len(history.client.pending) == 2
+    # Only after that terminal occupant is consumed may the successor be sent.
+    assert len(client.pending) == 2
+    successor, _ = client.pending[1]
+    assert successor.window == second
     with pytest.raises(RuntimeError, match="ready"):
         history.ranking(second, "total_bytes")
 
@@ -475,9 +548,11 @@ def test_restart_preserves_both_daemon_epochs_and_marks_the_restart_gap(tmp_path
     assert sum(row.read_bytes for row in rows) == 80
     assert any(not s.proven and s.start_ns == 110*NS and s.end_ns == 121*NS
                for s in history.segments)
-    app_id = next(row.app_id for row in rows if row.read_bytes)
-    assert history.disk_share(app_id, scope).task_read_bytes == 80
-    assert sum(point.read_bytes for point in history.series(app_id, scope).points) == 80
+    row = next(row for row in rows if row.read_bytes)
+    assert detail(history, row.app_id, "disk_share", scope,
+                  key=row.app_key).task_read_bytes == 80
+    assert sum(point.read_bytes for point in detail(
+        history, row.app_id, "series", scope, key=row.app_key).points) == 80
 
 
 def test_straddling_subsecond_bucket_preserves_device_rows_and_nullable_residual(tmp_path):
@@ -497,13 +572,13 @@ def test_straddling_subsecond_bucket_preserves_device_rows_and_nullable_residual
     scope = window(100, 120)
     row, = result(history, scope)
     assert row.read_bytes == 12
-    share = history.disk_share(row.app_id, scope)
+    share = detail(history, row.app_id, "disk_share", scope, key=row.app_key)
     assert sum(device.rbytes for device in share.devices) == 50
     # A v1 handover seed lacks device/rate provenance; do not upgrade it.
     assert share.device_read_bytes is None
     assert share.residual_read is None
     assert share.coverage.device_state == "incomplete"
-    series = history.series(row.app_id, scope)
+    series = detail(history, row.app_id, "series", scope, key=row.app_key)
     assert sum(point.read_bytes for point in series.points) == 12
     assert sum(point.rbytes for point in series.device_points) == 50
     assert all(point.read is None for point in series.residual_points)
@@ -518,10 +593,10 @@ def test_signed_residuals_are_not_clamped_when_device_evidence_is_available(tmp_
     history = router(store)
     scope = window(100, 120)
     row, = result(history, scope)
-    share = history.disk_share(row.app_id, scope)
+    share = detail(history, row.app_id, "disk_share", scope, key=row.app_key)
     assert share.device_read_bytes == 10
     assert share.residual_read == -2
-    timeline = history.series(row.app_id, scope)
+    timeline = detail(history, row.app_id, "series", scope, key=row.app_key)
     assert sum(point.read for point in timeline.residual_points) == -2
 
 
@@ -537,10 +612,10 @@ def test_remote_evidence_rejections_have_no_numeric_fallback(tmp_path, variant):
     if variant == "paginated":
         rows = [replace(row, coverage=replace(row.coverage, complete=True)) for row in rows]
     history = router(local)
-    history.client.state = ClientState(verified=True, answering=True)
+    answering_remote(history)
     history.prepare(scope)
     history.client.pending[0][1].set_result({"kind": "ranking", "result": rows,
-        "snapshot": "fixed", "next_cursor": "more" if variant == "paginated" else None})
+        "snapshot": SNAPSHOT, "next_cursor": "more" if variant == "paginated" else None})
     history._local_future.result(timeout=10)
     assert history.ready(scope)
     ranked = history.ranking(scope, "total_bytes")
@@ -559,7 +634,7 @@ def test_incomplete_remote_history_is_retained_with_honest_coverage(tmp_path):
     assert expected and not expected[0].coverage.complete
 
     history = router(local)
-    history.client.state = ClientState(verified=True, answering=True)
+    answering_remote(history)
     history.prepare(scope)
 
     def answer_pending():
@@ -575,7 +650,8 @@ def test_incomplete_remote_history_is_retained_with_honest_coverage(tmp_path):
                 result = getattr(service, "disk_share" if request.kind == "totals" else "series")(
                     app_id, scope
                 )
-            future.set_result({"kind": request.kind, "result": result, "snapshot": "fixed"})
+            future.set_result({"kind": request.kind, "result": result,
+                               "snapshot": SNAPSHOT, "next_cursor": None})
 
     for _ in range(4):
         answer_pending()
@@ -606,7 +682,7 @@ def test_remote_fallback_uses_scoped_ownership_not_filtered_counters(
     remote, _ = source(tmp_path / "remote.db", "iod")
     history = router(local)
     service, scope = QueryService(remote), window(100, 120)
-    history.client.state = ClientState(verified=True, answering=True)
+    answering_remote(history)
     try:
         history.prepare(scope)
         history._local_future.result(timeout=10)
@@ -622,7 +698,8 @@ def test_remote_fallback_uses_scoped_ownership_not_filtered_counters(
                     ).fetchone()[0]
                     value = getattr(service, "disk_share" if request.kind == "totals" else "series")(
                         app_id, scope)
-                future.set_result({"kind": request.kind, "result": value, "snapshot": "fixed"})
+                future.set_result({"kind": request.kind, "result": value,
+                                   "snapshot": SNAPSHOT, "next_cursor": None})
             if history.ready(scope):
                 break
         assert history.ready(scope)
@@ -639,10 +716,11 @@ def test_remote_fallback_uses_scoped_ownership_not_filtered_counters(
 def test_empty_or_partial_remote_answer_cannot_replace_proved_local_bytes(tmp_path):
     local, _ = source(tmp_path / "local.db")
     history = router(local)
-    history.client.state = ClientState(verified=True, answering=True)
+    answering_remote(history)
     scope = window()
     history.prepare(scope)
-    history.client.pending[0][1].set_result({"kind": "ranking", "result": [], "next_cursor": None})
+    history.client.pending[0][1].set_result({"kind": "ranking", "result": [],
+        "snapshot": SNAPSHOT, "next_cursor": None})
     work = getattr(history, "_local_future", None)
     if work is not None:
         work.result(timeout=10)
