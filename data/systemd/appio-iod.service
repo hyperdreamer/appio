@@ -7,6 +7,13 @@ Type=simple
 User=root
 Group=appio
 ExecStart=/usr/bin/appio-iod
+# The ratified ceiling (spec A13, 1_500_000_000 bytes) cannot hold this host's
+# retention: 24 h of 10 s per-app samples, 30 days of 60 s rollups and 365 days
+# of hourly rollups need ~6.3 GB with the coverage JSON each row carries. Pinned
+# just under a 1.5 GB ceiling the store sat one page below the limit and
+# compacted every maintenance pass -- 4.6 TB of writes in 37 h. The code default
+# is unchanged; this is a deployment override, and the pruner still enforces it.
+Environment=APPIO_QUOTA_BYTES=8000000000
 UMask=0077
 StateDirectory=appio
 StateDirectoryMode=0711

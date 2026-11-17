@@ -458,3 +458,92 @@ def test_deletion_checkpoint_tolerates_a_live_read_snapshot(db):
         reader.close()
     # With the reader gone the quota boundary can truncate again.
     assert QuotaPruner(db, [path])._checkpoint(truncate=True) is True
+
+
+def _free_pages(db, rows):
+    """Occupy then release pages so the file carries a real freelist."""
+    db.execute("CREATE TABLE ballast(payload BLOB)")
+    db.executemany("INSERT INTO ballast VALUES(randomblob(4000))", [()] * rows)
+    db.execute("DELETE FROM ballast")
+    db.execute("DROP TABLE ballast")
+    db.commit()
+
+
+def _checkpointed_physical(db):
+    main = Path(db.execute("PRAGMA database_list").fetchone()[2])
+    assert db.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()[0] == 0
+    return main, physical_store_bytes(main)
+
+
+def test_store_at_its_ceiling_defers_a_rewrite_for_a_few_free_pages(db):
+    """A retention delete frees a handful of pages; that must not rewrite the file.
+
+    Falsifier: rewrite the whole database whenever ``freelist_count > 0``. On the
+    author's host the store sat one page under its ceiling, so every maintenance
+    pass VACUUMed 1.4 GB back and forth -- 4.6 TiB of writes in 37 hours -- and the
+    ``compaction_deferred`` result never appeared.
+    """
+    seed_core_with_materialization(db)
+    _free_pages(db, 2_000)  # ~8 MB of free pages, far below the rewrite floor
+    main, physical = _checkpointed_physical(db)
+    assert QuotaPruner(db, [main]).reclaimable_bytes() > 0
+    pruner = QuotaPruner(db, [main], quota_bytes=physical - 1)
+    events = []
+    db.set_trace_callback(events.append)
+    try:
+        result = pruner.shrink_if_needed()
+    finally:
+        db.set_trace_callback(None)
+    assert [sql for sql in events if sql.upper().startswith("VACUUM")] == []
+    assert result.reason == "compaction_deferred"
+    assert not result.sampling_paused
+    assert pruner.coverage_complete
+    assert pruner.sampling_paused is False
+
+
+def test_compaction_runs_once_the_reclaim_pays_for_the_rewrite(db):
+    # Falsifier: never compact, so a store that freed a large share never shrinks again.
+    seed_core_with_materialization(db)
+    _free_pages(db, 12_000)  # ~48 MB, above the 32 MiB floor
+    main, physical = _checkpointed_physical(db)
+    pruner = QuotaPruner(db, [main], quota_bytes=physical - 1)
+    assert pruner.reclaimable_bytes() >= pruner.compaction_reserve()
+    events = []
+    db.set_trace_callback(events.append)
+    try:
+        result = pruner.shrink_if_needed()
+    finally:
+        db.set_trace_callback(None)
+    assert len([sql for sql in events if sql.upper().startswith("VACUUM")]) == 1
+    assert result.reason is None
+    assert not result.sampling_paused
+    assert result.physical_bytes <= pruner.quota_bytes
+    assert pruner.reclaimable_bytes() == 0
+
+
+def test_no_rewrite_when_the_live_data_alone_exceeds_the_quota(db):
+    # Falsifier: VACUUM a file whose retained rows already fill the ceiling.
+    seed_core_with_materialization(db)
+    _free_pages(db, 12_000)
+    main, _ = _checkpointed_physical(db)
+    pruner = QuotaPruner(db, [main], quota_bytes=1)
+    events = []
+    db.set_trace_callback(events.append)
+    try:
+        result = pruner.shrink_if_needed()
+    finally:
+        db.set_trace_callback(None)
+    assert [sql for sql in events if sql.upper().startswith("VACUUM")] == []
+    assert result.sampling_paused
+
+
+def test_quota_override_keeps_the_ratified_default_unless_it_is_usable():
+    from appio.quota import DEFAULT_QUOTA_BYTES, configured_quota
+
+    assert DEFAULT_QUOTA_BYTES == 1_500_000_000
+    assert configured_quota({}) == 1_500_000_000
+    assert configured_quota({"APPIO_QUOTA_BYTES": "4000000000"}) == 4_000_000_000
+    # A typo in a unit file must not take the collector down or silently free the ceiling.
+    assert configured_quota({"APPIO_QUOTA_BYTES": "nonsense"}) == 1_500_000_000
+    assert configured_quota({"APPIO_QUOTA_BYTES": "0"}) == 1_500_000_000
+    assert configured_quota({"APPIO_QUOTA_BYTES": "-5"}) == 1_500_000_000

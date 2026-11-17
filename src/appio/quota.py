@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from heapq import nsmallest
+import os
 from pathlib import Path
 import sqlite3
 
@@ -21,6 +22,15 @@ from appio.ownership import ownership_settled
 DAY_NS = 86_400_000_000_000
 DEFAULT_QUOTA_BYTES = 1_500_000_000
 DEFAULT_BATCH_SIZE = 256
+#: Headroom a rewrite must leave under the ceiling. Compacting to the last free
+#: page puts the store straight back over the quota, so it rewrites itself again
+#: on the next pass: a store parked at its ceiling then spends its life copying
+#: 1.4 GB to bank 200 KB (on the author's host: 4.6 TB of writes in 37 hours).
+COMPACT_RESERVE_BYTES = 32 * 1024 * 1024
+COMPACT_RESERVE_FRACTION = (1, 20)  # 5 % of the database file
+#: Deployment override for the ratified ceiling; only a host that keeps more
+#: history than 1.5 GB can hold has any reason to set it.
+QUOTA_ENV = "APPIO_QUOTA_BYTES"
 RETENTION_NS = {"core": DAY_NS, "gap": DAY_NS, "file": 14 * DAY_NS,
                 "file_unknown": 14 * DAY_NS, 60: 30 * DAY_NS, 3600: 365 * DAY_NS}
 
@@ -29,6 +39,23 @@ def _paths(paths) -> tuple[Path, ...]:
     if isinstance(paths, (str, Path)):
         paths = (paths,)
     return tuple(dict.fromkeys(Path(path) for path in paths))
+
+
+def configured_quota(environ=None) -> int:
+    """The ratified ceiling, unless this deployment overrides it explicitly.
+
+    A malformed override must not take the collector down: the default is the
+    documented contract, and a typo in a unit file is not a reason to stop
+    measuring. Callers that want strictness pass an explicit mapping.
+    """
+    raw = (os.environ if environ is None else environ).get(QUOTA_ENV)
+    if raw is None or raw == "":
+        return DEFAULT_QUOTA_BYTES
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_QUOTA_BYTES
+    return value if value > 0 else DEFAULT_QUOTA_BYTES
 
 
 def physical_store_bytes(database_paths) -> int:
@@ -592,8 +619,8 @@ class QuotaPruner:
             c.execute("DELETE FROM rollup_app WHERE boot_id=? AND app_id=? AND bucket_secs=? AND bucket_start_mono_ns=?", pk)
         return stats
 
-    def _result(self, deleted, reason=None, *, paused=None, skipped=()):
-        if reason:
+    def _result(self, deleted, reason=None, *, paused=None, skipped=(), coverage_loss=True):
+        if reason and coverage_loss:
             self.coverage_complete = False
         self.last_reason = reason
         if paused is not None:
@@ -653,17 +680,66 @@ class QuotaPruner:
         reason = "missing_materialization" if skipped else "batch_limit" if self._candidate_more else None
         return self._result(deleted, reason, skipped=skipped)
 
+    def main_bytes(self) -> int:
+        """Size of the database file itself: the part a rewrite can shrink."""
+        path = next((row[2] for row in self.connection.execute("PRAGMA database_list") if row[1] == "main"), "")
+        if not path:
+            return 0
+        try:
+            return Path(path).stat().st_size
+        except FileNotFoundError:
+            return 0
+
+    def reclaimable_bytes(self) -> int:
+        """Bytes a rewrite could hand back to the filesystem right now."""
+        page_size = self.connection.execute("PRAGMA page_size").fetchone()[0]
+        free = self.connection.execute("PRAGMA freelist_count").fetchone()[0]
+        return free * page_size
+
+    def compaction_reserve(self) -> int:
+        """Free space a rewrite must leave under the ceiling to be worth doing."""
+        numerator, denominator = COMPACT_RESERVE_FRACTION
+        return max(COMPACT_RESERVE_BYTES, self.main_bytes() * numerator // denominator)
+
+    def _compact(self) -> bool:
+        """Rewrite the file only when the result is meaningfully under the ceiling.
+
+        ``False`` means no rewrite ran, so the caller owes no checkpoint. The
+        rewrite costs one full copy of the database, so it must return at least
+        ``compaction_reserve()`` bytes of headroom -- otherwise the store lands
+        back over quota almost immediately and rewrites again. When the live rows
+        alone exceed the quota no rewrite can help, and the caller must prune.
+        """
+        reclaimable = self.reclaimable_bytes()
+        if reclaimable <= 0:
+            return False
+        if physical_store_bytes(self.database_paths) - reclaimable + self.compaction_reserve() > self.quota_bytes:
+            return False
+        self.connection.execute("VACUUM")
+        return True
+
     def shrink_if_needed(self) -> PruneResult:
         self._require_idle()
         validate_sqlite_integer(self.quota_bytes, "quota_bytes")
         deleted, skipped = [], []
         if not self._checkpoint():
             return self._result(deleted, "checkpoint_busy", paused=True)
-        if physical_store_bytes(self.database_paths) > self.quota_bytes:
-            if self.connection.execute("PRAGMA freelist_count").fetchone()[0] > 0:
-                self.connection.execute("VACUUM")
+        physical = physical_store_bytes(self.database_paths)
+        if physical > self.quota_bytes:
+            reclaimable = self.reclaimable_bytes()
+            # Reachable by a rewrite: the live rows plus the pages already freed
+            # fit under the ceiling.
+            reachable = reclaimable > 0 and physical - reclaimable <= self.quota_bytes
+            if self._compact():
                 if not self._checkpoint():
                     return self._result(deleted, "checkpoint_busy", paused=True)
+            elif reachable:
+                # The file is over the ceiling only by pages this store already
+                # freed. Deleting history cannot shrink the file, and a rewrite is
+                # not yet worth it, so hold the free pages rather than spend
+                # gigabytes to bank them.
+                return self._result(deleted, "compaction_deferred", paused=False,
+                                    coverage_loss=False)
             if physical_store_bytes(self.database_paths) > self.quota_bytes:
                 units = self._candidates(after=self._quota_after)
                 if units is None:
@@ -686,10 +762,8 @@ class QuotaPruner:
                         self._quota_after = None
                 if deleted and physical_store_bytes(self.database_paths) > self.quota_bytes:
                     # Compact once per batch, never once per deleted unit.
-                    if self.connection.execute("PRAGMA freelist_count").fetchone()[0] > 0:
-                        self.connection.execute("VACUUM")
-                        if not self._checkpoint():
-                            return self._result(deleted, "checkpoint_busy", paused=True, skipped=skipped)
+                    if self._compact() and not self._checkpoint():
+                        return self._result(deleted, "checkpoint_busy", paused=True, skipped=skipped)
                 if physical_store_bytes(self.database_paths) > self.quota_bytes:
                     reason = ("missing_materialization" if skipped else
                               "batch_limit" if self._candidate_more else "quota_exhausted")

@@ -36,7 +36,7 @@ from .ipc_protocol import HEADER, FrameDecoder, ProtocolError, encode_frame
 from .ipc_queue import ClientQueue, SlowClientError
 from .ipc_security import PeerRejected, RefusalLog, authorize_client, read_peer, verify_runtime_paths
 from .live import LiveCollector, SystemClock
-from .quota import PruneResult, QuotaPruner
+from .quota import PruneResult, QuotaPruner, configured_quota
 
 NS = 1_000_000_000
 SAMPLE_NS = 10 * NS
@@ -412,7 +412,7 @@ class Daemon:
         connection.execute("PRAGMA journal_mode=WAL")
         connection.execute("PRAGMA synchronous=FULL")
         self._sidecars()
-        self._pruner = QuotaPruner(connection, self.paths.database)
+        self._pruner = QuotaPruner(connection, self.paths.database, quota_bytes=configured_quota())
         self.file_runtime = FileRuntime(connection, source_factory=self._file_source_factory)
         self.file_runtime.start()
 
