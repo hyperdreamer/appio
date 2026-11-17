@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from concurrent.futures import Future
 from dataclasses import FrozenInstanceError, fields, replace
+import os
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -51,7 +53,7 @@ from appio.history_types import (
 )
 from appio.handover import baseline_seed
 from appio.iodclient import AppRegistry, ClientState, RequestRejected
-from appio.ipc_models import QueryRequest
+from appio.ipc_models import QueryRequest, StreamCursor
 from appio.procs import AppKeyInputs, IoReadOutcome, ProcessIdentity, StableProcRecord
 from appio.query import QueryService
 from appio.sampler import TickInput, aggregate_tick
@@ -1492,3 +1494,748 @@ def test_worker_ids_are_never_reused_across_helper_and_files_admission(tmp_path,
         if router is not None:
             router.close()
         local.connection.close()
+
+
+# ---------------------------------------------------------------------------
+# Local positions and copy brackets (§§2.2, 4.1–4.3)
+# ---------------------------------------------------------------------------
+
+
+class _StateClient:
+    """A client whose only observable fact is the state under test."""
+
+    def __init__(self, state):
+        self.state = state
+
+
+def _db_path(store) -> str:
+    return store.connection.execute("PRAGMA database_list").fetchone()[2]
+
+
+def _source_stores(tmp_path):
+    """Two file-backed stores with their own connections and separate writers."""
+
+    local = _committed_store(tmp_path / "local.db", ((ALPHA, 17, 20), (BETA, 18, 7)))
+    imported = _committed_store(
+        tmp_path / "imported.db", ((ALPHA, 3, 30),), owner="iod", start=110, end=120)
+    return local, imported
+
+
+def _source_router(tmp_path):
+    local, imported = _source_stores(tmp_path)
+    history = HistoryRouter(QueryService(local), _IdleClient(), AppRegistry())
+    history.add_source(QueryService(imported), collector_id="imported", owner="iod")
+    return history, local, imported
+
+
+def test_local_vector_observes_each_registered_connection_without_hashing(
+        tmp_path, monkeypatch):
+    """One constant committed observation per source, ordered, never a scan.
+
+    The position is exactly ``(name, owner, registration_epoch, data_version,
+    total_changes)`` read on each registered connection: one PRAGMA plus a
+    property, no observer connection, no table/rowid read, and no
+    ``QueryService._snapshot`` around the boundary.
+    """
+
+    history, local, imported = _source_router(tmp_path)
+    try:
+        vector = history.source_position()
+        assert isinstance(vector, LocalPositionVector)
+        assert tuple(position.name for position in vector.sources) == ("imported", "local")
+        for position, store, owner in (
+                (vector.sources[0], imported, "iod"),
+                (vector.sources[1], local, "gui")):
+            connection = store.connection
+            assert position.owner == owner
+            assert position.registration_epoch >= 1
+            assert position.data_version == connection.execute(
+                "PRAGMA main.data_version").fetchone()[0]
+            assert position.total_changes == connection.total_changes
+        assert (vector.sources[0].registration_epoch
+                != vector.sources[1].registration_epoch)
+
+        traced = {"imported": [], "local": []}
+        imported.connection.set_trace_callback(traced["imported"].append)
+        local.connection.set_trace_callback(traced["local"].append)
+        for _ in range(2):
+            observed = history.source_position()
+        assert tuple(position.name for position in observed.sources) == ("imported", "local")
+        for name, statements in traced.items():
+            assert statements == ["PRAGMA main.data_version"] * 2, (name, statements)
+            for statement in statements:
+                upper = statement.upper()
+                assert "ROWID" not in upper
+                assert "FROM" not in upper
+                assert "SELECT" not in upper
+        # One call costs exactly one constant observation per registered source.
+        for statements in traced.values():
+            statements.clear()
+        history.source_position()
+        assert all(len(statements) == 1 for statements in traced.values()), traced
+
+        # No observer connection and no QueryService read snapshot is opened.
+        def forbidden(*_args, **_kwargs):
+            raise AssertionError("source observation opened another connection or snapshot")
+
+        with monkeypatch.context() as guard:
+            guard.setattr("appio.history_router.sqlite3.connect", forbidden)
+            guard.setattr(QueryService, "_snapshot", forbidden)
+            history.source_position()
+            history.local_position("local")
+
+        # Only a verified, answering connection that carries a cursor answers a
+        # remote position; every lesser state keeps the complete local vector.
+        history.client = _StateClient(ClientState(
+            verified=True, answering=True, cursor=StreamCursor(BOOT, 3, 9)))
+        assert history.source_position() == RemotePosition(BOOT, 3, 9)
+        history.client = _StateClient(ClientState(
+            verified=True, answering=False, cursor=StreamCursor(BOOT, 3, 9)))
+        assert isinstance(history.source_position(), LocalPositionVector)
+        # Answering is not enough without verification: the conjunction is the
+        # remote authority, and an unverified cursor stays local evidence.
+        history.client = _StateClient(ClientState(
+            verified=False, answering=True, cursor=StreamCursor(BOOT, 3, 9)))
+        assert isinstance(history.source_position(), LocalPositionVector)
+        history.client = _StateClient(ClientState(
+            verified=True, answering=True, cursor=None))
+        assert isinstance(history.source_position(), LocalPositionVector)
+    finally:
+        history.close()
+        local.connection.close()
+        imported.connection.close()
+
+
+def test_local_vector_changes_for_every_existing_commit_path(tmp_path):
+    """Every committed store path moves its own source's token, never another's.
+
+    Own-connection commit paths advance ``total_changes``; external commits
+    advance ``data_version``. Deletions of older rows (including WITHOUT ROWID
+    rollups) and in-place updates count even while row maxima repeat.
+    """
+
+    history, local, imported = _source_router(tmp_path)
+    external_local = sqlite3.connect(_db_path(local))
+    external_imported = sqlite3.connect(_db_path(imported))
+    stores = {"local": local, "imported": imported}
+    try:
+        def maxima(connection):
+            return (
+                connection.execute(
+                    "SELECT coalesce(max(observed_mono_ns), -1) FROM sample").fetchone()[0],
+                connection.execute(
+                    "SELECT coalesce(max(ts_mono_ns), -1) FROM sample").fetchone()[0],
+                connection.execute(
+                    "SELECT coalesce(max(bucket_start_mono_ns), -1) FROM rollup_app").fetchone()[0],
+            )
+
+        def changed(name, operation, *, external):
+            before = {key: history.local_position(key) for key in stores}
+            row_maxima = maxima(stores[name].connection)
+            operation()
+            after = {key: history.local_position(key) for key in stores}
+            position = after[name]
+            observer = stores[name].connection
+            assert position != before[name]
+            assert position.registration_epoch == before[name].registration_epoch
+            assert position.data_version == observer.execute(
+                "PRAGMA main.data_version").fetchone()[0]
+            assert position.total_changes == observer.total_changes
+            if external:
+                assert position.data_version > before[name].data_version
+            else:
+                assert position.total_changes > before[name].total_changes
+            # A deleted old row, a deleted rollup or an in-place update does not
+            # move a row maximum; the token still does.
+            assert maxima(observer) == row_maxima
+            for other, other_position in after.items():
+                if other != name:
+                    assert other_position == before[other]
+            return position
+
+        # 1. Own-connection deletion of the oldest sample row.
+        row = local.connection.execute(
+            "SELECT boot_id, source, epoch, seq, app_id, launch_id, ts_mono_ns "
+            "FROM sample ORDER BY observed_mono_ns, ts_mono_ns LIMIT 1").fetchone()
+        assert row is not None
+
+        def delete_old_sample():
+            local.connection.execute(
+                "DELETE FROM sample WHERE boot_id=? AND source=? AND epoch=? AND seq=? "
+                "AND app_id=? AND launch_id=? AND ts_mono_ns=?", row)
+            local.connection.commit()
+
+        changed("local", delete_old_sample, external=False)
+
+        # 2. External deletion of an older WITHOUT ROWID rollup row.
+        for bucket in (100 * NS, 200 * NS):
+            external_imported.execute(
+                "INSERT INTO rollup_app(boot_id, app_id, bucket_start_mono_ns, bucket_secs, "
+                "read_bytes, write_bytes, rchar, wchar, coverage_json) "
+                "VALUES (?, ?, ?, 3600, 0, 0, 0, 0, '{}')", (BOOT, 3, bucket))
+        external_imported.commit()
+
+        def delete_old_rollup():
+            external_imported.execute(
+                "DELETE FROM rollup_app WHERE boot_id=? AND app_id=? AND bucket_start_mono_ns=?",
+                (BOOT, 3, 100 * NS))
+            external_imported.commit()
+
+        changed("imported", delete_old_rollup, external=True)
+
+        # 3. Own-connection in-place collector_epoch update.
+        def bump_collector_epoch():
+            cursor = local.connection.execute(
+                "UPDATE collector_epoch SET epoch=epoch+1 WHERE source='gui'")
+            assert cursor.rowcount == 1
+            local.connection.commit()
+
+        changed("local", bump_collector_epoch, external=False)
+
+        # 4. External receipt update of the collector interval.
+        def extend_receipt():
+            cursor = external_imported.execute(
+                "UPDATE collector_interval SET to_mono_ns=to_mono_ns+1 WHERE source='iod'")
+            assert cursor.rowcount == 1
+            external_imported.commit()
+
+        changed("imported", extend_receipt, external=True)
+
+        # 5. Own-connection handover update.
+        external_local.execute(
+            "INSERT INTO handover(boot_id, from_source, to_source, cutoff_mono_ns, "
+            "baselines_json) VALUES (?, 'gui', 'iod', ?, '{}')", (BOOT, 105 * NS))
+        external_local.commit()
+
+        def update_handover():
+            cursor = local.connection.execute(
+                "UPDATE handover SET baselines_json='{\"marker\": 1}' "
+                "WHERE boot_id=? AND cutoff_mono_ns=?", (BOOT, 105 * NS))
+            assert cursor.rowcount == 1
+            local.connection.commit()
+
+        changed("local", update_handover, external=False)
+
+        # 6. A non-primary-only external write changes only its own source.
+        def bump_imported_epoch():
+            cursor = external_imported.execute(
+                "UPDATE collector_epoch SET epoch=epoch+1 WHERE source='iod'")
+            assert cursor.rowcount == 1
+            external_imported.commit()
+
+        position = changed("imported", bump_imported_epoch, external=True)
+        assert position.data_version > 1
+        assert len({history.local_position(key).registration_epoch
+                    for key in stores}) == 2
+    finally:
+        history.close()
+        external_local.close()
+        external_imported.close()
+        local.connection.close()
+        imported.connection.close()
+
+
+def test_local_registration_add_remove_replace_and_reopen_never_repeat_token(tmp_path):
+    """Every registration mutation consumes a fresh epoch, counters or not.
+
+    Replacement under the same name/owner can repeat both raw counters, so the
+    epoch is the identity. An unlinked connection whose path now denotes another
+    file refuses observation until an explicit rebinding replaces it, and a
+    connection the router has never registered is only accepted once its own
+    database image proves it reads the file now at that path.
+    """
+
+    local, imported = _source_stores(tmp_path)
+    imported_path = _db_path(imported)
+    history = HistoryRouter(QueryService(local), _IdleClient(), AppRegistry())
+    imported_service = QueryService(imported)
+    extra = []
+    try:
+        epochs = []
+        first = history.local_position("local")
+        assert first.registration_epoch == 1
+        with pytest.raises(ValueError):
+            history.remove_source("local")
+
+        history.add_source(imported_service, collector_id="imported", owner="iod")
+        added = history.local_position("imported")
+        epochs.append(added.registration_epoch)
+        assert tuple(position.name for position in history.source_position().sources) == (
+            "imported", "local")
+
+        # Removal changes the vector immediately; re-adding never reuses the
+        # retired epoch.
+        history.remove_source("imported")
+        assert tuple(position.name for position in history.source_position().sources) == (
+            "local",)
+        with pytest.raises(KeyError):
+            history.local_position("imported")
+        history.add_source(imported_service, collector_id="imported", owner="iod")
+        readded = history.local_position("imported")
+        epochs.append(readded.registration_epoch)
+        assert readded.registration_epoch != added.registration_epoch
+
+        # Same-name/owner replacement: two fresh connections to the same file
+        # report identical raw counters, so only the epoch can distinguish them.
+        fresh_a = sqlite3.connect(imported_path)
+        extra.append(fresh_a)
+        history.add_source(QueryService(fresh_a), collector_id="imported", owner="iod")
+        replaced = history.local_position("imported")
+        epochs.append(replaced.registration_epoch)
+        fresh_b = sqlite3.connect(imported_path)
+        extra.append(fresh_b)
+        history.add_source(QueryService(fresh_b), collector_id="imported", owner="iod")
+        replaced_again = history.local_position("imported")
+        epochs.append(replaced_again.registration_epoch)
+        assert (replaced.data_version, replaced.total_changes) == (
+            replaced_again.data_version, replaced_again.total_changes) == (1, 0)
+        assert replaced.registration_epoch != replaced_again.registration_epoch
+        assert replaced != replaced_again
+
+        # Reopening the registered service's connection is a registration
+        # replacement even without add_source.
+        reopened_connection = sqlite3.connect(imported_path)
+        extra.append(reopened_connection)
+        fresh_b_service = history._sources["imported"][0]
+        fresh_b_service.connection = reopened_connection
+        reopened = history.local_position("imported")
+        epochs.append(reopened.registration_epoch)
+        assert reopened.registration_epoch != replaced_again.registration_epoch
+        assert (reopened.data_version, reopened.total_changes) == (1, 0)
+
+        # Re-binding the same name/owner to another physical database.
+        third = _committed_store(tmp_path / "third.db", ((ALPHA, 5, 40),))
+        third_connection = sqlite3.connect(_db_path(third))
+        extra.append(third_connection)
+        history.add_source(
+            QueryService(third_connection), collector_id="imported", owner="iod")
+        rebound = history.local_position("imported")
+        epochs.append(rebound.registration_epoch)
+        assert rebound.registration_epoch > reopened.registration_epoch
+
+        # A path replacement under an unchanged connection: the file at the
+        # registered path is now another inode while the observer still holds
+        # the old (unlinked) one. Stat alone cannot certify that connection, so
+        # observation and preparation refuse until an explicit rebinding.
+        replacement = _committed_store(
+            tmp_path / "replacement.db", ((ALPHA, 6, 50),), owner="iod", start=110, end=120)
+        try:
+            third_path = _db_path(third)
+            row_total = ("SELECT coalesce(sum(read_bytes), 0) "
+                         "FROM app_lifetime_total")
+            # A connection opened on the original file before the replacement
+            # keeps reading the unlinked original forever. The router has never
+            # seen it, so its first registration is where the epoch is chosen.
+            preopened = sqlite3.connect(third_path)
+            extra.append(preopened)
+            assert preopened.execute(row_total).fetchone()[0] == 40
+            assert id(preopened) not in history._connection_bindings
+            prior_epoch = history._registrations["imported"].registration_epoch
+            prior_physical = history._registrations["imported"].physical
+            os.replace(tmp_path / "replacement.db", third_path)
+            assert preopened.execute(row_total).fetchone()[0] == 40
+            assert history.local_position("local").name == "local"
+            with pytest.raises(ValueError, match="history source"):
+                history.local_position("imported")
+            with pytest.raises(ValueError, match="history source"):
+                history.source_position()
+            with pytest.raises(ValueError, match="history source"):
+                history.prepare(Window("range", BOOT, 100 * NS, 140 * NS))
+            assert history._local_future is None
+            assert history._registrations["imported"].registration_epoch == prior_epoch
+            assert history._registrations["imported"].physical == prior_physical
+
+            # A reinstall cannot re-stamp the original connection with the
+            # replacement's identity. Both an explicit add_source with the
+            # registered service and a fresh QueryService around its existing
+            # connection still read the unlinked original, so accepting either
+            # would record the replacement inode and let a later equal bracket
+            # certify the old observer against a copy of the other file.
+            stale_service, stale_owner = history._sources["imported"]
+            observer_total = third_connection.execute(row_total).fetchone()[0]
+            copied = sqlite3.connect(third_path)
+            try:
+                copied_total = copied.execute(row_total).fetchone()[0]
+            finally:
+                copied.close()
+            assert (observer_total, copied_total) == (40, 50)
+            for proposal in (stale_service, QueryService(stale_service.connection)):
+                with pytest.raises(ValueError, match="history source"):
+                    history.add_source(
+                        proposal, collector_id="imported", owner=stale_owner)
+            assert history._sources["imported"][0] is stale_service
+            assert history._registrations["imported"].registration_epoch == prior_epoch
+            assert history._registrations["imported"].physical == prior_physical
+            with pytest.raises(ValueError, match="history source"):
+                history.local_position("imported")
+
+            # A connection the router has never registered is no proof either:
+            # opened before the replacement it still reads the unlinked original,
+            # and first registration would stamp it with the replacement inode.
+            # Both the explicit add_source and the automatic service-replacement
+            # route must refuse it instead of allocating an epoch for it.
+            with pytest.raises(ValueError, match="history source"):
+                history.add_source(
+                    QueryService(preopened), collector_id="imported", owner="iod")
+            history._sources["imported"] = (QueryService(preopened), stale_owner)
+            try:
+                with pytest.raises(ValueError, match="history source"):
+                    history.local_position("imported")
+            finally:
+                history._sources["imported"] = (stale_service, stale_owner)
+            assert id(preopened) not in history._connection_bindings
+            assert history._sources["imported"][0] is stale_service
+            assert history._registrations["imported"].registration_epoch == prior_epoch
+            assert history._registrations["imported"].physical == prior_physical
+
+            # Rebinding to a connection opened on the replacement file restores
+            # observation with a fresh, never-reused epoch.
+            recovered_connection = sqlite3.connect(third_path)
+            extra.append(recovered_connection)
+            history.add_source(
+                QueryService(recovered_connection), collector_id="imported", owner="iod")
+            recovered = history.local_position("imported")
+            epochs.append(recovered.registration_epoch)
+            assert recovered.registration_epoch > prior_epoch
+
+            # The same proven rebinding through the automatic route, and the
+            # certified bracket that follows it: the copied replacement file and
+            # the registered observer carry the same ALPHA total.
+            automatic_connection = sqlite3.connect(third_path)
+            extra.append(automatic_connection)
+            history._sources["imported"] = (QueryService(automatic_connection), "iod")
+            automatic = history.local_position("imported")
+            epochs.append(automatic.registration_epoch)
+            assert automatic.registration_epoch > recovered.registration_epoch
+            assert (automatic.data_version, automatic.total_changes) == (1, 0)
+            scope = Window("range", BOOT, 100 * NS, 140 * NS)
+            history.prepare(scope)
+            outcome = history._local_future.result(timeout=10)
+            assert history.ready(scope)
+            bracket = history._local_settlement.local_bracket
+            assert bracket is not None
+            assert bracket.opening == bracket.closing
+            imported_alpha = automatic_connection.execute(row_total).fetchone()[0]
+            local_alpha = local.connection.execute(
+                row_total + " WHERE app_id=17").fetchone()[0]
+            assert imported_alpha == 50
+            assert next(row.read_bytes for row in outcome.ranking
+                        if row.app_key == ALPHA) == local_alpha + imported_alpha
+        finally:
+            replacement.connection.close()
+
+        assert len(epochs) == len(set(epochs))
+        assert all(later > earlier for earlier, later in zip(epochs, epochs[1:]))
+
+        # A retired source keeps its path bound. An unseen connection opened
+        # before that path's file was replaced is refused even under a new name,
+        # a refusal spends no epoch, and a connection opened afterwards is
+        # proven and accepted.
+        other = _committed_store(tmp_path / "other.db", ((ALPHA, 7, 60),))
+        other_path = _db_path(other)
+        unseen_stale = sqlite3.connect(other_path)
+        extra.append(unseen_stale)
+        assert unseen_stale.execute(row_total).fetchone()[0] == 60
+        history.add_source(
+            QueryService(other.connection), collector_id="retired", owner="iod")
+        other.connection.close()
+        history.remove_source("retired")
+        stale_other = _committed_store(tmp_path / "stale.db", ((ALPHA, 8, 70),))
+        stale_other.connection.close()
+        os.replace(tmp_path / "stale.db", other_path)
+        assert unseen_stale.execute(row_total).fetchone()[0] == 60
+        next_epoch = history._next_registration_epoch
+        with pytest.raises(ValueError, match="history source"):
+            history.add_source(
+                QueryService(unseen_stale), collector_id="retired2", owner="iod")
+        assert history._next_registration_epoch == next_epoch
+        assert id(unseen_stale) not in history._connection_bindings
+        fresh_other = sqlite3.connect(other_path)
+        extra.append(fresh_other)
+        history.add_source(
+            QueryService(fresh_other), collector_id="retired2", owner="iod")
+        assert history.local_position("retired2").registration_epoch == next_epoch
+        assert history._next_registration_epoch == next_epoch + 1
+
+        # A source whose journal keeps committed frames outside its main file is
+        # not byte-identical to that file, so the database-image comparison keeps
+        # a correctly bound rebinding working instead of refusing it.
+        wal = _committed_store(tmp_path / "wal.db", ((ALPHA, 9, 80),))
+        wal_path = _db_path(wal)
+        wal.connection.execute("PRAGMA journal_mode=WAL")
+        wal.connection.execute("PRAGMA wal_autocheckpoint=0")
+        wal.connection.execute(
+            "UPDATE app_lifetime_total SET read_bytes = read_bytes + 1")
+        wal.connection.commit()
+        with open(wal_path, "rb") as handle:
+            wal_bytes = handle.read()
+        assert wal.connection.serialize(name="main") != wal_bytes
+        history.add_source(QueryService(wal.connection), collector_id="wal", owner="iod")
+        wal_rebound = sqlite3.connect(wal_path)
+        extra.append(wal_rebound)
+        history.add_source(QueryService(wal_rebound), collector_id="wal", owner="iod")
+        assert history.local_position("wal").name == "wal"
+        wal.connection.close()
+    finally:
+        history.close()
+        for connection in extra:
+            connection.close()
+        local.connection.close()
+        imported.connection.close()
+
+
+def test_local_observations_require_committed_registered_connections(tmp_path, monkeypatch):
+    """Both observers refuse an active transaction; invalid bindings are errors.
+
+    A pinned caller transaction neither hides an external commit nor gets
+    committed/rolled back by the router. Closing observation failures reach the
+    frame error seam, a registration change after the opening capture retires
+    the copy, and a missing/unbound/closed observer is never a sentinel.
+    """
+
+    history, local, imported = _source_router(tmp_path)
+    external_local = sqlite3.connect(_db_path(local))
+    imported_path = _db_path(imported)
+    scope = Window("range", BOOT, 100 * NS, 140 * NS)
+    try:
+        traced = []
+        before_dv = local.connection.execute("PRAGMA main.data_version").fetchone()[0]
+        before_total = local.connection.total_changes
+        local.connection.execute("BEGIN")
+        local.connection.set_trace_callback(traced.append)
+        for call in (lambda: history.local_position("local"),
+                     history.source_position,
+                     lambda: history.prepare(scope)):
+            with pytest.raises(
+                    ValueError, match="history source has an uncommitted transaction"):
+                call()
+            assert local.connection.in_transaction
+            assert history._local_future is None
+            assert history._local_worker_id is None
+        # The opening observer refuses before it executes any SQL.
+        assert traced == []
+
+        # A pinned caller transaction cannot hide an external commit: the
+        # observation refuses instead of certifying the pinned snapshot.
+        external_local.execute(
+            "UPDATE collector_epoch SET epoch=epoch+1 WHERE source='gui'")
+        external_local.commit()
+        with pytest.raises(
+                ValueError, match="history source has an uncommitted transaction"):
+            history.local_position("local")
+        assert local.connection.in_transaction
+        # The router neither commits nor rolls back the caller's transaction.
+        assert local.connection.total_changes == before_total
+        local.connection.rollback()
+        assert not local.connection.in_transaction
+        committed = history.local_position("local")
+        assert committed.data_version == local.connection.execute(
+            "PRAGMA main.data_version").fetchone()[0]
+        assert committed.data_version > before_dv
+        assert committed.total_changes == before_total
+
+        # The closing observer rejects an active transaction before publication
+        # and leaves the frame unconsumed for a later committed retry.
+        history.prepare(scope)
+        assert isinstance(history._local_future.result(timeout=15), LocalFrameOutcome)
+        local.connection.execute("BEGIN")
+        with pytest.raises(
+                ValueError, match="history source has an uncommitted transaction"):
+            history.ready(scope)
+        assert local.connection.in_transaction
+        assert history.view_state == "unavailable: local history evidence"
+        local.connection.rollback()
+        assert history.ready(scope) is True
+        settlement = history._local_settlement
+        assert isinstance(settlement, LocalSettlement)
+        assert settlement.local_bracket is not None
+        assert settlement.local_bracket.opening == settlement.local_bracket.closing
+
+        # An equal local bracket certifies only that local vector: it never
+        # promotes a remote cursor the connection has not verified or cannot
+        # answer from. Only the full conjunction is a remote authority.
+        cursor = StreamCursor(BOOT, 3, 9)
+        for state in (
+                ClientState(verified=False, answering=True, cursor=cursor),
+                ClientState(verified=True, answering=False, cursor=cursor)):
+            history.client = _StateClient(state)
+            assert history.source_position() == settlement.local_bracket.closing
+        history.client = _StateClient(ClientState(
+            verified=True, answering=True, cursor=cursor))
+        assert history.source_position() == RemotePosition(BOOT, 3, 9)
+        history.client = _IdleClient()
+
+        # A commit after the copy finished but before the closing read is the
+        # conservative boundary: the closing token moves while the opening one
+        # does not, so the frame is uncertified and no opening counter may be
+        # reused as its closing evidence.
+        history.prepare(scope)
+        copied = history._local_future.result(timeout=15)
+        assert isinstance(copied, LocalFrameOutcome)
+        assert copied.worker_id == history._local_worker_id
+        external_local.execute(
+            "UPDATE collector_epoch SET epoch=epoch+1 WHERE source='gui'")
+        external_local.commit()
+        assert history.ready(scope) is True
+        moved = history._local_settlement
+        assert moved is not settlement
+        moved_bracket = moved.local_bracket
+        assert moved_bracket is not None
+        assert moved_bracket.opening != moved_bracket.closing
+        opening_local = next(
+            position for position in moved_bracket.opening.sources
+            if position.name == "local")
+        closing_local = next(
+            position for position in moved_bracket.closing.sources
+            if position.name == "local")
+        assert closing_local.data_version > opening_local.data_version
+        assert closing_local.total_changes == opening_local.total_changes
+        assert closing_local == history.local_position("local")
+        assert moved_bracket.closing == history.source_position()
+
+        # A commit that lands after the real closing observation never rewrites
+        # the just-read boundary: this frame keeps the bracket it observed, and
+        # the next current-vector read is what detects the change.
+        history.prepare(scope)
+        copied = history._local_future.result(timeout=15)
+        assert isinstance(copied, LocalFrameOutcome)
+        closed_before = history.source_position()
+        original_observe = HistoryRouter._observe_registration
+        original_closing = history._closing_vector
+        phase = {"closing": False}
+
+        def closing(binding):
+            phase["closing"] = True
+            try:
+                return original_closing(binding)
+            finally:
+                phase["closing"] = False
+
+        def observe_then_commit(registration):
+            position = original_observe(registration)
+            if phase["closing"] and registration.name == "local":
+                # Commit after the closing observation of the last source, but
+                # before the bracket leaves the closing read.
+                phase["closing"] = False
+                external_local.execute(
+                    "UPDATE collector_epoch SET epoch=epoch+1 WHERE source='gui'")
+                external_local.commit()
+            return position
+
+        monkeypatch.setattr(history, "_closing_vector", closing)
+        monkeypatch.setattr(
+            HistoryRouter, "_observe_registration", staticmethod(observe_then_commit))
+        assert history.ready(scope) is True
+        closed = history._local_settlement.local_bracket
+        assert closed is not None
+        assert closed.opening == closed.closing == closed_before
+        # The commit was real: the next current-vector read moves.
+        assert history.source_position() != closed.closing
+        monkeypatch.undo()
+
+        # A registration identity change after the opening capture retires the
+        # copy: replacing the service object, its connection or its owner all
+        # change the registration set the closing vector was bound to.
+        for index, transition in enumerate(
+                ("service_only", "same_counter_connection", "owner")):
+            binding = history._capture_local_binding(
+                worker_id=810 + index, request=QueryRequest("ranking", scope))
+            service, owner = history._sources["imported"]
+            extra_connection = None
+            try:
+                if transition == "service_only":
+                    history._sources["imported"] = (
+                        QueryService(service.connection), owner)
+                elif transition == "same_counter_connection":
+                    extra_connection = sqlite3.connect(imported_path)
+                    history._sources["imported"] = (
+                        QueryService(extra_connection), owner)
+                else:
+                    history._sources["imported"] = (service, "gui")
+                with pytest.raises(ValueError, match="registrations changed"):
+                    history._closing_vector(binding)
+            finally:
+                history._sources["imported"] = (service, owner)
+                if extra_connection is not None:
+                    extra_connection.close()
+
+        # Adding a source changes the registered set itself, even though every
+        # captured registration still matches its own name.
+        binding = history._capture_local_binding(
+            worker_id=820, request=QueryRequest("ranking", scope))
+        added = QueryService(sqlite3.connect(imported_path))
+        try:
+            history.add_source(added, collector_id="another", owner="iod")
+            with pytest.raises(ValueError, match="registrations changed"):
+                history._closing_vector(binding)
+        finally:
+            history.remove_source("another")
+            added.connection.close()
+
+        # Missing, closed and unbound observers are operational errors.
+        with pytest.raises(KeyError):
+            history.local_position("missing")
+        imported.connection.close()
+        with pytest.raises(sqlite3.ProgrammingError, match="closed database"):
+            history.local_position("imported")
+        os.unlink(imported_path)
+        with pytest.raises(ValueError, match="history source"):
+            history.local_position("imported")
+        with pytest.raises(ValueError, match="history source"):
+            history.source_position()
+    finally:
+        history.close()
+        external_local.close()
+        local.connection.close()
+        imported.connection.close()
+
+
+def test_local_frame_rejects_a_foreign_worker_binding(tmp_path):
+    """A frame result publishes only under its exact admitted worker binding.
+
+    The copy worker receives the admitted worker id and request with its paths,
+    so its outcome already carries them; consumption never relabels a foreign
+    result. A mismatched worker identity and a mismatched request each fail
+    before the owner publishes any routing fact or closing bracket for that
+    result, and a later clean frame still publishes normally (§3.4, §4.3).
+    """
+
+    history, local, imported = _source_router(tmp_path)
+    scope = Window("range", BOOT, 100 * NS, 140 * NS)
+    try:
+        for corrupt, expected in (("worker", "worker"), ("request", "request")):
+            history.prepare(scope)
+            admitted = history._local_worker_id
+            outcome = history._local_future.result(timeout=15)
+            assert isinstance(outcome, LocalFrameOutcome)
+            # The submitted worker answers under its own admission; a matching
+            # default id would only be a consumer rewrite of a foreign result.
+            assert outcome.worker_id == admitted
+            assert outcome.request == QueryRequest("ranking", scope)
+            forged = replace(
+                outcome,
+                worker_id=admitted + 900 if corrupt == "worker" else admitted,
+                request=(outcome.request if corrupt == "worker"
+                         else QueryRequest("ranking", Window("lifetime"))),
+            )
+            future = Future()
+            future.set_result(forged)
+            history._local_future = future
+            with pytest.raises(ValueError, match=expected):
+                history.ready(scope)
+            assert history._ranking == []
+            assert history.view_state == "unavailable: local history evidence"
+            assert isinstance(history._local_settlement.error, ValueError)
+
+        # The rejection does not strand the lane: the next frame publishes under
+        # its own admitted binding.
+        history.prepare(scope)
+        admitted = history._local_worker_id
+        assert isinstance(history._local_future.result(timeout=15), LocalFrameOutcome)
+        assert history.ready(scope) is True
+        assert history._local_settlement.outcome.worker_id == admitted
+        assert history.local_position("local").name == "local"
+    finally:
+        history.close()
+        local.connection.close()
+        imported.connection.close()

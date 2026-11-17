@@ -22,6 +22,7 @@ from collections.abc import Callable, Mapping
 from concurrent.futures import CancelledError, Future, InvalidStateError, ThreadPoolExecutor
 from dataclasses import dataclass, replace
 import json
+import os
 from pathlib import Path
 import queue
 import sqlite3
@@ -35,6 +36,7 @@ from .contracts import (
 )
 from .history_types import (
     LocalBracket,
+    LocalPosition,
     LocalPositionVector,
     RemotePosition,
     RetentionScope,
@@ -533,13 +535,153 @@ SettlementInput = RemoteSettlement | LocalSettlement
 LocalOutcome = LocalFrameOutcome | LocalPartOutcome | LocalFilesOutcome
 
 
+@dataclass(frozen=True)
+class _SourceRegistration:
+    """One live local source and the identity the owner registered it under.
+
+    The registration is not a wire or durable record. It keeps the live service
+    and connection objects on the owner side only, together with the canonical
+    main path and filesystem ``(st_dev, st_ino)`` observed at install, so later
+    observations can prove they still address the registered file (§4.2).
+    """
+
+    name: str
+    owner: str
+    registration_epoch: int
+    service: QueryService
+    connection: sqlite3.Connection
+    path: str
+    physical: tuple[int, int] | None
+
+    def __post_init__(self) -> None:
+        _private_name(self.name, "registration.name")
+        _private_enum(self.owner, _POSITION_OWNERS, "registration.owner")
+        _private_int(self.registration_epoch, "registration.registration_epoch", minimum=1)
+        if not isinstance(self.service, QueryService) or not isinstance(
+                self.connection, sqlite3.Connection):
+            raise ValueError("a registration binds one query service and its connection")
+        if self.service.connection is not self.connection:
+            raise ValueError("a registration binds the service's own connection")
+        if not isinstance(self.path, str):
+            raise ValueError("registration.path must be text")
+        if self.physical is not None:
+            if (not isinstance(self.physical, tuple) or len(self.physical) != 2
+                    or any(isinstance(value, bool) or not isinstance(value, int)
+                           for value in self.physical)):
+                raise ValueError("registration.physical must be a (st_dev, st_ino) pair")
+
+
+@dataclass(frozen=True)
+class _SourceStamp:
+    """The immutable part of one registration that a worker binding carries."""
+
+    name: str
+    owner: str
+    registration_epoch: int
+    path: str
+    physical: tuple[int, int] | None
+
+    def __post_init__(self) -> None:
+        _private_name(self.name, "registration_stamp.name")
+        _private_enum(self.owner, _POSITION_OWNERS, "registration_stamp.owner")
+        _private_int(self.registration_epoch, "registration_stamp.registration_epoch", minimum=1)
+        if not isinstance(self.path, str):
+            raise ValueError("registration_stamp.path must be text")
+        if self.physical is not None:
+            if (not isinstance(self.physical, tuple) or len(self.physical) != 2
+                    or any(isinstance(value, bool) or not isinstance(value, int)
+                           for value in self.physical)):
+                raise ValueError("registration_stamp.physical must be a (st_dev, st_ino) pair")
+
+
+@dataclass(frozen=True)
+class _LocalCopyBinding:
+    """Registrations, paths and opening vector captured before one copy (§4.3).
+
+    The binding carries no live service, connection, selection or database
+    handle. A worker receives only ``paths``; the owner thread re-checks
+    ``registrations`` and observes ``closing`` before publication.
+    """
+
+    worker_id: int
+    token_id: int | None
+    request: QueryRequest
+    registrations: tuple[_SourceStamp, ...]
+    paths: tuple[tuple[str, str, str], ...]
+    opening: LocalPositionVector
+
+    def __post_init__(self) -> None:
+        _private_int(self.worker_id, "local_binding.worker_id", minimum=1)
+        if self.token_id is not None:
+            _private_int(self.token_id, "local_binding.token_id", minimum=1)
+        _normalize_request(self.request)
+        if not isinstance(self.registrations, tuple) or not self.registrations:
+            raise ValueError("a local binding carries its registered sources")
+        for stamp in self.registrations:
+            if not isinstance(stamp, _SourceStamp):
+                raise ValueError("a local binding carries only registration stamps")
+            _SourceStamp.__post_init__(stamp)
+        if not isinstance(self.paths, tuple) or len(self.paths) != len(self.registrations):
+            raise ValueError("a local binding carries one path per registration")
+        for stamp, entry in zip(self.registrations, self.paths, strict=True):
+            if (not isinstance(entry, tuple) or len(entry) != 3
+                    or entry[0] != stamp.name or entry[2] != stamp.owner
+                    or not isinstance(entry[1], str)):
+                raise ValueError("a local binding path must match its registration")
+        if not isinstance(self.opening, LocalPositionVector):
+            raise ValueError("a local binding carries its opening vector")
+        if len(self.opening.sources) != len(self.registrations):
+            raise ValueError("a local binding opening vector must match its registrations")
+        for stamp, position in zip(self.registrations, self.opening.sources, strict=True):
+            if ((position.name, position.owner, position.registration_epoch)
+                    != (stamp.name, stamp.owner, stamp.registration_epoch)):
+                raise ValueError(
+                    "a local binding opening vector must match its registrations")
+
+
+class _FrameCopyPaths(tuple):
+    """One frame's registered copy paths, carrying their admission binding.
+
+    The frame worker keeps its two-argument ``(paths, window)`` shape so
+    fixtures that substitute ``_read_local`` stay valid, while the copy itself
+    receives the exact admitted worker id and normalized request. The copy can
+    then return an outcome under its own binding and the owner never relabels a
+    foreign result with its own identity (§3.4, §4.3).
+    """
+
+    def __new__(cls, binding: _LocalCopyBinding) -> _FrameCopyPaths:
+        self = super().__new__(cls, binding.paths)
+        self.binding = binding
+        return self
+
+
 class HistoryRouter:
     def __init__(self, local: QueryService, client: IodClient, registry: AppRegistry):
         self.local, self.client, self.registry = local, client, registry
         self._sources = {"local": (local, "gui")}
+        # Registration bookkeeping (§4.2): a strictly increasing epoch that is
+        # never reused, plus the live service/connection identity, canonical
+        # main path and filesystem inode pair observed at install. A commit,
+        # query or frame generation never advances an epoch.
+        self._next_registration_epoch = 1
+        self._registrations: dict[str, _SourceRegistration] = {}
+        #: The first physical file each connection object was registered for.
+        #: Replacing the file at that pathname leaves the connection reading the
+        #: unlinked original, so a stat of the pathname describes another
+        #: database; one connection is never re-stamped with a replacement's
+        #: identity (§4.2). Retired entries stay so a removed source cannot be
+        #: re-added under the stale connection either.
+        self._connection_bindings: dict[int, tuple[sqlite3.Connection,
+                                                    tuple[int, int] | None]] = {}
+        #: Every database path this router has bound a connection to, retired
+        #: registrations included. A first registration for an unseen path
+        #: establishes that binding; any later connection offered for a known
+        #: path or an existing source name must be proven to read that file.
+        self._path_bindings: set[str] = set()
         # Capture identity only when a source is registered, never in a Files
         # request on the UI thread. Worker connections stay read-only.
-        self._source_paths = {"local": local.connection.execute("PRAGMA database_list").fetchone()[2]}
+        self._source_paths: dict[str, str] = {}
+        self._install_registration("local", local, "gui")
         self.segments: tuple[HistorySegment, ...] = ()
         self.boundaries: tuple[tuple[str, int, str, str], ...] = ()
         self.view_state = "unavailable"
@@ -578,8 +720,12 @@ class HistoryRouter:
         self._legacy_files_workers: set[int] = set()
         self._next_token_id = 1
         self._local_paths: tuple[tuple[str, str, str], ...] | None = None
-        self._local_request: QueryRequest | None = None
         self._local_future = None
+        #: Immutable admission/closing evidence, keyed by the admitted worker id.
+        #: The frame owns one entry; detail copies own one until their settlement.
+        self._worker_bindings: dict[int, _LocalCopyBinding] = {}
+        self._local_worker_id: int | None = None
+        self._local_settlement: LocalSettlement | None = None
         self._daemon_answer_error: DaemonAnswerError | None = None
         self._local_generation = None
         self._cached_parts = {}
@@ -600,6 +746,309 @@ class HistoryRouter:
         self._next_token_id = token_id + 1
         return token_id
 
+    @staticmethod
+    def _physical_identity(path: str) -> tuple[int, int] | None:
+        """The registered file's ``(st_dev, st_ino)``, or None when there is none."""
+
+        if not path:
+            return None
+        try:
+            info = os.stat(path)
+        except OSError:
+            return None
+        return (info.st_dev, info.st_ino)
+
+    def _rebinding(self, name: str, path: str) -> bool:
+        """Whether an unseen connection would replace an existing file binding.
+
+        A source name keeps its registration across replacement, and one
+        database path keeps the file the router already bound even after that
+        source was removed. Either case means the incoming connection is
+        claiming an identity the router has already certified, so it must be
+        proven (§4.2).
+        """
+
+        return name in self._registrations or (bool(path) and path in self._path_bindings)
+
+    @staticmethod
+    def _image_matches_file(path: str, image: bytes) -> bool:
+        """Whether ``image`` is exactly the current byte content of ``path``."""
+
+        view = memoryview(image)
+        offset = 0
+        with open(path, "rb") as handle:
+            while True:
+                chunk = handle.read(1 << 20)
+                if not chunk:
+                    return offset == len(view)
+                if offset + len(chunk) > len(view) or view[offset:offset + len(chunk)] != chunk:
+                    return False
+                offset += len(chunk)
+
+    @staticmethod
+    def _image_matches_database(path: str, image: bytes) -> bool:
+        """Whether a read-only connection to ``path`` serializes to ``image``.
+
+        A journal-mode-independent equality: the main file of a WAL source does
+        not carry its uncheckpointed frames, so a byte comparison cannot speak
+        for that source.
+        """
+
+        try:
+            probe = sqlite3.connect(Path(path).as_uri() + "?mode=ro", uri=True, timeout=0.0)
+        except sqlite3.Error:
+            return False
+        try:
+            return probe.serialize(name="main") == image
+        except (AttributeError, NotImplementedError, sqlite3.Error):
+            return False
+        finally:
+            probe.close()
+
+    def _prove_file_binding(self, name: str, connection: sqlite3.Connection,
+                            path: str) -> None:
+        """Prove an unseen connection reads the file now at ``path`` (§4.2).
+
+        ``stat`` identifies the file at a pathname, not the file a connection
+        holds. A connection opened before an ``os.replace`` keeps reading the
+        unlinked original, so stamping it with the pathname's identity would let
+        its counters certify a copy of the replacement. The owner-side proof is
+        the connection's own committed database image: it must be exactly the
+        bytes of the file at the path, or - for a source whose journal keeps some
+        committed frames outside the main file - the image a read-only connection
+        to that path reads. Anything that cannot be proven that way - a missing
+        image, an unreadable or non-file source, or a source that reads another
+        database - is refused rather than guessed. This runs only when an existing
+        source is rebound to an unseen connection, never per observation.
+        """
+
+        if connection.in_transaction:
+            raise ValueError(
+                f"history source {name!r} has an uncommitted transaction")
+        if not path:
+            raise ValueError(f"history source {name!r} has no provable file binding")
+        try:
+            image = connection.serialize(name="main")
+        except (AttributeError, NotImplementedError, sqlite3.Error) as error:
+            raise ValueError(
+                f"history source {name!r} has no provable file binding") from error
+        try:
+            matched = self._image_matches_file(path, image)
+        except OSError as error:
+            raise ValueError(f"history source {name!r} is unavailable") from error
+        if not matched:
+            matched = self._image_matches_database(path, image)
+        if not matched:
+            raise ValueError(
+                f"history source {name!r} is no longer bound to its registered file")
+
+    def _install_registration(self, name: str, service: QueryService,
+                              owner: str) -> _SourceRegistration:
+        """Bind one source to a fresh, never-reused registration epoch.
+
+        A failed installation publishes nothing: the previous registration (if
+        any) stays in place and the caller raises before any vector is observed.
+        Only this method allocates epochs; commits, queries, frame generations
+        and unchanged observations never do (§4.2).
+        """
+
+        if not isinstance(service, QueryService):
+            raise ValueError("a history source is a QueryService")
+        connection = service.connection
+        try:
+            row = connection.execute("PRAGMA database_list").fetchone()
+        except sqlite3.Error as error:
+            raise ValueError(f"history source {name!r} is unavailable") from error
+        path = "" if row is None or row[2] is None else row[2]
+        if path:
+            path = os.path.abspath(path)
+        current = self._physical_identity(path)
+        # One connection keeps the physical file it was first registered for.
+        # An explicit add_source or a new QueryService around that same
+        # connection is not a rebinding: if the pathname now denotes another
+        # inode, the connection still reads the unlinked original and no copy
+        # of the replacement may be certified by its counters. Only a
+        # connection opened for the replacement file is a genuine rebinding.
+        known = self._connection_bindings.get(id(connection))
+        if known is not None and known[0] is connection:
+            physical = known[1]
+            if current != physical:
+                raise ValueError(
+                    f"history source {name!r} is no longer bound to its "
+                    "registered file")
+        else:
+            # The epoch is chosen here, not when the connection was opened, so
+            # an unseen connection cannot inherit the pathname's identity: it
+            # may predate the file now at that path. Replacing an existing
+            # source binding therefore requires proof, and a failed proof keeps
+            # the previous registration and allocates no epoch.
+            if self._rebinding(name, path):
+                self._prove_file_binding(name, connection, path)
+                if self._physical_identity(path) != current:
+                    raise ValueError(
+                        f"history source {name!r} is no longer bound to its "
+                        "registered file")
+            physical = current
+        epoch = self._next_registration_epoch
+        self._next_registration_epoch = epoch + 1
+        registration = _SourceRegistration(
+            name, owner, epoch, service, connection, path, physical)
+        self._registrations[name] = registration
+        self._source_paths[name] = path
+        self._connection_bindings[id(connection)] = (connection, physical)
+        if path:
+            self._path_bindings.add(path)
+        return registration
+
+    def _current_registration(self, name: str) -> _SourceRegistration:
+        """The live registration for ``name``, refreshed when its identity moved.
+
+        Service or connection replacement/reopening is a registration
+        replacement, so it allocates a new epoch even under the same name,
+        owner, path and raw counters. A changed filesystem identity under an
+        unchanged connection is refused instead: stat alone cannot prove that
+        connection addresses the replacement file.
+        """
+
+        try:
+            service, owner = self._sources[name]
+        except KeyError:
+            raise KeyError(name) from None
+        registration = self._registrations.get(name)
+        if (registration is None or registration.service is not service
+                or registration.connection is not service.connection
+                or registration.owner != owner):
+            registration = self._install_registration(name, service, owner)
+        return self._verify_registration(registration)
+
+    @staticmethod
+    def _verify_registration(registration: _SourceRegistration) -> _SourceRegistration:
+        if registration.physical is not None:
+            try:
+                info = os.stat(registration.path)
+            except OSError as error:
+                raise ValueError(
+                    f"history source {registration.name!r} is unavailable") from error
+            if (info.st_dev, info.st_ino) != registration.physical:
+                raise ValueError(
+                    f"history source {registration.name!r} is no longer bound "
+                    "to its registered file")
+        return registration
+
+    @staticmethod
+    def _observe_registration(registration: _SourceRegistration) -> LocalPosition:
+        """One O(1) committed position on the registered connection (§4.1).
+
+        The table/column hash inventory is empty: this reads exactly
+        ``PRAGMA main.data_version`` and the connection's own ``total_changes``
+        property. It never opens an observer connection, scans a table, reads a
+        rowid, or borrows ``QueryService._snapshot``.
+        """
+
+        if registration.physical is None:
+            raise ValueError("asynchronous history requires a file-backed SQLite source")
+        connection = registration.connection
+        if connection.in_transaction:
+            raise ValueError("history source has an uncommitted transaction")
+        cursor = connection.execute("PRAGMA main.data_version")
+        try:
+            row = cursor.fetchone()
+            data_version = None if row is None else row[0]
+            cursor.fetchall()
+        finally:
+            cursor.close()
+        return LocalPosition(registration.name, registration.owner,
+                             registration.registration_epoch, data_version,
+                             connection.total_changes)
+
+    def local_position(self, source_name: str) -> LocalPosition:
+        """Observe one registered source's exact committed change token."""
+
+        return self._observe_registration(self._current_registration(source_name))
+
+    def _local_vector(self) -> LocalPositionVector:
+        names = sorted(self._sources, key=lambda name: name.encode("utf-8"))
+        return LocalPositionVector(tuple(self.local_position(name) for name in names))
+
+    def source_position(self) -> SourcePosition:
+        """The current source authority: a remote cursor or the local vector."""
+
+        state = self.client.state
+        if state is not None and state.verified and state.answering:
+            cursor = state.cursor
+            if cursor is not None:
+                return RemotePosition(cursor.boot_id, cursor.iod_epoch, cursor.seq)
+        return self._local_vector()
+
+    def remove_source(self, collector_id: str) -> None:
+        """Retire one imported source; its registration epoch is never reused."""
+
+        if collector_id == "local":
+            raise ValueError("the primary local source cannot be removed")
+        if collector_id not in self._sources:
+            raise KeyError(collector_id)
+        del self._sources[collector_id]
+        self._registrations.pop(collector_id, None)
+        self._source_paths.pop(collector_id, None)
+        # The retired connection's physical binding stays remembered: re-adding
+        # the same connection after a path replacement still addresses the old
+        # file and must be refused, not re-stamped (§4.2).
+        self.invalidate()
+
+    def _capture_local_binding(self, *, worker_id: int, token_id: int | None = None,
+                               request: QueryRequest) -> _LocalCopyBinding:
+        """Capture registrations, paths and the opening vector before a copy.
+
+        No live connection or current selection enters the binding handed to a
+        worker. Every source must be committed and bound to its registered file
+        at admission; a failed check publishes no vector.
+        """
+
+        names = sorted(self._sources, key=lambda name: name.encode("utf-8"))
+        stamps, paths, positions = [], [], []
+        for name in names:
+            registration = self._current_registration(name)
+            stamps.append(_SourceStamp(registration.name, registration.owner,
+                                       registration.registration_epoch,
+                                       registration.path, registration.physical))
+            paths.append((name, registration.path, registration.owner))
+            positions.append(self._observe_registration(registration))
+        return _LocalCopyBinding(worker_id, token_id, request, tuple(stamps),
+                                 tuple(paths), LocalPositionVector(tuple(positions)))
+
+    def _closing_vector(self, binding: _LocalCopyBinding) -> LocalPositionVector:
+        """Re-check identities and observe the closing vector before publication."""
+
+        names = sorted(self._sources, key=lambda name: name.encode("utf-8"))
+        if tuple(names) != tuple(stamp.name for stamp in binding.registrations):
+            raise ValueError("history source registrations changed during the copy")
+        positions = []
+        for stamp in binding.registrations:
+            registration = self._current_registration(stamp.name)
+            current = _SourceStamp(registration.name, registration.owner,
+                                   registration.registration_epoch,
+                                   registration.path, registration.physical)
+            if current != stamp:
+                raise ValueError("history source registrations changed during the copy")
+            positions.append(self._observe_registration(registration))
+        return LocalPositionVector(tuple(positions))
+
+    def _close_local_settlement(self, settlement: LocalSettlement, *,
+                                binding: _LocalCopyBinding | None = None
+                                ) -> LocalSettlement:
+        """Attach the owner-read closing bracket to one local settlement."""
+
+        if not isinstance(settlement, LocalSettlement):
+            raise ValueError("closing a local bracket needs a local settlement")
+        if binding is None:
+            binding = self._worker_bindings.get(settlement.worker_id)
+        if binding is None:
+            raise ValueError("a local settlement has no captured copy binding")
+        closing = self._closing_vector(binding)
+        return LocalSettlement(settlement.worker_id, outcome=settlement.outcome,
+                               error=settlement.error,
+                               local_bracket=LocalBracket(binding.opening, closing))
+
     def _background_charge(self, owner: str) -> int:
         return sum(1 for charged_owner, _ in self._worker_jobs.values() if charged_owner == owner)
 
@@ -615,6 +1064,7 @@ class HistoryRouter:
 
     def _submit_background_worker(
         self, token: RequestToken, work: Callable[[], LocalOutcome],
+        *, binding: _LocalCopyBinding | None = None,
     ) -> Future | None:
         """Charge one background slot and submit an immutable-outcome worker.
 
@@ -626,6 +1076,8 @@ class HistoryRouter:
 
         if not isinstance(token, RequestToken):
             raise ValueError("a background worker needs its admitted request token")
+        if binding is not None and token.owner != "detail":
+            raise ValueError("only a local detail worker brackets its copy")
         if token.origin != "local" or token.owner not in ("detail", "files"):
             raise ValueError("only a local detail or Files token owns a background worker")
         if token.token_id in self._worker_jobs:
@@ -633,6 +1085,17 @@ class HistoryRouter:
         worker_id = self._reserve_background_worker(token.owner, worker_id=token.token_id)
         if worker_id is None:
             return None
+        if binding is None and token.owner == "detail":
+            # Capture admission evidence immediately before submission; a
+            # refused capture releases the reservation and publishes nothing.
+            try:
+                binding = self._capture_local_binding(
+                    worker_id=worker_id, token_id=token.token_id, request=token.request)
+            except Exception:
+                self._reap_background_worker(worker_id)
+                raise
+        if binding is not None:
+            self._worker_bindings[worker_id] = binding
 
         def run() -> None:
             try:
@@ -734,6 +1197,7 @@ class HistoryRouter:
 
         if self._worker_jobs.pop(worker_id, None) is None:
             return
+        self._worker_bindings.pop(worker_id, None)
         self._legacy_files_workers.discard(worker_id)
         if self._closed:
             self._discard_completed(worker_id)
@@ -1074,8 +1538,11 @@ class HistoryRouter:
         if not collector_id or collector_id == "local":
             raise ValueError("an imported collector requires its own identity")
         validate_enum(owner, ("gui", "iod"), "owner")
+        # Install (and consume) the registration epoch before the source joins
+        # the live map: a failed install leaves the previous registration and
+        # source untouched, so no proposed vector can be published.
+        self._install_registration(collector_id, service, owner)
         self._sources[collector_id] = (service, owner)
-        self._source_paths[collector_id] = service.connection.execute("PRAGMA database_list").fetchone()[2]
         self.invalidate()
 
     def record_transport_gap(self, notice: GapNotice) -> None:
@@ -1350,11 +1817,17 @@ class HistoryRouter:
         """Copy, plan, materialise and rank in one frame worker (§3.3).
 
         Returns every routing/materialisation fact the owner needs and never
-        constructs a subject's detail or exposes a database handle. The
-        optional bindings default to a compatibility derivation so existing
-        fixtures that call this private worker directly keep their shape; the
-        owner passes its admitted token binding once settlement is wired.
+        constructs a subject's detail or exposes a database handle. The owner
+        passes its admitted binding with ``paths``; only a direct fixture call
+        with plain paths falls back to the compatibility worker id/request.
         """
+        if worker_id is None or request is None:
+            admission = getattr(paths, "binding", None)
+            if admission is not None:
+                if worker_id is None:
+                    worker_id = admission.worker_id
+                if request is None:
+                    request = admission.request
         if request is None:
             request = QueryRequest("ranking", window)
         if worker_id is None:
@@ -1510,21 +1983,30 @@ class HistoryRouter:
         self.view_state = "loading"
         if self._local_future is not None:
             self._local_future.cancel()
-        paths = []
-        for name, (service, owner) in self._sources.items():
-            if service.connection.in_transaction:
-                raise ValueError("history source has an uncommitted transaction")
-            path = service.connection.execute("PRAGMA database_list").fetchone()[2]
-            if not path:
-                raise ValueError("asynchronous history requires a file-backed SQLite source")
-            paths.append((name, path, owner))
+        if self._local_worker_id is not None:
+            # The previous generation can never be consumed (§3.2/§4.3), so its
+            # admission evidence is retired with it. Capacity stays a resource.
+            self._worker_bindings.pop(self._local_worker_id, None)
+        worker_id = self._allocate_token_id()
+        request = QueryRequest("ranking", window)
+        binding = self._capture_local_binding(worker_id=worker_id, request=request)
+        self._worker_bindings[worker_id] = binding
         self._local_generation = self._generation
-        self._local_paths = tuple(paths)
-        self._local_request = QueryRequest("ranking", window)
+        self._local_worker_id = worker_id
+        self._local_paths = binding.paths
         # The frame lane holds exactly one charged Future. A completed but
         # undrained predecessor stays observable through its own result before
-        # the frozen `not done()` gate admits a replacement.
-        self._local_future = self._frame_executor.submit(self._read_local, paths, window)
+        # the frozen `not done()` gate admits a replacement. The submission
+        # carries the admitted worker binding into the copy itself.
+        try:
+            self._local_future = self._frame_executor.submit(
+                self._read_local, _FrameCopyPaths(binding), window)
+        except Exception:
+            # A refused submission publishes no admission evidence; the caller
+            # receives the submit failure through the existing seam.
+            self._worker_bindings.pop(worker_id, None)
+            self._local_worker_id = None
+            raise
         state = self.client.state
         if state is not None and state.verified and state.answering:
             self._queue.append(QueryRequest("ranking", window))
@@ -1538,17 +2020,37 @@ class HistoryRouter:
             return False
         if self._local_future is None or not self._local_future.done():
             return False
+        outcome = error = None
         try:
             outcome = self._local_future.result()
+        except Exception as caught:  # noqa: BLE001 - re-raised after the bracket
+            error = caught
+        worker_id = self._local_worker_id
+        binding = None if worker_id is None else self._worker_bindings.get(worker_id)
+        if binding is None:
+            self._file_status = FileAvailability(False, False, "file_source_unavailable")
+            raise ValueError("a local frame has no captured copy binding")
+        if error is None:
+            try:
+                outcome = self._admitted_frame_outcome(outcome, binding)
+            except Exception as caught:  # noqa: BLE001 - reported after the bracket
+                outcome, error = None, caught
+        try:
+            settlement = self._close_local_settlement(
+                LocalSettlement(worker_id, outcome=outcome, error=error), binding=binding)
         except Exception:
+            if error is None:
+                self._file_status = FileAvailability(False, False, "file_source_unavailable")
+                raise
+            # The copy already failed: keep its original diagnostics rather than
+            # masking them with a closing observation failure. No bracket is
+            # fabricated for an unobserved boundary.
+            settlement = LocalSettlement(worker_id, error=error)
+        self._local_settlement = settlement
+        self._worker_bindings.pop(worker_id, None)
+        if error is not None:
             self._file_status = FileAvailability(False, False, "file_source_unavailable")
-            raise
-        if not isinstance(outcome, LocalFrameOutcome):
-            self._file_status = FileAvailability(False, False, "file_source_unavailable")
-            raise ValueError("a local frame worker must return a typed frame outcome")
-        if outcome.request != self._local_request:
-            self._file_status = FileAvailability(False, False, "file_source_unavailable")
-            raise ValueError("a local frame worker answered another request")
+            raise error
         self.segments, self.boundaries = outcome.segments, outcome.boundaries
         self._gap_ranges = list(outcome.gaps)
         self._known_gap_ranges = list(outcome.known_gaps)
@@ -1564,6 +2066,24 @@ class HistoryRouter:
                          for row in outcome.ranking]
         self._local_generation = None
         return True
+
+    def _admitted_frame_outcome(self, outcome: object,
+                                binding: _LocalCopyBinding) -> LocalFrameOutcome:
+        """Validate a frame outcome against the owner's admitted binding.
+
+        The submitted copy receives the admitted worker id and request, so a
+        result under any other identity is foreign. It is rejected before the
+        owner reads a closing bracket or publishes any frame fact; a worker
+        result is never relabelled as this admission (§3.4, §4.3).
+        """
+
+        if not isinstance(outcome, LocalFrameOutcome):
+            raise ValueError("a local frame worker must return a typed frame outcome")
+        if outcome.worker_id != binding.worker_id:
+            raise ValueError("a local frame worker answered another worker binding")
+        if outcome.request != binding.request:
+            raise ValueError("a local frame worker answered another request")
+        return outcome
 
     def _build_ranking(self, window):
         grouped = defaultdict(list)
@@ -1793,15 +2313,28 @@ class HistoryRouter:
             if value is None:
                 # Lazy local detail: only a caller that actually selects this
                 # subject/kind pays for its private snapshot and reducer merge.
-                # Exact getters move to owner settlement in the next task; this
-                # compatibility bridge keeps their original synchronous contract
-                # until then.
+                # Admission and closing observations bracket that copy; exact
+                # owner settlement replaces this compatibility bridge in Task 6.
                 if not self._local_paths:
                     raise KeyError(app_id)
-                outcome = self._read_local_part(
-                    self._local_paths, QueryRequest(kind, window, key),
-                    worker_id=self._allocate_token_id(), app_key=key)
-                value = outcome.value
+                worker_id = self._allocate_token_id()
+                request = QueryRequest(kind, window, key)
+                binding = self._capture_local_binding(worker_id=worker_id, request=request)
+                try:
+                    outcome = self._read_local_part(
+                        binding.paths, request, worker_id=worker_id, app_key=key)
+                except Exception as error:
+                    try:
+                        self._close_local_settlement(
+                            LocalSettlement(worker_id, error=error), binding=binding)
+                    except Exception:
+                        # Keep the copy's original diagnostics; a closing failure
+                        # here must not mask the detail failure it accompanies.
+                        pass
+                    raise
+                settlement = self._close_local_settlement(
+                    LocalSettlement(worker_id, outcome=outcome), binding=binding)
+                value = settlement.outcome.value
                 self._cached_parts[marker] = value
             return [value]
         parts = []
