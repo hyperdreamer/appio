@@ -56,6 +56,12 @@ from appio.contracts import (
     Window,
     WindowUnavailableError,
 )
+from appio.history_types import (
+    AcceptedIdentity,
+    AnswerProvenance,
+    SeriesMetadata,
+    retention_scope,
+)
 from appio.ui import formatting
 from appio.ui.formatting import (
     A22_LAUNCH_REASON,
@@ -724,7 +730,7 @@ def test_build_overview_has_five_ordered_kpis_and_none_peak_is_unavailable() -> 
         1,
         SINCE_BOOT,
         app_total(1, "unit:/alpha.service", "Alpha", 200, peak_bps=0),
-        Series(1, SINCE_BOOT, "raw", task, devices, (), coverage(tier="rollup_60s")),
+        Series(1, SINCE_BOOT, "raw", task, devices, (), coverage(gap_intervals=1)),
         share,
     )
     assert "series coverage: coverage: complete" in differing.detail_line
@@ -1075,7 +1081,7 @@ def test_lifetime_series_does_not_join_unrelated_boot_clocks() -> None:
         DeviceSeriesPoint(first_start, 10, "8:0", 256, 128),
         DeviceSeriesPoint(second_start, 10, "8:0", 512, 256),
     )
-    series = Series(1, lifetime, "rollup_3600s", points, devices, (), coverage())
+    series = Series(1, lifetime, "rollup_3600s", points, devices, (), coverage(tier="rollup_3600s"))
     rows = (
         DeviceShareRow(BOOT, "8:0", 300, 150, 450),
         DeviceShareRow("99999999-8888-4777-8666-555555555555", "8:0", 700, 350, 1050),
@@ -3016,3 +3022,746 @@ def test_ranking_delegate_draws_bar_and_reserves_its_height(qtbot) -> None:
     hinted = delegate.sizeHint(option, index)
     assert hinted.width() == base.width()
     assert hinted.height() >= base.height() + BAR_HEIGHT
+
+
+# --------------------------------------------------------------------------
+# 12.5 Measured provenance, typed series metadata and endpoint availability
+# (spec §7.1–§7.3, plan Task 8).
+# --------------------------------------------------------------------------
+
+BOOT_A = "aaaaaaaa-1111-4111-8111-111111111111"
+BOOT_B = "bbbbbbbb-2222-4222-8222-222222222222"
+WINDOW_A = Window(kind="since_boot", boot_id=BOOT_A, end_mono_ns=20_000_000_000)
+WINDOW_B = Window(kind="since_boot", boot_id=BOOT_A, end_mono_ns=30_000_000_000)
+SUBJECT_KEY = "unit:/alpha.service"
+DEVICE_ENDPOINTS_REASON = "device measurements have different endpoints"
+DEVICE_TOTAL_REASON = "device total unavailable"
+
+
+def measured_share(
+    window: Window,
+    *,
+    boot: str = BOOT_A,
+    task_read: int = 17,
+    task_write: int = 5,
+    device_read: int = 10,
+    device_write: int = 4,
+    cov: Coverage | None = None,
+) -> DiskShare:
+    """The §12.5 fixture share: read 17, write 5, total 22, device 14."""
+
+    residual_read = task_read - device_read
+    residual_write = task_write - device_write
+    return DiskShare(
+        1,
+        window,
+        task_read,
+        task_write,
+        task_read + task_write,
+        (DeviceShareRow(boot, "8:0", device_read, device_write, device_read + device_write),),
+        device_read,
+        device_write,
+        device_read + device_write,
+        residual_read,
+        residual_write,
+        residual_read + residual_write,
+        cov or coverage(),
+    )
+
+
+def measured_series(window: Window) -> Series:
+    """One raw 10 s task bucket with its matching ``8:0`` device bucket."""
+
+    return Series(
+        1,
+        window,
+        "raw",
+        (SeriesPoint(0, 10, None, 512, 256, 1024, None, None, False),),
+        (DeviceSeriesPoint(0, 10, "8:0", 10, 4),),
+        (),
+        coverage(),
+    )
+
+
+def measured_provenance(
+    kind: str,
+    app_key: str,
+    window: Window,
+    *,
+    first_seen: int | None = None,
+) -> AnswerProvenance:
+    """An identity-less provenance, or one carrying an accepted identity+stamp."""
+
+    identity = None
+    if first_seen is not None:
+        digest = {"ranking": "a", "totals": "b", "series": "c"}[kind]
+        identity = AcceptedIdentity(kind, app_key, window, digest * 64)
+    return AnswerProvenance(
+        kind,
+        app_key,
+        retention_scope(app_key, window),
+        window,
+        identity,
+        first_seen,
+        None,
+        None,
+    )
+
+
+def test_overview_provenance_accepts_older_same_scope_rejects_contradictions() -> None:
+    total_b = app_total(1, SUBJECT_KEY, "Alpha", 22, peak_bps=None)
+    series_b = measured_series(WINDOW_B)
+    share_a = measured_share(WINDOW_A)
+    ranking_p_b = measured_provenance(
+        "ranking", SUBJECT_KEY, WINDOW_B, first_seen=3_000_000_000
+    )
+    series_p_b = measured_provenance(
+        "series", SUBJECT_KEY, WINDOW_B, first_seen=3_000_000_000
+    )
+    share_p_a = measured_provenance(
+        "totals", SUBJECT_KEY, WINDOW_A, first_seen=1_000_000_000
+    )
+
+    model = build_overview(
+        1,
+        WINDOW_B,
+        total_b,
+        series_b,
+        share_a,
+        ranking_provenance=ranking_p_b,
+        series_provenance=series_p_b,
+        share_provenance=share_p_a,
+    )
+    assert model.requested_window == WINDOW_B
+    assert model.app_key == SUBJECT_KEY
+    assert model.ranking_provenance is ranking_p_b
+    assert model.series_provenance is series_p_b
+    assert model.share_provenance is share_p_a
+    # The older same-scope share keeps its own Window, identity and stamp.
+    assert model.share is share_a
+    assert model.share.window == WINDOW_A
+    assert model.share_provenance.measured_window == WINDOW_A
+    assert model.share_provenance.accepted_identity is not None
+    assert model.share_provenance.accepted_identity.window == WINDOW_A
+    assert model.share_provenance.first_seen_at_ns == 1_000_000_000
+    assert model.series_metadata == SeriesMetadata(
+        1, SUBJECT_KEY, WINDOW_B, "raw", coverage()
+    )
+    assert model.task_points == series_b.points
+    assert [kpi.text for kpi in model.kpis[:3]] == [
+        format_bytes(22),
+        format_bytes(17),
+        format_bytes(5),
+    ]
+    assert model.device_lanes == () and model.more_devices == 0
+    assert model.device_lanes_unavailable == DEVICE_ENDPOINTS_REASON
+    assert (
+        f"; share measured: since_boot {BOOT_A} through 20000000000 ns"
+        in model.detail_line
+    )
+    assert "series measured:" not in model.detail_line
+
+    # Exact legacy calls stay valid and carry identity-less provenance.
+    legacy = build_overview(
+        1,
+        WINDOW_A,
+        app_total(1, SUBJECT_KEY, "Alpha", 22),
+        measured_series(WINDOW_A),
+        measured_share(WINDOW_A),
+    )
+    assert legacy.requested_window == WINDOW_A
+    assert legacy.app_key == SUBJECT_KEY
+    assert legacy.series_metadata == SeriesMetadata(
+        1, SUBJECT_KEY, WINDOW_A, "raw", coverage()
+    )
+    for provenance, kind in (
+        (legacy.ranking_provenance, "ranking"),
+        (legacy.series_provenance, "series"),
+        (legacy.share_provenance, "totals"),
+    ):
+        assert provenance is not None
+        assert provenance.kind == kind
+        assert provenance.app_key == SUBJECT_KEY
+        assert provenance.measured_window == WINDOW_A
+        assert provenance.accepted_identity is None
+        assert provenance.first_seen_at_ns is None
+    assert [lane.dev for lane in legacy.device_lanes] == ["8:0"]
+    assert legacy.device_lanes_unavailable is None
+    assert "measured:" not in legacy.detail_line
+
+    # Frozen early branches carry the requested Window but no external key,
+    # no accepted detail and no lane reason.
+    refused = build_overview(
+        1, WINDOW_A, None, None, None, ranking_error="window is unavailable"
+    )
+    file_only = build_overview(1, WINDOW_A, None, None, None)
+    for early in (refused, file_only):
+        assert early.requested_window == WINDOW_A
+        assert early.app_key is None
+        assert early.ranking_provenance is None
+        assert early.series_provenance is None
+        assert early.share_provenance is None
+        assert early.series_metadata is None
+        assert early.device_lanes_unavailable is None
+    assert refused.detail_line == "window is unavailable"
+    assert file_only.detail_line == FILE_ONLY_REASON
+
+    # A measured endpoint after the requested endpoint is never rewritten.
+    with pytest.raises(ValueError, match="after the requested"):
+        build_overview(
+            1,
+            WINDOW_A,
+            app_total(1, SUBJECT_KEY, "Alpha", 22),
+            measured_series(WINDOW_B),
+            measured_share(WINDOW_A),
+            series_provenance=series_p_b,
+        )
+    # Another boot, start or complete range tuple is another retention scope.
+    series_boot_b = measured_series(
+        Window(kind="since_boot", boot_id=BOOT_B, end_mono_ns=20_000_000_000)
+    )
+    with pytest.raises(ValueError, match="retention scope"):
+        build_overview(
+            1,
+            WINDOW_A,
+            app_total(1, SUBJECT_KEY, "Alpha", 22),
+            series_boot_b,
+            measured_share(WINDOW_A),
+            series_provenance=measured_provenance(
+                "series", SUBJECT_KEY, series_boot_b.window
+            ),
+        )
+    range_full = Window(
+        kind="range", boot_id=BOOT_A, start_mono_ns=0, end_mono_ns=20_000_000_000
+    )
+    range_short = Window(
+        kind="range", boot_id=BOOT_A, start_mono_ns=0, end_mono_ns=10_000_000_000
+    )
+    range_late = Window(
+        kind="range", boot_id=BOOT_A, start_mono_ns=5_000_000_000, end_mono_ns=20_000_000_000
+    )
+    for measured in (range_short, range_late):
+        with pytest.raises(ValueError, match="retention scope"):
+            build_overview(
+                1,
+                range_full,
+                app_total(1, SUBJECT_KEY, "Alpha", 22),
+                measured_series(measured),
+                measured_share(range_full),
+                series_provenance=measured_provenance("series", SUBJECT_KEY, measured),
+            )
+    # A range control with the complete tuple remains exact and eligible.
+    full_range = build_overview(
+        1,
+        range_full,
+        app_total(1, SUBJECT_KEY, "Alpha", 22),
+        measured_series(range_full),
+        measured_share(range_full),
+        series_provenance=measured_provenance("series", SUBJECT_KEY, range_full),
+        share_provenance=measured_provenance("totals", SUBJECT_KEY, range_full),
+    )
+    assert full_range.series_metadata.measured_window == range_full
+    assert full_range.series_provenance.measured_window == range_full
+    assert [lane.dev for lane in full_range.device_lanes] == ["8:0"]
+    assert full_range.device_lanes_unavailable is None
+    # A boot-less lifetime control keeps typed metadata and no time lanes.
+    lifetime = Window(kind="lifetime")
+    eternal_series = measured_provenance("series", SUBJECT_KEY, lifetime, first_seen=1)
+    eternal_share = measured_provenance("totals", SUBJECT_KEY, lifetime, first_seen=1)
+    eternal = build_overview(
+        1,
+        lifetime,
+        app_total(1, SUBJECT_KEY, "Alpha", 22),
+        measured_series(lifetime),
+        measured_share(lifetime, boot=BOOT_A),
+        series_provenance=eternal_series,
+        share_provenance=eternal_share,
+    )
+    assert eternal.series_metadata == SeriesMetadata(
+        1, SUBJECT_KEY, lifetime, "raw", coverage()
+    )
+    assert eternal.series_provenance is eternal_series
+    assert eternal.series_unavailable == LIFETIME_REASON
+    assert eternal.task_points == ()
+    assert eternal.device_lanes == () and eternal.more_devices == 0
+    assert eternal.device_lanes_unavailable == LIFETIME_REASON
+    assert "measured:" not in eternal.detail_line
+
+    # Wrong subject, wrong dependency kind and a provenance/value window
+    # mismatch are contradictions, never silently repaired values.
+    with pytest.raises(ValueError, match="external subject"):
+        build_overview(
+            1,
+            WINDOW_B,
+            total_b,
+            series_b,
+            share_a,
+            series_provenance=measured_provenance(
+                "series", "unit:/beta.service", WINDOW_B
+            ),
+            share_provenance=share_p_a,
+        )
+    with pytest.raises(ValueError, match="provenance must describe"):
+        build_overview(
+            1,
+            WINDOW_B,
+            total_b,
+            series_b,
+            share_a,
+            series_provenance=share_p_a,
+            share_provenance=share_p_a,
+        )
+    with pytest.raises(ValueError, match="measured window must match"):
+        build_overview(
+            1,
+            WINDOW_B,
+            total_b,
+            series_b,
+            share_a,
+            share_provenance=measured_provenance("totals", SUBJECT_KEY, WINDOW_B),
+        )
+    # The ranking provenance describes the applied frame and is exactly at
+    # the requested Window; an older ranking row cannot be borrowed.
+    with pytest.raises(ValueError, match="requested window"):
+        build_overview(
+            1,
+            WINDOW_B,
+            total_b,
+            series_b,
+            measured_share(WINDOW_B),
+            ranking_provenance=measured_provenance("ranking", SUBJECT_KEY, WINDOW_A),
+        )
+    # Provenance without its value would fabricate accepted data.
+    with pytest.raises(ValueError, match="without its value"):
+        build_overview(
+            1, WINDOW_B, total_b, None, share_a, series_provenance=series_p_b
+        )
+    with pytest.raises(ValueError, match="without its value"):
+        build_overview(
+            1, WINDOW_B, total_b, series_b, None, share_provenance=share_p_a
+        )
+    # An object with its own error stays a contradiction even with provenance.
+    with pytest.raises(ValueError):
+        build_overview(
+            1,
+            WINDOW_B,
+            total_b,
+            series_b,
+            share_a,
+            series_error="series refused",
+            series_provenance=series_p_b,
+            share_provenance=share_p_a,
+        )
+    # A nonexact value without explicit provenance cannot silently weaken the
+    # old structural callers' exact-window validation.
+    with pytest.raises(ValueError, match="exact"):
+        build_overview(
+            1,
+            WINDOW_B,
+            total_b,
+            measured_series(WINDOW_A),
+            measured_share(WINDOW_B),
+        )
+
+
+def test_overview_direct_metadata_validates_series_coverage_and_requested_endpoint() -> None:
+    total_b = app_total(1, SUBJECT_KEY, "Alpha", 22, peak_bps=None)
+    series_b = measured_series(WINDOW_B)
+    share_a = measured_share(WINDOW_A)
+    series_p_b = measured_provenance(
+        "series", SUBJECT_KEY, WINDOW_B, first_seen=3_000_000_000
+    )
+    share_p_a = measured_provenance("totals", SUBJECT_KEY, WINDOW_A, first_seen=1)
+
+    model = build_overview(
+        1,
+        WINDOW_B,
+        total_b,
+        series_b,
+        share_a,
+        series_provenance=series_p_b,
+        share_provenance=share_p_a,
+    )
+    assert model.requested_window == WINDOW_B
+    assert model.app_key == SUBJECT_KEY
+    assert model.share.window == WINDOW_A
+    assert model.share_provenance.measured_window == WINDOW_A
+    assert model.series_metadata == SeriesMetadata(
+        1, SUBJECT_KEY, WINDOW_B, "raw", coverage()
+    )
+    assert model.device_lanes == () and model.more_devices == 0
+    assert model.device_lanes_unavailable == DEVICE_ENDPOINTS_REASON
+    assert (
+        f"; share measured: since_boot {BOOT_A} through 20000000000 ns"
+        in model.detail_line
+    )
+    # A ranking row from another applied frame cannot be replaced in place.
+    with pytest.raises(ValueError, match="exactly at the requested"):
+        replace(
+            model,
+            ranking_provenance=measured_provenance("ranking", SUBJECT_KEY, WINDOW_A),
+        )
+
+    # An otherwise eligible model with populated lanes cannot claim a
+    # device-incomplete successful series.
+    eligible = build_overview(
+        1,
+        WINDOW_A,
+        app_total(1, SUBJECT_KEY, "Alpha", 22),
+        measured_series(WINDOW_A),
+        measured_share(WINDOW_A),
+    )
+    assert [lane.dev for lane in eligible.device_lanes] == ["8:0"]
+    # The gutter is the share row's exact bytes, never a device-point sum.
+    assert (
+        eligible.device_lanes[0].read_bytes,
+        eligible.device_lanes[0].write_bytes,
+    ) == (10, 4)
+    assert eligible.device_lanes_unavailable is None
+    with pytest.raises(ValueError, match="device lanes"):
+        replace(eligible, device_lanes_unavailable=SERIES_REASON)
+    with pytest.raises(ValueError, match="device lanes"):
+        replace(
+            eligible,
+            series_metadata=replace(
+                eligible.series_metadata,
+                coverage=coverage(complete=False, device_state="incomplete"),
+            ),
+        )
+
+    # A 30 s detail with a 20 s requested Window is rejected even with no
+    # ranking provenance at all.
+    no_ranking = replace(model, ranking_provenance=None)
+    assert no_ranking.ranking_provenance is None
+    with pytest.raises(ValueError, match="after the requested"):
+        replace(no_ranking, requested_window=WINDOW_A)
+    share_model = build_overview(
+        1,
+        WINDOW_B,
+        total_b,
+        measured_series(WINDOW_A),
+        measured_share(WINDOW_B),
+        series_provenance=measured_provenance("series", SUBJECT_KEY, WINDOW_A),
+        share_provenance=measured_provenance("totals", SUBJECT_KEY, WINDOW_B),
+    )
+    with pytest.raises(ValueError, match="after the requested"):
+        replace(replace(share_model, ranking_provenance=None), requested_window=WINDOW_A)
+
+    # Typed metadata is positive, associated and tier-consistent.
+    with pytest.raises(ValueError, match="app_id"):
+        replace(model, series_metadata=replace(model.series_metadata, app_id=2))
+    with pytest.raises(ValueError, match="series metadata subject"):
+        replace(
+            model,
+            series_metadata=replace(model.series_metadata, app_key="unit:/beta.service"),
+        )
+    with pytest.raises(ValueError, match="duration"):
+        replace(
+            model,
+            series_metadata=replace(
+                model.series_metadata,
+                tier="rollup_60s",
+                coverage=coverage(tier="rollup_60s"),
+            ),
+        )
+    with pytest.raises(ValueError, match="tier"):
+        replace(
+            model,
+            series_metadata=replace(
+                model.series_metadata, coverage=coverage(tier="rollup_60s")
+            ),
+        )
+    # A dependency's provenance must agree with the selected external subject.
+    with pytest.raises(ValueError, match="external subject"):
+        replace(
+            model,
+            share_provenance=measured_provenance(
+                "totals", "unit:/beta.service", WINDOW_A
+            ),
+        )
+    # A series provenance cannot outlive its typed metadata (the successful
+    # chronology guard itself is isolated in its own test below).
+    with pytest.raises(ValueError, match="series metadata"):
+        replace(eligible, series_metadata=None)
+    # A missing dependency cannot keep that dependency's provenance.
+    with pytest.raises(ValueError, match="missing share"):
+        replace(eligible, share=None, device_lanes=(), more_devices=0, reconciliation=None)
+
+    # The frozen all-default direct shape stays a valid legacy model.
+    legacy = OverviewModel(
+        1,
+        eligible.kpis,
+        (),
+        (),
+        0,
+        None,
+        None,
+        None,
+        None,
+        eligible.coverage_line,
+        "window: since_boot; tier: raw",
+    )
+    assert legacy.requested_window is None
+    assert legacy.app_key is None
+    assert legacy.ranking_provenance is None
+    assert legacy.series_provenance is None
+    assert legacy.share_provenance is None
+    assert legacy.device_lanes_unavailable is None
+    assert legacy.series_metadata is None
+    assert legacy.task_points == ()
+
+
+def test_overview_direct_future_endpoint_rejected_without_ranking_provenance() -> None:
+    """The endpoint guard rejects on its own, with no ranking row to mask it."""
+
+    model = build_overview(
+        1,
+        WINDOW_B,
+        app_total(1, SUBJECT_KEY, "Alpha", 22, peak_bps=None),
+        measured_series(WINDOW_B),
+        measured_share(WINDOW_A),
+        series_provenance=measured_provenance("series", SUBJECT_KEY, WINDOW_B),
+        share_provenance=measured_provenance("totals", SUBJECT_KEY, WINDOW_A),
+    )
+    no_ranking = replace(model, ranking_provenance=None)
+    assert no_ranking.ranking_provenance is None
+    assert no_ranking.device_lanes == () and no_ranking.more_devices == 0
+    # B's series ends after A's requested endpoint. With the endpoint guard
+    # removed this replacement would construct, so the failure is direct.
+    with pytest.raises(ValueError, match="after the requested"):
+        replace(no_ranking, requested_window=WINDOW_A)
+
+
+def test_overview_direct_available_empty_series_requires_metadata_alone() -> None:
+    """The metadata guard fails alone when no lane reason can mask it."""
+
+    model = build_overview(
+        1,
+        WINDOW_A,
+        app_total(1, SUBJECT_KEY, "Alpha", 22),
+        measured_series(WINDOW_A),
+        measured_share(WINDOW_A),
+    )
+    assert model.series_metadata is not None
+    assert model.device_lanes and model.device_lanes_unavailable is None
+    # An available-empty series keeps the lane reason that the missing series
+    # measurement itself implies, and exposes no lanes or points, so only the
+    # typed-metadata guard can reject this shape.
+    with pytest.raises(ValueError, match="typed series metadata"):
+        replace(
+            model,
+            ranking_provenance=None,
+            task_points=(),
+            series_provenance=None,
+            series_metadata=None,
+            device_lanes=(),
+            more_devices=0,
+            device_lanes_unavailable=SERIES_REASON,
+        )
+
+
+def test_build_overview_rejects_ranking_total_for_another_subject() -> None:
+    """The subject identity must agree across the ranking and detail inputs."""
+
+    with pytest.raises(ValueError, match="ranking total app_id 2"):
+        build_overview(
+            1,
+            WINDOW_A,
+            app_total(2, SUBJECT_KEY, "Alpha", 22),
+            measured_series(WINDOW_A),
+            measured_share(WINDOW_A),
+        )
+
+
+def test_overview_direct_early_outcome_rejects_task_points() -> None:
+    """A subjectless early outcome cannot expose accepted task points."""
+
+    file_only = build_overview(1, WINDOW_A, None, None, None)
+    assert file_only.app_key is None
+    assert file_only.series_metadata is None
+    with pytest.raises(ValueError, match="task points"):
+        replace(
+            file_only,
+            task_points=measured_series(WINDOW_A).points,
+            series_unavailable=None,
+        )
+
+
+def test_overview_direct_lifetime_rejects_task_points() -> None:
+    """Lifetime policy withholds chronology even when points are injected."""
+
+    lifetime = Window(kind="lifetime")
+    eternal = build_overview(
+        1,
+        lifetime,
+        app_total(1, SUBJECT_KEY, "Alpha", 22),
+        measured_series(lifetime),
+        measured_share(lifetime, boot=BOOT_A),
+    )
+    assert eternal.series_unavailable == LIFETIME_REASON
+    assert eternal.task_points == ()
+    assert eternal.series_metadata is not None
+    with pytest.raises(ValueError, match="lifetime chronology cannot project"):
+        replace(
+            eternal,
+            task_points=measured_series(lifetime).points,
+            series_unavailable=None,
+        )
+
+
+def test_new_share_device_unavailability_removes_old_device_values() -> None:
+    total = app_total(1, SUBJECT_KEY, "Alpha", 22, peak_bps=None)
+    series = measured_series(WINDOW_A)
+    available = build_overview(1, WINDOW_A, total, series, measured_share(WINDOW_A))
+    assert available.kpis[4].text == format_bytes(14)
+    assert [lane.dev for lane in available.device_lanes] == ["8:0"]
+    assert available.more_devices == 0
+    assert available.reconciliation is not None
+    assert available.device_lanes_unavailable is None
+
+    # Available -> incomplete: DEVICE, bars, residual strip and device lanes
+    # clear in the same model application while task outputs stay measured.
+    incomplete_share = measured_share(
+        WINDOW_A, cov=coverage(complete=False, device_state="incomplete")
+    )
+    incomplete = build_overview(1, WINDOW_A, total, series, incomplete_share)
+    assert incomplete.kpis[4].text == "unavailable"
+    assert incomplete.device_lanes == () and incomplete.more_devices == 0
+    assert incomplete.reconciliation is None
+    assert incomplete.device_lanes_unavailable == "incomplete"
+    assert [kpi.text for kpi in incomplete.kpis[:3]] == [
+        format_bytes(22),
+        format_bytes(17),
+        format_bytes(5),
+    ]
+    assert incomplete.task_points == series.points
+    assert incomplete.series_metadata == available.series_metadata
+    assert incomplete.share is incomplete_share
+    assert incomplete.share_provenance.measured_window == WINDOW_A
+    assert "device lanes: incomplete" in incomplete.detail_line
+
+    # A coverage reason wins over the raw state token.
+    reasoned = build_overview(
+        1,
+        WINDOW_A,
+        total,
+        series,
+        measured_share(
+            WINDOW_A,
+            cov=coverage(
+                complete=False,
+                device_state="incomplete",
+                unavailable_reason="not_retained",
+            ),
+        ),
+    )
+    assert reasoned.device_lanes_unavailable == "not_retained"
+    assert reasoned.device_lanes == () and reasoned.more_devices == 0
+
+    # Available attribution with an undefined device total is the second
+    # same-update case: DEVICE and bars clear, totals keep measuring.
+    undefined_total = DiskShare(
+        1, WINDOW_A, 17, 5, 22, (), None, None, None, None, None, None, coverage()
+    )
+    undefined = build_overview(1, WINDOW_A, total, series, undefined_total)
+    assert undefined.kpis[4].text == "unavailable"
+    assert undefined.device_lanes == () and undefined.more_devices == 0
+    assert undefined.reconciliation is None
+    assert undefined.device_lanes_unavailable == DEVICE_TOTAL_REASON
+    assert [kpi.text for kpi in undefined.kpis[:3]] == [
+        format_bytes(22),
+        format_bytes(17),
+        format_bytes(5),
+    ]
+    assert undefined.task_points == series.points
+    assert undefined.series_metadata == available.series_metadata
+    assert "device lanes: device total unavailable" in undefined.detail_line
+    # The old device values are gone from the new model, not retained.
+    assert format_bytes(14) not in [kpi.text for kpi in undefined.kpis]
+    assert all(lane.dev != "8:0" for lane in undefined.device_lanes)
+
+
+def test_mixed_endpoint_inputs_keep_independent_outputs() -> None:
+    total = app_total(1, SUBJECT_KEY, "Alpha", 22, peak_bps=None)
+    series_a = measured_series(WINDOW_A)
+    series_b = measured_series(WINDOW_B)
+    share_a = measured_share(WINDOW_A)
+    share_b = measured_share(
+        WINDOW_B, task_read=19, task_write=7, device_read=11, device_write=5
+    )
+
+    # A retained share A with a newer requested series B.
+    share_old = build_overview(
+        1,
+        WINDOW_B,
+        total,
+        series_b,
+        share_a,
+        series_provenance=measured_provenance(
+            "series", SUBJECT_KEY, WINDOW_B, first_seen=3_000_000_000
+        ),
+        share_provenance=measured_provenance(
+            "totals", SUBJECT_KEY, WINDOW_A, first_seen=1_000_000_000
+        ),
+    )
+    assert share_old.requested_window == WINDOW_B
+    assert share_old.share.window == WINDOW_A
+    assert share_old.share_provenance.measured_window == WINDOW_A
+    assert share_old.share_provenance.first_seen_at_ns == 1_000_000_000
+    assert share_old.series_metadata.measured_window == WINDOW_B
+    assert share_old.series_metadata.tier == "raw"
+    assert share_old.task_points == series_b.points
+    assert [kpi.text for kpi in share_old.kpis[:3]] == [
+        format_bytes(22),
+        format_bytes(17),
+        format_bytes(5),
+    ]
+    assert share_old.kpis[4].text == format_bytes(14)
+    assert share_old.reconciliation is not None
+    assert share_old.device_lanes == () and share_old.more_devices == 0
+    assert share_old.device_lanes_unavailable == DEVICE_ENDPOINTS_REASON
+    assert (
+        f"; share measured: since_boot {BOOT_A} through 20000000000 ns"
+        in share_old.detail_line
+    )
+    assert "series measured:" not in share_old.detail_line
+    assert share_old.detail_line.endswith(
+        "; device lanes: device measurements have different endpoints"
+    )
+
+    # A retained series A with a newer requested share B.
+    series_old = build_overview(
+        1,
+        WINDOW_B,
+        total,
+        series_a,
+        share_b,
+        series_provenance=measured_provenance(
+            "series", SUBJECT_KEY, WINDOW_A, first_seen=1_000_000_000
+        ),
+        share_provenance=measured_provenance(
+            "totals", SUBJECT_KEY, WINDOW_B, first_seen=3_000_000_000
+        ),
+    )
+    assert series_old.share.window == WINDOW_B
+    assert series_old.share_provenance.measured_window == WINDOW_B
+    assert series_old.series_metadata.measured_window == WINDOW_A
+    assert series_old.series_provenance.measured_window == WINDOW_A
+    assert series_old.series_provenance.first_seen_at_ns == 1_000_000_000
+    assert series_old.task_points == series_a.points
+    assert [kpi.text for kpi in series_old.kpis[:3]] == [
+        format_bytes(26),
+        format_bytes(19),
+        format_bytes(7),
+    ]
+    assert series_old.kpis[4].text == format_bytes(16)
+    assert series_old.device_lanes == () and series_old.more_devices == 0
+    assert series_old.device_lanes_unavailable == DEVICE_ENDPOINTS_REASON
+    assert (
+        f"; series measured: since_boot {BOOT_A} through 20000000000 ns"
+        in series_old.detail_line
+    )
+    assert "share measured:" not in series_old.detail_line
+    assert series_old.detail_line.endswith(
+        "; device lanes: device measurements have different endpoints"
+    )

@@ -1,9 +1,10 @@
 """Pure render models for the appio console.
 
 Every class here is immutable data and every builder is pure: this module
-imports only the standard library, :mod:`appio.contracts` and the display
-formatters. No Qt object, query, history handle, future or painter is stored,
-and no unavailable input is ever normalised into a measured zero.
+imports only the standard library, :mod:`appio.contracts`, the neutral
+:mod:`appio.history_types` records/helpers and the display formatters. No Qt
+object, query, history handle, future or painter is stored, and no unavailable
+input is ever normalised into a measured zero.
 """
 
 from __future__ import annotations
@@ -16,10 +17,18 @@ from appio.contracts import (
     AppTotal,
     Coverage,
     DeviceSeriesPoint,
+    DeviceShareRow,
     DiskShare,
     Series,
     SeriesPoint,
     Window,
+    validate_window,
+)
+from appio.history_types import (
+    AnswerProvenance,
+    SeriesMetadata,
+    applied_endpoint,
+    retention_scope,
 )
 from appio.ui.formatting import UNAVAILABLE, format_bytes, format_peak, format_residual
 
@@ -31,10 +40,19 @@ SHARE_UNAVAILABLE_REASON = "task/device split unavailable"
 LIFETIME_CHRONOLOGY_REASON = "lifetime chronology unavailable"
 RESIDUAL_NOTE = "difference between accounting points"
 COVERAGE_UNAVAILABLE = "coverage: unavailable"
+DEVICE_TOTAL_UNAVAILABLE_REASON = "device total unavailable"
+DEVICE_ENDPOINTS_REASON = "device measurements have different endpoints"
 MAX_DEVICE_LANES = 3
 SHARE_TOLERANCE = 1e-12
 
 _NANOSECONDS = 10**9
+
+#: The fixed bucket duration every projected point of a tier carries.
+_TIER_BUCKET_SECS: dict[str, int] = {
+    "raw": 10,
+    "rollup_60s": 60,
+    "rollup_3600s": 3_600,
+}
 
 
 # --------------------------------------------------------------------------
@@ -65,6 +83,158 @@ def _require_optional_text(value: object, field: str) -> str | None:
     if value is None:
         return None
     return _require_text(value, field)
+
+
+def _identity_less_provenance(
+    kind: str, app_key: str, measured: Window
+) -> AnswerProvenance:
+    """Provenance for an exact-window legacy value with unknown identity/stamp."""
+
+    return AnswerProvenance(
+        kind,  # type: ignore[arg-type]
+        app_key,
+        retention_scope(app_key, measured),
+        measured,
+        None,
+        None,
+        None,
+        None,
+    )
+
+
+def _measured_window_text(measured: Window) -> str:
+    """The exact provenance disclosure for one differing measured Window."""
+
+    if measured.kind == "since_boot":
+        return f"since_boot {measured.boot_id} through {measured.end_mono_ns} ns"
+    if measured.kind == "range":
+        return (
+            f"range {measured.boot_id} "
+            f"[{measured.start_mono_ns}, {measured.end_mono_ns}) ns"
+        )
+    if measured.kind == "lifetime":
+        return "lifetime"
+    # A22 refuses launch before admission; this stays a total, not a guess.
+    return measured.kind
+
+
+def _device_lane_reason(
+    *,
+    chronology_reason: str | None,
+    share: DiskShare | None,
+    share_unavailable: str | None,
+    series_coverage: Coverage | None,
+    series_window: Window | None,
+) -> str | None:
+    """The first applicable device-lane reason in the frozen §7.3 order."""
+
+    if chronology_reason is not None:
+        return chronology_reason
+    if share is None:
+        return (
+            share_unavailable
+            if share_unavailable is not None
+            else SHARE_UNAVAILABLE_REASON
+        )
+    if share.coverage.device_state != "available":
+        return share.coverage.unavailable_reason or share.coverage.device_state
+    if share.device_total_bytes is None:
+        return DEVICE_TOTAL_UNAVAILABLE_REASON
+    if series_coverage is None or series_window is None:
+        # Successful chronology always carries typed series metadata; without
+        # it there is no second measurement to compare.
+        return SERIES_UNAVAILABLE_REASON
+    if series_coverage.device_state != "available":
+        return series_coverage.unavailable_reason or series_coverage.device_state
+    if applied_endpoint(share.window) != applied_endpoint(series_window):
+        return DEVICE_ENDPOINTS_REASON
+    return None
+
+
+def _check_detail_window(
+    measured: Window, requested: Window, app_key: str | None, name: str
+) -> None:
+    """Same requested retention scope, and never a newer measured endpoint."""
+
+    if app_key is None:
+        raise ValueError(
+            f"the {name} measurement requires the selected external subject"
+        )
+    if retention_scope(app_key, measured) != retention_scope(app_key, requested):
+        raise ValueError(
+            f"the {name} measured window does not share the requested retention scope"
+        )
+    requested_end = applied_endpoint(requested)
+    if requested_end is None:
+        return
+    measured_end = applied_endpoint(measured)
+    if measured_end is not None and measured_end > requested_end:
+        raise ValueError(
+            f"the {name} measured detail cannot end after the requested window"
+        )
+
+
+def _check_detail_provenance(
+    provenance: AnswerProvenance,
+    kind: str,
+    app_key: str | None,
+    value_window: Window,
+    requested: Window,
+    name: str,
+) -> None:
+    if provenance.kind != kind:
+        raise ValueError(f"{name} provenance must describe a {kind} value")
+    if app_key is None or provenance.app_key != app_key:
+        raise ValueError(
+            f"{name} provenance must match the selected external subject"
+        )
+    if provenance.measured_window != value_window:
+        raise ValueError(f"{name} provenance measured window must match its value")
+    _check_detail_window(value_window, requested, app_key, name)
+
+
+def _validate_projected_points(
+    metadata: SeriesMetadata, points: Sequence[SeriesPoint]
+) -> None:
+    """Tier durations of the points a model actually projects."""
+
+    if metadata.tier == "totals_only":
+        if points:
+            raise ValueError("a totals_only series projects no points")
+        return
+    duration = _TIER_BUCKET_SECS[metadata.tier]
+    for point in points:
+        if point.bucket_secs != duration:
+            raise ValueError(
+                "every projected point duration must match the series tier"
+            )
+
+
+def _optional_provenance(value: object, field: str) -> AnswerProvenance | None:
+    if value is None:
+        return None
+    if not isinstance(value, AnswerProvenance):
+        raise ValueError(f"{field} must be an AnswerProvenance or None")
+    # Re-run the record's own validation instead of trusting forged fields.
+    AnswerProvenance.__post_init__(value)
+    return value
+
+
+def _optional_metadata(value: object, field: str) -> SeriesMetadata | None:
+    if value is None:
+        return None
+    if not isinstance(value, SeriesMetadata):
+        raise ValueError(f"{field} must be a SeriesMetadata or None")
+    SeriesMetadata.__post_init__(value)
+    return value
+
+
+def _requested_window(value: object, field: str) -> Window | None:
+    if value is None:
+        return None
+    if not isinstance(value, Window):
+        raise ValueError(f"{field} must be a Window or None")
+    return validate_window(value)
 
 
 def _require_share(value: object, field: str) -> float:
@@ -213,6 +383,13 @@ class OverviewModel:
     coverage_line: str
     detail_line: str
     coverage_diagnostic: str | None = None
+    ranking_provenance: AnswerProvenance | None = None
+    series_provenance: AnswerProvenance | None = None
+    share_provenance: AnswerProvenance | None = None
+    device_lanes_unavailable: str | None = None
+    requested_window: Window | None = None
+    app_key: str | None = None
+    series_metadata: SeriesMetadata | None = None
 
     def __post_init__(self) -> None:
         _require_int(self.app_id, "overview.app_id", minimum=1)
@@ -304,6 +481,178 @@ class OverviewModel:
 
         _require_text(self.coverage_line, "overview.coverage_line")
         _require_text(self.detail_line, "overview.detail_line")
+
+        # -- measured provenance and typed series metadata (spec §7.1) -----
+        ranking_provenance = _optional_provenance(
+            self.ranking_provenance, "overview.ranking_provenance"
+        )
+        series_provenance = _optional_provenance(
+            self.series_provenance, "overview.series_provenance"
+        )
+        share_provenance = _optional_provenance(
+            self.share_provenance, "overview.share_provenance"
+        )
+        lane_reason = _require_optional_text(
+            self.device_lanes_unavailable, "overview.device_lanes_unavailable"
+        )
+        requested_window = _requested_window(
+            self.requested_window, "overview.requested_window"
+        )
+        model_key = _require_optional_text(self.app_key, "overview.app_key")
+        series_metadata = _optional_metadata(
+            self.series_metadata, "overview.series_metadata"
+        )
+
+        # Legacy direct mode is exactly the all-default new-field shape. Only
+        # represented data can be checked; nothing absent is inferred.
+        extended = any(
+            value is not None
+            for value in (
+                ranking_provenance,
+                series_provenance,
+                share_provenance,
+                requested_window,
+                model_key,
+                series_metadata,
+            )
+        )
+        if lane_reason is not None and not extended:
+            raise ValueError(
+                "overview.device_lanes_unavailable requires the extended model"
+            )
+        if not extended:
+            return
+
+        # -- extended direct mode ------------------------------------------
+        if requested_window is None:
+            raise ValueError("an extended overview model requires its requested Window")
+        accepted = (
+            self.share is not None
+            or series_metadata is not None
+            or ranking_provenance is not None
+            or series_provenance is not None
+            or share_provenance is not None
+        )
+        if model_key is None and not accepted:
+            # A frozen early (refusal or file-only) outcome: no external
+            # subject, no accepted detail and deliberately no lane reason.
+            if lane_reason is not None:
+                raise ValueError(
+                    "an early overview outcome carries no device lane reason"
+                )
+            if self.task_points:
+                raise ValueError(
+                    "an early overview outcome carries no task points"
+                )
+            if self.device_lanes or self.more_devices:
+                raise ValueError(
+                    "an early overview outcome carries no device lanes"
+                )
+            return
+        if accepted and model_key is None:
+            raise ValueError(
+                "overview accepted data requires the selected external app_key"
+            )
+
+        if self.share is None:
+            if share_provenance is not None:
+                raise ValueError("a missing share cannot carry its provenance")
+        else:
+            if share_provenance is not None:
+                _check_detail_provenance(
+                    share_provenance,
+                    "totals",
+                    model_key,
+                    self.share.window,
+                    requested_window,
+                    "share",
+                )
+            _check_detail_window(
+                self.share.window, requested_window, model_key, "share"
+            )
+
+        # A failed series is not a successful effective Series; only the
+        # lifetime chronology reason describes a value that was measured.
+        if series_metadata is not None:
+            if series_metadata.app_id != self.app_id:
+                raise ValueError("series metadata app_id must match the overview app_id")
+            if model_key is not None and series_metadata.app_key != model_key:
+                raise ValueError(
+                    "series metadata subject must match the overview subject"
+                )
+            if series_unavailable not in (None, LIFETIME_CHRONOLOGY_REASON):
+                raise ValueError("a failed series cannot carry typed series metadata")
+            _check_detail_window(
+                series_metadata.measured_window, requested_window, model_key, "series"
+            )
+            _validate_projected_points(series_metadata, self.task_points)
+        if series_provenance is not None:
+            if series_metadata is None:
+                raise ValueError("a series provenance requires typed series metadata")
+            _check_detail_provenance(
+                series_provenance,
+                "series",
+                model_key,
+                series_metadata.measured_window,
+                requested_window,
+                "series",
+            )
+        if series_unavailable is None and series_metadata is None:
+            raise ValueError(
+                "successful series chronology requires typed series metadata"
+            )
+
+        # Points carry no per-point boot identity, so a lifetime measurement
+        # cannot be drawn as one continuous task timeline (spec §7.1). The
+        # metadata and provenance stay valid; only the projected points fail.
+        if (
+            requested_window.kind == "lifetime"
+            and series_unavailable is None
+            and self.task_points
+        ):
+            raise ValueError(
+                "lifetime chronology cannot project task points"
+            )
+
+        if ranking_provenance is not None:
+            if model_key is None or ranking_provenance.app_key != model_key:
+                raise ValueError(
+                    "ranking provenance must match the selected external subject"
+                )
+            if ranking_provenance.kind != "ranking":
+                raise ValueError("ranking provenance must describe a ranking row")
+            if ranking_provenance.measured_window != requested_window:
+                raise ValueError(
+                    "ranking provenance must be exactly at the requested window"
+                )
+
+        # The lane reason must be the first applicable prerequisite, and a
+        # reason always means zero lanes; both are construction errors when
+        # they disagree with the represented measurements.
+        chronology_reason = series_unavailable
+        if chronology_reason is None and requested_window.kind == "lifetime":
+            chronology_reason = LIFETIME_CHRONOLOGY_REASON
+        expected_reason = _device_lane_reason(
+            chronology_reason=chronology_reason,
+            share=self.share,
+            share_unavailable=share_unavailable,
+            series_coverage=(
+                series_metadata.coverage if series_metadata is not None else None
+            ),
+            series_window=(
+                series_metadata.measured_window
+                if series_metadata is not None
+                else None
+            ),
+        )
+        if lane_reason != expected_reason:
+            raise ValueError(
+                "device lanes: the unavailable reason must be the first applicable reason"
+            )
+        if expected_reason is not None and (self.device_lanes or self.more_devices):
+            raise ValueError(
+                "an unavailable device lane stack carries no lanes or more count"
+            )
 
 
 # --------------------------------------------------------------------------
@@ -409,27 +758,32 @@ def _device_lanes(
 ) -> tuple[tuple[DeviceLaneModel, ...], int]:
     """Select up to three active device lanes ordered by attributable bytes."""
 
-    active: dict[str, list[int]] = {}
-    for row in share.devices:
-        if row.total_bytes <= 0:
-            continue
-        totals = active.setdefault(row.dev, [0, 0])
-        totals[0] += row.rbytes
-        totals[1] += row.wbytes
     ordered = sorted(
-        active.items(),
-        key=lambda item: (-(item[1][0] + item[1][1]), item[0].encode("utf-8")),
+        (
+            row
+            for row in share.devices
+            if row.total_bytes > 0
+            and (share.window.boot_id is None or row.boot_id == share.window.boot_id)
+        ),
+        key=lambda row: (-(row.rbytes + row.wbytes), row.dev.encode("utf-8")),
     )
+    seen: set[str] = set()
+    selected: list[DeviceShareRow] = []
+    for row in ordered:
+        if row.dev in seen:
+            continue
+        seen.add(row.dev)
+        selected.append(row)
     lanes: list[DeviceLaneModel] = []
-    for dev, (read_bytes, write_bytes) in ordered[:MAX_DEVICE_LANES]:
+    for row in selected[:MAX_DEVICE_LANES]:
         points = tuple(
             sorted(
-                (point for point in series.device_points if point.dev == dev),
+                (point for point in series.device_points if point.dev == row.dev),
                 key=lambda point: point.bucket_start_mono_ns,
             )
         )
-        lanes.append(DeviceLaneModel(dev, points, read_bytes, write_bytes))
-    more_devices = max(0, len(ordered) - MAX_DEVICE_LANES)
+        lanes.append(DeviceLaneModel(row.dev, points, row.rbytes, row.wbytes))
+    more_devices = max(0, len(selected) - MAX_DEVICE_LANES)
     return tuple(lanes), more_devices
 
 
@@ -444,6 +798,9 @@ def build_overview(
     series_error: str | None = None,
     share_error: str | None = None,
     coverage_diagnostic: str | None = None,
+    ranking_provenance: AnswerProvenance | None = None,
+    series_provenance: AnswerProvenance | None = None,
+    share_provenance: AnswerProvenance | None = None,
 ) -> OverviewModel:
     """Build the Overview pane from independently available query results."""
 
@@ -462,6 +819,13 @@ def build_overview(
     diagnostic = _require_optional_text(
         coverage_diagnostic, "overview.coverage_diagnostic"
     )
+    ranking_prov = _optional_provenance(
+        ranking_provenance, "overview.ranking_provenance"
+    )
+    series_prov = _optional_provenance(
+        series_provenance, "overview.series_provenance"
+    )
+    share_prov = _optional_provenance(share_provenance, "overview.share_provenance")
 
     # An object supplied together with its own error is a contradiction.
     if total is not None and ranking_reason is not None:
@@ -471,20 +835,57 @@ def build_overview(
     if share is not None and share_reason is not None:
         raise ValueError("a share cannot accompany its error")
 
+    # A dependency missing or failed cannot carry its provenance, and a
+    # provenance alone cannot manufacture accepted data.
+    if ranking_prov is not None and (total is None or ranking_reason is not None):
+        raise ValueError("ranking provenance requires a successful ranking row")
+    if series_prov is not None:
+        if series is None:
+            raise ValueError("series provenance cannot be supplied without its value")
+        if series_reason is not None:
+            raise ValueError("series provenance cannot accompany a series error")
+    if share_prov is not None:
+        if share is None:
+            raise ValueError("share provenance cannot be supplied without its value")
+        if share_reason is not None:
+            raise ValueError("share provenance cannot accompany a share error")
+
+    # Every supplied input describes the same presentation subject: a ranking
+    # row for another ID cannot supply this subject's key, ranking provenance
+    # or PEAK.
+    if total is not None and total.app_id != app_id:
+        raise ValueError(
+            f"ranking total app_id {total.app_id} does not match subject {app_id}"
+        )
+
     if series is not None:
         if series.app_id != app_id:
             raise ValueError(
                 f"series app_id {series.app_id} does not match subject {app_id}"
             )
-        if series.window != window:
-            raise ValueError("series window does not match the requested window")
+        if series_prov is None and series.window != window:
+            raise ValueError(
+                "a series without explicit provenance must carry the exact "
+                "requested window"
+            )
     if share is not None:
         if share.app_id != app_id:
             raise ValueError(
                 f"share app_id {share.app_id} does not match subject {app_id}"
             )
-        if share.window != window:
-            raise ValueError("share window does not match the requested window")
+        if share_prov is None and share.window != window:
+            raise ValueError(
+                "a share without explicit provenance must carry the exact "
+                "requested window"
+            )
+
+    if total is None and (
+        series is not None
+        or share is not None
+        or series_prov is not None
+        or share_prov is not None
+    ):
+        raise ValueError("a file-only subject carries no accepted dependent data")
 
     kind = scope_text(window)
 
@@ -506,6 +907,7 @@ def build_overview(
             _unavailable_coverage_text(diagnostic),
             ranking_reason,
             diagnostic,
+            requested_window=window,
         )
 
     # A subject outside the process ranking (for example a file-only app).
@@ -523,9 +925,49 @@ def build_overview(
             _unavailable_coverage_text(diagnostic),
             NOT_RANKED_REASON,
             diagnostic,
+            requested_window=window,
         )
 
     # KPIs: the share owns TOTAL/READ/WRITE/DEVICE, the ranking owns PEAK.
+    app_key = total.app_key
+    if ranking_prov is None:
+        ranking_prov = _identity_less_provenance("ranking", app_key, window)
+    else:
+        if ranking_prov.kind != "ranking":
+            raise ValueError("ranking provenance must describe a ranking row")
+        if ranking_prov.app_key != app_key:
+            raise ValueError(
+                "ranking provenance must match the selected external subject"
+            )
+        if ranking_prov.measured_window != window:
+            raise ValueError(
+                "ranking provenance must be exactly at the requested window"
+            )
+
+    if share is not None:
+        if share_prov is None:
+            share_prov = _identity_less_provenance("totals", app_key, share.window)
+        _check_detail_provenance(
+            share_prov, "totals", app_key, share.window, window, "share"
+        )
+    if series is not None:
+        if series_prov is None:
+            series_prov = _identity_less_provenance("series", app_key, series.window)
+        _check_detail_provenance(
+            series_prov, "series", app_key, series.window, window, "series"
+        )
+    series_metadata = (
+        SeriesMetadata(
+            series.app_id,
+            app_key,
+            series.window,
+            series.tier,
+            series.coverage,
+        )
+        if series is not None
+        else None
+    )
+
     kpis: tuple[Kpi, ...]
     if share is not None:
         device_defined = (
@@ -561,16 +1003,30 @@ def build_overview(
     else:
         task_points = series.points
 
+    if series_metadata is not None:
+        _validate_projected_points(series_metadata, task_points)
+
+    if share is None:
+        share_unavailable: str | None = (
+            share_reason if share_reason is not None else SHARE_UNAVAILABLE_REASON
+        )
+    else:
+        share_unavailable = None
+
+    device_reason = _device_lane_reason(
+        chronology_reason=chronology_reason,
+        share=share,
+        share_unavailable=share_unavailable,
+        series_coverage=(
+            series_metadata.coverage if series_metadata is not None else None
+        ),
+        series_window=(
+            series_metadata.measured_window if series_metadata is not None else None
+        ),
+    )
     device_lanes: tuple[DeviceLaneModel, ...] = ()
     more_devices = 0
-    if (
-        series is not None
-        and share is not None
-        and chronology_reason is None
-        and share.coverage.device_state == "available"
-        and series.coverage.device_state == "available"
-        and share.device_total_bytes is not None
-    ):
+    if device_reason is None and series is not None and share is not None:
         device_lanes, more_devices = _device_lanes(series, share)
 
     reconciliation = _reconciliation_text(share) if share is not None else None
@@ -590,13 +1046,22 @@ def build_overview(
     if chronology_reason is not None:
         detail_parts.append(f"; series: {chronology_reason}")
     if share is None:
-        share_unavailable = share_reason if share_reason is not None else SHARE_UNAVAILABLE_REASON
         detail_parts.append(f"; share: {share_unavailable}")
-    else:
-        share_unavailable = None
     for name, coverage in sources[1:]:
         if coverage != primary_coverage:
             detail_parts.append(f"; {name} coverage: {_coverage_text(coverage)}")
+    # Provenance disclosure, fixed order share then series, only when the
+    # effective detail measures a different Window than the requested one.
+    if share is not None and share.window != window:
+        detail_parts.append(
+            f"; share measured: {_measured_window_text(share.window)}"
+        )
+    if series is not None and series.window != window:
+        detail_parts.append(
+            f"; series measured: {_measured_window_text(series.window)}"
+        )
+    if device_reason is not None:
+        detail_parts.append(f"; device lanes: {device_reason}")
 
     return OverviewModel(
         app_id,
@@ -611,11 +1076,20 @@ def build_overview(
         coverage_line,
         "".join(detail_parts),
         diagnostic,
+        ranking_provenance=ranking_prov,
+        series_provenance=series_prov,
+        share_provenance=share_prov,
+        device_lanes_unavailable=device_reason,
+        requested_window=window,
+        app_key=app_key,
+        series_metadata=series_metadata,
     )
 
 
 __all__ = [
     "COVERAGE_UNAVAILABLE",
+    "DEVICE_ENDPOINTS_REASON",
+    "DEVICE_TOTAL_UNAVAILABLE_REASON",
     "EMPTY_RANKING_TEXT",
     "KPI_CAPTIONS",
     "LIFETIME_CHRONOLOGY_REASON",
