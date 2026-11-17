@@ -48,6 +48,14 @@ from appio.contracts import (
 from appio.file_runtime import FileAvailability
 from appio.history_export import ExportResult
 from appio.history_router import FileViewResult
+from appio.history_types import (
+    FrameProvenance,
+    LocalBracket,
+    LocalPosition,
+    LocalPositionVector,
+    RemotePosition,
+    SourcePosition,
+)
 from appio.setup_boundary import CommandResult
 from appio.setup_client import SetupReply
 from appio.ui import collector_window as cw
@@ -87,7 +95,14 @@ class FakeConnection:
 
 
 class FakeHistory:
-    """Router-shaped; the ready gate is flipped by the test, never implied."""
+    """Router-shaped; the ready gate is flipped by the test, never implied.
+
+    Source certification is explicit and controllable: ``source`` is the
+    observed ``SourcePosition`` (a local vector by default), ``prepare`` stores
+    the gate's capture, and ``become_ready`` publishes that generation's
+    certificate. ``drain`` reports a changed batch so notification order is
+    observable instead of implied by Window equality.
+    """
 
     def __init__(self, *, ready: bool = False, boot_id: str | None = BOOT, events=None):
         self.local = SimpleNamespace(connection=FakeConnection(boot_id))
@@ -95,6 +110,15 @@ class FakeHistory:
         self.actions: list[tuple] = []
         self.events = events if events is not None else []
         self.prepared: Window | None = None
+        self.prepared_sources: dict[Window, SourcePosition] = {}
+        self.certificates: dict[Window, FrameProvenance] = {}
+        self.source: SourcePosition = LocalPositionVector(
+            (LocalPosition("local", "gui", 1, 1, 0),)
+        )
+        self.source_reads = 0
+        self.drain_calls = 0
+        self.drain_changed = False
+        self.pending_work_flag = False
         self.ranking_calls: list[Window] = []
         self._ready = ready
         self.rows: list[object] = []
@@ -114,14 +138,66 @@ class FakeHistory:
         self.actions.append(("prepare", window))
         self.events.append(("prepare", window))
         self.prepared = window
+        # A new frame owner replaces the previous generation: its capture is
+        # the one the shell reads back, and no older certificate survives.
+        self.prepared_sources = {window: self.source}
+        self.certificates = {}
         self.view_state = "loading"
 
     def ready(self, window: Window) -> bool:
         return self._ready and window == self.prepared
 
+    def source_position(self) -> SourcePosition:
+        self.source_reads += 1
+        return self.source
+
+    def preparation_source(self, window: Window) -> SourcePosition | None:
+        return self.prepared_sources.get(window)
+
+    def frame_provenance(self, window: Window) -> FrameProvenance | None:
+        return self.certificates.get(window)
+
+    def drain(self) -> bool:
+        self.drain_calls += 1
+        changed = self.drain_changed
+        self.drain_changed = False
+        return changed
+
+    @property
+    def pending_work(self) -> bool:
+        return self.pending_work_flag
+
+    def advance_source(self) -> None:
+        """Move the observed source without touching the requested Window."""
+
+        if isinstance(self.source, RemotePosition):
+            self.source = RemotePosition(
+                self.source.boot_id, self.source.iod_epoch, self.source.seq + 1
+            )
+            return
+        source = self.source.sources[0]
+        self.source = LocalPositionVector(
+            (replace(source, total_changes=source.total_changes + 1),)
+        )
+
+    def _certify(self, window: Window) -> None:
+        source = self.prepared_sources.get(window)
+        if source is None:
+            return
+        bracket = (
+            LocalBracket(source, source)
+            if isinstance(source, LocalPositionVector)
+            else None
+        )
+        self.certificates[window] = FrameProvenance(
+            1, window, source, source, bracket, True
+        )
+
     def become_ready(self):
         self._ready = True
         self.view_state = "complete"
+        if self.prepared is not None:
+            self._certify(self.prepared)
 
     def ranking(self, window: Window, metric: str):
         self.ranking_reads += 1
@@ -1725,7 +1801,7 @@ def test_collector_window_wires_stall_caption_to_real_files_view(qtbot, tmp_path
         frames.db.close()
 
 
-@pytest.mark.parametrize("change", ["time", "boot"])
+@pytest.mark.parametrize("change", ["source", "boot"])
 def test_pending_history_retains_a_until_applied_before_b(qtbot, change):
     window, coordinator, history, setup = build(
         qtbot, facts=ON, history=ControlledHistory())
@@ -1737,9 +1813,12 @@ def test_pending_history_retains_a_until_applied_before_b(qtbot, change):
     assert window._displayed is None
     assert len(history.actions) == 1
 
-    # Advance the requested scope without retiring the pending preparation.
-    if change == "time":
+    # Advance the due source without retiring the pending preparation. An
+    # endpoint-only clock advance is expressly not a replacement trigger; a
+    # source position change is.
+    if change == "source":
         window._clock_ns = lambda: END + RAW_BUCKET_NS // 2
+        history.advance_source()
         advanced = Window(kind="since_boot", boot_id=BOOT, end_mono_ns=END + RAW_BUCKET_NS)
     else:
         history.local.connection.boot_id = "next-boot"
@@ -2278,7 +2357,9 @@ def test_real_history_router_gates_rendering_until_ready(qtbot, tmp_path):
         qtbot.waitUntil(lambda: window.history_visible is True, timeout=5000)
         assert window._prepared == requested
         assert history.ready(window._prepared)
-        assert window.history_state.text() == ""
+        # An applied but empty ranking is a settled panel, never an indefinite
+        # loading/live claim (status row 6c).
+        assert window.history_state.text() == "no applications observed"
     finally:
         history.close()
         store.connection.close()
@@ -2664,6 +2745,9 @@ class ControlledHistory(FakeHistory):
         self.registry = SimpleNamespace(id_for=lambda key: 2 if key == "file:beta" else 3)
         self.file_apps: list[tuple[str, str, int]] = []
         self.local.file_applications = self._file_applications
+        #: Test control: a readiness read normally publishes the generation's
+        #: certificate; the uncertified-race arm installs its own instead.
+        self.certify_on_ready = True
 
     @property
     def local_read_in_flight(self):
@@ -2684,12 +2768,18 @@ class ControlledHistory(FakeHistory):
             raise self.prepare_failures.pop(0)
 
     def ready(self, window: Window) -> bool:
-        return window in self.ready_windows
+        is_ready = window in self.ready_windows
+        if is_ready and self.certify_on_ready:
+            # The router publishes a terminal generation's certificate by the
+            # time readiness reports true; mirror that single promotion here.
+            self._certify(window)
+        return is_ready
 
     def become_ready(self, window: Window) -> None:
         self.prepared = window
         self.ready_windows.add(window)
         self.view_state = "ready"
+        self._certify(window)
 
     def request_file_view(self, app_id, window, sort, direction, search):
         self.file_requests.append((app_id, window, sort, direction, search))
@@ -2824,7 +2914,7 @@ def test_replacement_keeps_frame_and_eventually_displays_new_scope(qtbot):
     assert window._pending == scope_window(boot="boot-2")
     assert window.view is host
     assert window.history_visible
-    assert "updating" in window.history_state.text()
+    assert "no applications observed" == window.history_state.text()
     apply_scope(window, history, window._pending)
     assert window._prepared == scope_window(boot="boot-2")
 
@@ -3627,7 +3717,7 @@ class HeldFileDelivery:
 
 def invalidate_shell(shell, route, monkeypatch, *, defer_tick=True):
     window, history, coordinator = shell.window, shell.history, shell.coordinator
-    if defer_tick and route not in ("clock_prepare", "explicit_prepare"):
+    if defer_tick and route not in ("source_prepare", "explicit_prepare"):
         monkeypatch.setattr(window, "_tick_target", lambda: None)
     if route in ("pump", "healthy_pump"):
         if route == "pump":
@@ -3656,9 +3746,17 @@ def invalidate_shell(shell, route, monkeypatch, *, defer_tick=True):
                               "cutoff_mono_ns": frames.state.checkpoint_mono_ns}}))
         assert len(shell.owner._exports) == 1, window.error_label.text()
         assert len(history._sources) == 2
-    elif route == "clock_prepare":
-        shell.target = Window("since_boot", "boot-A",
-            end_mono_ns=shell.target.end_mono_ns + RAW_BUCKET_NS)
+    elif route == "source_prepare":
+        # The source position, not the clock endpoint, is the replacement
+        # trigger. A committed change through the registered connection's own
+        # file changes its total_changes while the requested Window stays the
+        # same, which is exactly one gated replacement (§6.1).
+        frames = shell.frames
+        frames.db.execute(
+            "CREATE TEMP TABLE IF NOT EXISTS source_advance(marker INTEGER)"
+        )
+        frames.db.execute("INSERT INTO source_advance VALUES (1)")
+        frames.db.commit()
         window._clock_ns = lambda: shell.target.end_mono_ns - 1
         window._tick_target()
     elif route == "explicit_prepare":
@@ -3709,7 +3807,7 @@ def test_disable_export_import_preserves_files_through_add_source(real_files_she
 
 
 @pytest.mark.parametrize("route", ["pump", "reconcile", "tick_local", "quiesce", "import",
-                                    "clock_prepare", "explicit_prepare"])
+                                    "source_prepare", "explicit_prepare"])
 def test_worker_wins_cancellation_delivery_is_transient_while_pending(
     real_files_shell, monkeypatch, route
 ):
@@ -3730,7 +3828,7 @@ def test_worker_wins_cancellation_delivery_is_transient_while_pending(
 
 
 @pytest.mark.parametrize("route", ["pump", "reconcile", "tick_local", "quiesce", "import",
-    "clock_prepare", "explicit_prepare", "healthy_pump", "healthy_tick"])
+    "source_prepare", "explicit_prepare", "healthy_pump", "healthy_tick"])
 def test_transient_scope_exit_retires_worker_delivery_before_next_target_tick(
     real_files_shell, monkeypatch, route
 ):
@@ -3751,7 +3849,7 @@ def test_transient_scope_exit_retires_worker_delivery_before_next_target_tick(
         held.win_cancellation(monkeypatch)
         invalidate_shell(shell, route, monkeypatch)
         assert not shell.view._transient
-        if route not in ("clock_prepare", "explicit_prepare"):
+        if route not in ("source_prepare", "explicit_prepare"):
             assert shell.view._scope_ready  # SR-1: readiness has not closed yet.
             assert shell.window._pending is None
         assert shell.view._generation > held.generation
@@ -4624,3 +4722,674 @@ def test_typed_refusal_transitions_own_category_and_preserve_frame(qtbot):
     window._tick_target()
     assert window._presentation_refusal is None
     assert window._displayed is None
+
+
+# ---------------------------------------------------------------------------
+# Task 12: source-driven preparation, continued drain and one composer
+# ---------------------------------------------------------------------------
+
+
+def _remote_client(*, generation: int = 2, epoch: int = 7, seq: int = 3):
+    """A verified answering remote observation with an explicit generation."""
+
+    from appio.ipc_models import StreamCursor
+
+    return SimpleNamespace(
+        state=SimpleNamespace(
+            verified=True,
+            answering=True,
+            cursor=StreamCursor(BOOT, epoch, seq),
+        ),
+        generation=generation,
+    )
+
+
+@pytest.mark.parametrize("mode", ["local", "remote"])
+def test_unchanged_certified_local_or_remote_source_is_quiescent(qtbot, mode):
+    """Only the endpoint-free scope and the certified source permit a prepare."""
+
+    history = ControlledHistory(ready=True)
+    if mode == "remote":
+        history.client = _remote_client()
+        history.source = RemotePosition(BOOT, 7, 3)
+    window, _, history, _ = controlled_build(qtbot, history=history)
+    window._timer.stop()
+    window._poll_timer.stop()
+    recovery = [END - RAW_BUCKET_NS // 2]
+    window._clock_ns = lambda: recovery[0]
+
+    window._tick_target()
+    first = window._pending
+    assert first is not None
+    assert history.prepare_calls == [first]
+    first_source = history.prepared_sources[first]
+    assert first_source == history.source
+    history.become_ready(first)
+    assert window.apply_ready_frame(now=recovery[0]) is True
+    assert window._displayed == first
+    assert window._displayed_certified is True
+    assert window._displayed_source == first_source
+
+    # Repeated endpoint-only ticks in both modes issue no prepare. The larger
+    # unqueried Window is a target, never an applied frame.
+    for _ in range(3):
+        recovery[0] += RAW_BUCKET_NS
+        window._tick_target(now=recovery[0])
+        assert window.apply_ready_frame(now=recovery[0]) is False
+        assert window._pending is None
+    assert history.prepare_calls == [first]
+    assert window._displayed == first
+    # Neither the applied frame nor the desired target adopts the unqueried
+    # larger endpoint while the certified source is unchanged.
+    assert window._target == first
+    assert window._displayed_certified is True
+
+    # A source change is exactly one gated replacement, never one per tick.
+    history.advance_source()
+    window._tick_target(now=recovery[0])
+    assert len(history.prepare_calls) == 2
+    replacement = window._pending
+    assert replacement is not None
+    assert history.prepared_sources[replacement] == history.source
+    assert window.apply_ready_frame(now=recovery[0]) is False
+    history.become_ready(replacement)
+    assert window.apply_ready_frame(now=recovery[0]) is True
+    assert window._displayed == replacement
+    assert window._displayed_source == history.source
+
+    # An explicit request may requery the identical Window/source; afterwards
+    # the unchanged certified source is quiescent again.
+    window.show_window(replacement)
+    assert len(history.prepare_calls) == 3
+    explicit = window._pending
+    assert explicit is not None
+    history.become_ready(explicit)
+    assert window.apply_ready_frame(now=recovery[0]) is True
+    assert window._displayed == replacement
+    window._tick_target(now=recovery[0])
+    assert len(history.prepare_calls) == 3
+    assert window._pending is None
+
+    # A same-authority sequence/counter advance preserves view detail memory; a
+    # mode/connection/boot/epoch or registration change resets it exactly once,
+    # synchronously before the next adoption/notification.
+    view = window.view
+    assert view is not None
+    epoch_before = view._exact_authority_epoch
+    history.advance_source()
+    window._tick_target(now=recovery[0])
+    assert view._exact_authority_epoch == epoch_before
+    advanced = window._pending
+    assert advanced is not None
+    history.become_ready(advanced)
+    assert window.apply_ready_frame(now=recovery[0]) is True
+    if mode == "remote":
+        history.client.generation += 1
+        history.advance_source()
+    else:
+        source = history.source.sources[0]
+        history.source = LocalPositionVector(
+            (replace(source, registration_epoch=source.registration_epoch + 1),)
+        )
+    window._tick_target(now=recovery[0])
+    assert view._exact_authority_epoch == epoch_before + 1
+    # A repeated observation under the same new authority never resets again.
+    window.apply_ready_frame(now=recovery[0])
+    assert view._exact_authority_epoch == epoch_before + 1
+
+
+def test_pending_source_advances_coalesce_without_retiring_detail(qtbot):
+    """Multiple source advances while pending coalesce into one replacement."""
+
+    history = ControlledHistory()
+    history.rows = [app_total()]
+    window, _, history, _ = controlled_build(qtbot, history=history)
+    window._timer.stop()
+    window._poll_timer.stop()
+    window._clock_ns = lambda: END - RAW_BUCKET_NS // 2
+    view = window.view
+    assert view is not None
+    window._tick_target()
+    first = window._pending
+    assert first is not None
+    first_source = history.prepared_sources[first]
+    epoch_before = view._exact_authority_epoch
+    selections = []
+    original_select = view._detail_service.select_detail
+
+    def select(app_key, scope):
+        selections.append((app_key, scope))
+        return original_select(app_key, scope)
+
+    view._detail_service.select_detail = select
+
+    # Same-authority advances while the nonretired preparation is pending
+    # coalesce: no new prepare, no retirement, no detail reset.
+    for _ in range(3):
+        history.advance_source()
+        window._tick_target()
+    assert history.prepare_calls == [first]
+    assert window._pending == first
+    assert window._retry_after is None
+    assert window._pending_source == first_source
+    assert view._exact_authority_epoch == epoch_before
+    assert selections == []
+
+    # Only frame ranking promotes the proved displayed source, and it promotes
+    # the generation's captured source, not the newer coalesced one.
+    history.become_ready(first)
+    assert window.apply_ready_frame() is True
+    assert window._displayed == first
+    assert window._displayed_source == first_source
+    assert window._displayed_certified is True
+    assert window._pending_source is None
+    view.refresh_measurements()
+    assert window._displayed_source == first_source
+
+    # After application the latest due source prepares exactly once.
+    latest = history.source
+    window._tick_target()
+    assert len(history.prepare_calls) == 2
+    replacement = window._pending
+    assert replacement is not None
+    assert history.prepared_sources[replacement] == latest
+    assert window._displayed == first
+    history.become_ready(replacement)
+    assert window.apply_ready_frame() is True
+    assert window._displayed == replacement
+    assert window._displayed_source == latest
+
+    # Same source, same scope: quiescent again.
+    window._tick_target()
+    assert len(history.prepare_calls) == 2
+
+    # An uncertified generation never promotes its source: the flag clears and
+    # the last proved displayed token stays as a token, not as certification.
+    history.advance_source()
+    window._tick_target()
+    uncertified = window._pending
+    assert uncertified is not None
+    newest = history.source
+    following = LocalPositionVector((
+        replace(newest.sources[0], total_changes=newest.sources[0].total_changes + 1),
+    ))
+    history.become_ready(uncertified)
+    history.certificates[uncertified] = FrameProvenance(
+        1, uncertified, newest, None, LocalBracket(newest, following), False
+    )
+    history.certify_on_ready = False
+    assert window.apply_ready_frame() is True
+    assert window._displayed == uncertified
+    assert window._displayed_certified is False
+    assert window._displayed_source == latest
+    assert window._pending_source is None
+
+
+def test_recovery_transition_ownership_survives_source_driven_trigger(qtbot):
+    """Source-driven replacement keeps every frozen recovery owner intact."""
+
+    now = [END - RAW_BUCKET_NS // 2]
+    history = CountingControlledHistory(ready=True)
+    window, coordinator, history, _ = controlled_build(qtbot, history=history)
+    window._timer.stop()
+    window._poll_timer.stop()
+    window._clock_ns = lambda: now[0]
+    window._tick_target()
+    first = window._pending
+    assert first is not None
+    history.become_ready(first)
+    assert window.apply_ready_frame(now=now[0]) is True
+    assert window._displayed_certified is True
+
+    # The frozen queued-reader gate still blocks a due source.
+    history.local_read_busy = True
+    history.advance_source()
+    calls = len(history.prepare_calls)
+    window._tick_target()
+    assert len(history.prepare_calls) == calls
+    assert window._pending is None
+    assert window._displayed == first
+    history.local_read_busy = False
+
+    # With the reader free, the latest due source prepares once through the
+    # existing gate.
+    window._tick_target()
+    replacement = window._pending
+    assert replacement is not None
+    assert len(history.prepare_calls) == calls + 1
+
+    # A same-source probe observation never reconciles while preparation is
+    # pending: the frozen delta predicate still owns that decision.
+    window._facts = OFF
+    window._probe_ticket = 1
+    window._setup_generation = 0
+    reconciles = len(coordinator.reconciles)
+    window._apply_facts(cw.ProbePayload(OFF, None, 1, 0))
+    assert len(coordinator.reconciles) == reconciles
+    assert window._pending == replacement
+
+    # Retirement is the frozen owner: one floor, one deferred target, no
+    # inline replacement.
+    history.view_state = "unavailable: authority changed"
+    retired_at = now[0]
+    window._tick_target()
+    assert window._pending is None
+    assert window._pending_source is None
+    assert window._retry_after == retired_at + PENDING_BUDGET_NS
+    assert window._deferred_target == replacement
+    assert len(history.prepare_calls) == calls + 1
+    now[0] = window._retry_after - 1
+    window._tick_target()
+    assert len(history.prepare_calls) == calls + 1
+    now[0] = window._retry_after
+    window._tick_target()
+    assert len(history.prepare_calls) == calls + 2
+    pending = window._pending
+    assert pending is not None
+    history.become_ready(pending)
+    assert window.apply_ready_frame(now=now[0]) is True
+
+    # The explicit retry marker is still owned by `_submit_prepare`: a source
+    # advance never consumes or retries it from the target tick.
+    history.prepare_failures.append(OSError("disk read failed"))
+    with pytest.raises(OSError, match="disk read failed"):
+        window.show_window(window._displayed)
+    marker = window._prepare_retry
+    assert marker is not None and marker.owner == "explicit"
+    assert window._prepare_error == "appio: disk read failed"
+    calls = len(history.prepare_calls)
+    history.advance_source()
+    window._tick_target()
+    assert window._prepare_retry is marker
+    assert len(history.prepare_calls) == calls
+
+    # `_refresh_after_apply` keeps its sole consume site at the end of apply.
+    window.show_window(window._displayed)
+    retried = window._pending
+    assert retried is not None
+    assert window._prepare_retry is None
+    invalidations = history.invalidations
+    window._refresh_after_apply = True
+    history.become_ready(retried)
+    assert window.apply_ready_frame(now=now[0]) is True
+    assert window._refresh_after_apply is False
+    assert history.invalidations == invalidations + 1
+    assert window.apply_ready_frame(now=now[0]) is False
+    assert history.invalidations == invalidations + 1
+
+
+def test_no_frame_poll_drains_details_and_files_and_notifies_immediately(
+    qtbot, monkeypatch
+):
+    """A settled batch reaches the view from the poll, never from the 1 s tick."""
+
+    now = [END - RAW_BUCKET_NS // 2]
+    history = ControlledHistory()
+    window, _, history, _ = controlled_build(qtbot, history=history)
+    window._timer.stop()
+    window._poll_timer.stop()
+    window._clock_ns = lambda: now[0]
+    window._tick_target()
+    first = window._pending
+    history.become_ready(first)
+    assert window.apply_ready_frame(now=now[0]) is True
+    assert window._pending is None
+    view = window.view
+    assert view is not None
+
+    events: list[tuple] = []
+    original_notify = view.refresh_measurements
+    monkeypatch.setattr(
+        view, "refresh_measurements", lambda: events.append(("notify",)) or original_notify()
+    )
+    original_drain = history.drain
+
+    def drain() -> bool:
+        events.append(("drain", history.pending_work_flag))
+        return original_drain()
+
+    monkeypatch.setattr(history, "drain", drain)
+    monkeypatch.setattr(
+        window, "_current_window", lambda *_args: pytest.fail("poll computed a target")
+    )
+    ranking_reads = history.ranking_reads
+    prepare_calls = len(history.prepare_calls)
+
+    # A completed detail/Files batch is applied and notified before any tick.
+    history.pending_work_flag = True
+    history.drain_changed = True
+    assert window.apply_ready_frame(now=now[0], context="poll") is False
+    assert events == [("drain", True), ("notify",)]
+    assert history.ranking_reads == ranking_reads
+    assert len(history.prepare_calls) == prepare_calls
+    assert window._pending is None
+    assert window._poll_timer.isActive()
+
+    # A held expired slot keeps the same pump armed.
+    window._poll_history()
+    assert window._poll_timer.isActive()
+    # Poll stops only once no frame, detail or Files work remains.
+    history.pending_work_flag = False
+    window._poll_history()
+    assert not window._poll_timer.isActive()
+    assert events[0] == ("drain", True)
+
+    # A changed batch is drained even when no public work bit remains set: the
+    # notification is the owner-thread delivery, not a second query.
+    history.drain_changed = True
+    assert window.apply_ready_frame(now=now[0], context="poll") is False
+    assert events[-2:] == [("drain", False), ("notify",)]
+
+    # Admission after application arms the same pump: the view's measurement
+    # signal and the Files state-change handler both route to `_arm_poll`.
+    history.pending_work_flag = True
+    window._poll_timer.stop()
+    view.measurement_work_requested.emit()
+    assert window._poll_timer.isActive()
+    window._poll_timer.stop()
+    window.files_view.state_changed.emit("files")
+    assert window._poll_timer.isActive()
+    history.pending_work_flag = False
+    window._poll_timer.stop()
+
+    # A deferred target alone arms nothing and authorises no poll submission.
+    deferred = scope_window(END + RAW_BUCKET_NS)
+    window._deferred_target = deferred
+    window._deferred_origin = "clock"
+    calls = len(history.prepare_calls)
+    assert window.apply_ready_frame(now=now[0], context="poll") is False
+    assert len(history.prepare_calls) == calls
+    assert window._deferred_target == deferred
+    window._poll_history()
+    assert not window._poll_timer.isActive()
+    assert window._deferred_target == deferred
+
+    # A still-owned explicit PrepareRetry stays owned and unconsumed.
+    marker = cw.PrepareRetry(deferred, "explicit", now[0])
+    window._prepare_retry = marker
+    window._prepare_error = "appio: disk read failed"
+    assert window.apply_ready_frame(now=now[0], context="poll") is False
+    assert window._prepare_retry is marker
+    assert window._prepare_error == "appio: disk read failed"
+    assert len(history.prepare_calls) == calls
+    window._update_overview_status(now[0])
+    assert window.history_state.text() == "appio: disk read failed"
+
+
+def _deferred_fixture(qtbot, *, ready: bool = False):
+    history = ControlledHistory(ready=ready)
+    window, _, history, _ = controlled_build(qtbot, history=history)
+    window._timer.stop()
+    window._poll_timer.stop()
+    now = [END - RAW_BUCKET_NS // 2]
+    window._clock_ns = lambda: now[0]
+    deferred = scope_window(END + RAW_BUCKET_NS)
+    window._deferred_target = deferred
+    window._deferred_origin = "clock"
+    return window, history, now, deferred
+
+
+def _recovery_fields(window) -> tuple:
+    return (
+        window._pending,
+        window._pending_source,
+        window._deferred_target,
+        window._deferred_origin,
+        window._prepare_retry,
+        window._prepare_error,
+        window._retry_after,
+        window._stalled,
+    )
+
+
+def test_no_frame_deferred_apply_uses_ordinary_gate_but_poll_never_submits(qtbot):
+    """Only an ordinary apply may run the deferred target gate, exactly once."""
+
+    # Free gate: exactly one ordinary prepare, zero poll prepares, at most one
+    # immediate apply.
+    window, history, now, deferred = _deferred_fixture(qtbot)
+    events: list[tuple] = []
+    view = window.view
+    original_notify = view.refresh_measurements
+    original_drain = history.drain
+    monkeypatch = pytest.MonkeyPatch()
+    try:
+        monkeypatch.setattr(
+            view, "refresh_measurements",
+            lambda: events.append(("notify",)) or original_notify(),
+        )
+
+        def drain() -> bool:
+            events.append(("drain",))
+            return original_drain()
+
+        monkeypatch.setattr(history, "drain", drain)
+        history.drain_changed = True
+        assert window.apply_ready_frame(now=now[0], context="poll") is False
+        assert events == [("drain",), ("notify",)]
+        assert len(history.prepare_calls) == 0
+        assert window._deferred_target == deferred
+        history.drain_changed = True
+        assert window.apply_ready_frame(now=now[0], context="ordinary") is False
+        assert len(history.prepare_calls) == 1
+        assert history.prepare_calls == [deferred]
+        assert window._pending == deferred
+        assert window._deferred_target == deferred
+        # Every context drains and notifies a completed detail batch first.
+        assert events[2:] == [("drain",), ("notify",)]
+    finally:
+        monkeypatch.undo()
+        window.shutdown()
+
+    # Immediately ready registration: the same ordinary call applies once.
+    window, history, now, deferred = _deferred_fixture(qtbot, ready=True)
+    try:
+        history.ready_windows.add(deferred)
+        assert window.apply_ready_frame(now=now[0], context="ordinary") is True
+        assert window._displayed == deferred
+        assert history.prepare_calls == [deferred]
+        assert window.apply_ready_frame(now=now[0], context="ordinary") is False
+        assert len(history.prepare_calls) == 1
+    finally:
+        window.shutdown()
+
+    # Held frame Future: both contexts prepare zero and preserve the request.
+    window, history, now, deferred = _deferred_fixture(qtbot)
+    try:
+        window._pending = scope_window()
+        window._pending_since = now[0]
+        before = _recovery_fields(window)
+        assert window.apply_ready_frame(now=now[0], context="poll") is False
+        assert window.apply_ready_frame(now=now[0], context="ordinary") is False
+        assert history.prepare_calls == []
+        assert _recovery_fields(window) == before
+    finally:
+        window.shutdown()
+
+    # Future floor: both contexts prepare zero and preserve floor/request.
+    window, history, now, deferred = _deferred_fixture(qtbot)
+    try:
+        window._retry_after = now[0] + 1_000_000_001
+        before = _recovery_fields(window)
+        assert window.apply_ready_frame(now=now[0], context="poll") is False
+        assert window.apply_ready_frame(now=now[0], context="ordinary") is False
+        assert history.prepare_calls == []
+        assert _recovery_fields(window) == before
+        assert window._retry_after == now[0] + 1_000_000_001
+        # An expired floor with an idle reader: ordinary prepares once, poll
+        # still submits nothing and leaves the request deferred.
+        now[0] = window._retry_after
+        assert window.apply_ready_frame(now=now[0], context="poll") is False
+        assert history.prepare_calls == []
+        assert window._deferred_target == deferred
+        assert window.apply_ready_frame(now=now[0], context="ordinary") is False
+        assert history.prepare_calls == [deferred]
+        assert window._pending == deferred
+    finally:
+        window.shutdown()
+
+    # Explicit PrepareRetry: zero prepares in both contexts, marker preserved.
+    window, history, now, deferred = _deferred_fixture(qtbot)
+    try:
+        marker = cw.PrepareRetry(deferred, "explicit", now[0])
+        window._prepare_retry = marker
+        window._prepare_error = "appio: disk read failed"
+        before = _recovery_fields(window)
+        assert window.apply_ready_frame(now=now[0], context="poll") is False
+        assert window.apply_ready_frame(now=now[0], context="ordinary") is False
+        assert history.prepare_calls == []
+        assert _recovery_fields(window) == before
+    finally:
+        window.shutdown()
+
+
+def test_native_composition_binds_one_age_clock_domain(qtbot, tmp_path):
+    """Real client/router/view/composer share one MONOTONIC age clock only."""
+
+    from appio.history_router import HistoryRouter
+    from appio.iodclient import (
+        NO_ANSWER_NS,
+        REQUEST_LIFETIME_NS,
+        AppRegistry,
+    )
+    from appio.query import QueryService
+    from appio.store import AppIoStore
+    from live_overview_support import Clock, total
+    from live_overview_transport import QueryTransportHarness
+
+    key = "unit:alpha.service"
+    age = Clock(ns=5_000_000_000)
+    recovery = Clock(ns=age.ns + 300_000_000_000)
+    assert recovery.ns - age.ns == 300_000_000_000
+    transport = QueryTransportHarness(
+        boot_id=BOOT, cursor=RemotePosition(BOOT, 7, 3), clock=age
+    )
+    transport.stream(4)
+    store = AppIoStore(tmp_path / "native-composition.db")
+    store.start_boot(BOOT, 1, 0, 1000.0, "gui")
+    store.connection.commit()
+    router = HistoryRouter(
+        QueryService(store), transport.client, AppRegistry(), clock_ns=age
+    )
+    coordinator = ControlledCoordinator()
+    coordinator.history = router
+    window = CollectorWindow(
+        coordinator,
+        router,
+        ControlledSetup(OFF),
+        clock_ns=recovery,
+        age_clock_ns=age,
+        pump=transport.pump,
+        refresh_interval_ms=1000,
+    )
+    qtbot.addWidget(window)
+    qtbot.addWidget(window.settings)
+    window.show()
+    window._timer.stop()
+    window._poll_timer.stop()
+    try:
+        view = window.view
+        assert view is not None
+        # One age clock reaches the client, router, embedded view and composer;
+        # the shell's BOOTTIME recovery clock stays separate.
+        assert transport.client._clock_ns is age
+        assert router._clock_ns is age
+        assert window._age_clock_ns is age
+        assert window._clock_ns is recovery
+        assert view._clock_ns is age
+
+        window._tick_target(now=recovery())
+        pending = window._pending
+        assert pending is not None
+        transport.pump()
+        _token, future = router._occupant
+        assert router._local_future is not None
+        assert router._local_future.result(timeout=20) is not None
+        transport.reply(future, [total(17, key, peak=1024)], snapshot="a" * 64)
+        assert router.ready(pending) is True
+        assert window.apply_ready_frame(now=recovery()) is True
+        assert view.measurement_status().displayed_answers
+        assert view.overview_age.text() == "oldest answer 0 s ago"
+
+        # One second of the age clock moves only the age label.
+        age.advance_ns(1_000_000_000)
+        window._update_overview_status(recovery())
+        assert view.overview_age.text() == "oldest answer 1 s ago"
+
+        # A recovery-only advance changes the retry floor text, never the age.
+        window._retry_after = recovery() + 1_000_000_001
+        window._update_overview_status(recovery())
+        assert window.history_state.text().endswith("retrying in 2 s")
+        recovery.advance_ns(1_000_000_000)
+        window._update_overview_status(recovery())
+        assert window.history_state.text().endswith("retrying in 1 s")
+        assert view.overview_age.text() == "oldest answer 1 s ago"
+        # The floor is a BOOTTIME instant: the age clock can never arm it.
+        assert window._retry_after > age()
+
+        # Router retirement deadline: the same age clock decides the
+        # request-specific silence deadline. A dedicated real router holds one
+        # ranking request past its wire expiry so no successor can mask the
+        # occupied slot.
+        deadline_store = AppIoStore(tmp_path / "native-router-deadline.db")
+        deadline_store.start_boot(BOOT, 1, 0, 1000.0, "gui")
+        deadline_store.connection.commit()
+        deadline_transport = QueryTransportHarness(
+            boot_id=BOOT, cursor=RemotePosition(BOOT, 7, 3), clock=age
+        )
+        deadline_transport.stream(4)
+        deadline_router = HistoryRouter(
+            QueryService(deadline_store),
+            deadline_transport.client,
+            AppRegistry(),
+            clock_ns=age,
+        )
+        deadline_window = Window("since_boot", BOOT, end_mono_ns=pending.end_mono_ns)
+        deadline_router.prepare(deadline_window)
+        deadline_transport.pump()
+        _deadline_token, ranking_future = deadline_router._occupant
+        assert deadline_router._local_future is not None
+        deadline_router._local_future.result(timeout=20)
+        state = deadline_transport.client.query_transport(ranking_future)
+        issued = state.issued_at_ns
+        assert issued == age()
+        deadline = issued + REQUEST_LIFETIME_NS + NO_ANSWER_NS
+        # A BOOTTIME instant is already past this deadline, which cannot settle
+        # or release the request by itself.
+        assert recovery() > deadline
+        assert ranking_future.done() is False
+        age.ns = issued + REQUEST_LIFETIME_NS - 1
+        deadline_transport.stream(5)
+        assert ranking_future.done() is False
+        age.ns = issued + REQUEST_LIFETIME_NS
+        deadline_transport.stream(6)
+        assert ranking_future.done() is True
+        deadline_router.drain()
+        # Expired but before the silence deadline: the occupant stays and the
+        # connection remains usable for a correlated late answer.
+        assert deadline_router._occupant is not None
+        assert (
+            deadline_transport.client.query_transport(ranking_future).phase
+            == "expired"
+        )
+        age.ns = deadline - 1
+        deadline_transport.stream(7)
+        deadline_router.drain()
+        assert deadline_router._occupant is not None
+        assert (
+            deadline_transport.client.query_transport(ranking_future).phase
+            == "expired"
+        )
+        # At equality the router retires the still-expired connection once.
+        age.ns = deadline
+        deadline_router.drain()
+        assert deadline_router._occupant is None
+        assert (
+            deadline_transport.client.query_transport(ranking_future).phase
+            == "lost"
+        )
+        deadline_router.close()
+        deadline_store.connection.close()
+    finally:
+        window.shutdown()
+        store.connection.close()
