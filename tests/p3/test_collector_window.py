@@ -2856,6 +2856,73 @@ def controlled_build(qtbot, *, facts=OFF, ready=False, setup=None, history=None,
     return window, coordinator, history, setup
 
 
+class PublicHistoryProvider:
+    """Expose the public injected-history surface without fake gate fields."""
+
+    _public = frozenset({
+        "client", "local", "registry", "view_state", "prepare", "ready",
+        "source_position", "preparation_source", "frame_provenance", "drain",
+        "pending_work", "local_read_in_flight", "ranking", "file_source_status",
+        "request_file_view", "disk_share", "series", "invalidate", "close",
+    })
+
+    def __init__(self, backing):
+        self._backing = backing
+
+    def __getattr__(self, name):
+        if name not in self._public:
+            raise AttributeError(name)
+        return getattr(self._backing, name)
+
+
+def test_injected_public_ready_contract_binds_files_to_applied_frame(qtbot):
+    backing = ControlledHistory(ready=True)
+    provider = PublicHistoryProvider(backing)
+    assert all(not hasattr(provider, name) for name in ("ready_windows", "prepared", "_ready", "_frame"))
+    window, _, _, _ = controlled_build(qtbot, history=provider)
+    window._timer.stop()
+    window._poll_timer.stop()
+    try:
+        window.refresh()
+        assert window._displayed is not None
+        assert window.view is not None
+        assert window.files_view._window == window._displayed
+    finally:
+        window.shutdown()
+
+
+@pytest.mark.parametrize("outcome", ["false", "error"])
+def test_injected_public_ready_false_or_error_does_not_sync_files(qtbot, monkeypatch, outcome):
+    backing = ControlledHistory(ready=True)
+    provider = PublicHistoryProvider(backing)
+    window, _, _, _ = controlled_build(qtbot, history=provider)
+    window._timer.stop()
+    window._poll_timer.stop()
+    try:
+        window.refresh()
+        displayed = window._displayed
+        assert displayed is not None
+        assert window.files_view._window == displayed
+        readiness_calls = []
+        sync_calls = []
+
+        def unavailable_ready(checked_window):
+            readiness_calls.append(checked_window)
+            if outcome == "error":
+                raise RuntimeError("readiness unavailable")
+            return False
+
+        monkeypatch.setattr(backing, "ready", unavailable_ready)
+        monkeypatch.setattr(window.files_view, "set_window", sync_calls.append)
+        assert window._history_ready(displayed) is False
+        window._sync_files()
+        assert readiness_calls and all(checked == displayed for checked in readiness_calls)
+        assert sync_calls == []
+        assert window.files_view._window == displayed
+    finally:
+        window.shutdown()
+
+
 def settle_probe(qtbot, window, *, after):
     qtbot.waitUntil(lambda: window.facts_applied > after, timeout=2000)
 

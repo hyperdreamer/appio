@@ -732,18 +732,17 @@ class CollectorWindow(QMainWindow):
     # -- Files ownership --------------------------------------------------
 
     def _history_ready(self, window: Window | None) -> bool:
-        """Read the last owner-published readiness result without pumping.
+        """Observe native published readiness or an injected provider's contract.
 
         HistoryRouter.ready() drains worker completions before returning. A
         status refresh cannot own that drain because the shell would lose the
         changed bit needed to notify the Overview. Read the router's published
-        gate state here; frame readiness itself remains owned by
-        apply_ready_frame().
+        gate state here; other providers expose readiness through ready(window).
         """
 
         if window is None:
             return False
-        if hasattr(self.history, "_frame") and hasattr(self.history, "_window"):
+        if isinstance(self.history, HistoryRouter):
             frame = getattr(self.history, "_frame", None)
             return bool(
                 getattr(self.history, "_window", None) == window
@@ -753,14 +752,10 @@ class CollectorWindow(QMainWindow):
                 and getattr(frame, "error", None) is None
                 and getattr(self.history, "_frame_error", None) is None
             )
-        ready_windows = getattr(self.history, "ready_windows", None)
-        if ready_windows is not None:
-            return window in ready_windows
-        prepared = getattr(self.history, "prepared", None)
-        return bool(
-            prepared == window
-            and getattr(self.history, "_ready", False)
-        )
+        try:
+            return bool(self.history.ready(window))
+        except Exception:
+            return False
 
     def _files_status_text(self) -> str | None:
         window = self._displayed or self._pending or self._target
