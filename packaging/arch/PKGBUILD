@@ -2,7 +2,7 @@
 # Local/dev package: the source tarball is exported from this checkout by
 # packaging/arch/build-package.sh, which also verifies the digest below.
 pkgname=appio
-pkgver=0.1.5
+pkgver=0.1.6
 pkgrel=1
 pkgdesc='Application I/O monitor: system-wide collector, IPC protocol and Qt viewer'
 arch=('x86_64')
@@ -14,7 +14,7 @@ makedepends=('clang' 'pkgconf' 'python-build' 'python-installer' 'python-setupto
 # would otherwise drop C sources for the BPF object under /usr/src/debug.
 options=('!strip' '!debug')
 source=("appio-$pkgver.tar.gz")
-sha256sums=('c2cefe175abe90d785b34ce642e10aea28262447fb314d5c135dae81463e5e84')
+sha256sums=('73629acdecb8676ea600651982857a2d963b5199861a9974a09a307764fa8efa')
 
 build() {
   cd "$srcdir/$pkgname-$pkgver"
