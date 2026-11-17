@@ -951,6 +951,18 @@ class CollectorWindow(QMainWindow):
         if waiting and not self._poll_timer.isActive():
             self._poll_timer.start()
 
+    def _drain_history(self) -> None:
+        """Collect settled router work on the owner thread; never query.
+
+        A ready frame is settled through ``ready``; Files pages and lazy detail
+        finish on the shared scheduler and are only published by an owner
+        drain. The shell's history service is structural, so a service that
+        reports no pending work has nothing to collect.
+        """
+
+        if getattr(self.history, "pending_work", False):
+            self.history.drain()
+
     def _submit_prepare(
         self, wanted: Window, origin: Literal["clock", "explicit"], *, now: int | None = None
     ) -> bool:
@@ -1043,6 +1055,11 @@ class CollectorWindow(QMainWindow):
     def apply_ready_frame(self, *, now: int | None = None) -> bool:
         if self._closed:
             return False
+        # Framework details, Files pages and lazy detail all settle through the
+        # router's one scheduler, so every apply/ordinary call drains it once
+        # even when no frame is pending. Settling never issues a query; a
+        # completed page must reach its owner before the next readiness read.
+        self._drain_history()
         if self._prepare_retry is not None and self._prepare_retry.owner == "explicit":
             return False
         now = self._clock_ns() if now is None else now
@@ -1108,7 +1125,13 @@ class CollectorWindow(QMainWindow):
             with self.files_view.transient_scope():
                 self._refresh_after_apply = False
                 self.history.invalidate()
-        self._poll_timer.stop()
+        # Application does not end router work: the adoption above may have
+        # admitted Files pages or lazy detail. Stop the poll only when nothing
+        # is left to pump and drain, as the frozen stop rule requires.
+        if getattr(self.history, "pending_work", False):
+            self._arm_poll()
+        else:
+            self._poll_timer.stop()
 
     def _poll_history(self) -> None:
         if self._closed or (self._pending is None and not getattr(self.history, "pending_work", False)):

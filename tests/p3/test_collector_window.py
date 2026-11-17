@@ -3512,11 +3512,23 @@ def real_files_shell(qtbot, tmp_path, monkeypatch):
     history._local_future.result(timeout=5)
     assert window.apply_ready_frame()
     view = window.files_view
-    qtbot.waitUntil(lambda: view.last_result is not None, timeout=5000)
+
+    def pumped(predicate):
+        # Files pages, frame ranking and lazy detail all settle through the
+        # router's scheduler, which the console's own poll drains and pumps.
+        # Both timers are stopped in this fixture, so the wait drives exactly
+        # that production entry point instead of assuming a direct callback.
+        def probe():
+            window._poll_history()
+            return predicate()
+
+        return probe
+
+    qtbot.waitUntil(pumped(lambda: view.last_result is not None), timeout=5000)
     window.open_files_unavailable()
     view.set_sort("bytes_r", "asc")
     view.search_field.setText("alpha")
-    qtbot.waitUntil(lambda: not view._outstanding, timeout=5000)
+    qtbot.waitUntil(pumped(lambda: not view._outstanding), timeout=5000)
     assert view.model.rowCount() == 24
     view.table.setFixedHeight(100)
     qtbot.wait(10)
@@ -3554,10 +3566,12 @@ class HeldFileDelivery:
         history, view = shell.history, shell.view
         read = history._read_local_files
 
-        def held(*args):
+        def held(*args, **kwargs):
             self.started.set()
             assert self.release.wait(5), "file worker not released"
-            return read(*args)
+            # The scheduler admits its Files worker with its token binding, so
+            # the wrapper forwards the worker id/request keywords untouched.
+            return read(*args, **kwargs)
 
         def capture(generation, future):
             self.transient_at_settlement.append(view._transient)
@@ -3566,13 +3580,23 @@ class HeldFileDelivery:
 
         monkeypatch.setattr(history, "_read_local_files", held)
         monkeypatch.setattr(view, "_deliver", capture)
+        charged = set(history._worker_jobs)
         view.request_refresh()
         assert self.started.wait(1)
+        admitted = set(history._worker_jobs) - charged
+        self.worker_future = history._worker_jobs[next(iter(admitted))][1]
         self.future = next(iter(history._file_jobs))
         self.generation = view._generation
         self.history_generation = history._generation
         self.requests = len(view.requests)
         self.snapshot = files_snapshot(view)
+
+    def settle_worker(self):
+        """Release the held worker and wait for its terminal executor outcome."""
+
+        self.release.set()
+        assert self.worker_future is not None
+        self.worker_future.result(timeout=5)
 
     def win_cancellation(self, monkeypatch, *, synchronous=False):
         history, view = self.shell.history, self.shell.view
@@ -3580,15 +3604,23 @@ class HeldFileDelivery:
 
         def after_generation_bump():
             assert history._generation > self.history_generation
-            self.release.set()
+            # The worker wins the race: it has already finished before the
+            # cancellation runs. Its outcome waits in the router's completion
+            # queue, and the cancellation retires the delivery that a removed
+            # direct callback used to settle.
+            self.settle_worker()
+            cancel()
             assert self.delivered.wait(2), "worker did not settle before cancellation"
             if synchronous:
                 view._on_delivered(self.payloads[0])
-            cancel()
 
         monkeypatch.setattr(history, "_cancel_file_requests", after_generation_bump)
 
     def replay(self):
+        # A terminal worker is collected by the owner's drain, which is the
+        # scheduler's replacement for the removed per-job completion callback.
+        self.settle_worker()
+        self.shell.history.drain()
         assert self.delivered.wait(2)
         self.shell.view._on_delivered(self.payloads[0])
 
@@ -3769,6 +3801,34 @@ def test_late_retired_file_delivery_after_ready_is_dropped_and_requeried_once(
         assert len(shell.view.requests) == held.requests + 1
     finally:
         held.release.set()
+
+
+def test_files_page_admitted_after_application_settles_without_a_new_frame(
+    real_files_shell, qtbot
+):
+    """An applied frame still has to collect the Files work it admitted.
+
+    Every Files page is a scheduler slot, so nothing completes it straight from
+    a worker callback any more. Application keeps the poll armed while the
+    router holds work, and an apply call drains that work even with no pending
+    frame. Without the drain the page would stay outstanding and the table
+    would never leave its loading state.
+    """
+
+    shell = real_files_shell
+    window, history, view = shell.window, shell.history, shell.view
+    assert window._pending is None and window._displayed is not None
+    before = len(view.requests)
+    view.set_sort("bytes_w", "asc")
+    assert len(view.requests) == before + 1
+    assert view._outstanding and history.pending_work
+
+    # No replacement frame is due; only the router's settled page remains.
+    qtbot.waitUntil(
+        lambda: (window.apply_ready_frame(), not view._outstanding)[1], timeout=5000
+    )
+    assert view.last_result is not None
+    assert view.last_request.sort == "bytes_w"
 
 
 # Task 4 review regressions. Each M-number names the review ledger mutation
