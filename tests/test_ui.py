@@ -49,6 +49,7 @@ from appio.contracts import (
     DeviceSeriesPoint,
     DeviceShareRow,
     DiskShare,
+    HistoryPending,
     HookHits,
     MAX_RANGE_NS,
     Series,
@@ -517,6 +518,8 @@ def test_window_consumes_only_query_contracts(qtbot) -> None:
             "sqlite3",
             "appio.query",
             "appio.store",
+            "appio.history_router",
+            "appio.iodclient",
             "/proc",
             "SELECT ",
         ):
@@ -3765,3 +3768,783 @@ def test_mixed_endpoint_inputs_keep_independent_outputs() -> None:
     assert series_old.detail_line.endswith(
         "; device lanes: device measurements have different endpoints"
     )
+
+
+# --------------------------------------------------------------------------
+# §6.2-6.3 / §12.5 retained capability: the real exact-only adapter, identity
+# reacceptance, authority reset and the query-free measurement notification.
+# --------------------------------------------------------------------------
+
+
+class ExactOnlyClock:
+    """An injected MONOTONIC age clock in ns; never the wall clock."""
+
+    def __init__(self, now_ns: int = 0) -> None:
+        self.now_ns = now_ns
+
+    def __call__(self) -> int:
+        return self.now_ns
+
+    def advance_ns(self, delta: int) -> None:
+        self.now_ns += delta
+
+
+class ExactOnlyQuery:
+    """A structural three-method exact service with independent kind answers.
+
+    It has no retained methods, no identity method, no store and no connection:
+    the window's real private adapter owns selection, slot, record, failure and
+    reset semantics. Results are keyed by ``(kind, app_id, window)`` so one
+    kind/window can be pending or failed without disturbing the other, and
+    every query/identity call is recorded.
+    """
+
+    def __init__(self) -> None:
+        self.rows: list[AppTotal] = []
+        self.results: dict[tuple[str, int, Window], object] = {}
+        self.calls: dict[str, int] = {
+            "ranking": 0,
+            "series": 0,
+            "totals": 0,
+            "identity": 0,
+        }
+        self.events: list[tuple] = []
+        self.ranking_error: BaseException | None = None
+
+    # -- configuration ----------------------------------------------------
+
+    def set_share(self, window: Window, value: DiskShare) -> None:
+        self.results[("totals", value.app_id, window)] = value
+
+    def set_series(self, window: Window, value: Series) -> None:
+        self.results[("series", value.app_id, window)] = value
+
+    def set_pending(self, kind: str, app_id: int, window: Window) -> None:
+        self.results[(kind, app_id, window)] = HistoryPending("still loading")
+
+    def set_error(
+        self, kind: str, app_id: int, window: Window, error: BaseException
+    ) -> None:
+        self.results[(kind, app_id, window)] = error
+
+    # -- the three exact getters ------------------------------------------
+
+    def ranking(self, window: Window, metric: str) -> list[AppTotal]:
+        self.calls["ranking"] += 1
+        self.events.append(("ranking", window, metric))
+        if self.ranking_error is not None:
+            raise self.ranking_error
+        return list(self.rows)
+
+    def disk_share(self, app_id: int, window: Window) -> DiskShare:
+        return self._exact("totals", app_id, window)
+
+    def series(self, app_id: int, window: Window) -> Series:
+        return self._exact("series", app_id, window)
+
+    def _exact(self, kind: str, app_id: int, window: Window):
+        self.calls[kind] += 1
+        self.events.append(("get", kind, app_id, window))
+        configured = self.results.get((kind, app_id, window))
+        if isinstance(configured, BaseException):
+            raise configured
+        if configured is not None:
+            return configured
+        if kind == "series":
+            return measured_series(window)
+        return measured_share(window)
+
+
+class IdentityExactOnlyQuery(ExactOnlyQuery):
+    """Adds exactly the one optional ``exact_answer_identity`` callable."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.identities: dict[tuple[str, str, Window], object] = {}
+
+    def exact_answer_identity(
+        self, kind: str, app_key: str, window: Window
+    ) -> object:
+        self.calls["identity"] += 1
+        self.events.append(("identity", kind, app_key, window))
+        configured = self.identities.get((kind, app_key, window))
+        if isinstance(configured, BaseException):
+            raise configured
+        return configured
+
+
+class PartialRetainedQuery(ExactOnlyQuery):
+    """Four of the five retained methods: a partial capability must fall back."""
+    def __init__(self) -> None:
+        super().__init__()
+        self.retained_calls: list[tuple] = []
+
+    def _unused(self, name: str, *args: object):
+        self.retained_calls.append((name, args))
+        raise AssertionError(f"a partial retained capability must not be used: {name}")
+
+    def select_detail(self, app_key, window):
+        return self._unused("select_detail", app_key, window)
+
+    def request_detail(self, kind, app_id, window):
+        return self._unused("request_detail", kind, app_id, window)
+
+    def part_state(self, kind, app_key, scope):
+        return self._unused("part_state", kind, app_key, scope)
+
+    def retained(self, kind, app_key, scope, applied_endpoint_at):
+        return self._unused("retained", kind, app_key, scope, applied_endpoint_at)
+
+
+class RecordingRetainedQuery(ExactOnlyQuery):
+    """The full five-method capability, recording its owner-side retirement."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.select_calls: list[tuple] = []
+        self.retained_calls: list[tuple] = []
+        self.records: dict[str, object] = {}
+        self._selected: tuple[str | None, Window | None] = (None, None)
+        self._requests = 0
+
+    def select_detail(self, app_key, window) -> None:
+        self.select_calls.append((app_key, window))
+        self._selected = (app_key, window)
+
+    def request_detail(self, kind, app_id, window):
+        from appio.history_types import PartState
+
+        self.retained_calls.append(("request_detail", kind, app_id, window))
+        self._requests += 1
+        key = self._selected[0]
+        assert key is not None
+        return PartState(
+            kind,
+            key,
+            retention_scope(key, window),
+            "pending",
+            self._requests,
+            window,
+            None,
+            None,
+        )
+
+    def part_state(self, kind, app_key, scope):
+        from appio.history_types import PartState
+
+        self.retained_calls.append(("part_state", kind, app_key, scope))
+        return PartState(kind, app_key, scope, "absent", None, None, None, None)
+
+    def retained(self, kind, app_key, scope, applied_endpoint_at):
+        self.retained_calls.append(("retained", kind, app_key, scope))
+        return self.records.get(kind)
+
+    def ranking_provenance(self, app_key, window):
+        self.retained_calls.append(("ranking_provenance", app_key, window))
+        return None
+
+
+class BrokenRetainedQuery(ExactOnlyQuery):
+    """All five retained methods are callable and genuinely fail."""
+
+    def _broken(self, name: str, *args: object):
+        raise RuntimeError(f"retained capability failed: {name}")
+
+    def select_detail(self, app_key, window):
+        return self._broken("select_detail", app_key, window)
+
+    def request_detail(self, kind, app_id, window):
+        return self._broken("request_detail", kind, app_id, window)
+
+    def part_state(self, kind, app_key, scope):
+        return self._broken("part_state", kind, app_key, scope)
+
+    def retained(self, kind, app_key, scope, applied_endpoint_at):
+        return self._broken("retained", kind, app_key, scope, applied_endpoint_at)
+
+    def ranking_provenance(self, app_key, window):
+        return self._broken("ranking_provenance", app_key, window)
+
+
+def test_pending_refresh_keeps_retained_dependency_values(qtbot) -> None:
+    clock = ExactOnlyClock(1_000_000_000)
+    service = IdentityExactOnlyQuery()
+    service.rows = [app_total(1, SUBJECT_KEY, "Alpha", 22, peak_bps=None)]
+    service.set_share(WINDOW_A, measured_share(WINDOW_A))
+    service.set_series(WINDOW_A, measured_series(WINDOW_A))
+    service.identities[("totals", SUBJECT_KEY, WINDOW_A)] = AcceptedIdentity(
+        "totals", SUBJECT_KEY, WINDOW_A, "b" * 64
+    )
+    service.identities[("series", SUBJECT_KEY, WINDOW_A)] = AcceptedIdentity(
+        "series", SUBJECT_KEY, WINDOW_A, "c" * 64
+    )
+    view = AppIoWindow(
+        service, WINDOW_A.boot_id, WINDOW_A.end_mono_ns, clock_ns=clock
+    )
+    qtbot.addWidget(view)
+    view.show()
+
+    accepted = view._overview_model
+    total_widget = view._total_chart
+    task_points = accepted.task_points
+    signals: list[int] = []
+    view.measurement_work_requested.connect(lambda: signals.append(1))
+    assert task_points == measured_series(WINDOW_A).points
+    assert accepted.share_provenance.measured_window == WINDOW_A
+    assert accepted.share_provenance.first_seen_at_ns == 1_000_000_000
+    assert accepted.series_provenance.measured_window == WINDOW_A
+
+    # B is applied while both exact getters are still pending: the accepted A
+    # dependency values, widget identity and stamps survive unchanged.
+    clock.advance_ns(2_000_000_000)
+    service.set_pending("totals", 1, WINDOW_B)
+    service.set_pending("series", 1, WINDOW_B)
+    view.set_window(WINDOW_B)
+
+    # One admission-bearing selection emitted the work signal exactly once; a
+    # query-free notification never does.
+    assert signals == [1]
+
+    model = view._overview_model
+    assert model is not None
+    assert model.requested_window == WINDOW_B
+    assert model.share is not None and model.share.window == WINDOW_A
+    assert model.share_provenance.measured_window == WINDOW_A
+    assert model.share_provenance.first_seen_at_ns == 1_000_000_000
+    assert model.series_provenance.measured_window == WINDOW_A
+    assert model.series_provenance.first_seen_at_ns == 1_000_000_000
+    assert model.task_points == task_points
+    # Pending is not an error: neither dependency carries a reason, and the
+    # chart is not repainted as unavailable over the retained task lane.
+    assert model.series_unavailable is None
+    assert model.share_unavailable is None
+    assert "still loading" not in model.detail_line
+    assert view._total_chart is total_widget
+    assert total_widget.is_available() is True
+    assert total_widget.unavailable_reason() is None
+    assert total_widget.columns() != ()
+    assert [kpi.text for kpi in model.kpis[:3]] == [
+        format_bytes(22),
+        format_bytes(17),
+        format_bytes(5),
+    ]
+    assert model.kpis[3].text == "unavailable"  # undefined PEAK is not zero
+    assert model.kpis[4].text == format_bytes(14)
+    assert (
+        f"; share measured: since_boot {BOOT_A} through 20000000000 ns"
+        in model.detail_line
+    )
+    assert (
+        f"; series measured: since_boot {BOOT_A} through 20000000000 ns"
+        in model.detail_line
+    )
+    # One observation per admitted kind for the newly applied Window.
+    assert [
+        event for event in service.events if event[0] == "get" and event[3] == WINDOW_B
+    ] == [
+        ("get", "series", 1, WINDOW_B),
+        ("get", "totals", 1, WINDOW_B),
+    ]
+    view.refresh_measurements()
+    assert signals == [1]
+
+
+def test_exact_only_adapter_matches_retention_failure_and_reset_rules(
+    qtbot,
+) -> None:
+    clock = ExactOnlyClock(1_000_000_000)
+    service = ExactOnlyQuery()
+    service.rows = [app_total(1, SUBJECT_KEY, "Alpha", 22, peak_bps=None)]
+    service.set_share(WINDOW_A, measured_share(WINDOW_A))
+    service.set_series(WINDOW_A, measured_series(WINDOW_A))
+    view = AppIoWindow(
+        service, WINDOW_A.boot_id, WINDOW_A.end_mono_ns, clock_ns=clock
+    )
+    qtbot.addWidget(view)
+    view.show()
+    adapter = view._detail_service
+    assert adapter is not service
+
+    # A plain exact success retains the measured Window, but no identity or
+    # stamp: age is unknown rather than guessed.
+    accepted = view._overview_model
+    assert accepted.share is not None and accepted.share.task_total_bytes == 22
+    assert accepted.share_provenance.measured_window == WINDOW_A
+    assert accepted.share_provenance.accepted_identity is None
+    assert accepted.share_provenance.first_seen_at_ns is None
+    assert accepted.share_provenance.answered_source is None
+    assert accepted.share_provenance.local_bracket is None
+
+    # A successful exact result that contradicts its selector is failed before
+    # acceptance as invalid_result; the other dependency is not erased.
+    service.results[("totals", 1, WINDOW_A)] = measured_share(WINDOW_B)
+    view.refresh()
+    refused = view._overview_model
+    assert refused.share is None
+    assert refused.share_unavailable == "invalid_result"
+    assert refused.series_metadata is not None
+    service.results[("series", 1, WINDOW_A)] = replace(
+        measured_series(WINDOW_A), app_id=2
+    )
+    service.set_share(WINDOW_A, measured_share(WINDOW_A))
+    view.refresh()
+    mismatched = view._overview_model
+    assert mismatched.series_metadata is None
+    assert mismatched.series_unavailable == "invalid_result"
+    assert mismatched.share is not None
+    service.set_series(WINDOW_A, measured_series(WINDOW_A))
+    view.refresh()
+    assert view._overview_model.series_metadata is not None
+
+    # A forward applied Window with both getters pending keeps A effective and
+    # reports pending through the slot, never a failure.
+    service.set_pending("totals", 1, WINDOW_B)
+    service.set_pending("series", 1, WINDOW_B)
+    view.set_window(WINDOW_B)
+    scope_b = retention_scope(SUBJECT_KEY, WINDOW_B)
+    endpoint_b = WINDOW_B.end_mono_ns
+    retained_a = adapter.retained("totals", SUBJECT_KEY, scope_b, endpoint_b)
+    assert retained_a is not None
+    assert retained_a.provenance.measured_window == WINDOW_A
+    assert adapter.part_state("totals", SUBJECT_KEY, scope_b).state == "pending"
+    assert view._overview_model.share is not None
+    assert view._overview_model.share_unavailable is None
+
+    # A current failure clears the record before notification and keeps its own
+    # exact reason; the pending series stays an independent retained value.
+    service.set_error("totals", 1, WINDOW_B, RuntimeError("share_bad"))
+    view.refresh()
+    failed = view._overview_model
+    assert failed.share is None and failed.share_unavailable == "share_bad"
+    failed_state = adapter.part_state("totals", SUBJECT_KEY, scope_b)
+    assert failed_state.state == "failed"
+    assert failed_state.reason == "share_bad"
+    assert adapter.retained("totals", SUBJECT_KEY, scope_b, endpoint_b) is None
+    assert failed.series_metadata is not None
+    assert failed.series_metadata.measured_window == WINDOW_A
+
+    # A pending retry cannot restore the failed record.
+    service.set_pending("totals", 1, WINDOW_B)
+    view.refresh()
+    retried = view._overview_model
+    assert retried.share is None
+    assert retried.share_unavailable == SHARE_UNAVAILABLE_REASON
+    assert adapter.retained("totals", SUBJECT_KEY, scope_b, endpoint_b) is None
+    assert adapter.part_state("totals", SUBJECT_KEY, scope_b).state == "pending"
+
+    # Only a new accepted success restores a measured record.
+    service.set_share(
+        WINDOW_B,
+        measured_share(
+            WINDOW_B, task_read=19, task_write=7, device_read=11, device_write=5
+        ),
+    )
+    view.refresh()
+    restored = view._overview_model
+    assert restored.share is not None and restored.share.window == WINDOW_B
+    assert restored.share_provenance.measured_window == WINDOW_B
+
+    # A pending observation keeps its own exact Window while a newer Window is
+    # applied: the same A getter is observed once per ordinary refresh (never
+    # abandoned for B), and only one latest successor B is remembered.
+    between = Window(kind="since_boot", boot_id=BOOT_A, end_mono_ns=25_000_000_000)
+    adapter.select_detail(SUBJECT_KEY, between)
+    service.set_pending("totals", 1, between)
+    adapter.request_detail("totals", 1, between)
+    assert service.events[-1] == ("get", "totals", 1, between)
+    adapter.select_detail(SUBJECT_KEY, WINDOW_B)
+    adapter.request_detail("totals", 1, WINDOW_B)
+    assert service.events[-1] == ("get", "totals", 1, between)
+    between_scope = retention_scope(SUBJECT_KEY, between)
+    assert adapter.part_state("totals", SUBJECT_KEY, between_scope).state == "pending"
+    # Settling A publishes its own measured Window; the successor is not
+    # discarded, mutated into B or used to relabel A.
+    service.set_share(between, measured_share(between))
+    adapter.request_detail("totals", 1, WINDOW_B)
+    assert service.events[-1] == ("get", "totals", 1, between)
+    settled_a = adapter.retained(
+        "totals", SUBJECT_KEY, retention_scope(SUBJECT_KEY, WINDOW_B), endpoint_b
+    )
+    assert settled_a is not None
+    assert settled_a.provenance.measured_window == between
+    # The next ordinary call admits the remembered successor B.
+    adapter.request_detail("totals", 1, WINDOW_B)
+    assert service.events[-1] == ("get", "totals", 1, WINDOW_B)
+
+    # A backward endpoint, a changed subject and the both-None retirement all
+    # retire records synchronously and issue no query.
+    total_calls = service.calls["totals"]
+    back = Window(kind="since_boot", boot_id=BOOT_A, end_mono_ns=15_000_000_000)
+    adapter.select_detail(SUBJECT_KEY, back)
+    assert (
+        adapter.retained(
+            "totals", SUBJECT_KEY, retention_scope(SUBJECT_KEY, back), back.end_mono_ns
+        )
+        is None
+    )
+    adapter.select_detail("unit:/other.service", WINDOW_A)
+    assert adapter.retained("totals", SUBJECT_KEY, scope_b, endpoint_b) is None
+    adapter.select_detail(None, None)
+    assert adapter.part_state("totals", SUBJECT_KEY, scope_b).state == "absent"
+    assert service.calls["totals"] == total_calls
+
+    # A partial capability falls back to the real adapter; none of the four
+    # supplied retained methods is ever called and the exact values render.
+    partial = PartialRetainedQuery()
+    partial.rows = [app_total(1, SUBJECT_KEY, "Alpha", 22, peak_bps=None)]
+    partial.set_share(WINDOW_A, measured_share(WINDOW_A))
+    partial.set_series(WINDOW_A, measured_series(WINDOW_A))
+    partial_view = AppIoWindow(
+        partial, WINDOW_A.boot_id, WINDOW_A.end_mono_ns, clock_ns=clock
+    )
+    qtbot.addWidget(partial_view)
+    partial_view.show()
+    assert partial_view._detail_service is not partial
+    assert partial.retained_calls == []
+    assert partial_view._overview_model.share is not None
+    assert partial_view._overview_model.share_provenance.accepted_identity is None
+
+    # A full retained capability keeps its own retirement: a reset calls its
+    # select_detail(None, None) and never an adapter-only method.
+    recording = RecordingRetainedQuery()
+    recording.rows = [app_total(1, SUBJECT_KEY, "Alpha", 22, peak_bps=None)]
+    retained_view = AppIoWindow(
+        recording, WINDOW_A.boot_id, WINDOW_A.end_mono_ns, clock_ns=clock
+    )
+    qtbot.addWidget(retained_view)
+    retained_view.show()
+    assert retained_view._detail_service is recording
+    assert (SUBJECT_KEY, WINDOW_A) in recording.select_calls
+    selections = list(recording.select_calls)
+    queries = dict(recording.calls)
+    retained_view.reset_query_authority()
+    assert recording.select_calls == selections + [(None, None)]
+    assert recording.calls == queries
+    assert retained_view._exact_authority_epoch == 2
+
+    # A builder refusal of one dependency's observation removes only that
+    # dependency; the independently valid other input still renders.
+    from appio.history_types import RetainedRecord
+
+    contradictory = RecordingRetainedQuery()
+    contradictory.rows = [app_total(1, SUBJECT_KEY, "Alpha", 22, peak_bps=None)]
+    future = Window(kind="since_boot", boot_id=BOOT_A, end_mono_ns=31_000_000_000)
+    contradictory.records["series"] = RetainedRecord(
+        measured_series(WINDOW_A), measured_provenance("series", SUBJECT_KEY, WINDOW_A)
+    )
+    contradictory.records["totals"] = RetainedRecord(
+        measured_share(future),
+        measured_provenance("totals", SUBJECT_KEY, future),
+    )
+    contradictory_view = AppIoWindow(
+        contradictory, WINDOW_A.boot_id, WINDOW_A.end_mono_ns, clock_ns=clock
+    )
+    qtbot.addWidget(contradictory_view)
+    contradictory_view.show()
+    kept = contradictory_view._overview_model
+    assert kept.share is None
+    assert kept.share_unavailable is not None
+    assert kept.share_unavailable != SHARE_UNAVAILABLE_REASON
+    assert kept.series_metadata is not None
+    assert kept.task_points == measured_series(WINDOW_A).points
+
+    # A full capability whose method raises is a real failure, never silent
+    # fallback to an adapter.
+    broken = BrokenRetainedQuery()
+    broken.rows = [app_total(1, SUBJECT_KEY, "Alpha", 22, peak_bps=None)]
+    broken.set_share(WINDOW_A, measured_share(WINDOW_A))
+    broken.set_series(WINDOW_A, measured_series(WINDOW_A))
+    with pytest.raises(RuntimeError, match="retained capability failed"):
+        AppIoWindow(
+            broken, WINDOW_A.boot_id, WINDOW_A.end_mono_ns, clock_ns=clock
+        )
+
+
+def test_exact_only_identity_reacceptance_reuses_stamp(qtbot) -> None:
+    clock = ExactOnlyClock(1_000_000_000)
+    service = IdentityExactOnlyQuery()
+    service.rows = [app_total(1, SUBJECT_KEY, "Alpha", 22, peak_bps=None)]
+    service.set_share(WINDOW_A, measured_share(WINDOW_A))
+    service.set_series(WINDOW_A, measured_series(WINDOW_A))
+    identity = AcceptedIdentity("totals", SUBJECT_KEY, WINDOW_A, "b" * 64)
+    service.identities[("totals", SUBJECT_KEY, WINDOW_A)] = identity
+    view = AppIoWindow(
+        service, WINDOW_A.boot_id, WINDOW_A.end_mono_ns, clock_ns=clock
+    )
+    qtbot.addWidget(view)
+    view.show()
+
+    def identity_events() -> list[tuple]:
+        return [
+            event
+            for event in service.events
+            if event[0] == "identity" and event[1] == "totals"
+        ]
+
+    # Exactly one identity call, immediately after the successful totals getter
+    # and before any other getter or adoption.
+    events = list(service.events)
+    assert [event[0] for event in events[:6]] == [
+        "ranking",
+        "identity",
+        "get",
+        "identity",
+        "get",
+        "identity",
+    ]
+    assert events[1] == ("identity", "ranking", SUBJECT_KEY, WINDOW_A)
+    getter_at = events.index(("get", "totals", 1, WINDOW_A))
+    assert events[getter_at + 1] == (
+        "identity",
+        "totals",
+        SUBJECT_KEY,
+        WINDOW_A,
+    )
+    assert identity_events() == [("identity", "totals", SUBJECT_KEY, WINDOW_A)]
+    accepted = view._overview_model
+    assert accepted.share_provenance.accepted_identity == identity
+    assert accepted.share_provenance.first_seen_at_ns == 1_000_000_000
+    assert accepted.series_provenance.accepted_identity is None
+
+    # Reaccepting the identical identity at t=3 s reuses its 1 s stamp: the age
+    # is 2 s in the one injected clock domain.
+    clock.advance_ns(2_000_000_000)
+    view.refresh()
+    again = view._overview_model
+    assert again.share is not None and again.share.task_total_bytes == 22
+    assert again.share_provenance.accepted_identity == identity
+    assert again.share_provenance.first_seen_at_ns == 1_000_000_000
+    assert clock.now_ns - again.share_provenance.first_seen_at_ns == 2_000_000_000
+    assert service.calls["totals"] == 2
+
+    # A malformed, contradicting or raising identity fails only that current
+    # dependency as invalid_result; the independent series stays accepted.
+    contradictions: tuple[object, ...] = (
+        AcceptedIdentity("series", SUBJECT_KEY, WINDOW_A, "c" * 64),
+        AcceptedIdentity("totals", "unit:/other.service", WINDOW_A, "d" * 64),
+        AcceptedIdentity("totals", SUBJECT_KEY, WINDOW_B, "e" * 64),
+        SimpleNamespace(
+            kind="totals",
+            app_key=SUBJECT_KEY,
+            window=WINDOW_A,
+            data_digest="not-a-digest",
+        ),
+        RuntimeError("identity capability failed"),
+    )
+    for supplied in contradictions:
+        service.identities[("totals", SUBJECT_KEY, WINDOW_A)] = supplied
+        view.refresh()
+        rejected = view._overview_model
+        assert rejected.share is None
+        assert rejected.share_unavailable == "invalid_result"
+        assert rejected.series_metadata is not None
+        assert rejected.series_provenance.measured_window == WINDOW_A
+
+    # A valid None identity remains identity-less and unknown.
+    service.identities[("totals", SUBJECT_KEY, WINDOW_A)] = None
+    view.refresh()
+    identity_less = view._overview_model
+    assert identity_less.share is not None
+    assert identity_less.share_provenance.accepted_identity is None
+    assert identity_less.share_provenance.first_seen_at_ns is None
+
+    # Pending and failing getters never ask the optional capability, and the
+    # query-free notification asks nothing at all.
+    service.identities[("totals", SUBJECT_KEY, WINDOW_A)] = identity
+    before_pending = len(identity_events())
+    service.set_pending("totals", 1, WINDOW_B)
+    service.set_pending("series", 1, WINDOW_B)
+    view.set_window(WINDOW_B)
+    assert len(identity_events()) == before_pending
+    service.set_error("totals", 1, WINDOW_B, RuntimeError("share_bad"))
+    view.refresh()
+    assert len(identity_events()) == before_pending
+    calls = dict(service.calls)
+    event_log = list(service.events)
+    view.refresh_measurements()
+    assert service.calls == calls
+    assert service.events == event_log
+
+    # A malformed ranking identity uses the ranking's normal error path and no
+    # row, subject or stale PEAK survives it.
+    service.identities[("ranking", SUBJECT_KEY, WINDOW_A)] = SimpleNamespace(
+        kind="ranking", app_key=SUBJECT_KEY, window=WINDOW_A, data_digest="bad"
+    )
+    view.set_window(WINDOW_A)
+    assert view.selected_app_id() is None
+    assert listing(view).count() == 0
+    assert view._total_chart.unavailable_reason() == "invalid_result"
+    service.identities[("ranking", SUBJECT_KEY, WINDOW_A)] = None
+
+
+def test_exact_only_authority_reset_retires_unchanged_lifetime(qtbot) -> None:
+    clock = ExactOnlyClock(1_000_000_000)
+    lifetime = Window(kind="lifetime")
+    service = IdentityExactOnlyQuery()
+    service.rows = [app_total(1, SUBJECT_KEY, "Alpha", 22, peak_bps=None)]
+    service.set_share(lifetime, measured_share(lifetime))
+    service.set_pending("series", 1, lifetime)
+    first_identity = AcceptedIdentity("totals", SUBJECT_KEY, lifetime, "b" * 64)
+    service.identities[("totals", SUBJECT_KEY, lifetime)] = first_identity
+    view = AppIoWindow(service, clock_ns=clock)
+    qtbot.addWidget(view)
+    view.show()
+    view.set_window(lifetime)
+    scope = retention_scope(SUBJECT_KEY, lifetime)
+    adapter = view._detail_service
+
+    accepted = view._overview_model
+    assert accepted.share is not None and accepted.share.task_total_bytes == 22
+    assert accepted.share_provenance.measured_window == lifetime
+    assert accepted.share_provenance.first_seen_at_ns == 1_000_000_000
+    assert view._exact_authority_epoch == 1
+    assert adapter.retained("totals", SUBJECT_KEY, scope, None) is not None
+    stale_series = adapter.part_state("series", SUBJECT_KEY, scope)
+    assert stale_series.state == "pending"
+    assert stale_series.request_id is not None
+
+    # An authority reset at t=3 s retires records, stamps and the selection for
+    # the unchanged lifetime Window, issues no query and changes no shell field.
+    clock.advance_ns(2_000_000_000)
+    calls_before = dict(service.calls)
+    view.reset_query_authority()
+    assert view._exact_authority_epoch == 2
+    assert service.calls == calls_before
+    assert adapter.retained("totals", SUBJECT_KEY, scope, None) is None
+    assert adapter.part_state("totals", SUBJECT_KEY, scope).state == "absent"
+    assert adapter.part_state("series", SUBJECT_KEY, scope).state == "absent"
+    with pytest.raises(ValueError):
+        adapter.reset_authority(2)
+    with pytest.raises(ValueError):
+        adapter.reset_authority(0)
+
+    # The query-free notification publishes zero old values and asks nothing.
+    view.refresh_measurements()
+    assert service.calls == calls_before
+    stale = view._overview_model
+    assert stale.share is None and stale.share_provenance is None
+    assert stale.series_metadata is None and stale.series_provenance is None
+    assert stale.share_unavailable == SHARE_UNAVAILABLE_REASON
+    assert view._total_chart.is_available() is False
+
+    # Adopting the same lifetime at epoch 2 establishes a fresh lifetime; a new
+    # accepted success alone restores values, stamped at t=4 s with age 0 s.
+    clock.advance_ns(1_000_000_000)
+    second_identity = AcceptedIdentity("totals", SUBJECT_KEY, lifetime, "f" * 64)
+    service.set_share(
+        lifetime,
+        measured_share(
+            lifetime, task_read=19, task_write=7, device_read=11, device_write=5
+        ),
+    )
+    service.identities[("totals", SUBJECT_KEY, lifetime)] = second_identity
+    totals_before = service.calls["totals"]
+    view.refresh()
+    restored = view._overview_model
+    assert service.calls["totals"] == totals_before + 1
+    assert restored.share is not None and restored.share.task_total_bytes == 26
+    assert restored.share_provenance.accepted_identity == second_identity
+    assert restored.share_provenance.first_seen_at_ns == 4_000_000_000
+    assert clock.now_ns - restored.share_provenance.first_seen_at_ns == 0
+    # The series stayed pending across the reset: no restored record/age.
+    assert restored.series_metadata is None
+    assert restored.task_points == ()
+    assert restored.series_provenance is None
+
+    # A same-authority forward refresh is not a reset and reuses the stamp.
+    epoch = view._exact_authority_epoch
+    view.refresh()
+    assert view._exact_authority_epoch == epoch
+    assert service.calls["totals"] == totals_before + 2
+    assert view._overview_model.share_provenance.first_seen_at_ns == 4_000_000_000
+
+
+def test_detail_notification_is_query_free_and_preserves_other_dependency(
+    qtbot,
+) -> None:
+    clock = ExactOnlyClock(1_000_000_000)
+    service = IdentityExactOnlyQuery()
+    service.rows = [app_total(1, SUBJECT_KEY, "Alpha", 22, peak_bps=None)]
+    service.set_share(WINDOW_A, measured_share(WINDOW_A))
+    service.set_series(WINDOW_A, measured_series(WINDOW_A))
+    service.identities[("totals", SUBJECT_KEY, WINDOW_A)] = AcceptedIdentity(
+        "totals", SUBJECT_KEY, WINDOW_A, "b" * 64
+    )
+    service.identities[("series", SUBJECT_KEY, WINDOW_A)] = AcceptedIdentity(
+        "series", SUBJECT_KEY, WINDOW_A, "c" * 64
+    )
+    files = FakeFilesHistory(ranking_rows=(service.rows[0],))
+    view = AppIoWindow(
+        service,
+        WINDOW_A.boot_id,
+        WINDOW_A.end_mono_ns,
+        files_view=FilesView(files),
+        clock_ns=clock,
+    )
+    qtbot.addWidget(view)
+    view.show()
+
+    accepted = view._overview_model
+    assert accepted.share is not None and accepted.series_metadata is not None
+    chart, donut, bars = view._total_chart, view._donut, view._share_bars
+
+    # A query-free notification rereads states/records only: no ranking, no
+    # detail admission, no Files request, no identity probe, no widget rebuild.
+    calls = dict(service.calls)
+    event_log = list(service.events)
+    file_requests = len(files.requests)
+    view.refresh_measurements()
+    assert service.calls == calls
+    assert service.events == event_log
+    assert len(files.requests) == file_requests
+    same = view._overview_model
+    assert view._total_chart is chart
+    assert view._donut is donut
+    assert view._share_bars is bars
+    assert same.share == accepted.share
+    assert same.share_provenance == accepted.share_provenance
+    assert same.series_provenance == accepted.series_provenance
+    assert same.task_points == accepted.task_points
+
+    # A newer applied Window keeps the accepted A share while its own detail is
+    # pending; the current series failure then lands through the real adapter.
+    service.set_share(WINDOW_B, measured_share(WINDOW_B))
+    service.set_pending("totals", 1, WINDOW_B)
+    service.set_pending("series", 1, WINDOW_B)
+    view.set_window(WINDOW_B)
+    assert view._overview_model.share.window == WINDOW_A
+    assert view._overview_model.share_provenance.first_seen_at_ns == 1_000_000_000
+    service.set_error("series", 1, WINDOW_B, RuntimeError("series_bad"))
+    view._detail_service.request_detail("series", 1, WINDOW_B)
+
+    # The notification applies that failure immediately and preserves the
+    # independently accepted share and every existing widget.
+    failed_calls = dict(service.calls)
+    view.refresh_measurements()
+    assert service.calls == failed_calls
+    failed = view._overview_model
+    assert failed.series_unavailable == "series_bad"
+    assert failed.series_metadata is None and failed.task_points == ()
+    assert failed.series_provenance is None
+    assert failed.share is not None and failed.share.window == WINDOW_A
+    assert failed.share_provenance.measured_window == WINDOW_A
+    assert failed.share_provenance.first_seen_at_ns == 1_000_000_000
+    assert [kpi.text for kpi in failed.kpis[:3]] == [
+        format_bytes(22),
+        format_bytes(17),
+        format_bytes(5),
+    ]
+    assert view._donut is donut and donut.shares() is not None
+    assert view._share_bars is bars and bars.fractions() != ()
+    assert view._total_chart is chart
+    assert chart.is_available() is False
+    assert chart.unavailable_reason() == "series_bad"
+    # Pending is not failure: the share's newer slot is still pending, and no
+    # pending text was rendered as an error.
+    assert (
+        view._detail_service.part_state(
+            "totals", SUBJECT_KEY, retention_scope(SUBJECT_KEY, WINDOW_B)
+        ).state
+        == "pending"
+    )
+    assert "still loading" not in failed.detail_line
