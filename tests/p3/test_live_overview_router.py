@@ -21,6 +21,7 @@ from appio.contracts import (
     DeviceShareRow,
     FileCoverage,
     FileTable,
+    HistoryPending,
     HookHits,
     UnknownOwnerOverflow,
     Window,
@@ -52,7 +53,15 @@ from appio.history_types import (
     retention_scope,
 )
 from appio.handover import baseline_seed
-from appio.iodclient import AppRegistry, ClientState, RequestRejected
+from appio.history_validation import _normalize_request
+from appio.iodclient import (
+    AppRegistry,
+    ClientState,
+    ConnectionLost,
+    QueryTransportState,
+    RemoteError,
+    RequestRejected,
+)
 from appio.ipc_models import QueryRequest, StreamCursor
 from appio.procs import AppKeyInputs, IoReadOutcome, ProcessIdentity, StableProcRecord
 from appio.query import QueryService
@@ -2239,3 +2248,843 @@ def test_local_frame_rejects_a_foreign_worker_binding(tmp_path):
         history.close()
         local.connection.close()
         imported.connection.close()
+
+
+# ---------------------------------------------------------------------------
+# Authority retirement, scope-owned detail and the sole settlement writer
+# (§§2.4, 3.1–3.4, 5.1, 12.2)
+# ---------------------------------------------------------------------------
+
+
+class _BoundClient:
+    """A verified answering client whose Futures carry real transport states.
+
+    Every Future is bound to its normalized request before it can settle, as
+    the production client's observation seam does, so a settlement arm fails
+    only for the single fault a test names.
+    """
+
+    def __init__(self, *, boot=BOOT, epoch=3, seq=7, clock=None):
+        self.clock = Clock(50) if clock is None else clock
+        self.cursor = StreamCursor(boot, epoch, seq)
+        self.state = ClientState(verified=True, answering=True, cursor=self.cursor)
+        self._generation = 0
+        self._serial = 0
+        self.requests = []
+        self.rejected = []
+        self.retired = []
+        self._records = {}
+
+    @property
+    def generation(self):
+        return self._generation
+
+    def source(self):
+        return RemotePosition(self.cursor.boot_id, self.cursor.iod_epoch, self.cursor.seq)
+
+    def query(self, request):
+        normalized = _normalize_request(request)
+        future = Future()
+        self._serial += 1
+        self._records[future] = {
+            "request": normalized,
+            "connection_generation": self._generation,
+            "request_id": f"q{self._generation}-{self._serial}",
+            "phase": "active",
+            "issued_at_ns": self.clock(),
+            "issued_source": self.source(),
+            "answered_source": None,
+        }
+        self.requests.append((normalized, future))
+        return future
+
+    def query_transport(self, future):
+        try:
+            record = self._records[future]
+        except KeyError:
+            raise ValueError("this Future is not bound to a client query") from None
+        return QueryTransportState(**record)
+
+    def retire_query_connection(self, future):
+        record = self._records[future]
+        if record["phase"] not in ("active", "expired") or record["request_id"] is None:
+            return False
+        record["phase"] = "lost"
+        self._generation += 1
+        self.retired.append(future)
+        return True
+
+    def reject_query_result(self, future):
+        if future not in self._records:
+            raise ValueError("this Future is not bound to a client query")
+        self.rejected.append(future)
+
+    def settle(self, future, value):
+        record = self._records[future]
+        record["phase"] = "terminal"
+        record["answered_source"] = record["issued_source"]
+        future.set_result(value)
+
+    def fail(self, future, error):
+        record = self._records[future]
+        record["phase"] = "terminal"
+        record["answered_source"] = None
+        future.set_exception(error)
+
+    def corrupt(self, future, **changes):
+        self._records[future].update(changes)
+
+    def expire(self, future):
+        self._records[future]["phase"] = "expired"
+
+    def held(self, kind):
+        return [
+            future for request, future in self.requests
+            if request.kind == kind and not future.done()
+        ]
+
+    def only(self, kind):
+        futures = self.held(kind)
+        assert len(futures) == 1, f"expected exactly one held {kind} query, saw {len(futures)}"
+        return futures[0]
+
+
+def _empty_router(tmp_path, client, *, name):
+    store = AppIoStore(tmp_path / name)
+    store.connection.commit()
+    router = HistoryRouter(
+        QueryService(store), client, AppRegistry(), clock_ns=client.clock)
+    return router, store
+
+
+def _remote_frame(router, client, window, *, key=KEY, app_id=17):
+    """Prepare one remote-ranking frame and settle its local ownership evidence."""
+
+    router.prepare(window)
+    assert router._local_future is not None
+    router._local_future.result(timeout=15)
+    future = client.only("ranking")
+    client.settle(future, {
+        "kind": "ranking",
+        "result": [total(app_id, key)],
+        "snapshot": DIGEST,
+        "next_cursor": None,
+    })
+    assert router.ready(window) is True
+    return router.registry.id_for(key)
+
+
+def _totals_response(key=KEY, *, window, value=None, snapshot=DIGEST, kind="totals"):
+    response = {
+        "kind": kind,
+        "result": share(1, window) if value is None else value,
+        "snapshot": snapshot,
+        "next_cursor": None,
+    }
+    if key is not None:
+        response["app_key"] = key
+    return response
+
+
+def _file_coverage(window):
+    """One complete file-coverage envelope, for a wrong-variant coverage arm."""
+
+    overflow = UnknownOwnerOverflow(window, "overflow_owner_unknown", 0, 0, 0, coverage())
+    return FileCoverage(
+        1, window,
+        0, 0, 0, 0, 0, 0,
+        0, 0, 0,
+        HookHits(0, 0, 0, 0, 0, 0),
+        0, 0,
+        overflow, coverage(),
+    )
+
+
+def test_settlement_rejects_each_selector_shape_or_binding_violation(tmp_path):
+    """Each single selector/binding fault is a current invalid_result, never absent.
+
+    The malformed process-coverage arms are the two separate mappings from
+    §12.3 plus their passing control; every arm settles through its real
+    associated Future, so no arm can pass by fabricating a router record.
+    """
+
+    client = _BoundClient()
+    router, store = _empty_router(tmp_path, client, name="settlement.db")
+    window = Window("since_boot", BOOT, end_mono_ns=140 * NS)
+    other = Window("since_boot", BOOT, end_mono_ns=150 * NS)
+    try:
+        presentation = _remote_frame(router, client, window)
+        router.select_detail(KEY, window)
+        scope = retention_scope(KEY, window)
+
+        def admit(kind="totals"):
+            state = router.request_detail(kind, presentation, window)
+            assert state.state == "pending"
+            return client.only(kind)
+
+        def assert_failed(future, label):
+            assert router.part_state("totals", KEY, scope).state == "failed", label
+            assert router.part_state("totals", KEY, scope).reason == "invalid_result", label
+            assert router.retained("totals", KEY, scope, window.end_mono_ns) is None, label
+            assert client.rejected and client.rejected[-1] is future, label
+
+        arms = (
+            ("wrong kind", _totals_response(KEY, window=window, kind="series",
+                                            value=series(1, window))),
+            ("wrong external key", _totals_response(OTHER_KEY, window=window)),
+            ("wrong window", _totals_response(KEY, window=window, value=share(1, other))),
+            ("coverage for totals", _totals_response(KEY, window=window, value=coverage())),
+        )
+        for label, response in arms:
+            future = admit()
+            client.settle(future, response)
+            assert router.drain() is True, label
+            assert_failed(future, label)
+
+        # The bound transport must carry this exact normalized request.
+        future = admit()
+        client.corrupt(future, request=_normalize_request(
+            QueryRequest("series", window, KEY)))
+        client.settle(future, _totals_response(KEY, window=window))
+        assert router.drain() is True
+        assert_failed(future, "wrong request association")
+
+        # A duplicate ranking identity is a frame-ranking rejection, and the
+        # rejected candidate is evicted before any notification.
+        router.prepare(window)
+        router._local_future.result(timeout=15)
+        duplicate = client.only("ranking")
+        client.settle(duplicate, {
+            "kind": "ranking",
+            "result": [total(17, KEY), total(18, KEY)],
+            "snapshot": DIGEST,
+            "next_cursor": None,
+        })
+        assert router.ready(window) is True
+        assert router._remote is None
+        assert router.daemon_answer_error is not None
+        assert router.daemon_answer_error.kind == "rejected"
+        assert router.daemon_answer_error.reason == "invalid_result"
+        assert client.rejected[-1] is duplicate
+
+        # Coverage selectors are validated at the same settlement boundary. A
+        # frame owns at most one remote token per owner/generation context.
+        frame = router._frame
+        serial = [0]
+
+        def coverage_arm(request, result, label, *, rejected):
+            serial[0] += 1
+            token = RequestToken(
+                900 + serial[0], request, "remote", None, "frame",
+                frame.owner_id, 500 + serial[0], frame.authority,
+                frame.requested_source)
+            future = client.query(request)
+            client.settle(future, {
+                "kind": "coverage", "result": result, "snapshot": DIGEST,
+                "next_cursor": None,
+            })
+            settled = router._settle(token, RemoteSettlement(future, response=future.result()))
+            assert settled is False, label
+            if rejected:
+                assert client.rejected[-1] is future, label
+            return future
+
+        process = QueryRequest("coverage", window, None, coverage_kind="process")
+        coverage_arm(process, _file_coverage(window), "file coverage in process slot",
+                     rejected=True)
+        coverage_arm(process, coverage(), "scalar in unscoped process slot", rejected=True)
+        control = coverage_arm(
+            process, {"unit:alpha.service": coverage()},
+            "valid unscoped process mapping", rejected=False)
+        assert control not in client.rejected
+
+        unknown = QueryRequest("coverage", window, None, coverage_kind="unknown_owner")
+        coverage_arm(unknown, coverage(), "invalid UnknownOwnerOverflow", rejected=True)
+    finally:
+        router.close()
+        store.connection.close()
+
+
+def test_settlement_superseded_or_duplicate_has_no_publication_effect(tmp_path):
+    """Stale or duplicate outcomes never mutate a record, stamp or marker.
+
+    Covers a superseded frame generation, a dead detail lifetime under changed
+    connection authority, subject/scope/boot retirement, and a second
+    settlement after success and after failure; only the matching terminal wire
+    slot is released.
+    """
+
+    client = _BoundClient()
+    router, store = _empty_router(tmp_path, client, name="superseded.db")
+    window = Window("since_boot", BOOT, end_mono_ns=140 * NS)
+    scope = retention_scope(KEY, window)
+    try:
+        presentation = _remote_frame(router, client, window)
+
+        # A superseded frame generation cannot publish its delayed ranking.
+        router.prepare(window)
+        stale_ranking = client.only("ranking")
+        router.prepare(window)
+        client.settle(stale_ranking, {
+            "kind": "ranking", "result": [total(17, KEY)], "snapshot": DIGEST,
+            "next_cursor": None,
+        })
+        assert router.drain() is False
+        assert router._remote is None
+        assert router.frame_provenance(window) is None
+        # Complete the replacement frame so the wire is free for the detail arm.
+        router._local_future.result(timeout=15)
+        client.settle(client.only("ranking"), {
+            "kind": "ranking", "result": [total(17, KEY)], "snapshot": DIGEST,
+            "next_cursor": None,
+        })
+        assert router.ready(window) is True
+
+        # A dead detail lifetime cannot publish a delayed success.
+        router.select_detail(KEY, window)
+        state = router.request_detail("totals", presentation, window)
+        stale_token = router._detail.live["totals"]
+        stale_future = client.only("totals")
+        router.select_detail(None, None)
+        client.settle(stale_future, _totals_response(KEY, window=window))
+        router.drain()
+        assert router.retained("totals", KEY, scope, window.end_mono_ns) is None
+        assert router.part_state("totals", KEY, scope).state == "absent"
+        assert router._occupant is None  # the terminal wire slot was released
+
+        # A connection-authority change retires the lifetime before the old
+        # answer can publish.
+        router.select_detail(KEY, window)
+        router.request_detail("totals", presentation, window)
+        old_future = client.only("totals")
+        client._generation += 1
+        client.settle(old_future, _totals_response(KEY, window=window))
+        router.drain()
+        assert router.retained("totals", KEY, scope, window.end_mono_ns) is None
+        assert router.part_state("totals", KEY, scope).state == "absent"
+        assert router._occupant is None
+
+        # Subject and scope retirement behave the same way.
+        for retire in (
+            lambda: router.select_detail(OTHER_KEY, window),
+            lambda: router.select_detail(KEY, Window("range", BOOT, 0, 140 * NS)),
+            lambda: router.select_detail(KEY, Window("since_boot", "boot-b",
+                                                     end_mono_ns=140 * NS)),
+        ):
+            router.select_detail(KEY, window)
+            router.request_detail("totals", presentation, window)
+            future = client.only("totals")
+            retire()
+            client.settle(future, _totals_response(KEY, window=window))
+            router.drain()
+            assert router.retained("totals", KEY, scope, window.end_mono_ns) is None
+            assert router._occupant is None
+
+        # Duplicate settlement after success: same record, same stamp, no change.
+        router.select_detail(KEY, window)
+        router.request_detail("totals", presentation, window)
+        accepted = router._detail.live["totals"]
+        future = client.only("totals")
+        client.settle(future, _totals_response(KEY, window=window))
+        assert router.drain() is True
+        record = router.retained("totals", KEY, scope, window.end_mono_ns)
+        assert record is not None
+        stamp = record.provenance.first_seen_at_ns
+        assert router._settle(accepted, RemoteSettlement(future, response=future.result())) is False
+        assert router.retained("totals", KEY, scope, window.end_mono_ns) is record
+        assert record.provenance.first_seen_at_ns == stamp
+
+        # Duplicate settlement after failure: the failed slot is unchanged.
+        router.request_detail("totals", presentation, window)
+        failed_token = router._detail.live["totals"]
+        failed_future = client.only("totals")
+        error = RemoteError("daemon_error", "collector exploded")
+        client.fail(failed_future, error)
+        assert router.drain() is True
+        failed = router.part_state("totals", KEY, scope)
+        assert failed.state == "failed" and failed.reason == "collector exploded"
+        assert router._settle(
+            failed_token, RemoteSettlement(failed_future, error=error)) is False
+        assert router.part_state("totals", KEY, scope) == failed
+        assert stale_token.token_id != accepted.token_id
+        assert router.pending_work is False
+    finally:
+        router.close()
+        store.connection.close()
+
+
+def test_scope_owned_detail_survives_forward_frame_generations(tmp_path):
+    """Detail belongs to its selected scope, not to one preparing frame.
+
+    An ordinary forward preparation neither cancels the pending owner nor
+    relabels its delayed answer; the exact A window remains readable through
+    the retained accessor while B is applied/pending.
+    """
+
+    client = _BoundClient()
+    router, store = _empty_router(tmp_path, client, name="scope-owned.db")
+    window_a = Window("since_boot", BOOT, end_mono_ns=140 * NS)
+    window_b = Window("since_boot", BOOT, end_mono_ns=180 * NS)
+    scope_a = retention_scope(KEY, window_a)
+    scope_b = retention_scope(KEY, window_b)
+    try:
+        presentation = _remote_frame(router, client, window_a)
+        router.select_detail(KEY, window_a)
+        state_a = router.request_detail("totals", presentation, window_a)
+        assert state_a.state == "pending"
+        owner = state_a.request_id
+        pending_future = client.only("totals")
+
+        router.prepare(window_b)
+        assert router._detail.live["totals"].request.window == window_a
+        assert router.part_state("totals", KEY, scope_a).request_id == owner
+        assert router.part_state("totals", KEY, scope_a).state == "pending"
+        # A since-boot retention scope carries its boot, not a moving endpoint:
+        # both applied windows share one slot and one owner.
+        assert scope_a == scope_b
+        assert router.part_state("totals", KEY, scope_b).requested_window == window_a
+
+        client.settle(pending_future, _totals_response(KEY, window=window_a, value=share(1, window_a, read=91)))
+        assert router.drain() is True
+
+        record = router.retained("totals", KEY, scope_b, window_b.end_mono_ns)
+        assert record is not None
+        assert record.value.window == window_a
+        assert record.value.task_read_bytes == 91
+        assert record.provenance.measured_window == window_a
+        assert record.provenance.accepted_identity.window == window_a
+        assert router.part_state("totals", KEY, scope_a).state == "ok"
+        assert router.part_state("totals", KEY, scope_a).request_id == owner
+
+        with pytest.raises(HistoryPending):
+            router.disk_share(presentation, window_b)
+        assert router.retained("totals", KEY, scope_b, window_b.end_mono_ns) == record
+
+        # A record survives an ordinary preparation too; only adoption of a
+        # changed scope retires it.
+        router.prepare(window_b)
+        assert router.retained("totals", KEY, scope_b, window_b.end_mono_ns) == record
+        router.select_detail(KEY, window_b)
+        assert router.retained("totals", KEY, scope_b, window_b.end_mono_ns) == record
+        assert router.part_state("totals", KEY, scope_b).state == "ok"
+        with pytest.raises(HistoryPending):
+            router.disk_share(presentation, window_b)
+        assert router.retained("totals", KEY, scope_b, window_b.end_mono_ns) == record
+    finally:
+        router.close()
+        store.connection.close()
+
+
+@pytest.mark.parametrize(
+    "fault",
+    ["remote_error", "window_unavailable", "connection_lost", "query_timeout",
+     "invalid_result"],
+)
+def test_current_detail_failure_clears_record_before_view_notification(tmp_path, fault):
+    """A current failure clears the record before the drain batch notifies.
+
+    RemoteError, WindowUnavailableError, an authority-current injected
+    ConnectionLost, query_timeout and invalid_result each preserve their own
+    exception/reason; a pending retry cannot restore the record.
+    """
+
+    client = _BoundClient()
+    router, store = _empty_router(tmp_path, client, name=f"failure-{fault}.db")
+    window = Window("since_boot", BOOT, end_mono_ns=140 * NS)
+    scope = retention_scope(KEY, window)
+    try:
+        presentation = _remote_frame(router, client, window)
+        router.select_detail(KEY, window)
+        router.request_detail("totals", presentation, window)
+        first = client.only("totals")
+        client.settle(first, _totals_response(KEY, window=window))
+        assert router.drain() is True
+        assert router.retained("totals", KEY, scope, window.end_mono_ns) is not None
+
+        observed = []
+        original_notify = router._notify
+
+        def notify():
+            observed.append((
+                router.retained("totals", KEY, scope, window.end_mono_ns),
+                router.part_state("totals", KEY, scope),
+            ))
+            original_notify()
+
+        router._notify = notify
+        state = router.request_detail("totals", presentation, window)
+        assert state.state == "pending"
+        second = client.only("totals")
+        if fault == "remote_error":
+            error = RemoteError("daemon_error", "collector exploded")
+            client.fail(second, error)
+        elif fault == "window_unavailable":
+            error = WindowUnavailableError("file_source_unavailable", "file history unavailable")
+            client.fail(second, error)
+        elif fault == "connection_lost":
+            error = ConnectionLost("daemon_not_answering", "connection ended")
+            client.fail(second, error)
+        elif fault == "query_timeout":
+            error = RequestRejected("query_timeout", "the daemon did not answer within five seconds")
+            client.fail(second, error)
+        else:
+            error = RequestRejected("invalid_result", "invalid_result")
+            client.settle(second, _totals_response(KEY, window=window, value=coverage()))
+        assert router.drain() is True
+
+        assert observed, "the view notification observer never ran"
+        inside_record, inside_state = observed[-1]
+        assert inside_record is None
+        assert inside_state.state == "failed"
+        assert inside_state.reason == str(error) or inside_state.reason == error.reason
+        failed = router.part_state("totals", KEY, scope)
+        assert failed.state == "failed"
+        assert failed.reason == (str(error) if str(error) else type(error).__name__)
+        assert router.retained("totals", KEY, scope, window.end_mono_ns) is None
+        with pytest.raises(type(error)) as raised:
+            router.disk_share(presentation, window)
+        assert str(raised.value) == str(error)
+
+        # A pending retry cannot restore the cleared record.
+        retry = router.request_detail("totals", presentation, window)
+        assert retry.state == "pending"
+        assert router.retained("totals", KEY, scope, window.end_mono_ns) is None
+        assert router.drain() is False
+        assert router.part_state("totals", KEY, scope).state == "pending"
+        assert router.retained("totals", KEY, scope, window.end_mono_ns) is None
+    finally:
+        router.close()
+        store.connection.close()
+
+
+def test_exact_getters_reject_older_retained_window_without_hiding_record(tmp_path):
+    """An exact getter never repairs an older record into the requested window.
+
+    The applied B scope raises HistoryPending for its own exact answer while
+    the accepted A record stays readable and unmodified through retained.
+    """
+
+    client = _BoundClient()
+    router, store = _empty_router(tmp_path, client, name="exact-getters.db")
+    window_a = Window("since_boot", BOOT, end_mono_ns=140 * NS)
+    window_b = Window("since_boot", BOOT, end_mono_ns=180 * NS)
+    scope_b = retention_scope(KEY, window_b)
+    try:
+        presentation = _remote_frame(router, client, window_a)
+        router.select_detail(KEY, window_a)
+        router.request_detail("totals", presentation, window_a)
+        client.settle(client.only("totals"),
+                      _totals_response(KEY, window=window_a, value=share(1, window_a, read=89)))
+        assert router.drain() is True
+        record = router.retained("totals", KEY, scope_b, window_b.end_mono_ns)
+        assert record is not None and record.value.window == window_a
+
+        # Apply a forward frame B, then adopt it; the exact B answer is still
+        # missing, so the exact getter must raise rather than relabel A.
+        router.prepare(window_b)
+        router._local_future.result(timeout=15)
+        client.settle(client.only("ranking"), {
+            "kind": "ranking", "result": [total(17, KEY)], "snapshot": DIGEST,
+            "next_cursor": None,
+        })
+        assert router.ready(window_b) is True
+        router.select_detail(KEY, window_b)
+        assert router.retained("totals", KEY, scope_b, window_b.end_mono_ns) == record
+        with pytest.raises(HistoryPending):
+            router.disk_share(presentation, window_b)
+        assert router.retained("totals", KEY, scope_b, window_b.end_mono_ns) == record
+        pending = router.part_state("totals", KEY, retention_scope(KEY, window_b))
+        assert pending.state == "pending"
+        assert pending.requested_window == window_b
+        # The admitted exact B request still never rewrites the A measurement.
+        assert record.value.window == window_a
+        assert record.provenance.measured_window == window_a
+        assert record.value.app_id == presentation
+        assert router.registry.key_for(record.value.app_id) == KEY
+
+        # A wrong presentation id is a lookup failure, not a repaired subject.
+        with pytest.raises((KeyError, TypeError)):
+            router.disk_share(presentation + 1000, window_b)
+        assert router.retained("totals", KEY, scope_b, window_b.end_mono_ns) == record
+    finally:
+        router.close()
+        store.connection.close()
+
+
+def test_retained_accessor_uses_applied_endpoint_and_is_pure(tmp_path):
+    """Retained eligibility follows the caller's applied endpoint, never prepare.
+
+    The accessor sends, drains, restamps nothing, rejects malformed arguments,
+    withholds a future-end record, and keeps that answer through a forward and
+    a backward preparation until adoption resets it.
+    """
+
+    client = _BoundClient()
+    router, store = _empty_router(tmp_path, client, name="retained-pure.db")
+    window = Window("since_boot", BOOT, end_mono_ns=140 * NS)
+    forward = Window("since_boot", BOOT, end_mono_ns=180 * NS)
+    backward = Window("since_boot", BOOT, end_mono_ns=120 * NS)
+    scope = retention_scope(KEY, window)
+    try:
+        presentation = _remote_frame(router, client, window)
+        router.select_detail(KEY, window)
+        router.request_detail("totals", presentation, window)
+        client.settle(client.only("totals"),
+                      _totals_response(KEY, window=window, value=share(1, window, read=73)))
+        assert router.drain() is True
+        record = router.retained("totals", KEY, scope, window.end_mono_ns)
+        assert record is not None
+        stamp = record.provenance.first_seen_at_ns
+        sends = len(client.requests)
+        completed = router._completed.qsize()
+
+        original_drain = router.drain
+
+        def forbidden():
+            raise AssertionError("retained must not drain")
+
+        router.drain = forbidden
+        try:
+            for _ in range(3):
+                client.clock.advance_ns(10 * NS)
+                assert router.retained("totals", KEY, scope, window.end_mono_ns) is record
+                assert record.provenance.first_seen_at_ns == stamp
+            # A future measured endpoint is ineligible, not restamped.
+            assert router.retained("totals", KEY, scope, window.end_mono_ns - 1) is None
+            assert record.provenance.first_seen_at_ns == stamp
+            assert len(client.requests) == sends
+            assert router._completed.qsize() == completed
+
+            # Prepare cannot change eligibility; adoption owns the reset.
+            router.prepare(forward)
+            router._local_future.result(timeout=15)
+            assert router.retained("totals", KEY, scope, window.end_mono_ns) is record
+            router.prepare(backward)
+            router._local_future.result(timeout=15)
+            assert router.retained("totals", KEY, scope, window.end_mono_ns) is record
+        finally:
+            router.drain = original_drain
+
+        # Malformed arguments are rejected, never relabelled.
+        with pytest.raises(ValueError):
+            router.retained("totals", KEY, (OTHER_KEY, "lifetime"), None)
+        with pytest.raises(ValueError):
+            router.retained("totals", KEY, retention_scope(KEY, Window("lifetime")), 5)
+        with pytest.raises(ValueError):
+            router.retained("totals", KEY, (KEY, "range", BOOT, 0), 5)
+        with pytest.raises(ValueError):
+            router.retained("totals", KEY, scope, -1)
+
+        router.select_detail(KEY, backward)
+        assert router.retained("totals", KEY, scope, window.end_mono_ns) is None
+    finally:
+        router.close()
+        store.connection.close()
+
+
+def test_superseded_failure_does_not_clear_newer_accepted_record(tmp_path):
+    """An old token's delayed error cannot clear a newer accepted measurement.
+
+    A newer acceptance replaces the record and its first-seen stamp; the old
+    token's error and a later pending retry leave both exactly as accepted.
+    """
+
+    client = _BoundClient()
+    router, store = _empty_router(tmp_path, client, name="superseded-failure.db")
+    window = Window("since_boot", BOOT, end_mono_ns=140 * NS)
+    scope = retention_scope(KEY, window)
+    try:
+        presentation = _remote_frame(router, client, window)
+        router.select_detail(KEY, window)
+
+        router.request_detail("totals", presentation, window)
+        old_token = router._detail.live["totals"]
+        old_future = client.only("totals")
+        client.settle(old_future, _totals_response(KEY, window=window))
+        assert router.drain() is True
+        assert router.retained("totals", KEY, scope, window.end_mono_ns) is not None
+
+        router.request_detail("totals", presentation, window)
+        new_token = router._detail.live["totals"]
+        new_future = client.only("totals")
+        client.settle(new_future, _totals_response(KEY, window=window, value=share(1, window, read=64)))
+        assert router.drain() is True
+        newer = router.retained("totals", KEY, scope, window.end_mono_ns)
+        assert newer is not None and newer.value.task_read_bytes == 64
+        stamp = newer.provenance.first_seen_at_ns
+
+        # Deliver the superseded token's error after the newer acceptance.
+        error = RemoteError("daemon_error", "late failure")
+        assert router._settle(old_token, RemoteSettlement(old_future, error=error)) is False
+        assert router.retained("totals", KEY, scope, window.end_mono_ns) is newer
+        assert router.retained("totals", KEY, scope, window.end_mono_ns).provenance \
+            .first_seen_at_ns == stamp
+        assert router.part_state("totals", KEY, scope).state == "ok"
+        assert router.part_state("totals", KEY, scope).request_id == new_token.token_id
+
+        # A later pending retry neither restores nor clears the newer record.
+        router.request_detail("totals", presentation, window)
+        pending = router.part_state("totals", KEY, scope)
+        assert pending.state == "pending"
+        assert router.retained("totals", KEY, scope, window.end_mono_ns) is newer
+        assert newer.provenance.first_seen_at_ns == stamp
+        assert old_token.token_id != new_token.token_id
+    finally:
+        router.close()
+        store.connection.close()
+
+
+def test_retention_resets_before_subject_scope_boot_or_backward_display(tmp_path):
+    """Scope transitions clear old detail synchronously, before any render.
+
+    Subject, tag, range bounds, boot and a backward endpoint each retire the
+    live lifetime immediately; a backward-then-forward return and a second
+    distinct range never resurrect the old record.
+    """
+
+    client = _BoundClient()
+    router, store = _empty_router(tmp_path, client, name="retention-resets.db")
+    window = Window("since_boot", BOOT, end_mono_ns=140 * NS)
+    big = Window("since_boot", BOOT, end_mono_ns=180 * NS)
+    small = Window("since_boot", BOOT, end_mono_ns=110 * NS)
+    range_one = Window("range", BOOT, 0, 140 * NS)
+    range_two = Window("range", BOOT, 200 * NS, 240 * NS)
+    scope = retention_scope(KEY, window)
+    try:
+        presentation = _remote_frame(router, client, window)
+        router.select_detail(KEY, window)
+        router.request_detail("totals", presentation, window)
+        client.settle(client.only("totals"), _totals_response(KEY, window=window))
+        assert router.drain() is True
+        assert router.retained("totals", KEY, scope, window.end_mono_ns) is not None
+        sends = len(client.requests)
+        owner = router._detail.lifetime_id
+
+        transitions = (
+            ("subject", lambda: router.select_detail(OTHER_KEY, window)),
+            ("tag", lambda: router.select_detail(KEY, range_one)),
+            ("range bounds", lambda: router.select_detail(KEY, range_two)),
+            ("boot", lambda: router.select_detail(KEY, Window("since_boot", "boot-b",
+                                                              end_mono_ns=140 * NS))),
+        )
+        for label, retire in transitions:
+            router.select_detail(KEY, window)
+            router.request_detail("totals", presentation, window)
+            client.settle(client.only("totals"), _totals_response(KEY, window=window))
+            assert router.drain() is True
+            assert router.retained("totals", KEY, scope, window.end_mono_ns) is not None, label
+            retire()
+            # Synchronous: no drain, ready, render or query participates.
+            assert router.retained("totals", KEY, scope, window.end_mono_ns) is None, label
+            assert router.part_state("totals", KEY, scope).state == "absent", label
+            assert len(client.requests) == sends + 1, label
+            sends = len(client.requests)
+
+        # A backward endpoint retires; returning forward does not resurrect.
+        router.select_detail(KEY, window)
+        seen = router._detail.lifetime_id
+        router.select_detail(KEY, big)
+        assert router._detail.lifetime_id == seen  # forward preserves the lifetime
+        router.select_detail(KEY, small)
+        assert router._detail.lifetime_id != seen
+        assert router.retained("totals", KEY, scope, window.end_mono_ns) is None
+        router.select_detail(KEY, big)
+        assert router.retained("totals", KEY, scope, window.end_mono_ns) is None
+        assert router._detail.lifetime_id != seen
+        assert router._detail.lifetime_id != owner
+
+        # Two distinct ranges are distinct lifetimes too.
+        router.select_detail(KEY, range_one)
+        lifetime_one = router._detail.lifetime_id
+        router.select_detail(KEY, range_two)
+        assert router._detail.lifetime_id != lifetime_one
+        assert router.retained("totals", KEY, retention_scope(KEY, range_one),
+                               range_one.end_mono_ns) is None
+        assert router.retained("totals", KEY, retention_scope(KEY, range_two),
+                               range_two.end_mono_ns) is None
+    finally:
+        router.close()
+        store.connection.close()
+
+
+def test_authority_change_clears_details_without_conflating_cursor_advance(tmp_path):
+    """Only authority identities retire owners; sequence and counters do not.
+
+    Remote connection/boot/epoch and local registration changes clear the
+    selected lifetime and its records, while same-authority cursor sequence
+    advancement and local counter movement preserve them unchanged.
+    """
+
+    client = _BoundClient()
+    router, store = _empty_router(tmp_path, client, name="authority.db")
+    window = Window("since_boot", BOOT, end_mono_ns=140 * NS)
+    scope = retention_scope(KEY, window)
+    try:
+        presentation = _remote_frame(router, client, window)
+        router.select_detail(KEY, window)
+        router.request_detail("totals", presentation, window)
+        client.settle(client.only("totals"),
+                      _totals_response(KEY, window=window, value=share(1, window, read=52)))
+        assert router.drain() is True
+        record = router.retained("totals", KEY, scope, window.end_mono_ns)
+        assert record is not None
+        stamp = record.provenance.first_seen_at_ns
+
+        # Same authority: a sequence advance is not a connection change.
+        client.cursor = StreamCursor(BOOT, 3, 8)
+        client.state = ClientState(verified=True, answering=True, cursor=client.cursor)
+        client.clock.advance_ns(NS)
+        assert router.drain() is False
+        assert router.retained("totals", KEY, scope, window.end_mono_ns) is record
+        assert record.provenance.first_seen_at_ns == stamp
+
+        # A stored epoch is authority; a new epoch retires the lifetime once.
+        before = router._generation
+        client.cursor = StreamCursor(BOOT, 4, 8)
+        client.state = ClientState(verified=True, answering=True, cursor=client.cursor)
+        assert router.drain() is True
+        assert router.retained("totals", KEY, scope, window.end_mono_ns) is None
+        assert router.part_state("totals", KEY, scope).state == "absent"
+        assert router.view_state.startswith("unavailable")
+        retirements = router._generation
+        assert retirements > before
+        assert router.drain() is False
+        assert router._generation == retirements, "an already retired frame is not retired again"
+
+        # A new boot is authority too.
+        router.prepare(window)
+        router._local_future.result(timeout=15)
+        client.settle(client.only("ranking"), {
+            "kind": "ranking", "result": [total(17, KEY)], "snapshot": DIGEST,
+            "next_cursor": None,
+        })
+        assert router.ready(window) is True
+        router.select_detail(KEY, window)
+        router.request_detail("totals", presentation, window)
+        client.settle(client.only("totals"), _totals_response(KEY, window=window))
+        assert router.drain() is True
+        assert router.retained("totals", KEY, scope, window.end_mono_ns) is not None
+        client.cursor = StreamCursor("boot-b", 4, 8)
+        client.state = ClientState(verified=True, answering=True, cursor=client.cursor)
+        assert router.drain() is True
+        assert router.retained("totals", KEY, scope, window.end_mono_ns) is None
+
+        # A new connection generation with the same boot/epoch is a change.
+        router.prepare(window)
+        router._local_future.result(timeout=15)
+        client.settle(client.only("ranking"), {
+            "kind": "ranking", "result": [total(17, KEY)], "snapshot": DIGEST,
+            "next_cursor": None,
+        })
+        assert router.ready(window) is True
+        router.select_detail(KEY, window)
+        router.request_detail("totals", presentation, window)
+        client.settle(client.only("totals"), _totals_response(KEY, window=window))
+        assert router.drain() is True
+        assert router.retained("totals", KEY, scope, window.end_mono_ns) is not None
+        client._generation += 1
+        assert router.drain() is True
+        assert router.retained("totals", KEY, scope, window.end_mono_ns) is None
+    finally:
+        router.close()
+        store.connection.close()

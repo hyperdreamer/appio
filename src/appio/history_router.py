@@ -20,28 +20,35 @@ from __future__ import annotations
 from collections import defaultdict
 from collections.abc import Callable, Mapping
 from concurrent.futures import CancelledError, Future, InvalidStateError, ThreadPoolExecutor
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 import json
 import os
 from pathlib import Path
 import queue
 import sqlite3
+import time
 from typing import Literal
 from types import SimpleNamespace
 
 from .contracts import (
     AppTotal, Direction, DiskShare, FileCoverage, FileSort, FileTable, HistoryPending, Series, Window,
-    FILE_HOUR_NS, WindowUnavailableError, SQLITE_INT_MAX, validate_enum, validate_search,
-    validate_sqlite_integer,
+    FILE_HOUR_NS, LAUNCH_WINDOW_MESSAGE, WindowUnavailableError, SQLITE_INT_MAX,
+    validate_enum, validate_search, validate_sqlite_integer, validate_window,
 )
 from .history_types import (
+    AcceptedIdentity,
+    AnswerProvenance,
+    FrameProvenance,
     LocalBracket,
     LocalPosition,
     LocalPositionVector,
+    PartState,
     RemotePosition,
+    RetainedRecord,
     RetentionScope,
     SourcePosition,
     _boot_text,
+    applied_endpoint,
     local_answer_digest,
     retention_scope,
     validate_scope,
@@ -54,10 +61,13 @@ from .history_validation import (
     _validate_local_series,
     _validate_local_totals,
     _validate_served_bounds,
+    validate_query_result,
 )
 from .durable import decode_handover
 from .file_runtime import FileAvailability
 from .iodclient import (
+    NO_ANSWER_NS,
+    REQUEST_LIFETIME_NS,
     AppRegistry,
     ClientUnavailable,
     ConnectionLost,
@@ -95,6 +105,14 @@ _BACKGROUND_CHARGE = 10
 _TOKEN_ORIGINS = ("remote", "local")
 _TOKEN_OWNERS = ("frame", "detail", "files")
 _POSITION_OWNERS = ("gui", "iod")
+_DETAIL_KINDS = ("totals", "series")
+
+#: Scheduler ranks (§5.1). Lower runs first; admission serial breaks ties and
+#: no issued request is ever preempted.
+_PRIORITY_FRAME_RANKING = 0
+_PRIORITY_DETAIL = 1
+_PRIORITY_FILES = 2
+_PRIORITY_OTHER = 3
 
 
 @dataclass(frozen=True)
@@ -655,9 +673,86 @@ class _FrameCopyPaths(tuple):
         return self
 
 
+@dataclass(frozen=True)
+class _QueueEntry:
+    """One admitted historical request waiting for the single wire slot."""
+
+    token: RequestToken
+    priority: int
+    serial: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.token, RequestToken):
+            raise ValueError("a queue entry carries its admitted request token")
+        _private_int(self.priority, "queue_entry.priority")
+        _private_int(self.serial, "queue_entry.serial", minimum=1)
+
+
+@dataclass
+class _PartSlot:
+    """One exact-scope detail slot inside one selected lifetime.
+
+    Mutable owner-thread state only: no token, record or observation here ever
+    crosses an owner boundary. ``stamps`` keeps the identity-to-first-seen
+    lookup for this exact scope so a repeated accepted identity is not
+    restamped merely because another value was accepted in between (§2.4).
+    """
+
+    kind: str
+    scope: RetentionScope
+    phase: str = "absent"
+    token: RequestToken | None = None
+    record: RetainedRecord | None = None
+    reason: str | None = None
+    error: Exception | None = None
+    stamps: dict[AcceptedIdentity, int] = field(default_factory=dict)
+
+
+@dataclass
+class _DetailLifetime:
+    """One selected subject/scope lifetime; resets allocate a new id."""
+
+    app_key: str
+    family: tuple
+    lifetime_id: int
+    endpoint: int | None
+    slots: dict[tuple[str, RetentionScope], _PartSlot] = field(default_factory=dict)
+    live: dict[str, RequestToken] = field(default_factory=dict)
+    successors: dict[str, RequestToken] = field(default_factory=dict)
+
+
+@dataclass
+class _FrameOwner:
+    """One admitted frame generation's mutable owner-side context."""
+
+    owner_id: int
+    window: Window
+    requested_source: SourcePosition
+    authority: tuple
+    local_token: RequestToken
+    remote_token: RequestToken | None
+    local_binding: _LocalCopyBinding
+    local_settled: bool = False
+    remote_settled: bool = False
+    remote_candidate: dict | None = None
+    remote_applied: bool = False
+    retired: bool = False
+    error: Exception | None = None
+    certificate: FrameProvenance | None = None
+    ranking_provenance: dict[str, AnswerProvenance] = field(default_factory=dict)
+    local_bracket: LocalBracket | None = None
+    answered_source: SourcePosition | None = None
+    remote_future: Future | None = None
+    remote_answered: SourcePosition | None = None
+
+
 class HistoryRouter:
-    def __init__(self, local: QueryService, client: IodClient, registry: AppRegistry):
+    def __init__(self, local: QueryService, client: IodClient, registry: AppRegistry, *,
+                 clock_ns: Callable[[], int] = time.monotonic_ns):
+        if not callable(clock_ns):
+            raise ValueError("clock_ns must be callable")
         self.local, self.client, self.registry = local, client, registry
+        self._clock_ns = clock_ns
         self._sources = {"local": (local, "gui")}
         # Registration bookkeeping (§4.2): a strictly increasing epoch that is
         # never reused, plus the live service/connection identity, canonical
@@ -691,10 +786,29 @@ class HistoryRouter:
         self._views = []
         self._ranking = []
         self._remote = None
-        self._inflight: list[tuple[int, QueryRequest, Future]] = []
-        self._requested_parts: set[tuple[str, str]] = set()
-        self._queue = []
-        self._remote_parts = {}
+        self._remote_answered: SourcePosition | None = None
+        self._remote_snapshot = None
+        #: Scope-owned detail (§3.1-3.2): one selected lifetime, never a
+        #: cross-subject cache, plus the view's last adopted applied window.
+        self._detail: _DetailLifetime | None = None
+        self._next_lifetime_id = 1
+        self._applied_window: Window | None = None
+        #: One wire occupant and its priority-stable queue (§5.1).
+        self._queue: list[_QueueEntry] = []
+        self._occupant: tuple[RequestToken, Future] | None = None
+        self._admission_serial = 0
+        #: Settlement guards: a token settles exactly once, and a publication
+        #: retired token can never publish even if its Future completes.
+        self._settled_tokens: set[int] = set()
+        self._retired_tokens: set[int] = set()
+        #: Admitted local detail tokens waiting for background capacity.
+        self._unscheduled: dict[int, RequestToken] = {}
+        #: The current frame owner and its readiness/authority context (§3.4).
+        self._frame: _FrameOwner | None = None
+        self._frame_error: Exception | None = None
+        self._authority: tuple | None = None
+        self._ranking_stamps: dict[AcceptedIdentity, int] = {}
+        self._deferred_admissions: list[str] = []
         self._gap_ranges = []
         self._known_gap_ranges = []
         self._overlap_ranges = []
@@ -728,8 +842,6 @@ class HistoryRouter:
         self._local_settlement: LocalSettlement | None = None
         self._daemon_answer_error: DaemonAnswerError | None = None
         self._local_generation = None
-        self._cached_parts = {}
-        self._remote_snapshot = None
         self._closed = False
         self._file_jobs = set()
         self._file_status = FileAvailability(True, False)
@@ -1212,15 +1324,34 @@ class HistoryRouter:
 
     @property
     def pending_work(self) -> bool:
-        """True while a frame, a local worker or a detail still needs draining.
+        """True while any frame, detail, Files or transport work needs draining.
 
-        The console pumps the transport from its pending-frame poll; a subject's
-        part is requested outside a frame, so without this the reply waited for
-        the next refresh and could outlive the client's five second deadline.
+        A queued, running, completed-but-undrained or retired-held request keeps
+        the console's poll armed; it never waits for a target calculation.
         """
 
-        return bool(self._inflight or self._queue or self._worker_jobs
-                    or not self._completed.empty())
+        if (self._occupant is not None or self._queue or self._worker_jobs
+                or self._unscheduled or not self._completed.empty()):
+            return True
+        frame = self._frame
+        if (frame is None or frame.retired or frame.local_settled
+                or self._local_future is None):
+            return False
+        # A frame whose generation was retired (invalidate/prepare) is not work
+        # any drain can collect; only the live generation's copy still is.
+        return self._local_generation == self._generation
+
+    @property
+    def _pending(self):
+        """The oldest unsettled wire work, or None when nothing is outstanding."""
+
+        if self._occupant is not None:
+            token, future = self._occupant
+            return (self._generation, token.request, future)
+        if self._queue:
+            entry = self._queue[0]
+            return (self._generation, entry.token.request, None)
+        return None
 
     def _cancel_file_requests(self):
         for future in tuple(self._file_jobs):
@@ -1531,8 +1662,35 @@ class HistoryRouter:
         self._local_generation = -1
         if self._local_future is not None:
             self._local_future.cancel()
+        self._retire_frame_publication()
         self._ready = False
         self.view_state = "unavailable"
+
+    def _retire_frame_publication(self) -> None:
+        """Retire the admitted frame's publication rights without canceling it.
+
+        The running local Future and any sent transport occupant stay real
+        resources; their terminal completions are drained and ignored. This is
+        the generation seam's own retirement, distinct from authority change.
+        """
+
+        frame = self._frame
+        if frame is None or frame.retired:
+            return
+        frame.retired = True
+        self._retired_tokens.add(frame.local_token.token_id)
+        if frame.remote_token is not None:
+            self._retired_tokens.add(frame.remote_token.token_id)
+        self._queue = [entry for entry in self._queue
+                       if not (entry.token.owner == "frame"
+                               and entry.token.owner_id == frame.owner_id)]
+        frame.remote_candidate = None
+        frame.certificate = None
+        frame.ranking_provenance = {}
+        self._remote = None
+        self._remote_answered = None
+        self._remote_snapshot = None
+        self._ready = False
 
     def add_source(self, service: QueryService, *, collector_id: str, owner: str) -> None:
         if not collector_id or collector_id == "local":
@@ -1963,94 +2121,762 @@ class HistoryRouter:
         finally:
             HistoryRouter._close_local_worker(worker, sources)
 
+    # -- authority and source identity (§3.2) ------------------------------ #
+
+    def _local_authority(self) -> tuple:
+        """The current local authority: every registered identity, name-ordered."""
+
+        entries = []
+        for name in sorted(self._sources, key=lambda text: text.encode("utf-8")):
+            service, owner = self._sources[name]
+            registration = self._registrations.get(name)
+            if (registration is None or registration.service is not service
+                    or registration.connection is not service.connection
+                    or registration.owner != owner):
+                # A replacement is pending: its future epoch is not yet the
+                # installed identity of any connection. Never adopt it silently.
+                epoch = self._next_registration_epoch
+            else:
+                epoch = registration.registration_epoch
+            entries.append((name, owner, epoch))
+        return ("local", tuple(entries))
+
+    def _remote_authority(self) -> tuple | None:
+        """The verified remote connection identity, or None for local mode.
+
+        The cursor sequence is deliberately absent: advancing it is an ordinary
+        source change, never a connection-authority change.
+        """
+
+        state = self.client.state
+        if (state is None or not state.verified or not state.answering
+                or state.cursor is None):
+            return None
+        return ("remote", getattr(self.client, "generation", 0),
+                state.cursor.boot_id, state.cursor.iod_epoch)
+
+    def _current_authority(self) -> tuple:
+        remote = self._remote_authority()
+        return remote if remote is not None else self._local_authority()
+
+    def _remote_mode(self) -> bool:
+        return self._remote_authority() is not None
+
+    def _reconcile_authority(self) -> bool:
+        """Retire obsolete owners before collecting or dispatching (§3.2)."""
+
+        current = self._current_authority()
+        if self._authority is None:
+            self._authority = current
+            return False
+        if current == self._authority:
+            return False
+        self._retire_authority(current)
+        return True
+
+    def _retire_authority(self, current: tuple) -> None:
+        """One authority transition: clear detail and retire its admitted frame."""
+
+        self._authority = current
+        changed = self._retire_detail_lifetime()
+        frame = self._frame
+        if frame is not None and not frame.retired:
+            frame.error = None
+            self._settle(frame.local_token, retiring=True)
+            if frame.remote_token is not None:
+                self._settle(frame.remote_token, retiring=True)
+            changed = True
+        return changed
+
+    # -- scope-owned detail lifecycle (§§2.4, 3.1-3.2) --------------------- #
+
+    @staticmethod
+    def _scope_family(scope: RetentionScope) -> tuple:
+        tag = scope[1]
+        if tag == "range":
+            return (scope[0], "range", scope[2], scope[3])
+        if tag == "since_boot":
+            return (scope[0], "since_boot", scope[2])
+        return (scope[0], tag)
+
+    @staticmethod
+    def _window_family(app_key: str, window: Window) -> tuple:
+        if window.kind == "range":
+            return (app_key, "range", window.boot_id, window.start_mono_ns)
+        if window.kind == "since_boot":
+            return (app_key, "since_boot", window.boot_id)
+        return (app_key, window.kind)
+
+    def _retire_detail_lifetime(self) -> bool:
+        """Drop the selected lifetime, its records, stamps and live owners.
+
+        Publication retirement never releases a running worker or an issued
+        transport slot; their eventual completions are drained and ignored.
+        """
+
+        lifetime = self._detail
+        if lifetime is None:
+            self._applied_window = None
+            return False
+        for token in tuple(lifetime.live.values()) + tuple(lifetime.successors.values()):
+            self._retired_tokens.add(token.token_id)
+            self._unscheduled.pop(token.token_id, None)
+        self._detail = None
+        self._applied_window = None
+        return True
+
+    def select_detail(self, app_key: str | None, window: Window | None) -> None:
+        """Adopt the view's selected applied subject and scope, or retire it.
+
+        Same subject and scope with a nondecreasing endpoint preserves tokens,
+        records and stamps; a changed subject, tag, boot, range start or a
+        backward endpoint retires them synchronously. This sends no query.
+        """
+
+        if app_key is None and window is None:
+            self._retire_detail_lifetime()
+            return
+        if app_key is None or window is None:
+            raise ValueError("select_detail needs both the subject and the applied window")
+        key = _canonical_app_key(app_key)
+        if not isinstance(window, Window):
+            raise ValueError("select_detail requires an applied Window")
+        if window.kind == "launch":
+            raise WindowUnavailableError("launch_attribution", LAUNCH_WINDOW_MESSAGE)
+        validate_window(window)
+        family = self._window_family(key, window)
+        endpoint = applied_endpoint(window)
+        lifetime = self._detail
+        if (lifetime is not None and lifetime.app_key == key
+                and lifetime.family == family):
+            if endpoint is None:
+                self._applied_window = window
+                return
+            if lifetime.endpoint is not None and endpoint < lifetime.endpoint:
+                self._retire_detail_lifetime()
+            else:
+                lifetime.endpoint = endpoint
+                self._applied_window = window
+                return
+        self._retire_detail_lifetime()
+        self._detail = _DetailLifetime(key, family, self._next_lifetime_id, endpoint)
+        self._next_lifetime_id += 1
+        self._applied_window = window
+
+    def _detail_token_live(self, token: RequestToken) -> bool:
+        lifetime = self._detail
+        if lifetime is None or lifetime.lifetime_id != token.owner_id:
+            return False
+        if token.scope is None or lifetime.app_key != token.scope[0]:
+            return False
+        kind = token.request.kind
+        live = lifetime.live.get(kind)
+        if live is not None and live.token_id == token.token_id:
+            return True
+        successor = lifetime.successors.get(kind)
+        return successor is not None and successor.token_id == token.token_id
+
+    def _admit_detail(self, lifetime: _DetailLifetime, kind: str, key: str,
+                      window: Window, scope: RetentionScope) -> RequestToken:
+        token_id = self._allocate_token_id()
+        origin = "remote" if self._remote_mode() else "local"
+        authority = self._current_authority()
+        requested_source = self.source_position() if origin == "remote" else self._local_vector()
+        slot_id = self._allocate_token_id() if origin == "remote" else None
+        token = RequestToken(
+            token_id, QueryRequest(kind, window, key), origin, scope, "detail",
+            lifetime.lifetime_id, slot_id, authority, requested_source,
+        )
+        slot = lifetime.slots.get((kind, scope))
+        if slot is None:
+            slot = _PartSlot(kind, scope)
+            lifetime.slots[(kind, scope)] = slot
+        slot.phase = "pending"
+        slot.token = token
+        slot.reason = None
+        slot.error = None
+        lifetime.live[kind] = token
+        if origin == "remote":
+            self._queue.append(_QueueEntry(token, _PRIORITY_DETAIL, self._next_serial()))
+            self._dispatch()
+        else:
+            self._start_local_detail(token)
+        return token
+
+    def request_detail(self, kind: PartKind, app_id: int, window: Window) -> PartState:
+        """Admit at most one live token for one selected kind/scope.
+
+        An older in-flight exact request survives and is returned as pending;
+        only one latest eligible desired applied Window is remembered as its
+        successor. This never replaces a live owner on every forward frame.
+        """
+
+        _private_enum(kind, _DETAIL_KINDS, "detail.kind")
+        if isinstance(app_id, bool) or not isinstance(app_id, int) or app_id <= 0:
+            raise ValueError("request_detail requires a positive presentation subject id")
+        key = self.registry.key_for(app_id)
+        if not isinstance(window, Window):
+            raise ValueError("request_detail requires an exact Window")
+        self.local._precheck(window)
+        validate_window(window)
+        lifetime = self._detail
+        if lifetime is None or lifetime.app_key != key:
+            raise ValueError("request_detail requires the selected applied subject")
+        if self._window_family(key, window) != lifetime.family:
+            raise ValueError("request_detail window is outside the selected scope")
+        endpoint = applied_endpoint(window)
+        if endpoint is not None:
+            if lifetime.endpoint is None or endpoint > lifetime.endpoint:
+                raise ValueError("request_detail window is beyond the applied frame")
+        scope = retention_scope(key, window)
+        live = lifetime.live.get(kind)
+        if live is not None:
+            if live.request.window == window:
+                return self.part_state(kind, key, scope)
+            live_endpoint = applied_endpoint(live.request.window)
+            if endpoint is not None and live_endpoint is not None and endpoint >= live_endpoint:
+                successor = lifetime.successors.get(kind)
+                successor_endpoint = (None if successor is None
+                                      else applied_endpoint(successor.request.window))
+                if successor is None or successor_endpoint is None or endpoint >= successor_endpoint:
+                    if successor is not None:
+                        self._retired_tokens.add(successor.token_id)
+                        self._unscheduled.pop(successor.token_id, None)
+                    token = self._admit_detail(lifetime, kind, key, window, scope)
+                    lifetime.successors[kind] = token
+                    lifetime.live[kind] = live  # the older live owner keeps the wire
+                    return self.part_state(kind, key, scope)
+            return self.part_state(kind, key, scope)
+        self._admit_detail(lifetime, kind, key, window, scope)
+        return self.part_state(kind, key, scope)
+
+    def _part_state_from_slot(self, key: str, kind: str,
+                              scope: RetentionScope) -> PartState:
+        lifetime = self._detail
+        slot = None if lifetime is None else lifetime.slots.get((kind, scope))
+        if slot is None or slot.token is None:
+            return PartState(kind, key, scope, "absent", None, None, None, None)
+        token = slot.token
+        record = slot.record if slot.phase == "ok" else None
+        reason = slot.reason if slot.phase == "failed" else None
+        return PartState(kind, key, scope, slot.phase, token.token_id,
+                         token.request.window, record, reason)
+
+    def part_state(self, kind: PartKind, app_key: str,
+                   scope: RetentionScope) -> PartState:
+        """A pure observation of one exact slot, or a valid absent state."""
+
+        _private_enum(kind, _DETAIL_KINDS, "part_state.kind")
+        key = _canonical_app_key(app_key)
+        scope = validate_scope(scope)
+        if scope[0] != key:
+            raise ValueError("part_state scope must name its subject")
+        lifetime = self._detail
+        if (lifetime is None or lifetime.app_key != key
+                or self._scope_family(scope) != lifetime.family):
+            return PartState(kind, key, scope, "absent", None, None, None, None)
+        return self._part_state_from_slot(key, kind, scope)
+
+    def retained(self, kind: PartKind, app_key: str, scope: RetentionScope,
+                 applied_endpoint_at: int | None) -> RetainedRecord | None:
+        """The newest eligible accepted record; pure, never a send or a stamp."""
+
+        _private_enum(kind, _DETAIL_KINDS, "retained.kind")
+        key = _canonical_app_key(app_key)
+        scope = validate_scope(scope)
+        if scope[0] != key:
+            raise ValueError("retained scope must name its subject")
+        tag = scope[1]
+        if tag in ("lifetime", "launch"):
+            if applied_endpoint_at is not None:
+                raise ValueError("a lifetime or launch scope takes no applied endpoint")
+        else:
+            _private_int(applied_endpoint_at, "retained.applied_endpoint")
+        lifetime = self._detail
+        if lifetime is None or lifetime.app_key != key:
+            return None
+        if self._scope_family(scope) != lifetime.family:
+            # A different live scope (tag, boot, range start) is not this
+            # caller's slot; a retired or foreign slot supplies no record.
+            return None
+        exact = lifetime.slots.get((kind, scope))
+        if exact is not None and exact.phase == "failed":
+            return None
+        best = None
+        for (slot_kind, _slot_scope), slot in lifetime.slots.items():
+            if slot_kind != kind or slot.record is None or slot.phase == "failed":
+                continue
+            measured = slot.record.provenance.measured_window
+            if tag in ("range", "since_boot"):
+                if measured.end_mono_ns is None or measured.end_mono_ns > applied_endpoint_at:
+                    continue
+            if best is None:
+                best = slot.record
+                continue
+            best_end = best.provenance.measured_window.end_mono_ns
+            candidate_end = measured.end_mono_ns
+            if best_end is None:
+                best = slot.record
+            elif candidate_end is not None and candidate_end >= best_end:
+                best = slot.record
+        return best
+
+    def _exact_part(self, app_id: int, window: Window, kind: str):
+        """The exact-window detail getter: its own Window or HistoryPending."""
+
+        if isinstance(app_id, bool) or not isinstance(app_id, int) or app_id <= 0:
+            raise ValueError("a detail getter requires a positive presentation id")
+        key = self.registry.key_for(app_id)
+        if not isinstance(window, Window):
+            raise ValueError("a detail getter requires an exact Window")
+        lifetime = self._detail
+        if (lifetime is None or lifetime.app_key != key
+                or self._window_family(key, window) != lifetime.family):
+            # A legacy exact caller names its subject and applied Window itself.
+            # Adopting that scope here is the same synchronous reset the view's
+            # select_detail performs; it is never a cross-subject detail cache.
+            self.select_detail(key, window)
+            lifetime = self._detail
+        scope = retention_scope(key, window)
+        slot = lifetime.slots.get((kind, scope))
+        if (slot is not None and slot.phase == "failed" and slot.token is not None
+                and slot.token.request.window == window):
+            raise slot.error
+        if (slot is not None and slot.phase == "ok" and slot.record is not None
+                and slot.record.provenance.measured_window == window):
+            return slot.record.value
+        endpoint = applied_endpoint(window)
+        if endpoint is not None and (lifetime.endpoint is None or endpoint > lifetime.endpoint):
+            raise HistoryPending(
+                f"this application's {kind} is not measured at this applied endpoint")
+        self.request_detail(kind, app_id, window)
+        raise HistoryPending(
+            f"this application's {kind} is still loading from the collector")
+
+    def disk_share(self, app_id: int, window: Window) -> DiskShare:
+        return self._exact_part(app_id, window, "totals")
+
+    def series(self, app_id: int, window: Window) -> Series:
+        return self._exact_part(app_id, window, "series")
+
+    # -- frame preparation, readiness and lazy local detail (§3.3) --------- #
+
+    def _next_serial(self) -> int:
+        self._admission_serial += 1
+        return self._admission_serial
+
     def prepare(self, window: Window) -> None:
-        # Preparation may fail before a future exists to report unavailability.
+        # A22 precedes any source observation, exactly as before.
         self._file_status = FileAvailability(False, False, "file_source_unavailable")
         self.local._precheck(window)
         if self._closed:
             raise RuntimeError("history router is closed")
+        # Reconcile before admitting a new owner so this frame belongs to the
+        # authority observed now rather than retiring itself on its first drain.
+        self._reconcile_authority()
+        remote_mode = self._remote_mode()
+        requested_source = self.source_position() if remote_mode else None
+        previous = self._frame
+        if previous is not None:
+            self._retired_tokens.add(previous.local_token.token_id)
+            if previous.remote_token is not None:
+                self._retired_tokens.add(previous.remote_token.token_id)
+            self._queue = [entry for entry in self._queue
+                           if not (entry.token.owner == "frame"
+                                   and entry.token.owner_id == previous.owner_id)]
+        if self._local_future is not None:
+            self._local_future.cancel()
+        self._local_future = None
+        if self._local_worker_id is not None:
+            self._worker_bindings.pop(self._local_worker_id, None)
+            self._local_worker_id = None
         self._generation += 1
         self._cancel_file_requests()
         self._window, self._ready = window, False
         self.segments, self.boundaries = (), ()
         self._gap_ranges, self._known_gap_ranges, self._overlap_ranges = [], [], []
         self._has_local_history = False
-        self._ranking, self._remote_parts, self._queue, self._cached_parts = [], {}, [], {}
-        self._requested_parts = set()
-        self._remote = self._remote_snapshot = None
+        self._ranking = []
+        self._remote = None
+        self._remote_answered = None
+        self._remote_snapshot = None
         self._not_retained = self._chronology_unproved = False
         self._daemon_answer_error = None
+        self._frame_error = None
+        self._ranking_stamps = {}
         self.view_state = "loading"
-        if self._local_future is not None:
-            self._local_future.cancel()
-        if self._local_worker_id is not None:
-            # The previous generation can never be consumed (§3.2/§4.3), so its
-            # admission evidence is retired with it. Capacity stays a resource.
-            self._worker_bindings.pop(self._local_worker_id, None)
         worker_id = self._allocate_token_id()
         request = QueryRequest("ranking", window)
-        binding = self._capture_local_binding(worker_id=worker_id, request=request)
+        binding = self._capture_local_binding(
+            worker_id=worker_id, token_id=worker_id, request=request)
         self._worker_bindings[worker_id] = binding
         self._local_generation = self._generation
         self._local_worker_id = worker_id
         self._local_paths = binding.paths
-        # The frame lane holds exactly one charged Future. A completed but
-        # undrained predecessor stays observable through its own result before
-        # the frozen `not done()` gate admits a replacement. The submission
-        # carries the admitted worker binding into the copy itself.
+        authority = self._current_authority()
+        if requested_source is None:
+            # The local capture's opening observation is the requested source;
+            # it costs no third reader pass (§6.1).
+            requested_source = binding.opening
+        local_token = RequestToken(
+            worker_id, request, "local", None, "frame", self._generation, None,
+            authority, binding.opening)
+        remote_token = None
+        if remote_mode:
+            remote_token = RequestToken(
+                self._allocate_token_id(), request, "remote", None, "frame",
+                self._generation, self._allocate_token_id(), authority,
+                requested_source)
+            self._queue.append(_QueueEntry(
+                remote_token, _PRIORITY_FRAME_RANKING, self._next_serial()))
+        self._frame = _FrameOwner(
+            self._generation, window, requested_source, authority, local_token,
+            remote_token, binding)
         try:
             self._local_future = self._frame_executor.submit(
                 self._read_local, _FrameCopyPaths(binding), window)
         except Exception:
-            # A refused submission publishes no admission evidence; the caller
-            # receives the submit failure through the existing seam.
             self._worker_bindings.pop(worker_id, None)
             self._local_worker_id = None
+            self._frame = None
             raise
-        state = self.client.state
-        if state is not None and state.verified and state.answering:
-            self._queue.append(QueryRequest("ranking", window))
-            self._dispatch()
+        self._dispatch()
         self._file_status = FileAvailability(True, False)
 
-    def _consume_local(self):
-        if self._local_generation is None:
-            return self._local_future is not None
-        if self._local_generation != self._generation:
+    def preparation_source(self, window: Window) -> SourcePosition | None:
+        frame = self._frame
+        if frame is None or frame.window != window or frame.retired:
+            return None
+        return frame.requested_source
+
+    def frame_provenance(self, window: Window) -> FrameProvenance | None:
+        frame = self._frame
+        if frame is None or frame.window != window:
+            return None
+        return frame.certificate
+
+    def ranking_provenance(self, app_key: str, window: Window) -> AnswerProvenance | None:
+        key = _canonical_app_key(app_key)
+        frame = self._frame
+        if frame is None or frame.window != window or frame.certificate is None:
+            return None
+        return frame.ranking_provenance.get(key)
+
+    # -- the sole owner-side settlement writer (§3.4) ---------------------- #
+
+    def _notify(self) -> None:
+        """Owner-thread notification hook; view wiring arrives in Tasks 9/12."""
+
+    def _settle(self, token: RequestToken, outcome: SettlementInput | None = None,
+                *, retiring: bool = False) -> bool:
+        """Settle one admitted request token exactly once.
+
+        Guard order: closed/settled/retired, current token, live owner,
+        authority and scope; then the bound input association; then selector
+        and owner predicates. No ignored completion mutates another owner.
+        """
+
+        if not isinstance(token, RequestToken):
+            raise ValueError("a settlement requires its admitted request token")
+        if self._closed:
             return False
-        if self._local_future is None or not self._local_future.done():
+        if retiring:
+            if outcome is not None:
+                raise ValueError("an administrative retirement carries no outcome")
+            if token.token_id in self._retired_tokens:
+                return False
+            if token.owner == "frame":
+                # A frame owner retires once even after its local copy settled:
+                # the owner, not the settled token, is what authority retires.
+                return self._retire_frame_owner(token)
+            if token.token_id in self._settled_tokens:
+                return False
+            if token.owner == "detail":
+                return self._retire_detail_token(token)
             return False
-        outcome = error = None
-        try:
-            outcome = self._local_future.result()
-        except Exception as caught:  # noqa: BLE001 - re-raised after the bracket
-            error = caught
-        worker_id = self._local_worker_id
-        binding = None if worker_id is None else self._worker_bindings.get(worker_id)
-        if binding is None:
-            self._file_status = FileAvailability(False, False, "file_source_unavailable")
-            raise ValueError("a local frame has no captured copy binding")
-        if error is None:
+        if token.token_id in self._settled_tokens or token.token_id in self._retired_tokens:
+            return False
+        if token.owner == "frame":
+            frame = self._frame
+            if frame is None or frame.owner_id != token.owner_id or frame.retired:
+                return False
+            if token.authority != frame.authority:
+                return False
+            if token.request.window != self._window:
+                return False
+        elif token.owner == "detail":
+            if not self._detail_token_live(token):
+                return False
+            if token.authority != self._current_authority():
+                return False
+        else:
+            return False
+        if outcome is None:
+            return self._reject_token(
+                token, None, RequestRejected("invalid_result", "invalid_result"))
+        if isinstance(outcome, RemoteSettlement):
+            if token.origin != "remote":
+                return self._reject_token(
+                    token, outcome, RequestRejected("invalid_result", "invalid_result"))
+            return self._settle_remote(token, outcome)
+        if isinstance(outcome, LocalSettlement):
+            if token.origin != "local":
+                return self._reject_token(
+                    token, outcome, RequestRejected("invalid_result", "invalid_result"))
+            return self._settle_local(token, outcome)
+        return self._reject_token(
+            token, None, RequestRejected("invalid_result", "invalid_result"))
+
+    def _retire_frame_owner(self, token: RequestToken) -> bool:
+        frame = self._frame
+        if frame is None or frame.owner_id != token.owner_id or frame.retired:
+            return False
+        frame.retired = True
+        for side in (frame.local_token, frame.remote_token):
+            if side is not None:
+                self._retired_tokens.add(side.token_id)
+        self._queue = [entry for entry in self._queue
+                       if not (entry.token.owner == "frame"
+                               and entry.token.owner_id == frame.owner_id)]
+        frame.remote_candidate = None
+        frame.certificate = None
+        frame.ranking_provenance = {}
+        self._remote = None
+        self._remote_answered = None
+        self._remote_snapshot = None
+        self._ready = False
+        self._local_generation = -1
+        # Advance the generation once for this frame owner, exactly as the
+        # existing invalidation seam does. Its running Future and sent occupant
+        # stay real resources; they can never publish.
+        self._generation += 1
+        self.view_state = "unavailable: authority changed"
+        return True
+
+    def _retire_detail_token(self, token: RequestToken) -> bool:
+        lifetime = self._detail
+        if lifetime is None or lifetime.lifetime_id != token.owner_id:
+            return False
+        kind = token.request.kind
+        live = lifetime.live.get(kind)
+        successor = lifetime.successors.get(kind)
+        if live is not None and live.token_id == token.token_id:
+            del lifetime.live[kind]
+        elif successor is not None and successor.token_id == token.token_id:
+            del lifetime.successors[kind]
+        else:
+            return False
+        self._retired_tokens.add(token.token_id)
+        self._unscheduled.pop(token.token_id, None)
+        scope = token.scope
+        if scope is not None:
+            slot = lifetime.slots.get((kind, scope))
+            if slot is not None:
+                slot.record = None
+                slot.stamps.clear()
+                slot.phase = "absent"
+                slot.token = None
+                slot.reason = None
+                slot.error = None
+        return True
+
+    def _reject_token(self, token: RequestToken, outcome: SettlementInput | None,
+                      error: Exception) -> bool:
+        if isinstance(outcome, RemoteSettlement):
             try:
-                outcome = self._admitted_frame_outcome(outcome, binding)
-            except Exception as caught:  # noqa: BLE001 - reported after the bracket
-                outcome, error = None, caught
+                self.client.reject_query_result(outcome.future)
+            except Exception:
+                pass
+        return self._settle_failure(token, error)
+
+    def _settle_failure(self, token: RequestToken, error: Exception) -> bool:
+        self._settled_tokens.add(token.token_id)
+        if token.origin == "local":
+            # A failed copy is terminal: it keeps its diagnostics and its binding
+            # is retired; only a closing-observer failure stays retryable.
+            self._worker_bindings.pop(token.token_id, None)
+        if token.owner == "detail":
+            return self._current_detail_failure(token, error)
+        frame = self._frame
+        if frame is None:
+            return False
+        if token.origin == "local":
+            # The existing availability seam owns a local copy failure; it is
+            # never a successful empty measurement or a remote diagnostic.
+            frame.error = error
+            self._ready = False
+            self._file_status = FileAvailability(
+                False, False, "file_source_unavailable")
+            self.view_state = "unavailable: local history evidence"
+            self._ranking = []
+            return True
+        if token.request.kind == "ranking":
+            frame.remote_settled = True
+            frame.remote_candidate = None
+            self._fail_remote(error)
+            return True
+        return False
+
+    def _current_detail_failure(self, token: RequestToken, error: Exception) -> bool:
+        lifetime = self._detail
+        if lifetime is None or lifetime.lifetime_id != token.owner_id:
+            return False
+        kind = token.request.kind
+        scope = token.scope
+        slot = lifetime.slots.get((kind, scope))
+        if slot is None:
+            slot = _PartSlot(kind, scope)
+            lifetime.slots[(kind, scope)] = slot
+        # A current failure clears the record before any notification; a pending
+        # retry cannot restore it, and the original exception is retained.
+        slot.record = None
+        slot.phase = "failed"
+        slot.token = token
+        slot.reason = str(error) if str(error) else type(error).__name__
+        slot.error = error
+        live = lifetime.live.get(kind)
+        if live is not None and live.token_id == token.token_id:
+            del lifetime.live[kind]
+        successor = lifetime.successors.pop(kind, None)
+        if successor is not None:
+            self._retired_tokens.add(successor.token_id)
+            self._unscheduled.pop(successor.token_id, None)
+        return True
+
+    def _settle_remote(self, token: RequestToken, settlement: RemoteSettlement) -> bool:
+        future = settlement.future
         try:
-            settlement = self._close_local_settlement(
-                LocalSettlement(worker_id, outcome=outcome, error=error), binding=binding)
+            state = self.client.query_transport(future)
         except Exception:
-            if error is None:
-                self._file_status = FileAvailability(False, False, "file_source_unavailable")
-                raise
-            # The copy already failed: keep its original diagnostics rather than
-            # masking them with a closing observation failure. No bracket is
-            # fabricated for an unobserved boundary.
-            settlement = LocalSettlement(worker_id, error=error)
-        self._local_settlement = settlement
-        self._worker_bindings.pop(worker_id, None)
-        if error is not None:
-            self._file_status = FileAvailability(False, False, "file_source_unavailable")
-            raise error
+            return self._reject_token(
+                token, settlement, RequestRejected("invalid_result", "invalid_result"))
+        if state.request != token.request:
+            return self._reject_token(
+                token, settlement, RequestRejected("invalid_result", "invalid_result"))
+        if state.connection_generation != token.authority[1]:
+            return self._reject_token(
+                token, settlement, RequestRejected("invalid_result", "invalid_result"))
+        cache_hit = state.phase == "terminal" and state.request_id is None
+        if not cache_hit and state.issued_source != token.requested_source:
+            return self._reject_token(
+                token, settlement, RequestRejected("invalid_result", "invalid_result"))
+        if state.phase not in ("terminal", "expired", "lost"):
+            return self._reject_token(
+                token, settlement, RequestRejected("invalid_result", "invalid_result"))
+        if not future.done():
+            return self._reject_token(
+                token, settlement, RequestRejected("invalid_result", "invalid_result"))
+        try:
+            actual = future.result()
+        except Exception as error:  # noqa: BLE001 - the bound terminal exception
+            if settlement.error is not error:
+                return self._reject_token(
+                    token, settlement, RequestRejected("invalid_result", "invalid_result"))
+            return self._settle_failure(token, error)
+        if settlement.response is None or settlement.response != actual:
+            return self._reject_token(
+                token, settlement, RequestRejected("invalid_result", "invalid_result"))
+        try:
+            validate_query_result(token.request, actual)
+        except Exception:
+            return self._reject_token(
+                token, settlement, RequestRejected("invalid_result", "invalid_result"))
+        if token.owner == "detail":
+            kind = token.request.kind
+            value = actual["result"]
+            if kind == "totals" and not isinstance(value, DiskShare):
+                return self._reject_token(
+                    token, settlement, RequestRejected("invalid_result", "invalid_result"))
+            if kind == "series" and not isinstance(value, Series):
+                return self._reject_token(
+                    token, settlement, RequestRejected("invalid_result", "invalid_result"))
+            if value.window != token.request.window:
+                return self._reject_token(
+                    token, settlement, RequestRejected("invalid_result", "invalid_result"))
+            answered = state.answered_source
+            if answered is None or answered != token.requested_source:
+                return self._reject_token(
+                    token, settlement, RequestRejected("invalid_result", "invalid_result"))
+            digest = actual.get("snapshot")
+            presentation = self.registry.id_for(token.request.app_key)
+            return self._publish_detail(
+                token, replace(value, app_id=presentation), digest,
+                answered_source=answered, bracket=None)
+        if token.request.kind != "ranking":
+            # An already-supported other selector is validated and discarded;
+            # it publishes no owner record and does not affect the frame.
+            self._settled_tokens.add(token.token_id)
+            return False
+        frame = self._frame
+        if frame is None:
+            return False
+        if not frame.local_settled:
+            # The remote completion waits privately for this same frame's local
+            # ownership evidence and cannot become a readiness success early.
+            frame.remote_candidate = dict(actual)
+            frame.remote_future = future
+            frame.remote_answered = state.answered_source
+            frame.remote_settled = True
+            return False
+        try:
+            self._apply_remote_ranking(frame, actual, state.answered_source)
+        except Exception as error:  # noqa: BLE001 - rejection becomes the frame seam
+            frame.remote_settled = True
+            frame.remote_candidate = None
+            self._settled_tokens.add(token.token_id)
+            self._fail_remote(error)
+            try:
+                self.client.reject_query_result(future)
+            except Exception:
+                pass
+            return True
+        frame.remote_settled = True
+        frame.remote_applied = True
+        self._settled_tokens.add(token.token_id)
+        return True
+
+    def _settle_local(self, token: RequestToken, settlement: LocalSettlement) -> bool:
+        if settlement.worker_id != token.token_id:
+            return self._reject_token(
+                token, settlement, RequestRejected("invalid_result", "invalid_result"))
+        binding = self._worker_bindings.get(token.token_id)
+        if (binding is None or binding.token_id != token.token_id
+                or binding.request != token.request):
+            return self._reject_token(
+                token, settlement, RequestRejected("invalid_result", "invalid_result"))
+        if settlement.error is not None:
+            return self._settle_failure(token, settlement.error)
+        outcome = settlement.outcome
+        if token.owner == "detail":
+            if not isinstance(outcome, LocalPartOutcome):
+                return self._reject_token(
+                    token, settlement, RequestRejected("invalid_result", "invalid_result"))
+            if outcome.request != token.request or outcome.app_key != token.request.app_key:
+                return self._reject_token(
+                    token, settlement, RequestRejected("invalid_result", "invalid_result"))
+            bracket = settlement.local_bracket
+            if bracket is None or bracket.opening != binding.opening:
+                return self._reject_token(
+                    token, settlement, RequestRejected("invalid_result", "invalid_result"))
+            answered = bracket.opening if bracket.opening == bracket.closing else None
+            presentation = self.registry.id_for(outcome.app_key)
+            return self._publish_detail(
+                token, replace(outcome.value, app_id=presentation), outcome.data_digest,
+                answered_source=answered, bracket=bracket)
+        if not isinstance(outcome, LocalFrameOutcome):
+            return self._settle_failure(
+                token, ValueError("a local frame worker must return a typed frame outcome"))
+        frame = self._frame
+        if frame is None:
+            return False
+        try:
+            outcome = self._admitted_frame_outcome(outcome, binding)
+        except Exception as error:  # noqa: BLE001 - the existing readiness error seam
+            return self._settle_failure(token, error)
+        bracket = settlement.local_bracket
+        if bracket is None or bracket.opening != binding.opening:
+            return self._settle_failure(
+                token, ValueError("a local frame requires its owner-read bracket"))
         self.segments, self.boundaries = outcome.segments, outcome.boundaries
         self._gap_ranges = list(outcome.gaps)
         self._known_gap_ranges = list(outcome.known_gaps)
@@ -2065,6 +2891,269 @@ class HistoryRouter:
         self._ranking = [replace(row, app_id=self.registry.id_for(row.app_key))
                          for row in outcome.ranking]
         self._local_generation = None
+        self._local_settlement = settlement
+        self._worker_bindings.pop(token.token_id, None)
+        self._settled_tokens.add(token.token_id)
+        frame.local_settled = True
+        frame.local_bracket = bracket
+        if frame.remote_candidate is not None and not frame.remote_applied:
+            try:
+                self._apply_remote_ranking(
+                    frame, frame.remote_candidate, frame.remote_answered)
+            except Exception as error:  # noqa: BLE001 - rejection follows the seam
+                self._fail_remote(error)
+                if frame.remote_future is not None:
+                    try:
+                        self.client.reject_query_result(frame.remote_future)
+                    except Exception:
+                        pass
+            finally:
+                frame.remote_candidate = None
+        return True
+
+    def _publish_detail(self, token: RequestToken, value: DiskShare | Series,
+                        digest: str, *, answered_source: SourcePosition | None,
+                        bracket: LocalBracket | None) -> bool:
+        lifetime = self._detail
+        if lifetime is None or lifetime.lifetime_id != token.owner_id:
+            return False
+        kind = token.request.kind
+        app_key = token.request.app_key
+        scope = token.scope
+        window = token.request.window
+        identity = AcceptedIdentity(kind, app_key, window, digest)
+        slot = lifetime.slots.get((kind, scope))
+        if slot is None:
+            slot = _PartSlot(kind, scope)
+            lifetime.slots[(kind, scope)] = slot
+        if identity not in slot.stamps:
+            slot.stamps[identity] = self._clock_ns()
+        first_seen = slot.stamps[identity]
+        provenance = AnswerProvenance(
+            kind, app_key, scope, window, identity, first_seen, answered_source,
+            bracket)
+        record = RetainedRecord(value, provenance)
+        slot.record = record
+        slot.phase = "ok"
+        slot.token = token
+        slot.reason = None
+        slot.error = None
+        live = lifetime.live.get(kind)
+        if live is not None and live.token_id == token.token_id:
+            del lifetime.live[kind]
+        self._settled_tokens.add(token.token_id)
+        if kind not in self._deferred_admissions:
+            self._deferred_admissions.append(kind)
+        return True
+
+    def _apply_remote_ranking(self, frame: _FrameOwner, response: Mapping[str, object],
+                              answered_source: SourcePosition | None) -> None:
+        rows = response["result"]
+        window = frame.window
+        if (window.kind == "lifetime" or self._has_local_history or self._overlap_ranges
+                or any(row.total_bytes or row.rchar or row.wchar for row in self._ranking)):
+            raise ValueError("remote query cannot prove a mixed-store cutoff")
+        snapshot = response.get("snapshot")
+        if snapshot is None:
+            raise ValueError("remote history snapshot identity required")
+        if response.get("next_cursor") is not None:
+            raise ValueError("paginated remote ownership is not proved atomically")
+        if not rows:
+            raise ValueError("remote ownership evidence required")
+        self._remote_snapshot = snapshot
+        self._remote_answered = answered_source
+        self._remote = [replace(row, app_id=self.registry.id_for(row.app_key))
+                        for row in rows]
+        self._not_retained = self._not_retained or any(
+            row.coverage.unavailable_reason == "not_retained" for row in rows)
+        frame.remote_applied = True
+
+    def _fail_remote(self, error: Exception) -> None:
+        """Drop remote evidence for this frame, keeping locally proved parts."""
+
+        frame = self._frame
+        self._remote = None
+        self._remote_answered = None
+        if frame is not None:
+            self._queue = [entry for entry in self._queue
+                           if not (entry.token.owner == "frame"
+                                   and entry.token.owner_id == frame.owner_id)]
+        if isinstance(error, (WindowUnavailableError, CancelledError)):
+            return
+        if isinstance(error, RemoteError):
+            kind = "remote_error"
+        elif isinstance(error, ClientUnavailable):
+            kind = "unavailable"
+        elif isinstance(error, RequestRejected):
+            kind = "rejected"
+        elif isinstance(error, ConnectionLost):
+            kind = "transport"
+        else:
+            kind = "internal"
+        reason = (error.reason if isinstance(error, IodClientError)
+                  else str(error).strip() or type(error).__name__)
+        self._daemon_answer_error = DaemonAnswerError(kind, reason)
+
+    def _finish_frame_if_terminal(self) -> bool:
+        frame = self._frame
+        if frame is None or frame.retired or self._ready:
+            return False
+        if not frame.local_settled:
+            return False
+        if frame.remote_token is not None and not frame.remote_settled:
+            return False
+        local_mode = isinstance(frame.requested_source, LocalPositionVector)
+        if self._remote is not None:
+            answered: SourcePosition | None = self._remote_answered
+            bracket = None
+        else:
+            bracket = frame.local_bracket if local_mode else None
+            answered = (bracket.opening
+                        if bracket is not None and bracket.opening == bracket.closing
+                        else None)
+        certified = answered is not None and answered == frame.requested_source
+        self._finish()
+        certificate = FrameProvenance(
+            frame.owner_id, frame.window, frame.requested_source, answered,
+            bracket, certified)
+        frame.certificate = certificate
+        frame.answered_source = answered
+        self._build_ranking_provenance(frame, answered, bracket)
+        return True
+
+    def _build_ranking_provenance(self, frame: _FrameOwner,
+                                  answered: SourcePosition | None,
+                                  bracket: LocalBracket | None) -> None:
+        remote = self._remote is not None
+        digest = self._remote_snapshot if remote else None
+        rows = self._remote if remote else self._ranking
+        provenance: dict[str, AnswerProvenance] = {}
+        for row in rows:
+            key = row.app_key
+            if remote:
+                row_digest = digest
+                row_answered: SourcePosition | None = answered
+                row_bracket = None
+            else:
+                row_digest = local_answer_digest("ranking", key, frame.window, row)
+                row_answered = answered
+                row_bracket = bracket
+            identity = AcceptedIdentity("ranking", key, frame.window, row_digest)
+            stamps = self._ranking_stamps
+            if identity not in stamps:
+                stamps[identity] = self._clock_ns()
+            provenance[key] = AnswerProvenance(
+                "ranking", key, retention_scope(key, frame.window), frame.window,
+                identity, stamps[identity], row_answered, row_bracket)
+        frame.ranking_provenance = provenance
+
+    # -- scheduler: one wire occupant, priority and stable serial (§5.1) --- #
+
+    def _entry_is_live(self, token: RequestToken) -> bool:
+        if token.token_id in self._retired_tokens:
+            return False
+        if token.owner == "frame":
+            frame = self._frame
+            return (frame is not None and not frame.retired
+                    and frame.owner_id == token.owner_id
+                    and not frame.remote_settled)
+        if token.owner == "detail":
+            return self._detail_token_live(token)
+        return False
+
+    def _dispatch(self) -> None:
+        """Issue the highest-priority live queued request while the slot is free."""
+
+        if self._closed or self._occupant is not None:
+            return
+        while self._queue:
+            entry = min(self._queue, key=lambda item: (item.priority, item.serial))
+            self._queue.remove(entry)
+            if not self._entry_is_live(entry.token):
+                continue
+            try:
+                future = self.client.query(entry.token.request)
+            except Exception:
+                self._settle(entry.token, None)
+                continue
+            self._occupant = (entry.token, future)
+            return
+
+    def _collect_remote(self) -> bool:
+        if self._occupant is None:
+            return False
+        token, future = self._occupant
+        if not future.done():
+            return False
+        try:
+            value = future.result()
+        except Exception as error:  # noqa: BLE001 - the bound terminal exception
+            settlement: SettlementInput = RemoteSettlement(future, error=error)
+        else:
+            settlement = RemoteSettlement(future, response=value)
+        changed = self._settle(token, settlement)
+        try:
+            state = self.client.query_transport(future)
+        except Exception:
+            state = None
+        release = state is None or state.phase in ("terminal", "not_sent", "lost")
+        if not release and state.phase == "expired" and state.issued_at_ns is not None:
+            deadline = state.issued_at_ns + REQUEST_LIFETIME_NS + NO_ANSWER_NS
+            if self._clock_ns() >= deadline:
+                try:
+                    retired = self.client.retire_query_connection(future)
+                except Exception:
+                    retired = False
+                if retired:
+                    try:
+                        state = self.client.query_transport(future)
+                    except Exception:
+                        state = None
+                    release = state is None or state.phase in (
+                        "terminal", "not_sent", "lost")
+        if release:
+            self._occupant = None
+        return changed
+
+    def _collect_local_frame(self) -> bool:
+        frame = self._frame
+        if frame is None or frame.local_settled or self._local_future is None:
+            return False
+        if self._local_generation != self._generation:
+            return False
+        if not self._local_future.done():
+            return False
+        worker_id = self._local_worker_id
+        binding = None if worker_id is None else self._worker_bindings.get(worker_id)
+        try:
+            outcome = self._local_future.result()
+        except Exception as error:  # noqa: BLE001 - the existing readiness seam
+            settlement: LocalSettlement = LocalSettlement(worker_id, error=error)
+        else:
+            try:
+                settlement = LocalSettlement(worker_id, outcome=outcome)
+            except Exception as error:  # noqa: BLE001 - a foreign/typed failure
+                settlement = LocalSettlement(worker_id, error=error)
+        if binding is None:
+            self._frame_error = ValueError("a local frame has no captured copy binding")
+            self.view_state = "unavailable: local history evidence"
+            return False
+        if settlement.error is None:
+            try:
+                outcome = self._admitted_frame_outcome(outcome, binding)
+            except Exception as caught:  # noqa: BLE001 - reported after the bracket
+                settlement = LocalSettlement(worker_id, error=caught)
+            else:
+                try:
+                    settlement = self._close_local_settlement(
+                        LocalSettlement(worker_id, outcome=outcome), binding=binding)
+                except Exception as caught:  # noqa: BLE001 - retryable observation
+                    self._frame_error = caught
+                    self.view_state = "unavailable: local history evidence"
+                    return False
+        self._local_settlement = settlement
+        self._frame_error = None
+        self._settle(frame.local_token, settlement)
         return True
 
     def _admitted_frame_outcome(self, outcome: object,
@@ -2113,141 +3202,150 @@ class HistoryRouter:
                 merged.append((boot, left, right))
         return merged
 
-    @property
-    def _pending(self):
-        """The oldest unsettled remote request, or None when nothing is in flight."""
-
-        return self._inflight[0] if self._inflight else None
-
-    def _dispatch(self):
-        """Issue the next request as soon as the protocol allows it."""
-
-        while len(self._inflight) < MAX_INFLIGHT and self._queue:
-            request = self._queue.pop(0)
-            self._inflight.append((self._generation, request, self.client.query(request)))
-
-    def _fail_remote(self, error: Exception) -> None:
-        """Drop remote evidence for this frame, keeping locally proved parts."""
-
-        self._remote = None
-        self._queue = []
-        self._inflight = [item for item in self._inflight if item[0] != self._generation]
-        if isinstance(error, (WindowUnavailableError, CancelledError)):
+    def _start_local_detail(self, token: RequestToken) -> None:
+        try:
+            binding = self._capture_local_binding(
+                worker_id=token.token_id, token_id=token.token_id,
+                request=token.request)
+        except Exception as error:  # noqa: BLE001 - settles as a failed dependency
+            self._current_detail_failure(token, error)
             return
-        if isinstance(error, RemoteError):
-            kind = "remote_error"
-        elif isinstance(error, ClientUnavailable):
-            kind = "unavailable"
-        elif isinstance(error, RequestRejected):
-            kind = "rejected"
-        elif isinstance(error, ConnectionLost):
-            kind = "transport"
-        else:
-            kind = "internal"
-        reason = (error.reason if isinstance(error, IodClientError)
-                  else str(error).strip() or type(error).__name__)
-        self._daemon_answer_error = DaemonAnswerError(kind, reason)
+        self._worker_bindings[token.token_id] = binding
 
-    def _apply_response(self, window: Window, request: QueryRequest, response: dict) -> None:
-        if request.kind == "ranking":
-            rows = response["result"]
-            if (window.kind == "lifetime" or self._has_local_history or self._overlap_ranges
-                    or any(row.total_bytes or row.rchar or row.wchar for row in self._ranking)):
-                raise ValueError("remote query cannot prove a mixed-store cutoff")
-            self._remote_snapshot = response.get("snapshot")
-            if self._remote_snapshot is None:
-                raise ValueError("remote history snapshot identity required")
-            if response.get("next_cursor") is not None:
-                raise ValueError("paginated remote ownership is not proved atomically")
-            if not rows:
-                raise ValueError("remote ownership evidence required")
-            # Incomplete coverage is an honest property of the
-            # daemon's retained observations (reaps, gaps, or
-            # inaccessible identities), not proof that the answer
-            # is unusable. Keep the rows and let their contracts
-            # disclose the uncertainty. Only an empty answer lacks
-            # enough evidence to distinguish "no apps" from a
-            # missing/unretained history window.
-            self._remote = [replace(row, app_id=self.registry.id_for(row.app_key)) for row in rows]
-            self._not_retained = self._not_retained or any(
-                row.coverage.unavailable_reason == "not_retained" for row in rows
-            )
-            # Only the subject the window selects by default is prefetched: the
-            # ranking carries every row's totals, so the other 200+ apps' parts
-            # are fetched when (and if) an operator selects them. Fetching all of
-            # them made one frame 400+ round trips, longer than the daemon's 10 s
-            # commit cadence, so the snapshot moved underneath every frame.
-            if self._remote:
-                subject = self._remote[0].app_key
-                self._requested_parts.update({("totals", subject), ("series", subject)})
-                self._queue.extend([QueryRequest("totals", window, subject),
-                                    QueryRequest("series", window, subject)])
+        def work() -> LocalOutcome:
+            return self._read_local_part(
+                binding.paths, token.request, worker_id=token.token_id,
+                app_key=token.request.app_key)
+
+        try:
+            future = self._submit_background_worker(token, work, binding=binding)
+        except Exception as error:  # noqa: BLE001 - settles as a failed dependency
+            self._current_detail_failure(token, error)
             return
-        value = response["result"]
-        if value.window != window:
-            raise ValueError("remote history answered a different scope")
-        # A part may trail the ranking by one commit: the daemon also commits
-        # F-lane and maintenance work, so its snapshot digest moves far more often
-        # than the sampler does (measured: 3 commits in 3 s on a live store). The
-        # window above is the scope check; each part carries its own coverage and
-        # tier, so a detail read a moment later is disclosed, never fabricated.
-        self._remote_parts[(request.kind, request.app_key)] = value
-        self._requested_parts.discard((request.kind, request.app_key))
+        if future is None:
+            self._unscheduled[token.token_id] = token
 
-    def _finish(self):
+    def _schedule_unscheduled(self) -> None:
+        for token_id, token in list(self._unscheduled.items()):
+            if not self._detail_token_live(token) or token_id in self._retired_tokens:
+                self._unscheduled.pop(token_id, None)
+                continue
+            binding = self._worker_bindings.get(token_id)
+            if binding is None:
+                self._unscheduled.pop(token_id, None)
+                continue
+
+            def work(binding=binding, token=token) -> LocalOutcome:
+                return self._read_local_part(
+                    binding.paths, token.request, worker_id=token.token_id,
+                    app_key=token.request.app_key)
+
+            try:
+                future = self._submit_background_worker(token, work, binding=binding)
+            except Exception as error:  # noqa: BLE001 - settles as a failed dependency
+                self._unscheduled.pop(token_id, None)
+                self._settle(token, LocalSettlement(token_id, error=error))
+                continue
+            if future is not None:
+                self._unscheduled.pop(token_id, None)
+
+    def _collect_local_workers(self) -> bool:
+        changed = False
+        while True:
+            try:
+                token, settlement = self._completed.get_nowait()
+            except queue.Empty:
+                break
+            if self._closed:
+                continue
+            if settlement.worker_id != token.token_id:
+                self._reap_background_worker(token.token_id)
+                continue
+            if (isinstance(settlement, LocalSettlement)
+                    and settlement.outcome is not None
+                    and settlement.local_bracket is None):
+                binding = self._worker_bindings.get(token.token_id)
+                if binding is None:
+                    settlement = LocalSettlement(
+                        token.token_id,
+                        error=ValueError("a local worker has no captured copy binding"))
+                else:
+                    try:
+                        settlement = self._close_local_settlement(
+                            settlement, binding=binding)
+                    except Exception as error:  # noqa: BLE001 - failed dependency
+                        settlement = LocalSettlement(token.token_id, error=error)
+            changed |= self._settle(token, settlement)
+            self._reap_background_worker(token.token_id)
+        return changed
+
+    def _admit_successors(self) -> None:
+        pending = list(self._deferred_admissions)
+        self._deferred_admissions.clear()
+        for kind in pending:
+            lifetime = self._detail
+            if lifetime is None:
+                continue
+            token = lifetime.successors.get(kind)
+            if token is None or token.token_id in self._retired_tokens:
+                lifetime.successors.pop(kind, None)
+                continue
+            if lifetime.live.get(kind) is not None:
+                continue  # a newer live owner still owns the wire
+            lifetime.successors.pop(kind, None)
+            lifetime.live[kind] = token
+            slot = lifetime.slots.get((kind, token.scope))
+            if slot is None:
+                slot = _PartSlot(kind, token.scope)
+                lifetime.slots[(kind, token.scope)] = slot
+            slot.phase = "pending"
+            slot.token = token
+            slot.reason = None
+            slot.error = None
+            if token.origin == "remote":
+                self._queue.append(
+                    _QueueEntry(token, _PRIORITY_DETAIL, self._next_serial()))
+            else:
+                self._start_local_detail(token)
+
+    def drain(self) -> bool:
+        """Collect, settle, reap and dispatch once; never wait or mutate widgets."""
+
+        if self._closed:
+            return False
+        changed = self._reconcile_authority()
+        changed |= self._collect_local_frame()
+        changed |= self._collect_local_workers()
+        changed |= self._collect_remote()
+        changed |= self._finish_frame_if_terminal()
+        self._schedule_unscheduled()
+        self._dispatch()
+        if changed:
+            self._notify()
+            self._admit_successors()
+            self._dispatch()
+        return bool(changed)
+
+    def _finish(self) -> None:
         self._ready = True
         self.view_state = "incomplete: not_retained" if self._not_retained else (
             "incomplete: ownership gap" if self._gap_ranges else (
-                "incomplete: boot chronology unproved" if self._chronology_unproved else "ready"))
+                "incomplete: boot chronology unproved" if self._chronology_unproved
+                else "ready"))
 
     def ready(self, window: Window) -> bool:
         if window != self._window:
             return False
-        if self._ready and not self._inflight and not self._queue:
-            return True
-        # An obsolete generation can never populate this scope; drop it as soon as
-        # it settles instead of waiting on a request nobody will read. A subject's
-        # own part is the exception: it belongs to the window, not to one frame,
-        # so a replacement frame for the same scope must still receive it.
-        self._inflight = [
-            item for item in self._inflight
-            if item[0] == self._generation
-            or item[1].window == self._window
-            or not item[2].done()
-        ]
-        self._dispatch()
-        try:
-            local_ready = self._consume_local()
-        except Exception:
-            self.view_state = "unavailable: local history evidence"
-            raise
-        if not local_ready:
+        self.drain()
+        if self._frame_error is not None:
+            error, self._frame_error = self._frame_error, None
+            raise error
+        frame = self._frame
+        if frame is None or frame.retired:
             return False
-        index = 0
-        while index < len(self._inflight):
-            generation, request, future = self._inflight[index]
-            if not future.done():
-                index += 1
-                continue
-            del self._inflight[index]
-            stale = generation != self._generation
-            if not stale or (request.kind != "ranking" and request.window == self._window):
-                try:
-                    self._apply_response(self._window if stale else window, request, future.result())
-                except Exception as error:
-                    if request.kind == "ranking":
-                        # A ranking answer that contradicts its own frame is a
-                        # frame failure: no remote evidence can be trusted.
-                        self._fail_remote(error)
-                    else:
-                        # A subject's part is detail, never frame evidence. A part
-                        # that answers another scope is simply re-requested; it
-                        # must not blank a ranking that is already consistent.
-                        self._requested_parts.discard((request.kind, request.app_key))
-            self._dispatch()
-        self._dispatch()
-        if not self._inflight and not self._queue:
-            self._finish()
+        if frame.error is not None:
+            error, frame.error = frame.error, None
+            raise error
         return self._ready
 
     def _require(self, window):
@@ -2260,91 +3358,23 @@ class HistoryRouter:
         rows = self._remote if self._remote is not None else self._ranking
         if self._not_retained:
             rows = [replace(row, coverage=replace(row.coverage, complete=False,
-                                                   unavailable_reason="not_retained")) for row in rows]
+                                                   unavailable_reason="not_retained"))
+                    for row in rows]
         return sorted(rows, key=lambda row: (-getattr(row, "total_bytes" if metric == "total_bytes" else metric),
                                              row.app_key.encode("utf-8")))
 
-    def _request_part(self, kind: str, key: str, window: Window) -> None:
-        """Ask for one subject's part once, on this frame's snapshot.
+    def _consume_local(self):
+        """Compatibility seam: settle the local frame copy once, or raise its error."""
 
-        The reply is stored by its own callback: a part belongs to the window, and
-        the console refreshes on a timer, so waiting for the next ``ready()`` call
-        would leave the panel "still loading" until a frame happened to be pending.
-        The request still occupies the transport slot until a ``ready()`` pass
-        collects it, so two queries are never in flight at once (``query_busy``).
-        """
-
-        marker = (kind, key)
-        if marker in self._requested_parts:
-            return
-        self._requested_parts.add(marker)
-        request = QueryRequest(kind, window, key)
-        future = self.client.query(request)
-        self._inflight.append((self._generation, request, future))
-
-        def settle(done):
-            try:
-                value = done.result()["result"]
-                if value.window != window:
-                    raise ValueError("remote history answered a different scope")
-            except Exception:
-                self._requested_parts.discard(marker)
-                return
-            self._remote_parts[(kind, key)] = value
-            self._requested_parts.discard(marker)
-
-        future.add_done_callback(settle)
-
-    def _app_parts(self, app_id, window, method):
-        self._require(window)
-        key = self.registry.key_for(app_id)
-        kind = "totals" if method == "disk_share" else "series"
-        if self._remote is not None:
-            part = self._remote_parts.get((kind, key))
-            if part is None:
-                self._request_part(kind, key, window)
-                raise HistoryPending(
-                    f"this application's {kind} is still loading from the collector"
-                )
-            return [part]
-        if self._local_future is not None:
-            marker = (kind, key)
-            value = self._cached_parts.get(marker)
-            if value is None:
-                # Lazy local detail: only a caller that actually selects this
-                # subject/kind pays for its private snapshot and reducer merge.
-                # Admission and closing observations bracket that copy; exact
-                # owner settlement replaces this compatibility bridge in Task 6.
-                if not self._local_paths:
-                    raise KeyError(app_id)
-                worker_id = self._allocate_token_id()
-                request = QueryRequest(kind, window, key)
-                binding = self._capture_local_binding(worker_id=worker_id, request=request)
-                try:
-                    outcome = self._read_local_part(
-                        binding.paths, request, worker_id=worker_id, app_key=key)
-                except Exception as error:
-                    try:
-                        self._close_local_settlement(
-                            LocalSettlement(worker_id, error=error), binding=binding)
-                    except Exception:
-                        # Keep the copy's original diagnostics; a closing failure
-                        # here must not mask the detail failure it accompanies.
-                        pass
-                    raise
-                settlement = self._close_local_settlement(
-                    LocalSettlement(worker_id, outcome=outcome), binding=binding)
-                value = settlement.outcome.value
-                self._cached_parts[marker] = value
-            return [value]
-        parts = []
-        for _, service in self._views:
-            row = service.connection.execute("SELECT app_id FROM app WHERE key=?", (key,)).fetchone()
-            if row is not None:
-                parts.append(getattr(service, method)(row[0], window))
-        if not parts:
-            raise KeyError(app_id)
-        return parts
+        settled = self._collect_local_frame()
+        if self._frame_error is not None:
+            error, self._frame_error = self._frame_error, None
+            raise error
+        frame = self._frame
+        if frame is not None and frame.error is not None:
+            error, frame.error = frame.error, None
+            raise error
+        return settled
 
     def _part_coverage(self, parts):
         coverage = self._combine_coverage([part.coverage for part in parts])
@@ -2410,17 +3440,7 @@ class HistoryRouter:
             coverage=coverage)
 
     def disk_share(self, app_id: int, window: Window) -> DiskShare:
-        parts = self._app_parts(app_id, window, "disk_share")
-        coverage = (self._combine_coverage([part.coverage for part in parts])
-                    if self._remote is None and self._local_future is None else parts[0].coverage)
-        if self._not_retained:
-            coverage = replace(coverage, complete=False, unavailable_reason="not_retained")
-        return HistoryRouter._merge_disk_shares(parts, app_id, window, coverage)
+        return self._exact_part(app_id, window, "totals")
 
     def series(self, app_id: int, window: Window) -> Series:
-        parts = self._app_parts(app_id, window, "series")
-        coverage = (self._combine_coverage([part.coverage for part in parts])
-                    if self._remote is None and self._local_future is None else
-                    replace(parts[0].coverage, complete=False, unavailable_reason="not_retained")
-                    if self._not_retained else parts[0].coverage)
-        return HistoryRouter._merge_series(parts, app_id, window, coverage)
+        return self._exact_part(app_id, window, "series")
