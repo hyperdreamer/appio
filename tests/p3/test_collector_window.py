@@ -5393,3 +5393,259 @@ def test_native_composition_binds_one_age_clock_domain(qtbot, tmp_path):
     finally:
         window.shutdown()
         store.connection.close()
+
+
+@pytest.mark.parametrize("schedule", ["before-first-drain", "after-first-drain"])
+def test_real_local_detail_completion_is_not_consumed_by_readiness_without_notification(
+    qtbot, tmp_path, monkeypatch, schedule
+):
+    """A local series answer completed by ready() still reaches the Overview.
+
+    The control queues it before the poll's first drain. The treatment queues
+    it immediately after that drain returns, so displayed-frame readiness in
+    status rendering owns its completion.
+    """
+
+    from appio.handover import baseline_seed
+    from appio.history_router import HistoryRouter
+    from appio.history_types import retention_scope
+    from appio.iodclient import AppRegistry, ClientState
+    from appio.procs import AppKeyInputs, IoReadOutcome, ProcessIdentity, StableProcRecord
+    from appio.query import QueryService
+    from appio.sampler import TickInput, aggregate_tick
+    from appio.store import AppIoStore
+
+    key = "exe:/usr/bin/alpha"
+    ns = 1_000_000_000
+    store = AppIoStore(tmp_path / f"readiness-{schedule}.db")
+    store.start_boot(BOOT, 1, 0, 1000.0, "gui")
+    store.connection.execute(
+        "INSERT INTO app VALUES (?,?,?,NULL,0,0,'user')", (17, key, "alpha")
+    )
+    store.connection.commit()
+    store.start_collector("gui", BOOT, 100 * ns)
+    state = None
+    for seq, at in ((0, 100), (1, 110)):
+        amount = 20
+        process = StableProcRecord(
+            ProcessIdentity(BOOT, 410, 100), 1, 1000, key, "/fixture",
+            AppKeyInputs("/fixture", "alpha"),
+            IoReadOutcome("readable", (100 + seq * amount,) * 4, None, None),
+        )
+        observation = TickInput(
+            BOOT, "gui", 1, seq, at * ns, (1000 + at) * ns, (process,), ()
+        )
+        frame, state = (
+            baseline_seed(observation)
+            if seq == 0
+            else aggregate_tick(state, observation)
+        )
+        store.record_tick(frame, state)
+
+    class IdleClient:
+        state = ClientState()
+
+        def query(self, request):
+            raise AssertionError(f"local history issued a remote query: {request.kind}")
+
+    history = HistoryRouter(QueryService(store), IdleClient(), AppRegistry())
+    window = CollectorWindow(
+        ControlledCoordinator(), history, ControlledSetup(OFF),
+        clock_ns=lambda: 140 * ns,
+    )
+    qtbot.addWidget(window)
+    qtbot.addWidget(window.settings)
+    window.show()
+    window._timer.stop()
+    window._poll_timer.stop()
+
+    release_series = threading.Event()
+    series_entered = threading.Event()
+    series_worker: dict[str, object] = {}
+    queued = threading.Condition()
+    queued_count = [0]
+    completion_queue = history._completed
+
+    class WatchedCompletionQueue:
+        def put(self, item):
+            result = completion_queue.put(item)
+            with queued:
+                queued_count[0] += 1
+                queued.notify_all()
+            return result
+
+        def get_nowait(self):
+            return completion_queue.get_nowait()
+
+        def empty(self):
+            return completion_queue.empty()
+
+        def qsize(self):
+            return completion_queue.qsize()
+
+        def wait_for_puts(self, expected):
+            with queued:
+                return queued.wait_for(lambda: queued_count[0] >= expected, timeout=2)
+
+        def reset_put_count(self):
+            with queued:
+                queued_count[0] = 0
+
+    history._completed = WatchedCompletionQueue()
+    original_part = history._read_local_part
+
+    def held_series(paths, request, **kwargs):
+        if request.kind == "series":
+            series_worker["id"] = kwargs["worker_id"]
+            series_worker["request"] = request
+            series_worker["app_key"] = kwargs["app_key"]
+            series_entered.set()
+            assert release_series.wait(30), "the held local series worker was not released"
+        return original_part(paths, request, **kwargs)
+
+    monkeypatch.setattr(history, "_read_local_part", held_series)
+    try:
+        target = Window("since_boot", BOOT, end_mono_ns=140 * ns)
+        assert window._submit_prepare(target, "explicit", now=140 * ns)
+        assert history._local_future is not None
+        history._local_future.result(timeout=10)
+        assert window.apply_ready_frame(now=140 * ns) is True
+        history._completed.reset_put_count()
+        view = window.view
+        assert view is not None and view._subject_app_id is not None
+        assert series_entered.wait(5)
+        worker_id = series_worker["id"]
+        series_future = history._worker_jobs[worker_id][1]
+        assert series_future is not None
+        detail_futures = [
+            future for owner, future in history._worker_jobs.values()
+            if owner == "detail" and future is not None
+        ]
+        assert len(detail_futures) == 2
+        totals_future = next(future for future in detail_futures if future is not series_future)
+
+        notifications = []
+        original_refresh = view.refresh_measurements
+
+        def counted_refresh():
+            notifications.append(True)
+            return original_refresh()
+
+        monkeypatch.setattr(view, "refresh_measurements", counted_refresh)
+        token_id_before = history._next_token_id
+        generation_before = history._generation
+
+        if schedule == "before-first-drain":
+            release_series.set()
+            series_future.result(timeout=10)
+            totals_future.result(timeout=10)
+            assert history._completed.wait_for_puts(2)
+        else:
+            original_drain = history.drain
+            drains = 0
+
+            def drain_then_release_series():
+                nonlocal drains
+                drains += 1
+                changed = original_drain()
+                if drains == 1:
+                    assert changed is False, "detail work completed before the treatment drain"
+                    release_series.set()
+                    series_future.result(timeout=10)
+                    totals_future.result(timeout=10)
+                    assert history._completed.wait_for_puts(2)
+                return changed
+
+            monkeypatch.setattr(history, "drain", drain_then_release_series)
+
+        window._poll_timer.stop()
+        window._poll_history()
+        if schedule == "after-first-drain":
+            assert notifications == []
+            assert history.pending_work is True
+            assert window._poll_timer.isActive()
+            window._poll_history()
+        assert history.pending_work is False
+        assert history.part_state(
+            "series", series_worker["app_key"],
+            retention_scope(series_worker["app_key"], series_worker["request"].window),
+        ).state == "ok"
+        assert len(notifications) == 1
+        assert not window._poll_timer.isActive()
+        # Notifications remain retained-only: they admit no detail, ranking or
+        # frame work and preserve the one embedded composer/view.
+        assert history._next_token_id == token_id_before
+        assert history._generation == generation_before
+        assert window.view is view
+        assert view._exact_adapter is None  # the real router owns retained detail
+    finally:
+        release_series.set()
+        window.shutdown()
+        store.connection.close()
+
+
+def test_remote_view_authority_includes_registered_local_identities(qtbot):
+    """Remote cursor stability does not hide local registration replacement."""
+
+    history = ControlledHistory(ready=True)
+    history.client = _remote_client(generation=4, epoch=9, seq=12)
+    history.source = RemotePosition(BOOT, 9, 12)
+    history._sources = {"local": object()}
+    identities = {"local": LocalPosition("local", "gui", 3, 7, 11)}
+    history._local_vector = lambda: LocalPositionVector(tuple(
+        sorted(identities.values(), key=lambda position: position.name.encode("utf-8"))
+    ))
+    window, _, history, _ = controlled_build(qtbot, history=history)
+    window._timer.stop()
+    window._poll_timer.stop()
+    window._clock_ns = lambda: END - RAW_BUCKET_NS // 2
+    try:
+        window._tick_target()
+        pending = window._pending
+        assert pending is not None
+        history.become_ready(pending)
+        assert window.apply_ready_frame() is True
+        view = window.view
+        assert view is not None
+        initial_epoch = view._exact_authority_epoch
+        prepare_count = len(history.prepare_calls)
+
+        # Source sequence and local counters advance under unchanged registered
+        # identities; neither retires exact-only observations.
+        history.source = RemotePosition(BOOT, 9, 13)
+        identities["local"] = replace(
+            identities["local"], data_version=8, total_changes=12
+        )
+        window._tick_target()
+        assert view._exact_authority_epoch == initial_epoch
+        assert len(history.prepare_calls) == prepare_count + 1
+        pending = window._pending
+        assert pending is not None
+        history.become_ready(pending)
+        assert window.apply_ready_frame() is True
+        prepare_count = len(history.prepare_calls)
+        stable_epoch = view._exact_authority_epoch
+
+        # Registration additions/removals and same-name rebinds are authority
+        # changes even while the remote cursor itself remains fixed.
+        fixed_remote = history.source
+        history._sources["imported"] = object()
+        identities["imported"] = LocalPosition("imported", "iod", 1, 2, 3)
+        window._tick_target()
+        assert history.source == fixed_remote
+        assert view._exact_authority_epoch == stable_epoch + 1
+        assert len(history.prepare_calls) == prepare_count
+        window._tick_target()
+        assert view._exact_authority_epoch == stable_epoch + 1
+
+        del history._sources["imported"]
+        del identities["imported"]
+        window._tick_target()
+        assert view._exact_authority_epoch == stable_epoch + 2
+        assert len(history.prepare_calls) == prepare_count
+        identities["local"] = LocalPosition("local", "iod", 4, 8, 12)
+        window._tick_target()
+        assert view._exact_authority_epoch == stable_epoch + 3
+        assert len(history.prepare_calls) == prepare_count
+    finally:
+        window.shutdown()

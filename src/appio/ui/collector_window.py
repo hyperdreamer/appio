@@ -732,12 +732,35 @@ class CollectorWindow(QMainWindow):
     # -- Files ownership --------------------------------------------------
 
     def _history_ready(self, window: Window | None) -> bool:
+        """Read the last owner-published readiness result without pumping.
+
+        HistoryRouter.ready() drains worker completions before returning. A
+        status refresh cannot own that drain because the shell would lose the
+        changed bit needed to notify the Overview. Read the router's published
+        gate state here; frame readiness itself remains owned by
+        apply_ready_frame().
+        """
+
         if window is None:
             return False
-        try:
-            return bool(self.history.ready(window))
-        except Exception:
-            return False
+        if hasattr(self.history, "_frame") and hasattr(self.history, "_window"):
+            frame = getattr(self.history, "_frame", None)
+            return bool(
+                getattr(self.history, "_window", None) == window
+                and getattr(self.history, "_ready", False)
+                and frame is not None
+                and not getattr(frame, "retired", False)
+                and getattr(frame, "error", None) is None
+                and getattr(self.history, "_frame_error", None) is None
+            )
+        ready_windows = getattr(self.history, "ready_windows", None)
+        if ready_windows is not None:
+            return window in ready_windows
+        prepared = getattr(self.history, "prepared", None)
+        return bool(
+            prepared == window
+            and getattr(self.history, "_ready", False)
+        )
 
     def _files_status_text(self) -> str | None:
         window = self._displayed or self._pending or self._target
@@ -1115,8 +1138,20 @@ class CollectorWindow(QMainWindow):
     def _reconcile_view_authority(self, position: SourcePosition) -> None:
         if isinstance(position, RemotePosition):
             generation = getattr(getattr(self.history, "client", None), "generation", 0)
+            local_vector = getattr(self.history, "_local_vector", None)
+            if callable(local_vector):
+                registrations = local_vector()
+                if not isinstance(registrations, LocalPositionVector):
+                    raise TypeError("history local identity vector has an invalid shape")
+                local_identity = tuple(
+                    (source.name, source.owner, source.registration_epoch)
+                    for source in registrations.sources
+                )
+            else:
+                local_identity = None
             authority: tuple | None = (
-                "remote", generation, position.boot_id, position.iod_epoch
+                "remote", generation, position.boot_id, position.iod_epoch,
+                local_identity,
             )
         elif isinstance(position, LocalPositionVector):
             authority = (
@@ -1289,7 +1324,17 @@ class CollectorWindow(QMainWindow):
             return False
         if self._pending_since is not None and now - self._pending_since >= PENDING_BUDGET_NS:
             self._stalled = True
-        if self.history.ready(self._pending):
+        # Read the owner-published gate state after the drain above. Calling
+        # HistoryRouter.ready() here would pump a second batch and discard its
+        # changed bit before the notification seam. Non-router test providers
+        # retain their readiness contract (some also publish their certificate
+        # from that read).
+        ready = (
+            self._history_ready(self._pending)
+            if isinstance(self.history, HistoryRouter)
+            else bool(self.history.ready(self._pending))
+        )
+        if ready:
             self._apply_frame(now=now)
             self._update_overview_status(now)
             return True
