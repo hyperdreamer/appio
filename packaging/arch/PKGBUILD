@@ -6,7 +6,7 @@ pkgver=0.1.9
 pkgrel=1
 pkgdesc='Application I/O monitor: system-wide collector, IPC protocol and Qt viewer'
 arch=('x86_64')
-license=('unknown')  # the checkout declares no license file
+license=('MIT')
 depends=('python>=3.14' 'python-pyqt6' 'libbpf' 'polkit' 'systemd')
 makedepends=('clang' 'pkgconf' 'python-build' 'python-installer' 'python-setuptools')
 # fileio.bpf.o keeps its BTF section: stripping it would break every CO-RE

@@ -174,9 +174,6 @@ acceptance lane is separate and dry-run by default:
 - **Host accounting evidence is unrun.** No claim is made here that this machine
   accounts block I/O beyond what the rootless fixtures and the acceptance dry run
   exercise.
-- **No license.** The checkout declares none, so `PKGBUILD` uses
-  `license=('unknown')`. Treat the code as all rights reserved until a license is
-  chosen.
 
 ## Layout
 
