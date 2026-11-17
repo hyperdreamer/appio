@@ -1012,3 +1012,28 @@ def test_initial_attach_failure_recovers_into_new_hour_as_incomplete(frames, mon
     assert state.apps[0].coverage.complete == 0
     assert state.apps[0].coverage.gap_intervals >= 1
     assert state.unknown_owner.coverage.complete == 0
+
+
+def test_unmergeable_finalizing_hour_is_quarantined_once_instead_of_retried(frames):
+    """A closing hour that cannot extend its committed state must not be retried.
+
+    Falsifier: raise for a finalize-only hour too. The caller keeps that hour in
+    ``_hours``, so every later frame re-serialises every stuck hour -- 39 h of
+    ``state_json``, ~13 MB per frame -- and rolls the write back, which on the
+    author's host was 1 MB/s of writes for as long as the file source stayed down.
+    """
+    from appio.files import HourlyAccumulator
+
+    rt, loader = runtime(frames)
+    loader.queue(0, events=[event(amount=10)])
+    rt.consume(*frames.tick(0))
+    before = pending(frames)
+    app, zero = before.apps
+    stale = HourlyAccumulator.from_state(replace(
+        before, apps=(replace(app, files=(replace(app.files[0], bytes_r=9),)), zero)))
+
+    rt._persist({("boot-A", 0): stale}, [("boot-A", 0)])
+
+    assert frames.db.execute("SELECT reason FROM gap").fetchall() == [("collector_gap",)]
+    assert pending(frames) is None
+    assert not frames.db.in_transaction

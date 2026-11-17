@@ -270,10 +270,15 @@ class FileRuntime:
                 try:
                     self.store.apply_pending(acc.finalize())
                 except PendingStateRegressionError as failure:
-                    if not restoring:
+                    if not restoring and key not in finalize:
                         raise
-                    # Only a checkpoint loaded at startup may be quarantined.
-                    # A live regression still escapes to the normal fault path.
+                    # A checkpoint loaded at startup, or an hour that this same
+                    # call is finalizing, has no committed state left to extend.
+                    # Retrying it is not harmless: the accumulator stays in
+                    # _hours, so every frame re-serialized every stuck hour (39 h
+                    # of state_json, ~13 MB) and rolled the write back -- 1 MB/s
+                    # of writes for as long as the source stayed unavailable.
+                    # Trade the unmergeable hour for its gap once instead.
                     self.store.quarantine_pending(*key)
                     quarantined.add(key)
                     _LOG.warning(bounded_diagnostic(
@@ -282,6 +287,8 @@ class FileRuntime:
                 if time.monotonic() >= deadline:
                     raise TimeoutError("file persistence deadline expired")
             for key in finalize:
+                if key in quarantined:
+                    continue
                 self.store.finalize_hour(hours[key].finalize())
                 if time.monotonic() >= deadline:
                     raise TimeoutError("file persistence deadline expired")
