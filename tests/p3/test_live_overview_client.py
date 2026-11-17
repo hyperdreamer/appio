@@ -36,8 +36,11 @@ from appio.history_validation import (
     _validate_local_totals,
     validate_query_result,
 )
-from appio.iodclient import IodClientError
+from appio.history_router import FileViewResult, HistoryRouter
+from appio.iodclient import AppRegistry, IodClientError, RequestRejected
 from appio.ipc_models import QueryRequest
+from appio.query import QueryService
+from appio.store import AppIoStore
 from live_overview_support import coverage, series, share, total
 from live_overview_transport import QueryTransportHarness
 
@@ -1116,3 +1119,452 @@ def test_totals_and_series_decode_preserve_external_subject() -> None:
     transport.reply(wrong_series, series(peer_series_id, wrong_window), snapshot=SNAPSHOT)
     assert _reason(wrong_series) == "invalid_result"
     assert transport.client.cached_responses == accepted_entries
+
+
+# ---------------------------------------------------------------------------
+# Router-driven priority scheduling and Files settlement (Tasks 6-7)
+# ---------------------------------------------------------------------------
+
+
+def _scheduler_router(tmp_path, *, name="scheduler.db"):
+    """A production router over the real socketpair transport, Qt-free."""
+
+    store = AppIoStore(tmp_path / name)
+    store.connection.commit()
+    transport = QueryTransportHarness(cursor=RemotePosition(BOOT, 7, 3))
+    # One peer snapshot proves the file capability set and a cursor; a status
+    # reply alone carries no capabilities.
+    transport.stream(4)
+    router = HistoryRouter(QueryService(store), transport.client, AppRegistry(),
+                           clock_ns=transport.clock)
+    return router, transport, store
+
+
+def _ready_remote_frame(router, transport, window):
+    """Prepare one frame, settle local ownership then the remote ranking."""
+
+    router.prepare(window)
+    transport.pump()
+    assert transport.query_kinds[-1] == "ranking"
+    token, future = router._occupant
+    assert token.owner == "frame"
+    assert router._local_future.result(timeout=20) is not None
+    transport.reply(future, [total(17, KEY)], snapshot=SNAPSHOT)
+    assert router.ready(window) is True
+    assert router._remote is not None
+    return router.registry.id_for(KEY)
+
+
+def _answer_next(router, transport, value, *, snapshot=SNAPSHOT, next_cursor=None):
+    transport.pump()
+    token, future = router._occupant
+    transport.reply(future, value, snapshot=snapshot, next_cursor=next_cursor)
+    router.drain()
+    # Drain the peer side so the next dispatched envelope is observable too.
+    transport.pump()
+    return token, future
+
+
+def _evict_query(transport, request):
+    """Drop one exact request/cursor cache entry so an arm takes the wire."""
+
+    from appio.iodclient import _cache_key, _query_wire
+
+    key = _cache_key(_query_wire(request), transport.client._current_source())
+    transport.client._cache.pop(key, None)
+
+
+def _start_files(router, transport, presentation, window):
+    """Admit one Files view that must begin with a real page-one envelope."""
+
+    _evict_query(transport, QueryRequest(
+        "files", window, KEY, sort="bytes_total", direction="desc", search=None))
+    _evict_query(transport, QueryRequest(
+        "coverage", window, KEY, coverage_kind="file"))
+    return router.request_file_view(presentation, window, "bytes_total", "desc", None)
+
+
+def _page(window, *, rows=1, app_id=7, overflow_window=None):
+    context = window if overflow_window is None else overflow_window
+    overflow = UnknownOwnerOverflow(context, "overflow_owner_unknown", 0, 0, 0, coverage())
+    row = FileRow(0, "alpha.txt", "resolved", False, "8:0", 11, 1, 1, 1, 17, 5, 22, BOOT, 1)
+    return FileTable(app_id, window, tuple(row for _ in range(rows)), "bytes_total",
+                     "desc", None, overflow, coverage())
+
+
+def test_all_history_queries_share_one_priority_stable_scheduler(tmp_path):
+    """Every historical selector shares one occupant, priority and stable order.
+
+    Ranking, the displayed subject's series then totals, a Files first page, its
+    continuation and the final file coverage each produce exactly one real
+    envelope at a time. Priority (0 ranking, 1 detail, 2 Files) and admission
+    serial decide dispatch, a continuation is newly admitted rather than sent
+    recursively, and no self-generated ``query_busy`` ever appears.
+    """
+
+    window = Window("since_boot", BOOT, end_mono_ns=140 * NS)
+    router, transport, store = _scheduler_router(tmp_path)
+    try:
+        # Ranking (priority 0) is the first and only wire occupant.
+        router.prepare(window)
+        transport.pump()
+        assert transport.query_kinds == ["ranking"]
+        ranking_token, ranking_future = router._occupant
+        assert ranking_token.request.kind == "ranking"
+
+        # While ranking is held, series and totals queue in admission order and
+        # never become a second envelope.
+        router.select_detail(KEY, window)
+        presentation = router.registry.id_for(KEY)
+        assert router.request_detail("series", presentation, window).state == "pending"
+        assert router.request_detail("totals", presentation, window).state == "pending"
+        assert len(router._queue) == 2
+        assert transport.query_kinds == ["ranking"]
+
+        # Completing ranking dispatches the earlier detail admission first.
+        assert router._local_future.result(timeout=20) is not None
+        transport.reply(ranking_future, [total(17, KEY)], snapshot=SNAPSHOT)
+        assert router.ready(window) is True
+        transport.pump()
+        assert transport.query_kinds == ["ranking", "series"]
+
+        # A Files page admitted while series is on the wire waits as priority 2.
+        files_future = router.request_file_view(
+            presentation, window, "bytes_total", "desc", None)
+        assert transport.query_kinds == ["ranking", "series"]
+
+        # Series terminal -> totals runs before the queued Files page.
+        _answer_next(router, transport,
+                     series(1, window), snapshot=SNAPSHOT)
+        assert transport.query_kinds == ["ranking", "series", "totals"]
+
+        # Totals terminal -> the Files first page is the next envelope.
+        _answer_next(router, transport,
+                     share(1, window), snapshot=SNAPSHOT)
+        assert transport.query_kinds == ["ranking", "series", "totals", "files"]
+        files_token, files_request = router._occupant[0], router._occupant[0].request
+        assert files_request.cursor is None
+
+        # A continuation is a newly admitted priority-2 slot, never a recursive
+        # send inside the page callback.
+        _answer_next(router, transport, _page(window), next_cursor="opaque-2")
+        continuation = router._occupant[0].request
+        assert continuation.kind == "files" and continuation.cursor == "opaque-2"
+        assert transport.query_kinds == [
+            "ranking", "series", "totals", "files", "files"]
+
+        # The final file coverage is the last separately admitted slot.
+        _answer_next(router, transport, _page(window), next_cursor=None)
+        coverage_request = router._occupant[0].request
+        assert coverage_request.kind == "coverage"
+        assert coverage_request.coverage_kind == "file"
+        assert transport.query_kinds == [
+            "ranking", "series", "totals", "files", "files", "coverage"]
+
+        _answer_next(router, transport, _file_coverage(window))
+        assert files_future.done() is True
+        view = files_future.result(timeout=0)
+        assert view.served_gap_count is None
+        assert [row.basename for row in view.table.rows] == ["alpha.txt", "alpha.txt"]
+        assert transport.observed_historical_occupants and max(
+            transport.observed_historical_occupants) == 1
+        assert transport.client.pending_requests == 0
+        assert transport.client.state.last_error is None
+
+        # Every supported coverage selector shape is carried by the same client
+        # with at most one real historical job; each answer validates or fails
+        # on its own contract, never with a self-generated query_busy.
+        # A distinct window keeps these off the Files chain's cache entries, so
+        # each arm must produce a real envelope rather than a cache hit.
+        arm_window = Window("since_boot", BOOT, end_mono_ns=150 * NS)
+        coverage_arms = (
+            (QueryRequest("coverage", arm_window, KEY, coverage_kind="process"),
+             _file_coverage(arm_window).coverage),
+            (QueryRequest("coverage", arm_window, None, coverage_kind="process"),
+             {KEY: coverage()}),
+            (QueryRequest("coverage", arm_window, KEY, coverage_kind="file"),
+             _file_coverage(arm_window)),
+            (QueryRequest("coverage", arm_window, None, coverage_kind="unknown_owner"),
+             _file_coverage(arm_window).unknown_owner_overflow),
+        )
+        for request, value in coverage_arms:
+            before = len(transport.query_kinds)
+            future = transport.query(request)
+            assert len(transport.query_kinds) == before + 1
+            assert transport.observed_historical_occupants[-1] == 1
+            transport.reply(future, value, snapshot=SNAPSHOT)
+            assert transport.client.query_transport(future).phase == "terminal"
+            assert transport.observed_historical_occupants[-1] == 0
+            assert transport.client.state.last_error is None
+    finally:
+        router.close()
+        store.connection.close()
+
+
+def test_files_pages_and_coverage_use_single_settlement_acceptance(tmp_path):
+    """Files pages and coverage settle once and refuse every malformed shape.
+
+    A valid paged chain publishes only its final assembled table with remote
+    ``served_gap_count = None``. Wrong key/Window/snapshot/cursor-generation,
+    changed later-page metadata, bad coverage/served evidence and the 128-page
+    and 50,000-row bounds each fail the one owning view without a partial table.
+    """
+
+    window = Window("since_boot", BOOT, end_mono_ns=140 * NS)
+    router, transport, store = _scheduler_router(tmp_path)
+    try:
+        presentation = _ready_remote_frame(router, transport, window)
+
+        # -- valid paged chain ------------------------------------------------
+        future = _start_files(router, transport, presentation, window)
+        _answer_next(router, transport, _page(window, rows=2), next_cursor="opaque-c1")
+        continuation = router._occupant[0].request
+        assert continuation.cursor == "opaque-c1"
+        assert continuation.sort == "bytes_total" and continuation.direction == "desc"
+        assert continuation.search is None
+        _answer_next(router, transport, _page(window, rows=1), next_cursor=None)
+        _answer_next(router, transport, _file_coverage(window))
+        assert future.done() is True
+        view = future.result(timeout=0)
+        assert isinstance(view, FileViewResult)
+        assert view.table.app_id == view.coverage.app_id == presentation
+        assert view.table.window == view.coverage.window == window
+        assert len(view.table.rows) == 3
+        assert view.served_gap_count is None
+        assert router._file_owners == {}
+        frame_state = (router._not_retained, router._remote_snapshot,
+                       router.daemon_answer_error, list(router._ranking))
+
+        def assert_failed(failure, label, *, reason=None):
+            with pytest.raises(Exception) as caught:
+                failure.result(timeout=0)
+            actual = getattr(caught.value, "reason", None)
+            if reason is not None:
+                assert actual == reason, (label, type(caught.value).__name__,
+                                          str(caught.value), actual)
+            else:
+                assert actual in ("invalid_result", "file_source_unavailable",
+                                  "stale_cursor"), (label, actual)
+            # No partial assembled table or frame mutation survives an owner
+            # refusal: the outward view is the only failed surface.
+            assert router._file_owners == {}, label
+            assert (router._not_retained, router._remote_snapshot,
+                    router.daemon_answer_error, list(router._ranking)) == frame_state, label
+
+        # Wrong external key: the client refuses the malformed answer before it
+        # can be cached or assembled.
+        transport.register_subject(99, OTHER_KEY)
+        future = _start_files(router, transport, presentation, window)
+        _answer_next(router, transport, _page(window, app_id=99))
+        assert_failed(future, "wrong key", reason="invalid_result")
+
+        # Wrong requested Window is a malformed page, not a widened answer.
+        future = _start_files(router, transport, presentation, window)
+        other = Window("since_boot", BOOT, end_mono_ns=150 * NS)
+        _answer_next(router, transport, _page(other))
+        assert_failed(future, "wrong window", reason="invalid_result")
+
+        # A different (valid-looking) snapshot cannot replace the owner's
+        # ranking snapshot.
+        future = _start_files(router, transport, presentation, window)
+        _answer_next(router, transport, _page(window), snapshot="b" * 64)
+        assert_failed(future, "snapshot", reason="file_source_unavailable")
+
+        # A later page may not change its non-row metadata (served scope).
+        future = _start_files(router, transport, presentation, window)
+        _answer_next(router, transport, _page(window), next_cursor="opaque-c2")
+        served = Window("range", BOOT, 0, window.end_mono_ns)
+        _answer_next(router, transport, _page(window, overflow_window=served),
+                     next_cursor=None)
+        assert_failed(future, "page metadata", reason="file_source_unavailable")
+
+        # A committed cursor advance makes the pending chain stale rather than
+        # silently certifying the newer position with an older answer.
+        future = _start_files(router, transport, presentation, window)
+        _answer_next(router, transport, _page(window), next_cursor="opaque-c3")
+        assert router._occupant[0].request.cursor == "opaque-c3"
+        transport.stream(5)
+        _answer_next(router, transport, _page(window), next_cursor=None)
+        assert_failed(future, "cursor generation", reason="file_source_unavailable")
+
+        # The rebuilt frame restores a valid Files owner for coverage arms.
+        presentation = _ready_remote_frame(router, transport, window)
+        coverage_arms = (
+            ("wrong coverage window", _file_coverage(other)),
+            ("wrong coverage variant", _file_coverage(window).coverage),
+            ("unavailable served evidence", _file_coverage(window, unavailable=True)),
+        )
+        for label, coverage_value in coverage_arms:
+            future = _start_files(router, transport, presentation, window)
+            _answer_next(router, transport, _page(window), next_cursor=None)
+            _answer_next(router, transport, coverage_value)
+            assert_failed(future, label)
+
+        # A coverage snapshot must equal the Files owner's ranking snapshot.
+        future = _start_files(router, transport, presentation, window)
+        _answer_next(router, transport, _page(window), next_cursor=None)
+        _answer_next(router, transport, _file_coverage(window), snapshot="c" * 64)
+        assert_failed(future, "coverage snapshot", reason="file_source_unavailable")
+
+        # -- 128-page bound ---------------------------------------------------
+        future = _start_files(router, transport, presentation, window)
+        for index in range(128):
+            _answer_next(router, transport, _page(window, rows=1),
+                         next_cursor=f"opaque-limit-{index}")
+        _answer_next(router, transport, _page(window, rows=1), next_cursor=None)
+        with pytest.raises(RequestRejected) as too_many_pages:
+            future.result(timeout=0)
+        assert too_many_pages.value.reason == "query_too_large"
+        assert router._file_owners == {}
+
+        # -- 50,000-row bound -------------------------------------------------
+        future = _start_files(router, transport, presentation, window)
+        for index in range(100):
+            _answer_next(router, transport, _page(window, rows=500),
+                         next_cursor=f"opaque-rows-{index}")
+        _answer_next(router, transport, _page(window, rows=500), next_cursor=None)
+        with pytest.raises(RequestRejected) as too_many_rows:
+            future.result(timeout=0)
+        assert too_many_rows.value.reason == "query_too_large"
+        assert router._file_owners == {}
+        assert (router._not_retained, router._remote_snapshot,
+                router.daemon_answer_error, list(router._ranking)) == frame_state
+    finally:
+        router.close()
+        store.connection.close()
+
+
+def test_frame_failure_or_local_fallback_certifies_no_remote_position(tmp_path):
+    """No remote failure, fallback or replaced generation certifies a position.
+
+    A remote ranking that completes before the held local ownership evidence
+    stays a private candidate; the local mixed-store proof then rejects it and
+    evicts its bound cache entry while the transport has already been reaped.
+    Empty, paginated and failed remote rankings keep the locally proved rows and
+    neither certify a cursor nor lend an older frame's certificate or PEAK.
+    """
+
+    import threading
+
+    from test_live_overview_router import _committed_store as _process_store
+
+    window = Window("since_boot", BOOT, end_mono_ns=140 * NS)
+    mixed_key = "exe:/mixed"
+    local = _process_store(tmp_path / "mixed.db", ((mixed_key, 17, 20),))
+    transport = QueryTransportHarness(cursor=RemotePosition(BOOT, 7, 3))
+    transport.stream(4)
+    router = HistoryRouter(QueryService(local), transport.client, AppRegistry(),
+                           clock_ns=transport.clock)
+    try:
+        release = threading.Event()
+        entered = threading.Event()
+        real_read = router._read_local
+
+        def held_copy(paths, wanted):
+            entered.set()
+            assert release.wait(20), "the local ownership copy was never released"
+            return real_read(paths, wanted)
+
+        router._read_local = held_copy
+        router.prepare(window)
+        transport.pump()
+        assert transport.query_kinds == ["ranking"]
+        ranking_token, ranking_future = router._occupant
+        assert ranking_token.owner == "frame"
+        assert entered.wait(10)
+
+        # Remote completion first: the ranking answer waits privately for the
+        # held local ownership evidence; the wire slot is already reaped.
+        transport.reply(ranking_future, [total(17, mixed_key)], snapshot=SNAPSHOT)
+        assert router.ready(window) is False
+        frame = router._frame
+        assert frame.remote_candidate is not None
+        assert frame.remote_applied is False
+        assert router._remote is None and router._remote_answered is None
+        assert router._occupant is None
+        assert transport.observed_historical_occupants[-1] == 0
+
+        # Local mixed-store evidence rejects the candidate; the rejection also
+        # evicts the cache entry this exact Future produced.
+        router._read_local = real_read
+        release.set()
+        assert router._local_future.result(timeout=20) is not None
+        assert router.ready(window) is True
+        assert router._remote is None and router._remote_answered is None
+        assert router.daemon_answer_error is not None
+        assert router.daemon_answer_error.kind == "internal"
+        assert "mixed-store" in router.daemon_answer_error.reason
+        assert transport.client.cached_responses == 0
+        certificate = router.frame_provenance(window)
+        assert certificate is not None
+        assert certificate.requested_source == RemotePosition(BOOT, 7, 4)
+        assert certificate.answered_source is None
+        assert certificate.certified is False
+        assert router.ranking_provenance(mixed_key, window).accepted_identity.kind == "ranking"
+
+        # A new equal-Window/source generation inherits no old certificate/PEAK.
+        old_generation = certificate.generation
+        router.prepare(window)
+        assert router.frame_provenance(window) is None
+        assert router.ranking_provenance(mixed_key, window) is None
+        with pytest.raises(RuntimeError):
+            router.ranking(window, "total_bytes")
+        transport.pump()
+        token, future = router._occupant
+        assert router._local_future.result(timeout=20) is not None
+        transport.reply(future, [total(17, mixed_key)], snapshot=SNAPSHOT)
+        assert router.ready(window) is True
+        replaced = router.frame_provenance(window)
+        assert replaced is not None and replaced.generation != old_generation
+        assert replaced.certified is False
+
+        # A failed remote ranking is typed and certifies no remote position.
+        router.prepare(window)
+        transport.pump()
+        token, failed = router._occupant
+        assert router._local_future.result(timeout=20) is not None
+        transport.error(failed, "daemon_error", "collector exploded")
+        assert router.ready(window) is True
+        assert router._remote is None and router._remote_answered is None
+        assert router.daemon_answer_error.kind == "remote_error"
+        assert router.daemon_answer_error.reason == "daemon_error"
+        failed_certificate = router.frame_provenance(window)
+        assert failed_certificate.certified is False
+        assert failed_certificate.answered_source is None
+        assert router._ranking  # locally proved rows remain
+    finally:
+        release.set()
+        router.close()
+        local.connection.close()
+
+    # Empty and paginated remote rankings stay refusals, never certificates.
+    other = Window("since_boot", BOOT, end_mono_ns=160 * NS)
+    for index, (value, cursor, reason) in enumerate((
+        ([], None, "remote ownership evidence required"),
+        ([total(17, KEY)], "more-pages", "paginated remote ownership is not proved atomically"),
+    )):
+        empty_store = AppIoStore(tmp_path / f"empty-{index}.db")
+        empty_store.connection.commit()
+        empty_transport = QueryTransportHarness(cursor=RemotePosition(BOOT, 7, 3))
+        empty_transport.stream(4)
+        empty_router = HistoryRouter(
+            QueryService(empty_store), empty_transport.client, AppRegistry(),
+            clock_ns=empty_transport.clock)
+        try:
+            empty_router.prepare(other)
+            empty_transport.pump()
+            token, future = empty_router._occupant
+            assert empty_router._local_future.result(timeout=20) is not None
+            empty_transport.reply(future, value, snapshot=SNAPSHOT,
+                                  next_cursor=cursor)
+            assert empty_router.ready(other) is True
+            assert empty_router._remote is None
+            assert empty_router.daemon_answer_error is not None
+            assert empty_router.daemon_answer_error.reason == reason
+            certificate = empty_router.frame_provenance(other)
+            assert certificate.certified is False
+            assert certificate.answered_source is None
+            assert empty_transport.client.cached_responses == 0
+        finally:
+            empty_router.close()
+            empty_store.connection.close()

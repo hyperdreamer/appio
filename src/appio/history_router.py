@@ -93,6 +93,9 @@ _COUNTERS = ("rchar", "wchar", "read_bytes", "write_bytes")
 MAX_INFLIGHT = 1
 _PEAKS = ("peak_read_bps", "peak_write_bps", "peak_total_bps")
 _METRICS = ("total_bytes", "read_bytes", "write_bytes", "rchar", "wchar")
+_FILE_SORT_NAMES = (
+    "bytes_total", "bytes_r", "bytes_w", "reads", "writes", "basename", "dev", "last_seen",
+)
 
 #: Charged local lanes (§3.3). A frame owns at most one Future on its own
 #: executor; the background executor carries at most two detail Futures and
@@ -657,6 +660,43 @@ class _LocalCopyBinding:
                     "a local binding opening vector must match its registrations")
 
 
+@dataclass(frozen=True)
+class _FilesBinding:
+    """The worker association for one local Files job (§3.4).
+
+    A Files worker keeps its existing private-snapshot and served-interval
+    proofs, so it carries no opening vector and no closing bracket. The binding
+    is still the immutable admission evidence: the exact worker id, normalized
+    request and the registered source stamps/paths the worker was given.
+    """
+
+    worker_id: int
+    token_id: int
+    request: QueryRequest
+    registrations: tuple[_SourceStamp, ...]
+    paths: tuple[tuple[str, str, str], ...]
+
+    def __post_init__(self) -> None:
+        _private_int(self.worker_id, "files_binding.worker_id", minimum=1)
+        _private_int(self.token_id, "files_binding.token_id", minimum=1)
+        _normalize_request(self.request)
+        if self.request.kind != "files":
+            raise ValueError("a Files binding answers a files request")
+        if not isinstance(self.registrations, tuple) or not self.registrations:
+            raise ValueError("a Files binding carries its registered sources")
+        for stamp in self.registrations:
+            if not isinstance(stamp, _SourceStamp):
+                raise ValueError("a Files binding carries only registration stamps")
+            _SourceStamp.__post_init__(stamp)
+        if not isinstance(self.paths, tuple) or len(self.paths) != len(self.registrations):
+            raise ValueError("a Files binding carries one path per registration")
+        for stamp, entry in zip(self.registrations, self.paths, strict=True):
+            if (not isinstance(entry, tuple) or len(entry) != 3
+                    or entry[0] != stamp.name or entry[2] != stamp.owner
+                    or not isinstance(entry[1], str)):
+                raise ValueError("a Files binding path must match its registration")
+
+
 class _FrameCopyPaths(tuple):
     """One frame's registered copy paths, carrying their admission binding.
 
@@ -719,6 +759,68 @@ class _DetailLifetime:
     slots: dict[tuple[str, RetentionScope], _PartSlot] = field(default_factory=dict)
     live: dict[str, RequestToken] = field(default_factory=dict)
     successors: dict[str, RequestToken] = field(default_factory=dict)
+
+
+@dataclass
+class _FilesOwner:
+    """One outward Files view and the private page sequence it assembles.
+
+    Owner-thread mutable state only. Every page and the final file-coverage
+    answer is a separate immutable :class:`RequestToken` with its own scheduler
+    slot; this record never crosses into a worker and publishes no partial
+    table. ``snapshot``/``connection``/``cursor`` are the ranking snapshot and
+    connection/cursor authority captured when the view was admitted, and
+    ``cursors`` remembers every opaque continuation already visited so a page
+    can neither repeat nor skip.
+    """
+
+    owner_id: int
+    generation: int
+    outward: Future
+    origin: str
+    app_id: int
+    app_key: str
+    window: Window
+    sort: str
+    direction: str
+    search: str | None
+    authority: tuple
+    requested_source: SourcePosition
+    snapshot: str | None = None
+    connection: int | None = None
+    cursor: object = None
+    pages: list = field(default_factory=list)
+    cursors: set[str] = field(default_factory=set)
+    rows: int = 0
+    retired: bool = False
+    current: RequestToken | None = None
+
+    def __post_init__(self) -> None:
+        _private_int(self.owner_id, "files_owner.owner_id", minimum=1)
+        _private_int(self.generation, "files_owner.generation")
+        if not isinstance(self.outward, Future):
+            raise ValueError("a Files owner carries its outward Future")
+        _private_enum(self.origin, _TOKEN_ORIGINS, "files_owner.origin")
+        _private_int(self.app_id, "files_owner.app_id", minimum=1)
+        _private_name(self.app_key, "files_owner.app_key")
+        if not isinstance(self.window, Window):
+            raise ValueError("a Files owner carries its exact requested Window")
+        validate_window(self.window)
+        _private_enum(self.sort, _FILE_SORT_NAMES, "files_owner.sort")
+        _private_enum(self.direction, ("asc", "desc"), "files_owner.direction")
+        if self.search is not None:
+            _private_name(self.search, "files_owner.search")
+        _private_authority(self.authority)
+        _private_source(self.requested_source, "files_owner.requested_source")
+        if self.cursor is not None and not isinstance(
+                getattr(self.cursor, "boot_id", None), str):
+            raise ValueError("a Files owner carries its exact issue cursor")
+        if not isinstance(self.pages, list):
+            raise ValueError("a Files owner accumulates an owner-side page list")
+        if not isinstance(self.cursors, set):
+            raise ValueError("a Files owner remembers visited continuations")
+        _private_int(self.rows, "files_owner.rows")
+        _private_bool(self.retired, "files_owner.retired")
 
 
 @dataclass
@@ -803,6 +905,11 @@ class HistoryRouter:
         self._retired_tokens: set[int] = set()
         #: Admitted local detail tokens waiting for background capacity.
         self._unscheduled: dict[int, RequestToken] = {}
+        #: Outward Files views and their private page sequences (§3.4, §5.4).
+        #: Each delivery owns at most one live token; pages and coverage are
+        #: separately admitted scheduler slots, never recursive direct sends.
+        self._file_owners: dict[int, _FilesOwner] = {}
+        self._next_files_id = 1
         #: The current frame owner and its readiness/authority context (§3.4).
         self._frame: _FrameOwner | None = None
         self._frame_error: Exception | None = None
@@ -838,6 +945,8 @@ class HistoryRouter:
         #: Immutable admission/closing evidence, keyed by the admitted worker id.
         #: The frame owns one entry; detail copies own one until their settlement.
         self._worker_bindings: dict[int, _LocalCopyBinding] = {}
+        #: Local Files worker associations (no opening vector, no bracket).
+        self._files_bindings: dict[int, _FilesBinding] = {}
         self._local_worker_id: int | None = None
         self._local_settlement: LocalSettlement | None = None
         self._daemon_answer_error: DaemonAnswerError | None = None
@@ -1128,6 +1237,32 @@ class HistoryRouter:
         return _LocalCopyBinding(worker_id, token_id, request, tuple(stamps),
                                  tuple(paths), LocalPositionVector(tuple(positions)))
 
+    def _capture_files_binding(self, *, worker_id: int, token_id: int,
+                               request: QueryRequest) -> _FilesBinding:
+        """Capture a Files worker association without a UI-thread observer read.
+
+        Files keeps its existing private-snapshot/served-interval proofs, so it
+        needs no opening vector and must not execute even metadata SQL on the
+        owner connection. The live registration is read only when its object
+        identity matches the current source; a genuine replacement is installed
+        by the normal registration path first.
+        """
+
+        stamps, paths = [], []
+        names = sorted(self._sources, key=lambda name: name.encode("utf-8"))
+        for name in names:
+            service, owner = self._sources[name]
+            registration = self._registrations.get(name)
+            if (registration is None or registration.service is not service
+                    or registration.connection is not service.connection
+                    or registration.owner != owner):
+                registration = self._current_registration(name)
+            stamps.append(_SourceStamp(registration.name, registration.owner,
+                                       registration.registration_epoch,
+                                       registration.path, registration.physical))
+            paths.append((name, registration.path, registration.owner))
+        return _FilesBinding(worker_id, token_id, request, tuple(stamps), tuple(paths))
+
     def _closing_vector(self, binding: _LocalCopyBinding) -> LocalPositionVector:
         """Re-check identities and observe the closing vector before publication."""
 
@@ -1188,25 +1323,33 @@ class HistoryRouter:
 
         if not isinstance(token, RequestToken):
             raise ValueError("a background worker needs its admitted request token")
-        if binding is not None and token.owner != "detail":
-            raise ValueError("only a local detail worker brackets its copy")
         if token.origin != "local" or token.owner not in ("detail", "files"):
             raise ValueError("only a local detail or Files token owns a background worker")
         if token.token_id in self._worker_jobs:
             raise ValueError("a request token admits one worker only")
+        if binding is not None and token.owner == "files":
+            raise ValueError("a Files worker carries no opening-vector binding")
         worker_id = self._reserve_background_worker(token.owner, worker_id=token.token_id)
         if worker_id is None:
             return None
-        if binding is None and token.owner == "detail":
-            # Capture admission evidence immediately before submission; a
+        if binding is None:
+            # Capture the admission binding immediately before submission; a
             # refused capture releases the reservation and publishes nothing.
+            # Only frame/detail copies need an opening vector; a Files binding
+            # is the worker association, never a bracket (§3.4).
             try:
-                binding = self._capture_local_binding(
-                    worker_id=worker_id, token_id=token.token_id, request=token.request)
+                if token.owner == "files":
+                    self._files_bindings[worker_id] = self._capture_files_binding(
+                        worker_id=worker_id, token_id=token.token_id,
+                        request=token.request)
+                else:
+                    self._worker_bindings[worker_id] = self._capture_local_binding(
+                        worker_id=worker_id, token_id=token.token_id,
+                        request=token.request)
             except Exception:
                 self._reap_background_worker(worker_id)
                 raise
-        if binding is not None:
+        else:
             self._worker_bindings[worker_id] = binding
 
         def run() -> None:
@@ -1310,6 +1453,7 @@ class HistoryRouter:
         if self._worker_jobs.pop(worker_id, None) is None:
             return
         self._worker_bindings.pop(worker_id, None)
+        self._files_bindings.pop(worker_id, None)
         self._legacy_files_workers.discard(worker_id)
         if self._closed:
             self._discard_completed(worker_id)
@@ -1331,7 +1475,8 @@ class HistoryRouter:
         """
 
         if (self._occupant is not None or self._queue or self._worker_jobs
-                or self._unscheduled or not self._completed.empty()):
+                or self._unscheduled or self._file_owners
+                or not self._completed.empty()):
             return True
         frame = self._frame
         if (frame is None or frame.retired or frame.local_settled
@@ -1354,9 +1499,22 @@ class HistoryRouter:
         return None
 
     def _cancel_file_requests(self):
-        for future in tuple(self._file_jobs):
-            self._settle_file(future, self._generation, error=WindowUnavailableError(
-                "file_source_unavailable", "File history generation retired."))
+        """Retire every live Files delivery through its administrative arm.
+
+        Publication retirement only: a running local worker keeps its charge and
+        a sent transport occupant stays held until its genuine terminal outcome
+        is drained. No outward Future is completed from a second path here.
+        """
+
+        for owner in tuple(self._file_owners.values()):
+            token = owner.current
+            if token is None:
+                self._file_owners.pop(owner.owner_id, None)
+                owner.retired = True
+                self._settle_file(owner.outward, owner.generation, error=WindowUnavailableError(
+                    "file_source_unavailable", "File history generation retired."))
+            else:
+                self._settle(token, retiring=True)
 
     def _settle_file(self, future, generation, value=None, error=None):
         if future.done():
@@ -1541,9 +1699,18 @@ class HistoryRouter:
 
     def request_file_view(self, app_id: int, window: Window, sort: FileSort,
                           direction: Direction, search: str | None) -> Future[FileViewResult]:
+        """Admit one outward Files view; every page is a scheduler slot.
+
+        Admission validates the selector, captures the ranking snapshot and
+        connection/cursor authority, and enqueues only the first page (or the
+        one local worker). Continuations and the final file coverage are
+        separately admitted by :meth:`_settle`, never sent from a callback and
+        never accumulated in a partial outward table.
+        """
+
         # A22 must win even over a bad app/sort, just as on the RPC surface.
         self.local._precheck(window)
-        validate_enum(sort, ("bytes_total", "bytes_r", "bytes_w", "reads", "writes", "basename", "dev", "last_seen"), "sort")
+        validate_enum(sort, _FILE_SORT_NAMES, "sort")
         validate_enum(direction, ("asc", "desc"), "direction")
         validate_search(search)
         future, generation = Future(), self._generation
@@ -1552,108 +1719,234 @@ class HistoryRouter:
             return future
         self._file_jobs.add(future)
         future.add_done_callback(self._file_jobs.discard)
+        owner = None
         try:
             self._require(window)
             key = self.registry.key_for(app_id)
-            if self._remote is not None:
-                self._request_remote_files(future, generation, app_id, key, window, sort, direction, search)
+            remote = self._remote is not None
+            owner = _FilesOwner(
+                self._next_files_id, generation, future,
+                "remote" if remote else "local", app_id, key,
+                window, sort, direction, search, self._current_authority(),
+                self.source_position(),
+            )
+            self._next_files_id += 1
+            self._file_owners[owner.owner_id] = owner
+            if remote:
+                self._admit_remote_files(owner)
             else:
-                paths = []
-                for name, (service, owner) in self._sources.items():
-                    path = self._source_paths[name]
-                    if not path or service.connection.in_transaction:
-                        raise WindowUnavailableError("file_source_unavailable", "File history needs a committed store.")
-                    paths.append((name, path, owner))
-                # The legacy Files path shares the background executor, so it must
-                # reserve the same authoritative charge before submitting. Its
-                # binding is retained until an owner reap, not a done callback.
-                worker_id = self._reserve_background_worker("files")
-                if worker_id is None:
-                    future.set_exception(RequestRejected("query_busy", "File history queue is full."))
-                    return future
-                self._legacy_files_workers.add(worker_id)
-                def read():
-                    if not future.done():
-                        return self._read_local_files(paths, window, key, app_id, sort, direction, search)
-                try:
-                    job = self._background_executor.submit(read)
-                except RuntimeError:
-                    self._reap_background_worker(worker_id)
-                    raise
-                self._bind_background_worker(worker_id, "files", job)
-                def completed(job):
-                    try:
-                        outcome = job.result()
-                        self._settle_file(future, generation, value=FileViewResult(
-                            outcome.table, outcome.coverage, outcome.served_gap_count))
-                    except Exception as error:
-                        self._settle_file(future, generation, error=error)
-                job.add_done_callback(completed)
+                self._admit_local_files(owner)
         except Exception as error:
+            if owner is not None:
+                self._file_owners.pop(owner.owner_id, None)
             self._settle_file(future, generation, error=error)
         return future
 
-    def _request_remote_files(self, out, generation, app_id, key, window, sort, direction, search):
+    def _local_files_paths(self) -> tuple[tuple[str, str, str], ...]:
+        """Registered file-backed sources for one private-snapshot Files read."""
+
+        paths = []
+        for name, (service, owner) in self._sources.items():
+            path = self._source_paths[name]
+            if not path or service.connection.in_transaction:
+                raise WindowUnavailableError(
+                    "file_source_unavailable", "File history needs a committed store.")
+            paths.append((name, path, owner))
+        return tuple(paths)
+
+    def _admit_remote_files(self, owner: _FilesOwner) -> None:
+        """Capture the ranking snapshot/cursor and enqueue the first page."""
+
         snapshot = self._remote_snapshot
         state = self.client.state
         if not self.file_source_status().available or snapshot is None:
-            raise WindowUnavailableError("file_source_unavailable", "Daemon file source unavailable.")
-        cursor, connection = state.cursor, getattr(self.client, "generation", None)
-        pages, tokens = [], set()
-        request = QueryRequest("files", window, key, sort=sort, direction=direction, search=search)
+            raise WindowUnavailableError(
+                "file_source_unavailable", "Daemon file source unavailable.")
+        owner.snapshot = snapshot
+        owner.connection = getattr(self.client, "generation", None)
+        owner.cursor = state.cursor
+        self._enqueue_files_token(owner, QueryRequest(
+            "files", owner.window, owner.app_key, sort=owner.sort,
+            direction=owner.direction, search=owner.search))
 
-        def active():
-            now = self.client.state
-            if (out.done() or generation != self._generation or self._closed or now is None
-                    or not now.verified or not now.answering or now.cursor != cursor
-                    or getattr(self.client, "generation", None) != connection):
-                raise WindowUnavailableError("file_source_unavailable", "Stale file history response.")
+    def _admit_local_files(self, owner: _FilesOwner) -> None:
+        """Submit one ownership-proved local Files worker on the background lane."""
 
-        def decoded(job, kind):
-            active()
-            response = job.result()
-            if (response.get("snapshot") != snapshot or response.get("kind") != kind
-                    or response.get("app_key") != key):
-                raise WindowUnavailableError("file_source_unavailable", "Remote file scope or snapshot changed.")
-            return response
+        paths = self._local_files_paths()
+        request = QueryRequest("files", owner.window, owner.app_key, sort=owner.sort,
+                               direction=owner.direction, search=owner.search)
+        worker_id = self._allocate_token_id()
+        token = RequestToken(
+            worker_id, request, "local", None, "files", owner.owner_id, None,
+            owner.authority, owner.requested_source)
 
-        def covered(job):
+        def work() -> LocalOutcome:
+            return self._read_local_files(
+                paths, owner.window, owner.app_key, owner.app_id, owner.sort,
+                owner.direction, owner.search, worker_id=worker_id,
+                request=token.request)
+
+        owner.current = token
+        try:
+            future = self._submit_background_worker(token, work)
+        except Exception:
+            owner.current = None
+            raise
+        if future is None:
+            owner.current = None
+            raise RequestRejected("query_busy", "File history queue is full.")
+
+    def _enqueue_files_token(self, owner: _FilesOwner, request: QueryRequest) -> RequestToken:
+        """Admit one immutable Files page/coverage token as a priority-2 slot."""
+
+        token = RequestToken(
+            self._allocate_token_id(), request, "remote", None, "files",
+            owner.owner_id, self._allocate_token_id(), owner.authority,
+            owner.requested_source)
+        owner.current = token
+        self._queue.append(_QueueEntry(token, _PRIORITY_FILES, self._next_serial()))
+        self._dispatch()
+        return token
+
+    def _files_source_current(self, owner: _FilesOwner) -> bool:
+        """Whether the Files owner's exact snapshot/cursor authority still holds."""
+
+        state = self.client.state
+        return (
+            state is not None and state.verified and state.answering
+            and state.cursor == owner.cursor
+            and getattr(self.client, "generation", None) == owner.connection
+        )
+
+    def _accept_files_remote(self, token: RequestToken, response: Mapping[str, object],
+                             future: Future) -> bool:
+        """Owner predicates and private page assembly for one accepted answer."""
+
+        owner = self._file_owners.get(token.owner_id)
+        if owner is None or owner.retired:
+            return False
+        if owner.generation != self._generation or self._closed:
+            return self._files_failure(token, WindowUnavailableError(
+                "file_source_unavailable", "File history generation retired."),
+                future=future)
+        if not self._files_source_current(owner):
+            return self._files_failure(token, WindowUnavailableError(
+                "file_source_unavailable", "Stale file history response."),
+                future=future)
+        if response.get("snapshot") != owner.snapshot:
+            return self._files_failure(token, WindowUnavailableError(
+                "file_source_unavailable", "Remote file scope or snapshot changed."),
+                future=future)
+        if token.request.kind == "files":
+            return self._accept_files_page(owner, token, response, future)
+        return self._accept_files_coverage(owner, token, response, future)
+
+    def _accept_files_page(self, owner: _FilesOwner, token: RequestToken,
+                           response: Mapping[str, object], future: Future) -> bool:
+        table = response["result"]
+        if not isinstance(table, FileTable):
+            return self._files_failure(token, WindowUnavailableError(
+                "file_source_unavailable", "Invalid remote file page."),
+                future=future)
+        if owner.pages and replace(table, rows=owner.pages[0].rows) != owner.pages[0]:
+            return self._files_failure(token, WindowUnavailableError(
+                "file_source_unavailable", "Remote file page metadata changed."),
+                future=future)
+        owner.pages.append(table)
+        owner.rows += len(table.rows)
+        if owner.rows > 50_000 or len(owner.pages) > 128:
+            return self._files_failure(token, RequestRejected(
+                "query_too_large", "File history exceeds the bounded view budget."),
+                future=future)
+        continuation = response.get("next_cursor")
+        if continuation is None:
+            self._settled_tokens.add(token.token_id)
+            # The final coverage page is a newly admitted priority-2 slot.
+            self._enqueue_files_token(owner, QueryRequest(
+                "coverage", owner.window, owner.app_key, coverage_kind="file"))
+            return False
+        if not isinstance(continuation, str) or not continuation or not table.rows \
+                or continuation in owner.cursors:
+            return self._files_failure(token, WindowUnavailableError(
+                "file_source_unavailable", "Invalid file continuation."),
+                future=future)
+        # Opaque server HMAC, forwarded unchanged. Never decode, recompute,
+        # skip a page, repeat a cursor, or fabricate a local continuation.
+        owner.cursors.add(continuation)
+        self._settled_tokens.add(token.token_id)
+        self._enqueue_files_token(owner, replace(token.request, cursor=continuation))
+        return False
+
+    def _accept_files_coverage(self, owner: _FilesOwner, token: RequestToken,
+                               response: Mapping[str, object], future: Future) -> bool:
+        coverage = response["result"]
+        if not isinstance(coverage, FileCoverage) or not owner.pages:
+            return self._files_failure(token, WindowUnavailableError(
+                "file_source_unavailable", "Invalid remote file coverage."),
+                future=future)
+        table = replace(
+            owner.pages[0],
+            rows=tuple(row for page in owner.pages for row in page.rows),
+            app_id=owner.app_id,
+        )
+        try:
+            value = self._check_file_result(
+                table, replace(coverage, app_id=owner.app_id), None)
+        except Exception as error:  # noqa: BLE001 - acceptance failure of this owner
+            return self._files_failure(token, error, future=future)
+        self._settled_tokens.add(token.token_id)
+        return self._files_complete(token, value)
+
+    def _accept_files_local(self, token: RequestToken, outcome: LocalFilesOutcome,
+                            settlement: LocalSettlement) -> bool:
+        """Revalidate and publish one local Files worker's immutable outcome."""
+
+        owner = self._file_owners.get(token.owner_id)
+        if owner is None or owner.retired:
+            return False
+        if owner.generation != self._generation or self._closed:
+            return self._files_failure(token, WindowUnavailableError(
+                "file_source_unavailable", "File history generation retired."))
+        if settlement.local_bracket is not None:
+            return self._files_failure(token, RequestRejected("invalid_result", "invalid_result"))
+        try:
+            LocalFilesOutcome.__post_init__(outcome)
+        except Exception:  # noqa: BLE001 - a forged outcome never publishes
+            return self._files_failure(token, RequestRejected("invalid_result", "invalid_result"))
+        if (outcome.request != token.request or outcome.app_key != token.request.app_key
+                or outcome.table.app_id != owner.app_id
+                or outcome.coverage.app_id != owner.app_id):
+            return self._files_failure(token, RequestRejected("invalid_result", "invalid_result"))
+        try:
+            value = self._check_file_result(
+                outcome.table, outcome.coverage, outcome.served_gap_count)
+        except Exception as error:  # noqa: BLE001 - acceptance failure of this owner
+            return self._files_failure(token, error)
+        self._settled_tokens.add(token.token_id)
+        return self._files_complete(token, value)
+
+    def _files_complete(self, token: RequestToken, value: FileViewResult) -> bool:
+        owner = self._file_owners.pop(token.owner_id, None)
+        if owner is None:
+            return False
+        self._settle_file(owner.outward, owner.generation, value=value)
+        return True
+
+    def _files_failure(self, token: RequestToken, error: Exception, *,
+                       future: Future | None = None) -> bool:
+        self._settled_tokens.add(token.token_id)
+        if future is not None:
+            # Rejection evicts exactly the cache entry this bound Future
+            # produced, before the outward failure and never a successor.
             try:
-                response = decoded(job, "coverage")
-                coverage = response["result"]
-                if not isinstance(coverage, FileCoverage) or response.get("next_cursor") is not None:
-                    raise WindowUnavailableError("file_source_unavailable", "Invalid remote file coverage.")
-                table = replace(pages[0], rows=tuple(row for page in pages for row in page.rows), app_id=app_id)
-                value = self._check_file_result(table, replace(coverage, app_id=app_id), None)
-                self._settle_file(out, generation, value=value)
-            except Exception as error:
-                self._settle_file(out, generation, error=error)
-
-        def received(job):
-            try:
-                response = decoded(job, "files")
-                table = response["result"]
-                if (not isinstance(table, FileTable) or table.window != window or
-                        (table.sort, table.direction, table.search) != (sort, direction, search)):
-                    raise WindowUnavailableError("file_source_unavailable", "Remote file scope changed.")
-                if pages and replace(table, rows=pages[0].rows) != pages[0]:
-                    raise WindowUnavailableError("file_source_unavailable", "Remote file page metadata changed.")
-                pages.append(table)
-                if sum(len(page.rows) for page in pages) > 50_000 or len(pages) > 128:
-                    raise RequestRejected("query_too_large", "File history exceeds the bounded view budget.")
-                token = response.get("next_cursor")
-                if token is not None:
-                    if not isinstance(token, str) or not token or token in tokens or not table.rows:
-                        raise WindowUnavailableError("file_source_unavailable", "Invalid file continuation.")
-                    tokens.add(token)
-                    # Opaque server HMAC, forwarded unchanged. Never decode,
-                    # recompute, skip a page, or fabricate a local continuation.
-                    self.client.query(replace(request, cursor=token)).add_done_callback(received)
-                else:
-                    self.client.query(QueryRequest("coverage", window, key, coverage_kind="file")).add_done_callback(covered)
-            except Exception as error:
-                self._settle_file(out, generation, error=error)
-        self.client.query(request).add_done_callback(received)
+                self.client.reject_query_result(future)
+            except Exception:  # noqa: BLE001 - an evicted/absent entry is a no-op
+                pass
+        owner = self._file_owners.pop(token.owner_id, None)
+        if owner is None:
+            return False
+        self._settle_file(owner.outward, owner.generation, error=error)
+        return True
 
     def invalidate(self) -> None:
         self._generation += 1
@@ -2186,6 +2479,10 @@ class HistoryRouter:
             if frame.remote_token is not None:
                 self._settle(frame.remote_token, retiring=True)
             changed = True
+        # Files deliveries are owner-level too: they retire through their
+        # administrative settlement arm before any obsolete answer is read.
+        if self._cancel_file_requests():
+            changed = True
         return changed
 
     # -- scope-owned detail lifecycle (§§2.4, 3.1-3.2) --------------------- #
@@ -2612,6 +2909,8 @@ class HistoryRouter:
                 # owner-level: one call retires the lifetime exactly once,
                 # whether this representative token was settled or pending.
                 return self._retire_detail_token(token)
+            if token.owner == "files":
+                return self._retire_files_owner(token)
             return False
         if token.token_id in self._settled_tokens or token.token_id in self._retired_tokens:
             return False
@@ -2629,7 +2928,13 @@ class HistoryRouter:
             if token.authority != self._current_authority():
                 return False
         else:
-            return False
+            owner = self._file_owners.get(token.owner_id)
+            if (owner is None or owner.retired
+                    or owner.generation != self._generation
+                    or token.authority != owner.authority
+                    or owner.current is None
+                    or owner.current.token_id != token.token_id):
+                return False
         if outcome is None:
             return self._reject_token(
                 token, None, RequestRejected("invalid_result", "invalid_result"))
@@ -2670,6 +2975,25 @@ class HistoryRouter:
         # stay real resources; they can never publish.
         self._generation += 1
         self.view_state = "unavailable: authority changed"
+        return True
+
+    def _retire_files_owner(self, token: RequestToken) -> bool:
+        """Retire one outward Files delivery; publication only, once.
+
+        The matching outward Future receives the existing generation-retired
+        refusal. A running worker keeps its charge and an issued transport
+        occupant keeps its slot; both are drained later and can publish nothing.
+        """
+
+        owner = self._file_owners.get(token.owner_id)
+        if owner is None or owner.retired:
+            return False
+        owner.retired = True
+        if owner.current is not None:
+            self._retired_tokens.add(owner.current.token_id)
+        self._file_owners.pop(owner.owner_id, None)
+        self._settle_file(owner.outward, owner.generation, error=WindowUnavailableError(
+            "file_source_unavailable", "File history generation retired."))
         return True
 
     def _retire_detail_token(self, token: RequestToken) -> bool:
@@ -2720,8 +3044,13 @@ class HistoryRouter:
             # A failed copy is terminal: it keeps its diagnostics and its binding
             # is retired; only a closing-observer failure stays retryable.
             self._worker_bindings.pop(token.token_id, None)
+            self._files_bindings.pop(token.token_id, None)
         if token.owner == "detail":
             return self._current_detail_failure(token, error)
+        if token.owner == "files":
+            # A Files failure owns only its outward view: it can never alter the
+            # frame's not_retained flag, ranking diagnostic or applicability.
+            return self._files_failure(token, error)
         frame = self._frame
         if frame is None:
             return False
@@ -2794,10 +3123,13 @@ class HistoryRouter:
         try:
             actual = future.result()
         except Exception as error:  # noqa: BLE001 - the bound terminal exception
-            if settlement.error is not error:
+            # A cancelled Future re-raises a fresh CancelledError on every result
+            # read, so cancellation is the one bound outcome compared by class.
+            cancelled = future.cancelled() and isinstance(settlement.error, CancelledError)
+            if settlement.error is not error and not cancelled:
                 return self._reject_token(
                     token, settlement, RequestRejected("invalid_result", "invalid_result"))
-            return self._settle_failure(token, error)
+            return self._settle_failure(token, settlement.error)
         if settlement.response is None or settlement.response != actual:
             return self._reject_token(
                 token, settlement, RequestRejected("invalid_result", "invalid_result"))
@@ -2827,6 +3159,8 @@ class HistoryRouter:
             return self._publish_detail(
                 token, replace(value, app_id=presentation), digest,
                 answered_source=answered, bracket=None)
+        if token.owner == "files":
+            return self._accept_files_remote(token, actual, settlement.future)
         if token.request.kind != "ranking":
             # An already-supported other selector is validated and discarded;
             # it publishes no owner record and does not affect the frame.
@@ -2864,7 +3198,8 @@ class HistoryRouter:
         if settlement.worker_id != token.token_id:
             return self._reject_token(
                 token, settlement, RequestRejected("invalid_result", "invalid_result"))
-        binding = self._worker_bindings.get(token.token_id)
+        binding = (self._files_bindings.get(token.token_id) if token.owner == "files"
+                   else self._worker_bindings.get(token.token_id))
         if (binding is None or binding.token_id != token.token_id
                 or binding.request != token.request):
             return self._reject_token(
@@ -2874,6 +3209,14 @@ class HistoryRouter:
         outcome = settlement.outcome
         if token.owner == "detail":
             if not isinstance(outcome, LocalPartOutcome):
+                return self._reject_token(
+                    token, settlement, RequestRejected("invalid_result", "invalid_result"))
+            try:
+                # A worker result is not proof of its own validity: re-enter the
+                # record's validation so a forged key/kind/Window/digest never
+                # publishes a record or a stamp.
+                LocalPartOutcome.__post_init__(outcome)
+            except Exception:  # noqa: BLE001 - a malformed current input
                 return self._reject_token(
                     token, settlement, RequestRejected("invalid_result", "invalid_result"))
             if outcome.request != token.request or outcome.app_key != token.request.app_key:
@@ -2888,6 +3231,11 @@ class HistoryRouter:
             return self._publish_detail(
                 token, replace(outcome.value, app_id=presentation), outcome.data_digest,
                 answered_source=answered, bracket=bracket)
+        if token.owner == "files":
+            if not isinstance(outcome, LocalFilesOutcome):
+                return self._reject_token(
+                    token, settlement, RequestRejected("invalid_result", "invalid_result"))
+            return self._accept_files_local(token, outcome, settlement)
         if not isinstance(outcome, LocalFrameOutcome):
             return self._settle_failure(
                 token, ValueError("a local frame worker must return a typed frame outcome"))
@@ -3084,7 +3432,11 @@ class HistoryRouter:
                     and not frame.remote_settled)
         if token.owner == "detail":
             return self._detail_token_live(token)
-        return False
+        owner = self._file_owners.get(token.owner_id)
+        return (owner is not None and not owner.retired
+                and owner.generation == self._generation
+                and owner.current is not None
+                and owner.current.token_id == token.token_id)
 
     def _dispatch(self) -> None:
         """Issue the highest-priority live queued request while the slot is free."""
@@ -3193,6 +3545,9 @@ class HistoryRouter:
 
         if not isinstance(outcome, LocalFrameOutcome):
             raise ValueError("a local frame worker must return a typed frame outcome")
+        # Re-enter the record's own validation: a worker/forged object is not
+        # proof that every routing field is still well formed.
+        LocalFrameOutcome.__post_init__(outcome)
         if outcome.worker_id != binding.worker_id:
             raise ValueError("a local frame worker answered another worker binding")
         if outcome.request != binding.request:
@@ -3288,6 +3643,7 @@ class HistoryRouter:
                 continue
             if (isinstance(settlement, LocalSettlement)
                     and settlement.outcome is not None
+                    and not isinstance(settlement.outcome, LocalFilesOutcome)
                     and settlement.local_bracket is None):
                 binding = self._worker_bindings.get(token.token_id)
                 if binding is None:
