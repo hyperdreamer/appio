@@ -30,11 +30,14 @@ DEFAULT_QUOTA_BYTES = 1_500_000_000
 #: 4096 -> 4.2 s (superlinear), so 2048 is the largest pass that keeps headroom
 #: under the 2 s deadline and still outruns production 1.5x.
 DEFAULT_BATCH_SIZE = 2048
-#: Units retired per transaction. Deleting one unit per transaction costs a
-#: durability fsync each, which is most of a 4 ms unit, and that rate cannot keep
-#: up with a 10 s sample of ~226 app rows: retention fell ~1130 units/minute
-#: behind and the store only ever stopped growing when the quota paused it.
-DELETE_UNITS_PER_TRANSACTION = 128
+#: Units retired per transaction: the whole pass in one transaction. Measured on a
+#: real copy of the 1.45 GB store, deleting 2048 units cost 25.9 KiB/unit one
+#: transaction per 128 with a checkpoint after each, 9.9 KiB/unit at 512, and
+#: 5.6 KiB/unit as a single transaction with one checkpoint. Each checkpoint
+#: writes back every page the preceding chunk dirtied, so a per-chunk checkpoint
+#: rewrote the same pages sixteen times. A bigger dirty set is exactly what the
+#: page cache is for; nothing needs to reach disk until the pass ends.
+DELETE_UNITS_PER_TRANSACTION = 2048
 #: Headroom a rewrite must leave under the ceiling. Compacting to the last free
 #: page puts the store straight back over the quota, so it rewrites itself again
 #: on the next pass: a store parked at its ceiling then spends its life copying
@@ -778,8 +781,11 @@ class QuotaPruner:
                     skipped.append(SkippedUnit(unit.kind, unit.primary_key))
                 else:
                     deleted.append(stats)
-            if not self._checkpoint(truncate=False):
-                return self._result(deleted, "checkpoint_busy", paused=True, skipped=skipped)
+        # One checkpoint per pass, not per chunk: unit deletion has no
+        # remeasurement to serve, and a checkpoint between chunks publishes pages
+        # the next chunk dirties again.
+        if deleted and not self._checkpoint(truncate=False):
+            return self._result(deleted, "checkpoint_busy", paused=True, skipped=skipped)
         # Advancing past skipped units prevents a permanently bad oldest batch
         # from starving later ready units. Wrap after a sweep so repaired units
         # are retried, and late/imported observations are eventually revisited.

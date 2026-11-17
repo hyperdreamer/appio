@@ -51,9 +51,14 @@ def make_daemon(tmp_path):
         run.mkdir(mode=0o750)
         clock = Clock()
         loader = VectorLoader() if loader is None else loader
+        # The durable cadence is a deployment constant (``iod.SAMPLE_NS``), so these
+        # tests pin the interval they drive instead of inheriting whatever the
+        # production default happens to be: every case here steps the clock by 10 s
+        # and asserts which work that one boundary may and may not perform.
         daemon = Daemon(DaemonPaths(state / "iod.db", run / "iod.sock", proc, cgroup),
                         clock=clock, filesystem=FakeFilesystem(), selector=PollSelector(),
-                        query_worker=DeferredWorker(), file_source_factory=factory or (lambda: BpfFileSource(loader)))
+                        query_worker=DeferredWorker(), sample_ns=10 * NS, flush_ns=30 * NS,
+                        file_source_factory=factory or (lambda: BpfFileSource(loader)))
         made.append(daemon)
         daemon.start()
         return SimpleNamespace(daemon=daemon, clock=clock, loader=loader, proc=proc)
