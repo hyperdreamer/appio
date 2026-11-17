@@ -2174,7 +2174,7 @@ class HistoryRouter:
         self._retire_authority(current)
         return True
 
-    def _retire_authority(self, current: tuple) -> None:
+    def _retire_authority(self, current: tuple) -> bool:
         """One authority transition: clear detail and retire its admitted frame."""
 
         self._authority = current
@@ -2207,23 +2207,41 @@ class HistoryRouter:
             return (app_key, "since_boot", window.boot_id)
         return (app_key, window.kind)
 
-    def _retire_detail_lifetime(self) -> bool:
-        """Drop the selected lifetime, its records, stamps and live owners.
+    @staticmethod
+    def _lifetime_tokens(lifetime: _DetailLifetime) -> tuple[RequestToken, ...]:
+        """Every token a lifetime owns, pending, settled or superseded, once."""
 
-        Publication retirement never releases a running worker or an issued
-        transport slot; their eventual completions are drained and ignored.
+        owned: dict[int, RequestToken] = {}
+        for token in (*lifetime.live.values(), *lifetime.successors.values()):
+            owned[token.token_id] = token
+        for slot in lifetime.slots.values():
+            if slot.token is not None:
+                owned[slot.token.token_id] = slot.token
+        return tuple(owned.values())
+
+    def _retire_detail_lifetime(self) -> bool:
+        """Retire the selected lifetime through the sole settlement writer.
+
+        The lifetime is an owner, so one of its admitted tokens carries the
+        administrative retirement into ``_settle``; the arm clears every
+        pending/successor owner, accepted record and stamp lookup of that
+        lifetime and resets the selection pointer. Publication retirement never
+        releases a running worker or an issued transport slot; their eventual
+        completions are drained and ignored. A lifetime that never admitted a
+        token owns no record, stamp or live owner, so only its empty selection
+        pointer is reset here.
         """
 
         lifetime = self._detail
         if lifetime is None:
             self._applied_window = None
             return False
-        for token in tuple(lifetime.live.values()) + tuple(lifetime.successors.values()):
-            self._retired_tokens.add(token.token_id)
-            self._unscheduled.pop(token.token_id, None)
+        for token in self._lifetime_tokens(lifetime):
+            if token.token_id not in self._retired_tokens:
+                return self._settle(token, retiring=True)
         self._detail = None
         self._applied_window = None
-        return True
+        return False
 
     def select_detail(self, app_key: str | None, window: Window | None) -> None:
         """Adopt the view's selected applied subject and scope, or retire it.
@@ -2583,15 +2601,16 @@ class HistoryRouter:
         if retiring:
             if outcome is not None:
                 raise ValueError("an administrative retirement carries no outcome")
-            if token.token_id in self._retired_tokens:
-                return False
             if token.owner == "frame":
                 # A frame owner retires once even after its local copy settled:
                 # the owner, not the settled token, is what authority retires.
+                if token.token_id in self._retired_tokens:
+                    return False
                 return self._retire_frame_owner(token)
-            if token.token_id in self._settled_tokens:
-                return False
             if token.owner == "detail":
+                # A detail owner is its lifetime, so the retirement arm is
+                # owner-level: one call retires the lifetime exactly once,
+                # whether this representative token was settled or pending.
                 return self._retire_detail_token(token)
             return False
         if token.token_id in self._settled_tokens or token.token_id in self._retired_tokens:
@@ -2654,30 +2673,36 @@ class HistoryRouter:
         return True
 
     def _retire_detail_token(self, token: RequestToken) -> bool:
+        """Retire the selected detail lifetime that admitted ``token``, once.
+
+        Administrative detail retirement belongs to the lifetime, not to each
+        local/remote token: one call retires every pending and successor owner
+        of that lifetime, clears every accepted record and stamp lookup of it
+        (including already-settled slot records) and resets the selected
+        lifetime/applied-window bookkeeping. A running worker or sent transport
+        occupant stays a real resource; its completion is drained and ignored.
+        """
+
         lifetime = self._detail
         if lifetime is None or lifetime.lifetime_id != token.owner_id:
             return False
-        kind = token.request.kind
-        live = lifetime.live.get(kind)
-        successor = lifetime.successors.get(kind)
-        if live is not None and live.token_id == token.token_id:
-            del lifetime.live[kind]
-        elif successor is not None and successor.token_id == token.token_id:
-            del lifetime.successors[kind]
-        else:
+        owned = self._lifetime_tokens(lifetime)
+        if not any(item.token_id == token.token_id for item in owned):
             return False
-        self._retired_tokens.add(token.token_id)
-        self._unscheduled.pop(token.token_id, None)
-        scope = token.scope
-        if scope is not None:
-            slot = lifetime.slots.get((kind, scope))
-            if slot is not None:
-                slot.record = None
-                slot.stamps.clear()
-                slot.phase = "absent"
-                slot.token = None
-                slot.reason = None
-                slot.error = None
+        for item in owned:
+            self._retired_tokens.add(item.token_id)
+            self._unscheduled.pop(item.token_id, None)
+        for slot in lifetime.slots.values():
+            slot.record = None
+            slot.stamps.clear()
+            slot.phase = "absent"
+            slot.token = None
+            slot.reason = None
+            slot.error = None
+        lifetime.live.clear()
+        lifetime.successors.clear()
+        self._detail = None
+        self._applied_window = None
         return True
 
     def _reject_token(self, token: RequestToken, outcome: SettlementInput | None,

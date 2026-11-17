@@ -2938,8 +2938,9 @@ def test_retention_resets_before_subject_scope_boot_or_backward_display(tmp_path
     """Scope transitions clear old detail synchronously, before any render.
 
     Subject, tag, range bounds, boot and a backward endpoint each retire the
-    live lifetime immediately; a backward-then-forward return and a second
-    distinct range never resurrect the old record.
+    live lifetime immediately through the same owner settlement seam; a
+    backward-then-forward return and a second distinct range never resurrect
+    the old record.
     """
 
     client = _BoundClient()
@@ -2967,18 +2968,33 @@ def test_retention_resets_before_subject_scope_boot_or_backward_display(tmp_path
             ("boot", lambda: router.select_detail(KEY, Window("since_boot", "boot-b",
                                                               end_mono_ns=140 * NS))),
         )
-        for label, retire in transitions:
-            router.select_detail(KEY, window)
-            router.request_detail("totals", presentation, window)
-            client.settle(client.only("totals"), _totals_response(KEY, window=window))
-            assert router.drain() is True
-            assert router.retained("totals", KEY, scope, window.end_mono_ns) is not None, label
-            retire()
-            # Synchronous: no drain, ready, render or query participates.
-            assert router.retained("totals", KEY, scope, window.end_mono_ns) is None, label
-            assert router.part_state("totals", KEY, scope).state == "absent", label
-            assert len(client.requests) == sends + 1, label
-            sends = len(client.requests)
+        detail_calls = []
+        detail_impl = router._retire_detail_token
+
+        def detail_spy(token):
+            detail_calls.append(token.token_id)
+            return detail_impl(token)
+
+        router._retire_detail_token = detail_spy
+        try:
+            for label, retire in transitions:
+                router.select_detail(KEY, window)
+                router.request_detail("totals", presentation, window)
+                client.settle(client.only("totals"), _totals_response(KEY, window=window))
+                assert router.drain() is True
+                assert router.retained("totals", KEY, scope, window.end_mono_ns) is not None, label
+                settled_token = router._detail.slots[("totals", scope)].token.token_id
+                detail_calls.clear()
+                retire()
+                # Synchronous: no drain, ready, render or query participates,
+                # and the reset enters the one owner retirement seam once.
+                assert detail_calls == [settled_token], label
+                assert router.retained("totals", KEY, scope, window.end_mono_ns) is None, label
+                assert router.part_state("totals", KEY, scope).state == "absent", label
+                assert len(client.requests) == sends + 1, label
+                sends = len(client.requests)
+        finally:
+            del router._retire_detail_token
 
         # A backward endpoint retires; returning forward does not resurrect.
         router.select_detail(KEY, window)
@@ -3012,7 +3028,9 @@ def test_authority_change_clears_details_without_conflating_cursor_advance(tmp_p
 
     Remote connection/boot/epoch and local registration changes clear the
     selected lifetime and its records, while same-authority cursor sequence
-    advancement and local counter movement preserve them unchanged.
+    advancement and local counter movement preserve them unchanged. One
+    authority transition invokes each owner-level retirement arm exactly once
+    through ``_settle``, clearing the accepted record and the pending owner.
     """
 
     client = _BoundClient()
@@ -3038,16 +3056,74 @@ def test_authority_change_clears_details_without_conflating_cursor_advance(tmp_p
         assert router.retained("totals", KEY, scope, window.end_mono_ns) is record
         assert record.provenance.first_seen_at_ns == stamp
 
-        # A stored epoch is authority; a new epoch retires the lifetime once.
-        before = router._generation
-        client.cursor = StreamCursor(BOOT, 4, 8)
-        client.state = ClientState(verified=True, answering=True, cursor=client.cursor)
-        assert router.drain() is True
+        # One lifetime holds an accepted record and one pending detail. An
+        # authority change retires both through the sole settlement writer,
+        # invoking each owner-level retirement arm exactly once.
+        router.request_detail("series", presentation, window)
+        pending = router._detail.live["series"]
+        held_series = client.only("series")
+        accepted_slot = router._detail.slots[("totals", scope)]
+        assert accepted_slot.record is record
+        frame = router._frame
+        frame_sides = tuple(side.token_id for side in
+                            (frame.local_token, frame.remote_token) if side is not None)
+        assert len(frame_sides) == 2, "the frame owns its local and remote tokens"
+        frame_calls, detail_calls, retirements_seen = [], [], []
+        settle_impl = router._settle
+        frame_impl = router._retire_frame_owner
+        detail_impl = router._retire_detail_token
+
+        def settle_spy(token, outcome=None, *, retiring=False):
+            retirements_seen.append((token.owner, token.token_id, retiring))
+            return settle_impl(token, outcome, retiring=retiring)
+
+        def frame_spy(token):
+            frame_calls.append(token.token_id)
+            return frame_impl(token)
+
+        def detail_spy(token):
+            detail_calls.append(token.token_id)
+            return detail_impl(token)
+
+        router._settle = settle_spy
+        router._retire_frame_owner = frame_spy
+        router._retire_detail_token = detail_spy
+        try:
+            # A stored epoch is authority; a new epoch retires the lifetime once.
+            before = router._generation
+            client.cursor = StreamCursor(BOOT, 4, 8)
+            client.state = ClientState(verified=True, answering=True, cursor=client.cursor)
+            assert router.drain() is True
+        finally:
+            del router._settle, router._retire_frame_owner, router._retire_detail_token
+
+        # Frame owner: one retirement for both side tokens, one generation bump.
+        assert frame_calls == [frame_sides[0]], "one frame-owner retirement"
+        assert router._generation == before + 1, "one generation advance per frame owner"
+        assert set(frame_sides) <= router._retired_tokens
+        # Detail owner: one retirement clears the whole selected lifetime.
+        assert detail_calls == [pending.token_id], "one detail-lifetime retirement"
+        assert [entry for entry in retirements_seen
+                if entry[0] == "detail" and entry[2]] == [
+                    ("detail", pending.token_id, True)], "detail enters the settlement seam"
+        assert accepted_slot.record is None, "the retirement arm cleared the accepted record"
+        assert accepted_slot.stamps == {}, "the retirement arm cleared the stamp lookup"
+        assert router._detail is None
         assert router.retained("totals", KEY, scope, window.end_mono_ns) is None
         assert router.part_state("totals", KEY, scope).state == "absent"
+        assert router.part_state("series", KEY, scope).state == "absent"
         assert router.view_state.startswith("unavailable")
+
+        # A publication-retired completion is drained and ignored; its real
+        # transport occupant is released only now that it is terminal.
+        client.settle(held_series, _totals_response(
+            KEY, window=window, kind="series", value=series(1, window)))
+        assert router.drain() is False
+        assert router.retained("totals", KEY, scope, window.end_mono_ns) is None
+        assert router._occupant is None
+
         retirements = router._generation
-        assert retirements > before
+        assert retirements == before + 1
         assert router.drain() is False
         assert router._generation == retirements, "an already retired frame is not retired again"
 
