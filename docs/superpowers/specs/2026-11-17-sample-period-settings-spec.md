@@ -33,12 +33,12 @@ write boundaries.
 | `src/appio/ui/collector_window.py` | Add the sampling-period Settings row, consent text, pending/effective state handling, object names, status strings, and status-to-`ServiceFacts` pass-through. Keep `UNIT_SHOW_ARGV` and `parse_unit_facts` as the GUI service-state parser. |
 | `data/libexec/appio-setup` | Add the new verb and the anchored three-argument shape check while retaining the stdlib-only trust order and usage prefix. |
 | `data/systemd/appio-iod.service` | Preserve the unit file and its existing `APPIO_QUOTA_BYTES` deployment override. Do not add a unit-level sample environment assignment; the fixed `/etc` drop-in owns the setting. |
-| `tools/acceptance/appio-p3-root.py` | Add the explicit `period-capacity` host phase: create a disposable aged, materialized database fixture, run the production pruning path at the derived 2-second cadence for at least 30 minutes of monotonic wall time, and record measured backlog and throughput without touching the installed service database. |
-| `docs/acceptance/appio-p3-root.md` | Document the capacity phase command, fixture, expected duration, evidence, and isolation from the installed daemon and its database. |
+| `tools/acceptance/appio-p3-root.py` | Add the explicit `period-capacity` host phase: create a disposable aged, materialized database fixture for 226 app IDs with a calculated initial backlog that keeps every 2,048-unit pruning batch saturated for at least 30 minutes, run the production pruning path at the derived 2-second cadence, and record measured backlog and throughput without touching the installed service database. |
+| `docs/acceptance/appio-p3-root.md` | Document the capacity phase command, 226-app fixture, saturation-reserve calculation, expected duration, evidence, and isolation from the installed daemon and its database. |
 | `tests/p3/test_iod_cadence_pins.py` | Add parser, environment, derived-window, status, validator, and production-entry-point tests; preserve the existing default cadence pins. |
 | `tests/p3/test_setup_boundary.py` | Add the six-verb-plus-period argv table, period range table, invocation payload assertions, and account-lookup ordering tests. |
 | `tests/p3/test_setup_files.py` | Add canonical payload/parser, target allowlist, directory-fsync, foreign-content, empty-file, and byte-preservation tests. |
-| `tests/p3/test_setup_service.py` | Add result fields and all D7 operation, failure, repair, inactive, precedence, and systemd-view tests, including a second invocation that observes a persisted failed systemd result while the service remains inactive. |
+| `tests/p3/test_setup_service.py` | Add result fields and all D7 operation, failure, repair, inactive, precedence, and systemd-view tests, including assertions for both the first failed restart and its inactive retry, and the inactive conflicting-Environment diagnostic. |
 | `tests/p3/test_setup_client.py` | Add two-element/three-element launch vectors, payload pairing refusals, and new result-field decode tests. |
 | `tests/p3/test_collector_window.py` | Add row construction, object names, focus, range, edit preservation, exact status, apply lifecycle, consent, mismatch, and no-start assertions. |
 | `tests/p3/test_p3_acceptance.py` | Pin the explicit `period-capacity` phase in the dry-run CLI and prove the dry-run path performs no privileged appio imports, commands, or evidence writes. |
@@ -133,7 +133,7 @@ The setup result document keeps all existing keys and adds these exact keys to
 ```text
 version: int == 1
 verb: str
-uid: int
+uid: int | None
 enabled: bool | None
 answering: bool | None
 pending_activation: bool | None
@@ -144,6 +144,8 @@ error: str | None
 sample_period: int | None
 sample_period_state: str | None
 ```
+
+The pre-identity syntax/range-error path emits `uid: null`; after identity is resolved, `uid` is the beneficiary's exact integer. The helper never guesses a caller UID from argv or environment.
 
 For `set-sample-period`, `sample_period` is the requested seconds and
 `sample_period_state` is `None` on failure or one of
@@ -321,21 +323,28 @@ The handler executes these steps in order:
    by a directory-sync failure repairable and never treats the identical bytes as
    proof that the earlier operation completed.
 7. Run `/usr/bin/systemctl daemon-reload` when `needs_write` is true or the
-   configured value is not exactly `n`. A nonzero result is exit 1 with reason
-   `daemon_reload_failed`; the already-written canonical file remains valid for a
-   later repair.
+   configured value is not exactly `n`. On a nonzero result, retain
+   `daemon_reload_failed`, skip the restart and verification steps, and continue to
+   the final lifecycle read in step 10. The already-written canonical file remains
+   valid for a later repair, and this invocation cannot select a successful outcome.
 8. Run `/usr/bin/systemctl try-restart appio-iod.service` only when
    `active_before` is true and at least one of `needs_write`, configured value not
    equal to `n`, running value different from `n`, or running value unknown is
-   true. A nonzero result is exit 1 with reason `service_restart_failed`.
-   `try-restart` is never used for an inactive unit and therefore cannot start or
-   enable collection.
+   true. On a nonzero result, retain the `service_restart_failed` operation failure
+   and continue through steps 9–10; outcome selection waits for the final lifecycle
+   state. If that read proves the unit inactive, precedence reports
+   `service_not_running`; if it proves the unit remains active, the result is
+   `service_restart_failed`. No successful outcome is possible after a nonzero
+   restart. `try-restart` is never used for an inactive unit and therefore cannot
+   start or enable collection.
 9. Verify the resulting state. Re-read the configuration view and require the
-   merged `Environment` value to equal `n`. If the unit is active, require a
-   validated daemon status with `answering is True` and
-   `sample_ns == n * NS`. If the unit is inactive, require an empty
-   `EnvironmentFiles` field and require `UnsetEnvironment` not to name
-   `APPIO_SAMPLE_SECONDS`; an inactive unit cannot prove its runtime value.
+   merged `Environment` value to equal `n`. For an active unit, a configuration
+   mismatch, a missing/invalid status reply, or `sample_ns != n * NS` is an active
+   verification failure. For an inactive unit, a merged `Environment` mismatch,
+   non-empty `EnvironmentFiles`, or `UnsetEnvironment` naming
+   `APPIO_SAMPLE_SECONDS` is an unverifiable configuration failure. Inactive
+   verification does not claim a runtime value. Record verification failures and
+   continue to step 10 so lifecycle precedence is evaluated before returning.
 10. Re-read the full lifecycle view, including `ActiveState` and `Result`, after
     all operation and verification steps; retain them as `active_state_after` and
     `result_after`, and set `active_after = (active_state_after == "active")`.
@@ -351,43 +360,52 @@ The handler executes these steps in order:
     the final `ActiveState` and `Result`. A command or verification failure still
     performs this final read whenever the runner can obtain it.
 
-For an active mismatch, the exit-1 result reason is
-`sample_period_overridden`. Its exact bounded diagnostic is
-`sample_period_not_in_effect observed=<value> DropInPaths=<paths>`, where
-`<value>` is the observed integer seconds or `unknown`, and `<paths>` is the raw
-`DropInPaths` field or `(none)`. This covers a winning other drop-in,
-`EnvironmentFile=`, `UnsetEnvironment=`, or daemon value. For an inactive
-`EnvironmentFiles` or `UnsetEnvironment` violation, the reason is
-`sample_period_unverifiable` and the exact diagnostic is
-`sample_period_unverifiable EnvironmentFiles=<files> UnsetEnvironment=<unset> DropInPaths=<paths>`.
-A failed status observation while active uses the active reason with
-`observed=unknown`. These diagnostics are single lines.
+An active verification failure uses exit-1 reason `sample_period_overridden` and
+exact diagnostic `sample_period_not_in_effect observed=<value> DropInPaths=<paths>`.
+For an active `Environment` mismatch, `<value>` is the canonical integer seconds
+from the merged `Environment` token, or `unknown` if it is missing, duplicate,
+malformed, or noncanonical. For an active status mismatch or unavailable status,
+`<value>` is the daemon-reported seconds only when `sample_ns` is a positive exact
+multiple of `NS`; otherwise it is `unknown`. `<paths>` is the raw `DropInPaths`
+field or `(none)`. This covers a winning other drop-in, `EnvironmentFile=`,
+`UnsetEnvironment=`, or daemon value.
+
+An inactive verification failure uses exit-1 reason `sample_period_unverifiable`
+and exact diagnostic
+`sample_period_unverifiable observed=<value> EnvironmentFiles=<files> UnsetEnvironment=<unset> DropInPaths=<paths>`.
+Here `<value>` is parsed from the merged `Environment` token using the same rule
+above, or `unknown`; the remaining values are the raw fields or `(none)`. This
+covers an inactive conflicting drop-in as well as an environment file or unset
+rule. All diagnostics are single lines.
 
 Outcome selection is ordered and exclusive:
 
 | Precedence | Condition | Exit/result |
 |---:|---|---|
-| 1 | `active_before` is true and `active_after` is false; or `active_after` is false and either `result_before != "success"`, `result_after != "success"`, or `active_state_after == "failed"`. The first clause handles a stop racing this call; the latter clauses preserve evidence across later calls after a failed restart. | Exit 1; `sample_period_state="service_not_running"`; reason `service_not_running`. This suppresses every other outcome, including a passing inactive verification or a matching file. |
-| 2 | Verification fails after the first row does not apply | Exit 1; `sample_period_state=None`; use the exact reason from steps 7 or 9. |
-| 3 | Canonical bytes were written and `active_after` is true | Exit 0; `sample_period_state="applied"`. |
-| 4 | Canonical bytes were written, `active_before` and `active_after` are false, and both lifecycle results are `success` | Exit 0; `sample_period_state="applied_not_running"`. |
-| 5 | No write occurred, a reload or restart occurred, and `active_after` is true | Exit 0; `sample_period_state="repair"`. |
-| 6 | No write, reload, or restart occurred, `active_after` is false with successful lifecycle results, and verification passed | Exit 0; `sample_period_state="unchanged"`. |
+| 1 | `active_before` is true and `active_after` is false; or `active_after` is false and either `result_before != "success"`, `result_after != "success"`, or `active_state_after == "failed"`. The first clause handles a stop racing this call; the latter clauses preserve evidence across later calls after a failed restart. | Exit 1; `sample_period_state="service_not_running"`; reason `service_not_running`. This suppresses every other outcome, including restart failure, a passing inactive verification, or a matching file. |
+| 2 | `try-restart` returned nonzero and the valid final lifecycle view shows `active_after` true. | Exit 1; `sample_period_state=None`; reason `service_restart_failed`. |
+| 3 | Any other write, reload, or verification failure after rows 1–2 do not apply. | Exit 1; `sample_period_state=None`; preserve the exact failure reason from the operation or verification step. |
+| 4 | Canonical bytes were written and `active_after` is true. | Exit 0; `sample_period_state="applied"`. |
+| 5 | Canonical bytes were written, `active_before` and `active_after` are false, and both lifecycle results are `success`. | Exit 0; `sample_period_state="applied_not_running"`. |
+| 6 | No write occurred, a reload or restart occurred, and `active_after` is true. | Exit 0; `sample_period_state="repair"`. |
+| 7 | No write, reload, or restart occurred, `active_after` is false with successful lifecycle results, and verification passed. | Exit 0; `sample_period_state="unchanged"`. |
 
 A no-write inactive attempt cannot claim one of the four successful outcomes;
 it returns `service_not_running` when systemd retains a failed-invocation result,
-or `sample_period_unverifiable` when only configuration verification fails. A prior failed restart is therefore never collapsed into
-`unchanged` on the next helper invocation: its persisted `Result` or `failed`
-`ActiveState` takes precedence even when the drop-in bytes and inactive
-configuration view match. The helper never starts the unit to clear this state;
-the existing Settings switch remains the only start control.
+or `sample_period_unverifiable` when its configuration cannot be verified. A prior
+failed restart is therefore never collapsed into `unchanged` on the next helper
+invocation: its persisted `Result` or `failed` `ActiveState` takes precedence even
+when the drop-in bytes and inactive configuration view match. The helper never
+starts the unit to clear this state; the existing Settings switch remains the only
+start control.
 
-The result always carries `sample_period=n` for this verb. Existing lifecycle
-verbs leave both period result fields null. A write, reload, or restart failure
-is retriable; a retry evaluates the same state machine and can produce `repair`
-when the service is active. A successful identical re-apply produces
-`unchanged` only when no earlier operation was left incomplete and no reload or
-restart is needed.
+The result carries `sample_period=n` for a `set-sample-period` invocation that
+reaches dispatch, including operation failures. A pre-identity boundary error such
+as `sample_period_out_of_range` carries `sample_period=null`. Existing lifecycle
+verbs leave both period result fields null. A write, reload, or restart failure is
+retriable; a retry evaluates the same state machine and can produce `repair` when
+the service is active. A successful identical re-apply produces `unchanged` only
+when no earlier operation was left incomplete and no reload or restart is needed.
 
 ## 8. GUI contract
 
@@ -525,16 +543,17 @@ inactive collector. `appio --interval` and local `tick_local` remain untouched.
 | Condition | Exit | Exact reason or diagnostic |
 |---|---:|---|
 | invalid arity, verb, executable, or payload shape | 2 | `invalid_verb_or_argument_count` at the boundary; shim usage for shim-only rejection |
-| canonical period outside 2-30 | 2 | `sample_period_out_of_range` |
+| canonical period outside 2-30 | 2 | `sample_period_out_of_range`; before caller identity is resolved, JSON has `uid: null`, `sample_period: null`, and `sample_period_state: null` |
 | non-empty foreign period drop-in | 2 | reason `foreign_drop_in`; diagnostic `foreign_drop_in path=/etc/systemd/system/appio-iod.service.d/20-sample-period.conf` |
 | target omitted from fixed allowlist | 2 | `target:not_fixed_path` |
 | fixed target omitted from expected-content parser | 2 | `unexpected_content:not_a_config_target` |
-| daemon reload command fails | 1 | `daemon_reload_failed` |
-| try-restart command fails | 1 | `service_restart_failed` |
-| active before, inactive after, or an inactive unit retains failed lifecycle `Result`/`ActiveState` evidence | 1 | `service_not_running` |
-| active verification has a winning alternate value/source | 1 | reason `sample_period_overridden`; diagnostic begins `sample_period_not_in_effect observed=` |
-| inactive verification has `EnvironmentFiles` or the sample variable in `UnsetEnvironment` | 1 | `sample_period_unverifiable` with the exact fields named in section 7 |
-| write, rename, directory-sync, or underlying bounded command failure | 1 | existing underlying error is retained; the result is never a successful period state |
+| active before, inactive after, or an inactive unit retains failed lifecycle `Result`/`ActiveState` evidence | 1 | `service_not_running`; this is evaluated first and suppresses every later failure outcome |
+| try-restart command fails and the valid final lifecycle view shows the unit active | 1 | `service_restart_failed`; `sample_period_state=null` |
+| daemon reload command fails after the first lifecycle-precedence row does not apply | 1 | `daemon_reload_failed`; `sample_period_state=null` |
+| active verification finds a winning alternate value/source after the first row does not apply | 1 | reason `sample_period_overridden`; diagnostic `sample_period_not_in_effect observed=<value> DropInPaths=<paths>` |
+| inactive verification finds a merged `Environment` mismatch, an `EnvironmentFiles` entry, or the sample variable in `UnsetEnvironment`, after the first row does not apply | 1 | reason `sample_period_unverifiable`; diagnostic `sample_period_unverifiable observed=<value> EnvironmentFiles=<files> UnsetEnvironment=<unset> DropInPaths=<paths>` |
+| final lifecycle view is unavailable or invalid | 1 | bounded final-observation failure; `sample_period_state=null` and no successful outcome |
+| write, rename, directory-sync, or another bounded command fails after the first row does not apply | 1 | preserve the originating bounded error; `sample_period_state=null` |
 | missing helper or cancelled authentication | launcher outcome | existing bounded first stderr line; no fabricated helper result |
 
 The shim always writes `appio-setup: ` followed by its message and one LF. The
@@ -556,11 +575,11 @@ status-reader, and launcher seams.
 | 3 | `tests/p3/test_iod_cadence_pins.py::test_sampling_overdue_gate_uses_derived_flush_window` drives the sampling-duration gate below and above `flush_ns_for(30*NS)` with a controlled clock; `tests/p3/test_iod_cadence_pins.py::test_step_overdue_gate_uses_derived_flush_window` drives the pre-sample gate with the same clock; `tests/p3/test_iod_cadence_pins.py::test_shutdown_recovery_gate_uses_derived_flush_window` drives `stop()` below and above the threshold and asserts recovery/epoch effects; root acceptance `test_thirty_second_ten_minute_run_has_no_overdue_paths` runs ten minutes and asserts none of the three overdue effects. |
 | 4 | `tests/p3/test_iod_cadence_pins.py::test_parse_sample_seconds_acceptance_table` uses the literal accepted values in section 9.1 and asserts integers; `tests/p3/test_iod_cadence_pins.py::test_parse_sample_seconds_refusal_table` uses all named invalid values and asserts `None`; `tests/p3/test_iod_cadence_pins.py::test_configured_sample_ns_invalid_values_warn_once_and_start` parametrizes `1`, `31`, `abc`, `02`, ` 5`, a control character, and a 4,000-character value, asserts 10 seconds, exactly one log record, and completed startup; `tests/p3/test_iod_cadence_pins.py::test_status_validator_accepts_period_and_older_status` covers present and absent `sample_ns`. |
 | 5 | `tests/p3/test_setup_service.py::test_set_sample_period_inactive_writes_and_never_starts` uses a fake inactive unit and records no `enable`, `start`, or `try-restart`; `tests/p3/test_setup_service.py::test_set_sample_period_active_uses_try_restart` uses an active unit and asserts the exact reload/restart argv; `tests/p3/test_collector_window.py::test_sampling_apply_preserves_single_switch_activation_invariant` uses a fake setup client and asserts an inactive service is never started; root acceptance `test_apply_two_and_thirty_seconds_restarts_only_active_service` checks the service state and interval after each apply. |
-| 6 | `tests/p3/test_setup_service.py::test_identical_successful_apply_is_unchanged` preloads canonical bytes and matching configuration/status and asserts no write, reload, or restart plus `unchanged`; `test_identical_apply_repairs_failed_reload`, `test_identical_apply_repairs_failed_restart`, and `test_identical_apply_repairs_failed_directory_sync` inject each failure, re-arm the directory-sync fault on every attempt, retry, and assert `repair`; `test_failed_restart_inactive_retry_preserves_service_not_running` performs two separate helper invocations, leaves the first failed restart at inactive with `Result=exit-code`, and asserts the second returns `service_not_running` without `unchanged`, `start`, or `try-restart`; `test_inactive_success_result_can_be_unchanged` proves a cleanly inactive service remains eligible for the no-op outcome; `test_active_before_inactive_after_has_service_not_running_precedence` forces the final state down and asserts exit 1 and `service_not_running`; `test_final_lifecycle_read_failure_cannot_return_success` injects an unavailable final show result and asserts an exit-1 failure with `sample_period_state=None`; `tests/p3/test_collector_window.py::test_sampling_apply_success_waits_for_matching_nanosecond_probe` uses a real `N*NS` value and asserts success only on equality. |
-| 7 | `tests/p3/test_setup_files.py::test_sample_period_payload_and_parser_round_trip` covers 2, 10, and 30 exact bytes; `test_sample_period_target_is_in_both_allowlists` asserts both target tables; `test_missing_config_target_and_missing_parser_have_distinct_refusals` asserts `target:not_fixed_path` and `unexpected_content:not_a_config_target`; `test_foreign_sample_dropin_preserves_bytes` covers every refusal form; `test_empty_sample_dropin_is_replaced` covers the empty exception; `tests/p3/test_setup_service.py::test_sample_show_omitted_empty_environment_files_is_empty` omits the `EnvironmentFiles` line and asserts successful empty-value parsing; `test_sample_show_omitted_empty_unset_environment_is_empty` does the same for `UnsetEnvironment`; `test_active_override_reports_value_and_dropin_paths` and `test_inactive_environment_sources_are_unverifiable` cover both verification branches. |
-| 8 | `tools/acceptance/appio-p3-root.py --run --phase period-capacity` is an executable host phase. It builds a disposable, materialized SQLite fixture outside `/var/lib/appio`, with at least two days of expired core rows for 200 or more app IDs, then runs the production pruning path against the host filesystem for at least 1,800 seconds of `time.monotonic()` time. The fixture generates one eligible core unit per app every 2 seconds and runs maintenance at `maintenance_ns_for(2*NS)`; it asserts measured retired units per second exceed that fixture production rate and the eligible backlog at the end is no greater than at the start. Evidence records fixture app count, initial eligible units, generated and retired units, elapsed wall time, final eligible units, and each prune result. An empty or below-quota fixture is invalid. The phase invokes no helper or systemctl command and never opens the installed service database. `docs/acceptance/appio-p3-root.md` documents setup, invocation, the minimum duration, and the evidence fields; `tests/p3/test_p3_acceptance.py::test_period_capacity_phase_is_available_in_side_effect_free_dry_run` pins the command-line entry without running the 30-minute phase. |
+| 6 | `tests/p3/test_setup_service.py::test_identical_successful_apply_is_unchanged` preloads canonical bytes and matching configuration/status and asserts no write, reload, or restart plus `unchanged`; `test_identical_apply_repairs_failed_reload`, `test_identical_apply_repairs_failed_restart`, and `test_identical_apply_repairs_failed_directory_sync` inject each failure, re-arm the directory-sync fault on every attempt, retry, and assert `repair`; `test_failed_restart_inactive_retry_preserves_service_not_running` performs two separate helper invocations, asserts the first failed restart and the later retry both return `service_not_running`, confirms the persisted inactive `Result=exit-code` prevents `unchanged`, and asserts the retry issues no `start` or `try-restart`; `test_inactive_success_result_can_be_unchanged` proves a cleanly inactive service remains eligible for the no-op outcome; `test_active_before_inactive_after_has_service_not_running_precedence` forces the final state down and asserts exit 1 and `service_not_running`; `test_final_lifecycle_read_failure_cannot_return_success` injects an unavailable final show result and asserts an exit-1 failure with `sample_period_state=None`; `tests/p3/test_collector_window.py::test_sampling_apply_success_waits_for_matching_nanosecond_probe` uses a real `N*NS` value and asserts success only on equality. |
+| 7 | `tests/p3/test_setup_files.py::test_sample_period_payload_and_parser_round_trip` covers 2, 10, and 30 exact bytes; `test_sample_period_target_is_in_both_allowlists` asserts both target tables; `test_missing_config_target_and_missing_parser_have_distinct_refusals` asserts `target:not_fixed_path` and `unexpected_content:not_a_config_target`; `test_foreign_sample_dropin_preserves_bytes` covers every refusal form; `test_empty_sample_dropin_is_replaced` covers the empty exception; `tests/p3/test_setup_service.py::test_sample_show_omitted_empty_environment_files_is_empty` omits the `EnvironmentFiles` line and asserts successful empty-value parsing; `test_sample_show_omitted_empty_unset_environment_is_empty` does the same for `UnsetEnvironment`; `test_active_override_reports_value_and_dropin_paths` asserts the active reason and exact diagnostic; `test_inactive_environment_override_is_unverifiable_with_value_and_dropin_paths` supplies merged `Environment=APPIO_SAMPLE_SECONDS=7`, empty `EnvironmentFiles`/`UnsetEnvironment`, and `DropInPaths=/etc/systemd/system/appio-iod.service.d/20-sample-period.conf /etc/systemd/system/appio-iod.service.d/30-conflict.conf`, then asserts exit 1, `sample_period_state=None`, reason `sample_period_unverifiable`, and exact diagnostic `sample_period_unverifiable observed=7 EnvironmentFiles=(none) UnsetEnvironment=(none) DropInPaths=/etc/systemd/system/appio-iod.service.d/20-sample-period.conf /etc/systemd/system/appio-iod.service.d/30-conflict.conf`; `test_inactive_environment_sources_are_unverifiable` covers the inactive file and unset branches. |
+| 8 | `tools/acceptance/appio-p3-root.py --run --phase period-capacity` is an executable host phase. It builds a disposable, materialized SQLite fixture outside `/var/lib/appio` with 226 app IDs and at least 57,968 aged, eligible core units (retention age at least two days). At a 2-second sample period, `maintenance_ns_for(2*NS)` is 15 seconds and each pruning pass is limited to 2,048 candidate units. The reserve is `2048 + ceil(1800/15) * (2048 - 226 * floor(15/2)) = 57,968`: it conservatively allows only seven generated units per app during each 15-second maintenance interval, so the initial backlog can keep every batch saturated for the full 1,800-second monotonic measurement window. Generate one eligible core unit per app every 2 seconds and run the production pruning path at each maintenance deadline. Before every prune call, assert and record that at least 2,048 eligible units remain; each call must retire exactly 2,048 materialized units with no skipped units. Also record the minimum pre-prune count, app count, initial eligible count, generated and retired units, elapsed wall time, final eligible count, and each prune result. The phase passes only when every measured batch was saturated, retired units per second exceed the fixture production rate, elapsed time is at least 1,800 seconds, and final eligible backlog is no greater than the initial backlog. A fixture that misses these conditions or lacks materialized aged rows is invalid; no comparison with `APPIO_QUOTA_BYTES` or physical database size is required. The phase invokes no helper or systemctl command and never opens the installed service database. `docs/acceptance/appio-p3-root.md` documents setup, invocation, the minimum duration, reserve calculation, and evidence fields; `tests/p3/test_p3_acceptance.py::test_period_capacity_phase_is_available_in_side_effect_free_dry_run` pins the command-line entry without running the 30-minute phase. |
 
-Additional named seam tests are required for `tests/p3/test_setup_boundary.py::test_period_argv_forms_are_checked_before_account_lookup`, `test_period_payload_range_table`, `test_dispatch_preserves_period_payload`, and `test_forged_period_invocation_without_payload_is_rejected`; `tests/p3/test_setup_client.py::test_old_and_period_launch_vectors`, `test_period_payload_pairing_refuses_before_launch`, and `test_decode_body_validates_period_result_fields`; `tests/p3/test_setup_service.py::test_main_preserves_sample_period_out_of_range_reason_and_json` (exit 2, stderr and encoded result both preserve `sample_period_out_of_range`); `tests/p3/test_iod_cadence_pins.py::test_status_validator_accepts_period_and_older_status` (missing key accepted and explicit null rejected); and `tests/p3/test_collector_window.py::test_sampling_row_has_required_object_names`, `test_sampling_row_focus_and_spin_contract`, `test_sampling_edit_survives_refresh`, `test_sampling_status_strings_are_exact`, `test_sampling_apply_button_is_disabled_while_pending`, `test_sampling_mismatch_and_superseded_period_are_not_success`, `test_sampling_saved_status_is_shown_when_inactive`, `test_sampling_consent_discloses_exact_command`, `test_sampling_consent_cancellation_dispatches_nothing`, and `test_sampling_missing_helper_shows_bounded_stderr`.
+Additional named seam tests are required for `tests/p3/test_setup_boundary.py::test_period_argv_forms_are_checked_before_account_lookup`, `test_period_payload_range_table`, `test_dispatch_preserves_period_payload`, and `test_forged_period_invocation_without_payload_is_rejected`; `tests/p3/test_setup_client.py::test_old_and_period_launch_vectors`, `test_period_payload_pairing_refuses_before_launch`, and `test_decode_body_validates_period_result_fields`; `tests/p3/test_setup_service.py::test_main_preserves_sample_period_out_of_range_reason_and_json` (exit 2, stderr preserves `sample_period_out_of_range`, and the decoded JSON has the exact result key set with `uid=None`, `sample_period=None`, and `sample_period_state=None`); `tests/p3/test_iod_cadence_pins.py::test_status_validator_accepts_period_and_older_status` (missing key accepted and explicit null rejected); and `tests/p3/test_collector_window.py::test_sampling_row_has_required_object_names`, `test_sampling_row_focus_and_spin_contract`, `test_sampling_edit_survives_refresh`, `test_sampling_status_strings_are_exact`, `test_sampling_apply_button_is_disabled_while_pending`, `test_sampling_mismatch_and_superseded_period_are_not_success`, `test_sampling_saved_status_is_shown_when_inactive`, `test_sampling_consent_discloses_exact_command`, `test_sampling_consent_cancellation_dispatches_nothing`, and `test_sampling_missing_helper_shows_bounded_stderr`.
 
 ## 12. Compatibility and migration
 
@@ -588,7 +607,9 @@ verb. Removing the package leaves the `/etc` drop-in inert with the unit removed
 - The active foreign-source result uses the design's explicit exit reason
   `sample_period_overridden`; its one-line operator diagnostic uses the design's
   `sample_period_not_in_effect` wording and includes the observed value and
-  `DropInPaths`. Inactive source ambiguity uses `sample_period_unverifiable`.
+  `DropInPaths`. Inactive verification failures, including a merged `Environment`
+  mismatch, use `sample_period_unverifiable` and include the observed value,
+  `EnvironmentFiles`, `UnsetEnvironment`, and `DropInPaths`.
 - The helper keeps the old lifecycle `SHOW_ARGV`, adds a separate configuration
   query for D7, and leaves the GUI `UNIT_SHOW_ARGV` parser unchanged. This prevents
   a strict lifecycle parser from consuming environment properties or a GUI parser
@@ -601,8 +622,13 @@ verb. Removing the package leaves the `/etc` drop-in inert with the unit removed
   foreign and remains byte-identical.
 - `service_not_running` wins when an active-to-inactive transition races this call, and also when an inactive unit carries a persisted failed `Result`/`ActiveState` from an unsuccessful invocation. This preserves the failed-restart evidence across helper invocations and prevents matching inactive bytes from becoming `unchanged`; the helper never starts the unit, and the existing switch remains the repair path.
 - The optional status field distinguishes absence from an explicit JSON `null`: old replies without `sample_ns` remain compatible, while a present null is an invalid status value. Unknown status keys retain the `unknown_key` protocol reason; field-value faults retain `invalid_field`.
-- Criterion 8 is executable through the isolated `period-capacity` host phase and documented alongside the existing P3 host checks; it measures the production pruner against a sustained 2-second fixture without touching the installed service database.
-- The entry-point test pins that `sample_period_out_of_range` survives `setup_service.main` as both its exit-2 diagnostic and encoded result.
+- Criterion 8 is executable through the isolated `period-capacity` host phase and
+  documents the 226-app, 57,968-unit reserve needed to keep every 2,048-unit batch
+  saturated for 30 minutes; the fixture does not require an above-quota database.
+- The entry-point test pins that `sample_period_out_of_range` survives
+  `setup_service.main` as both its exit-2 diagnostic and encoded result; it asserts
+  the exact result key set and the pre-identity values `uid: null`,
+  `sample_period: null`, and `sample_period_state: null`.
 - A canonical target with no successful prior completion still runs the parent
   directory durability check. Matching bytes do not establish that a preceding
   rename and directory sync completed.
