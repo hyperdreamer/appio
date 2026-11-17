@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from heapq import nsmallest
+import heapq
 import os
 from pathlib import Path
 import sqlite3
@@ -21,12 +22,14 @@ from appio.ownership import ownership_settled
 
 DAY_NS = 86_400_000_000_000
 DEFAULT_QUOTA_BYTES = 1_500_000_000
-#: Units retired per maintenance pass. The pass blocks the owner loop, so it must
-#: stay under FRAME_TIMEOUT_NS (2 s) or live clients lose their frames: measured
-#: 1.4 s at 256. Raising it does NOT raise throughput -- _candidates() fetches
-#: batch_size rows for every app in every tier, so the cost is ~2.7 ms/unit and
-#: the real ceiling is the selection query, not this number.
-DEFAULT_BATCH_SIZE = 256
+#: Units retired per maintenance pass. Two constraints set this: the pass blocks
+#: the owner loop, so it must stay under FRAME_TIMEOUT_NS (2 s), and it must
+#: retire more than the collector produces or the retained tail grows forever.
+#: A 10 s sample of ~226 app rows produces ~1350 units/minute. Measured on the
+#: host with the heap-merged selection: 256 -> 0.14 s, 2048 -> 0.82 s,
+#: 4096 -> 4.2 s (superlinear), so 2048 is the largest pass that keeps headroom
+#: under the 2 s deadline and still outruns production 1.5x.
+DEFAULT_BATCH_SIZE = 2048
 #: Units retired per transaction. Deleting one unit per transaction costs a
 #: durability fsync each, which is most of a 4 ms unit, and that rate cannot keep
 #: up with a 10 s sample of ~226 app rows: retention fell ~1130 units/minute
@@ -43,6 +46,19 @@ COMPACT_RESERVE_FRACTION = (1, 20)  # 5 % of the database file
 QUOTA_ENV = "APPIO_QUOTA_BYTES"
 RETENTION_NS = {"core": DAY_NS, "gap": DAY_NS, "file": 14 * DAY_NS,
                 "file_unknown": 14 * DAY_NS, 60: 30 * DAY_NS, 3600: 365 * DAY_NS}
+#: (kind, bucket, table, index, time column, index order) per deletion tier. The
+#: order is a prefix of the A13 key inside one app, so a per-app keyset scan feeds
+#: a heap merge directly.
+_TIERS = (
+    ("core", 0, "sample_coverage", "sample_coverage_app_time_idx", "ts_mono_ns",
+     "ts_mono_ns,source,epoch,seq"),
+    ("file", 0, "file_coverage", "file_coverage_app_time_idx", "ts_mono_ns", "ts_mono_ns"),
+    ("file_unknown", 0, "file_overflow_unknown", None, "ts_mono_ns", "ts_mono_ns"),
+    ("rollup", 60, "rollup_app", "rollup_app_time_idx", "bucket_start_mono_ns",
+     "bucket_start_mono_ns"),
+    ("rollup", 3600, "rollup_app", "rollup_app_time_idx", "bucket_start_mono_ns",
+     "bucket_start_mono_ns"),
+)
 
 
 def _paths(paths) -> tuple[Path, ...]:
@@ -143,6 +159,31 @@ class _Unit:
                 self.epoch, self.seq, self.app_id,
                 ("core", "file", "file_unknown", "gap", "rollup").index(self.kind),
                 self.bucket_secs, self.gap_id, typed_pk)
+
+
+@dataclass
+class _Cursor:
+    """One ordered (tier, app, boot, clock segment) scan for the candidate merge.
+
+    Within a cursor, rows arrive in ``_Unit.key`` order, so a heap merge over the
+    cursors reproduces the A13 order one row at a time. The alternative -- asking
+    every app for ``batch_size`` rows per tier and merging in Python -- reads
+    O(apps x batch) rows to keep ``batch`` of them and cost ~2.7 ms per candidate
+    on a 500-app host, which is why retention could never keep up.
+    """
+    kind: str
+    secs: int
+    app: int
+    boot: str
+    low: int
+    high: int
+    offset: int
+    table: str
+    index: str | None
+    time: str
+    order: str
+    seek_sql: str = ""
+    seek_params: tuple = ()
 
 
 class QuotaPruner:
@@ -278,11 +319,13 @@ class QuotaPruner:
                 u.wall < self._selection_wall - RETENTION_NS["gap"]]
 
     def _candidates(self, now_wall=None, after=None) -> list[_Unit] | None:
-        """Merge bounded index ranges, already restricted to each retention tier.
+        """Merge ordered index scans, one row per cursor, restricted per tier.
 
-        Cost depends on batch size and app/boot/clock metadata, not the number of
-        retained samples. LIMIT is applied in each covering index before rows
-        become Python objects; the final merge retains the complete A13 key.
+        Every tier is scanned through the covering index that already orders rows
+        by ``(time, source, epoch, seq)`` inside one app, which is a prefix of the
+        A13 key, so a heap over per-app cursors yields the global key order while
+        touching only ``batch_size`` rows in total. The final order and the
+        resume key are therefore unchanged; only the row volume is.
         """
         self._scan_pending = False
         self._candidate_more = False
@@ -290,19 +333,18 @@ class QuotaPruner:
         apps = [row[0] for row in self.connection.execute("SELECT app_id FROM app ORDER BY app_id")]
         if self._unmapped(ranges, apps):
             return None
-        units = self._gap_candidates(ranges, now_wall, after)
-        if units is None or self._scan_pending:
-            return units
+        gaps = self._gap_candidates(ranges, now_wall, after)
+        if gaps is None or self._scan_pending:
+            return gaps
         now_wall = self._selection_wall
+        return self._merge(self._cursors(ranges, now_wall, after, apps), gaps, after)
+
+    def _cursors(self, ranges, now_wall, after, apps):
+        """One cursor per boot, clock segment, tier and app, already bounded."""
+        cursors = []
         for boot, segments in ranges.items():
             for start, end, offset in segments:
-                for kind, secs, table, index, time, order in (
-                    ("core", 0, "sample_coverage", "sample_coverage_app_time_idx", "ts_mono_ns", "ts_mono_ns,source,epoch,seq"),
-                    ("file", 0, "file_coverage", "file_coverage_app_time_idx", "ts_mono_ns", "ts_mono_ns"),
-                    ("file_unknown", 0, "file_overflow_unknown", None, "ts_mono_ns", "ts_mono_ns"),
-                    ("rollup", 60, "rollup_app", "rollup_app_time_idx", "bucket_start_mono_ns", "bucket_start_mono_ns"),
-                    ("rollup", 3600, "rollup_app", "rollup_app_time_idx", "bucket_start_mono_ns", "bucket_start_mono_ns"),
-                ):
+                for kind, secs, table, index, time, order in _TIERS:
                     tier = {0: 0, 60: 1, 3600: 2}[secs]
                     if after is not None and tier < after[0]:
                         continue
@@ -314,44 +356,93 @@ class QuotaPruner:
                         low = max(low, after[1] - offset)
                     if low > high:
                         continue
+                    pivot = after[1] - offset if same_tier else None
                     for app in (apps if kind != "file_unknown" else (0,)):
-                        params = [boot, low, high]
-                        condition = f"boot_id=? AND {time}>=? AND {time}<=?"
-                        if kind != "file_unknown":
-                            condition += " AND app_id=?"
-                            params.append(app)
-                        if secs:
-                            condition += " AND bucket_secs=?"
-                            params.append(secs)
-                        if kind == "core" and same_tier:
-                            # Seek past tied ticks in the index itself, rather
-                            # than rereading an arbitrarily large equal-time prefix.
-                            pivot = after[1] - offset
-                            if boot.encode() == after[2] and pivot >= start:
+                        seek_sql, seek_params = "", ()
+                        if kind == "core" and pivot is not None and pivot >= start:
+                            # Seek past tied ticks in the index itself instead of
+                            # rereading an arbitrarily large equal-time prefix. A
+                            # later app_id at the same tick is still eligible, so
+                            # the comparison is inclusive for those.
+                            if boot.encode() == after[2]:
                                 op = ">=" if app > after[6] else ">"
-                                condition = ("boot_id=? AND app_id=? AND ts_mono_ns<=? AND "
-                                             f"(ts_mono_ns,source,epoch,seq){op}(?,?,?,?)")
-                                params = [boot, app, high, pivot, after[3].decode(), after[4], after[5]]
-                            elif boot.encode() < after[2] and pivot >= start:
-                                condition += " AND ts_mono_ns>?"
-                                params.append(pivot)
-                        columns = (f"{time},source,epoch,seq" if not secs else f"{time},'',0,0")
-                        indexed = f" INDEXED BY {index}" if index else ""
-                        rows = self.connection.execute(
-                            f"SELECT {columns} FROM {table}{indexed} WHERE {condition} "
-                            f"ORDER BY {order} LIMIT ?", (*params, self.batch_size + 2),
-                        )
-                        for mono, source, epoch, seq in rows:
-                            pk = ((boot, source, epoch, seq, app) if kind == "core" else
-                                  (boot, app, mono) if kind == "file" else
-                                  (boot, mono) if kind == "file_unknown" else (boot, app, secs, mono))
-                            unit = _Unit(kind, pk, boot, mono, source, epoch, seq, app,
-                                         bucket_secs=secs, wall=mono + offset)
-                            if after is None or unit.key > after:
-                                units.append(unit)
-                        units = nsmallest(self.batch_size + 1, units, key=lambda u: u.key)
-        self._candidate_more = len(units) > self.batch_size
-        return units[:self.batch_size]
+                                seek_sql = f"({time},source,epoch,seq){op}(?,?,?,?)"
+                                seek_params = (pivot, after[3].decode(), after[4], after[5])
+                            elif boot.encode() < after[2]:
+                                seek_sql = f"{time}>?"
+                                seek_params = (pivot,)
+                        cursors.append(_Cursor(kind, secs, app, boot, low, high, offset,
+                                               table, index, time, order, seek_sql, seek_params))
+        return cursors
+
+    def _cursor_units(self, cursor, limit):
+        # A row-value seek says exactly where to start, and SQLite will not use it
+        # as a seek while a separate range constraint leads the same index column;
+        # with both, the tuple became a per-row filter and each advance rescanned
+        # the equal-time prefix (~1400 VM steps per unit instead of a seek).
+        tuple_seek = cursor.seek_sql.startswith("(")
+        params = [cursor.boot]
+        condition = "boot_id=?"
+        if cursor.kind != "file_unknown":
+            condition += " AND app_id=?"
+            params.append(cursor.app)
+        if cursor.secs:
+            condition += " AND bucket_secs=?"
+            params.append(cursor.secs)
+        if not tuple_seek:
+            condition += f" AND {cursor.time}>=?"
+            params.append(cursor.low)
+        condition += f" AND {cursor.time}<=?"
+        params.append(cursor.high)
+        if cursor.seek_sql:
+            condition += " AND " + cursor.seek_sql
+            params.extend(cursor.seek_params)
+        columns = (f"{cursor.time},source,epoch,seq" if not cursor.secs
+                   else f"{cursor.time},'',0,0")
+        indexed = f" INDEXED BY {cursor.index}" if cursor.index else ""
+        units = []
+        for mono, source, epoch, seq in self.connection.execute(
+            f"SELECT {columns} FROM {cursor.table}{indexed} WHERE {condition} "
+            f"ORDER BY {cursor.order} LIMIT ?", (*params, limit),
+        ):
+            pk = ((cursor.boot, source, epoch, seq, cursor.app) if cursor.kind == "core" else
+                  (cursor.boot, cursor.app, mono) if cursor.kind == "file" else
+                  (cursor.boot, mono) if cursor.kind == "file_unknown" else
+                  (cursor.boot, cursor.app, cursor.secs, mono))
+            units.append(_Unit(cursor.kind, pk, cursor.boot, mono, source, epoch, seq, cursor.app,
+                               bucket_secs=cursor.secs, wall=mono + cursor.offset))
+        return units
+
+    @staticmethod
+    def _advance_cursor(cursor, unit):
+        """Position a cursor strictly past the unit just merged from it."""
+        if cursor.secs or cursor.kind == "file_unknown":
+            cursor.seek_sql, cursor.seek_params = f"{cursor.time}>?", (unit.mono,)
+        else:
+            cursor.seek_sql = f"({cursor.time},source,epoch,seq)>(?,?,?,?)"
+            cursor.seek_params = (unit.mono, unit.source, unit.epoch, unit.seq)
+
+    def _merge(self, cursors, gaps, after):
+        """Heap-merge the cursors with the gap tier into the next A13 batch."""
+        frontier = [(unit.key, len(cursors), unit) for unit in gaps]
+        heapq.heapify(frontier)
+        for index, cursor in enumerate(cursors):
+            first = self._cursor_units(cursor, 1)
+            if first:
+                heapq.heappush(frontier, (first[0].key, index, first[0]))
+        merged = []
+        while frontier and len(merged) <= self.batch_size:
+            _, index, unit = heapq.heappop(frontier)
+            if after is None or unit.key > after:
+                merged.append(unit)
+            if index < len(cursors):
+                cursor = cursors[index]
+                self._advance_cursor(cursor, unit)
+                following = self._cursor_units(cursor, 1)
+                if following:
+                    heapq.heappush(frontier, (following[0].key, index, following[0]))
+        self._candidate_more = len(merged) > self.batch_size
+        return merged[:self.batch_size]
 
     @staticmethod
     def _dominates(total, contribution) -> bool:

@@ -547,3 +547,40 @@ def test_quota_override_keeps_the_ratified_default_unless_it_is_usable():
     assert configured_quota({"APPIO_QUOTA_BYTES": "nonsense"}) == 1_500_000_000
     assert configured_quota({"APPIO_QUOTA_BYTES": "0"}) == 1_500_000_000
     assert configured_quota({"APPIO_QUOTA_BYTES": "-5"}) == 1_500_000_000
+
+
+def test_candidate_keyset_resume_matches_one_larger_selection(db):
+    """Resuming across passes must not repeat or skip units at a batch boundary.
+
+    Falsifier: a heap merge whose resume seek is inclusive/strict for the wrong
+    side, or that drops the equal-tick prefix when the next app at the same tick
+    is still eligible. Ties are deliberate: three apps share each tick, and two
+    ticks share a wall value.
+    """
+    for app_id in (2, 3):
+        db.execute("INSERT INTO app VALUES(?,?,?,NULL,1000.0,1000.0,'user')",
+                   (app_id, f"exe:/demo{app_id}", f"Demo {app_id}"))
+    db.execute("DELETE FROM sample_coverage")
+    seq = 0
+    for tick in (0, 60_000_000_000, 120_000_000_000):
+        # One frame per tick: every app shares this (time, source, epoch, seq),
+        # so only app_id separates them -- exactly the equal-tick prefix.
+        seq += 1
+        for app_id in (1, 2, 3):
+            db.execute("INSERT INTO sample_coverage VALUES('boot-A','gui',1,?,?,?,?)",
+                       (seq, app_id, tick, coverage_json()))
+    db.commit()
+    now_wall = 1_000_000_000_000 + 10 * DAY
+    whole = QuotaPruner(db, [], batch_size=9)._candidates(now_wall, None)
+    assert len(whole) == 9
+    assert [u.key for u in whole] == sorted(u.key for u in whole)
+
+    # A batch of 4 splits *inside* a tie (3 apps share a tick), so the resume has
+    # to keep the later app of the same tick eligible.
+    picked, after = [], None
+    for _ in range(3):
+        batch = QuotaPruner(db, [], batch_size=4)._candidates(now_wall, after)
+        picked.extend(u.key for u in batch)
+        if batch:
+            after = batch[-1].key
+    assert picked == [u.key for u in whole]
