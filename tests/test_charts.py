@@ -9,6 +9,8 @@ inspected for the "no zero line" rule and for visible reason text.
 from __future__ import annotations
 
 import math
+from contextlib import contextmanager
+from dataclasses import replace
 
 import pytest
 
@@ -177,6 +179,398 @@ def width_of(plot) -> int:
 
 
 # --------------------------------------------------------------------------
+# Append, grouping and run-geometry helpers
+# --------------------------------------------------------------------------
+
+# Ten-second buckets are the frozen fixture width, and a 168 px widget leaves
+# an exact eight-pixel plot so power-of-two grouping is easy to state.
+TEN_NS = 10 * 10**9
+WIDE = 168
+
+
+def dense_points(
+    count: int,
+    *,
+    start_ns: int = 0,
+    bucket_secs: int = BUCKET_SECS,
+    read_bytes: int = 1,
+    write_bytes: int = 2,
+) -> tuple[SeriesPoint, ...]:
+    """One contiguous run of ``count`` buckets with constant raw bytes."""
+
+    return tuple(
+        task_point(
+            start_ns + index * bucket_secs * 10**9,
+            read_bytes=read_bytes,
+            write_bytes=write_bytes,
+            bucket_secs=bucket_secs,
+        )
+        for index in range(count)
+    )
+
+
+def group_bounds(chart) -> list[tuple[int, int]]:
+    return [(group.first_index, group.last_index) for group in chart._groups]
+
+
+def stored_intervals(chart) -> list[list[tuple[int, int, int]]]:
+    return [list(group.intervals) for group in chart._groups]
+
+
+def retained_state(chart) -> dict:
+    return {
+        "samples": chart._samples,
+        "identity": chart._identity,
+        "available": chart._available,
+        "reason": chart._reason,
+        "groups": chart._groups,
+        "group_width": chart._group_width,
+        "columns": chart._columns,
+        "durations": chart._durations,
+        "curves": chart._curves,
+        "segments": chart._segments,
+        "plot": chart._plot,
+        "geometry_size": chart._geometry_size,
+        "totals": chart._totals,
+    }
+
+
+def watch_aggregation(monkeypatch):
+    """Record every aggregate-member visit, including alternate reducers."""
+
+    calls: list[tuple[int, int]] = []
+    visits: list[int] = []
+    original = charts_module._aggregate_members
+
+    def wrapper(samples, first, last, first_run):
+        calls.append((first, last))
+        visits.extend(range(first, last + 1))
+        return original(samples, first, last, first_run)
+
+    monkeypatch.setattr(charts_module, "_aggregate_members", wrapper)
+    return calls, visits
+
+
+def watch_build_groups(monkeypatch):
+    calls: list[tuple[int, int]] = []
+    original = charts_module._build_groups
+
+    def wrapper(samples, width):
+        calls.append((len(samples), width))
+        return original(samples, width)
+
+    monkeypatch.setattr(charts_module, "_build_groups", wrapper)
+    return calls
+
+
+def watch_scale(monkeypatch):
+    visits: list[int] = []
+    original = charts_module._scale_maxima
+
+    def wrapper(columns, durations):
+        visits.append(len(columns))
+        return original(columns, durations)
+
+    monkeypatch.setattr(charts_module, "_scale_maxima", wrapper)
+    return visits
+
+
+def watch_validation(monkeypatch):
+    visits: list[int] = []
+    original = charts_module._admit_task_point
+
+    def wrapper(point):
+        visits.append(len(visits))
+        return original(point)
+
+    monkeypatch.setattr(charts_module, "_admit_task_point", wrapper)
+    return visits
+
+
+def watch_updates(chart, monkeypatch):
+    calls: list[bool] = []
+    monkeypatch.setattr(chart, "update", lambda: calls.append(True))
+    return calls
+
+
+class AppendProbe:
+    """Charge the actual production work of one §8.7 append fixture.
+
+    Every counter is raised by a production primitive or by a raw
+    ``_Sample``/``_Group`` attribute read, never by a test-side hand count:
+
+    * ``_admit_task_point`` validates an incoming point;
+    * ``_samples_equal_at`` compares one full raw prefix position;
+    * ``_aggregate_members`` visits the raw members of one group;
+    * ``_scale_maxima`` reads one cached column's rate pair;
+    * ``_bound_pair`` reads one promotion input pair and ``_merge_groups``
+      writes one promotion output pair;
+    * ``_mapped_y`` reads one cached column for geometry, cached interval
+      iteration is charged to geometry or to promotion merging, and emitted
+      curve/closure coordinates are counted from the returned geometry.
+
+    Raw member reads performed while no aggregation, comparison or geometry
+    phase is active land in ``unaccounted_raw_reads``. That is what charges an
+    alternate full-prefix reducer inserted in ``_append_members`` even though
+    it never calls ``_aggregate_members``. A group bound read made while
+    ``_promote_groups`` is running outside ``_bound_pair`` lands in
+    ``direct_promotion_bound_reads``, and a per-group member range built during
+    promotion lands in ``promotion_ranges``, so a copied member-index vector
+    cannot hide behind the expected pair counts.
+    """
+
+    RAW_FIELDS = (
+        "start",
+        "end",
+        "read_bytes",
+        "write_bytes",
+        "peak_read_bps",
+        "peak_write_bps",
+        "peak_total_bps",
+        "wall_start_seconds",
+        "spans_suspend",
+    )
+
+    def __init__(self) -> None:
+        self.reset()
+
+    def reset(self) -> None:
+        self.validation_visits = 0
+        self.comparison_visits = 0
+        self.aggregate_member_indices: list[int] = []
+        self.scale_column_visits = 0
+        self.bound_reads: list[tuple[int, int]] = []
+        self.bound_writes: list[tuple[int, int]] = []
+        self.promotion_output_bounds: list[tuple[int, int]] = []
+        self.merge_interval_visits = 0
+        self.geometry_column_visits = 0
+        self.interval_visits = 0
+        self.vertex_emit = 0
+        self.closure_emit = 0
+        self.unaccounted_raw_reads: list[str] = []
+        self.direct_promotion_bound_reads: list[str] = []
+        self.promotion_ranges: list[tuple[int, tuple[int, ...]]] = []
+        self._phase: str | None = None
+        self._promotions = 0
+
+    # -- installation ---------------------------------------------------
+
+    def install(self, monkeypatch) -> "AppendProbe":
+        probe = self
+        base_sample = charts_module._Sample
+        base_group = charts_module._Group
+        builtin_range = range
+
+        class CountedSample(base_sample):  # type: ignore[misc, valid-type]
+            __slots__ = ()
+
+        for field in self.RAW_FIELDS:
+            descriptor = getattr(base_sample, field)
+
+            def counted_read(sample, field=field, descriptor=descriptor):
+                probe._raw_read(field)
+                return descriptor.__get__(sample, type(sample))
+
+            def counted_write(sample, value, descriptor=descriptor):
+                descriptor.__set__(sample, value)
+
+            setattr(CountedSample, field, property(counted_read, counted_write))
+
+        class CountedIntervals(tuple):
+            __slots__ = ()
+
+            def __iter__(self):
+                for position in builtin_range(len(self)):
+                    probe._interval_visit()
+                    yield tuple.__getitem__(self, position)
+
+        class CountedGroup(base_group):  # type: ignore[misc, valid-type]
+            __slots__ = ()
+
+            @property
+            def first_index(self):
+                probe._bound_read("first_index")
+                return base_group.first_index.__get__(self, type(self))
+
+            @first_index.setter
+            def first_index(self, value):
+                base_group.first_index.__set__(self, value)
+
+            @property
+            def last_index(self):
+                probe._bound_read("last_index")
+                return base_group.last_index.__get__(self, type(self))
+
+            @last_index.setter
+            def last_index(self, value):
+                base_group.last_index.__set__(self, value)
+
+            @property
+            def intervals(self):
+                return base_group.intervals.__get__(self, type(self))
+
+            @intervals.setter
+            def intervals(self, value):
+                base_group.intervals.__set__(self, CountedIntervals(value))
+
+        monkeypatch.setattr(charts_module, "_Sample", CountedSample)
+        monkeypatch.setattr(charts_module, "_Group", CountedGroup)
+
+        original_admit = charts_module._admit_task_point
+
+        def counted_admit(point):
+            probe.validation_visits += 1
+            return original_admit(point)
+
+        monkeypatch.setattr(charts_module, "_admit_task_point", counted_admit)
+
+        original_equal = charts_module._samples_equal_at
+
+        def counted_equal(left, right, index):
+            probe.comparison_visits += 1
+            with probe._phase_of("compare"):
+                return original_equal(left, right, index)
+
+        monkeypatch.setattr(charts_module, "_samples_equal_at", counted_equal)
+
+        original_aggregate = charts_module._aggregate_members
+
+        def counted_aggregate(samples, first, last, first_run):
+            probe.aggregate_member_indices.extend(builtin_range(first, last + 1))
+            with probe._phase_of("aggregate"):
+                return original_aggregate(samples, first, last, first_run)
+
+        monkeypatch.setattr(charts_module, "_aggregate_members", counted_aggregate)
+
+        original_scale = charts_module._scale_maxima
+
+        def counted_scale(columns, durations):
+            probe.scale_column_visits += len(columns)
+            return original_scale(columns, durations)
+
+        monkeypatch.setattr(charts_module, "_scale_maxima", counted_scale)
+
+        original_bound = charts_module._bound_pair
+
+        def counted_bound(group):
+            with probe._phase_of("bound_pair"):
+                pair = original_bound(group)
+            probe.bound_reads.append(pair)
+            return pair
+
+        monkeypatch.setattr(charts_module, "_bound_pair", counted_bound)
+
+        original_merge = charts_module._merge_groups
+
+        def counted_merge(left, right, first_index, last_index):
+            with probe._phase_of("merge"):
+                merged = original_merge(left, right, first_index, last_index)
+            probe.bound_writes.append(
+                (
+                    base_group.first_index.__get__(merged, type(merged)),
+                    base_group.last_index.__get__(merged, type(merged)),
+                )
+            )
+            return merged
+
+        monkeypatch.setattr(charts_module, "_merge_groups", counted_merge)
+
+        original_promote = charts_module._promote_groups
+
+        def counted_promote(groups):
+            probe._promotions += 1
+            try:
+                with probe._phase_of("promote"):
+                    promoted = original_promote(groups)
+            finally:
+                probe._promotions -= 1
+            probe.promotion_output_bounds.extend(
+                (
+                    base_group.first_index.__get__(group, type(group)),
+                    base_group.last_index.__get__(group, type(group)),
+                )
+                for group in promoted
+            )
+            return promoted
+
+        monkeypatch.setattr(charts_module, "_promote_groups", counted_promote)
+
+        original_mapped = charts_module._mapped_y
+
+        def counted_mapped(*args):
+            probe.geometry_column_visits += 1
+            return original_mapped(*args)
+
+        monkeypatch.setattr(charts_module, "_mapped_y", counted_mapped)
+
+        original_geometry = charts_module._curve_geometry
+
+        def counted_geometry(columns, durations, groups, samples, plot):
+            with probe._phase_of("geometry"):
+                curves, segments = original_geometry(
+                    columns, durations, groups, samples, plot
+                )
+            probe.vertex_emit = sum(len(curve.vertices) for curve in curves)
+            probe.closure_emit = 3 * len(segments)
+            return curves, segments
+
+        monkeypatch.setattr(charts_module, "_curve_geometry", counted_geometry)
+
+        def counted_range(*args):
+            result = builtin_range(*args)
+            if probe._promotions:
+                probe.promotion_ranges.append((len(result), args))
+            return result
+
+        monkeypatch.setattr(charts_module, "range", counted_range, raising=False)
+        return self
+
+    # -- counters --------------------------------------------------------
+
+    @contextmanager
+    def _phase_of(self, phase: str):
+        previous = self._phase
+        self._phase = phase
+        try:
+            yield
+        finally:
+            self._phase = previous
+
+    def _raw_read(self, field: str) -> None:
+        if self._phase in ("aggregate", "compare", "geometry"):
+            return
+        self.unaccounted_raw_reads.append(field)
+
+    def _bound_read(self, field: str) -> None:
+        if self._promotions and self._phase != "bound_pair":
+            self.direct_promotion_bound_reads.append(field)
+
+    def _interval_visit(self) -> None:
+        if self._phase == "merge":
+            self.merge_interval_visits += 1
+        elif self._phase == "geometry":
+            self.interval_visits += 1
+
+
+def assert_no_curve_pixels(chart) -> None:
+    """Prove no read/write stroke or fill survived as a painted pixel."""
+
+    grab = chart.grab()
+    assert isinstance(grab, QPixmap) and not grab.isNull()
+    image = grab.toImage().convertToFormat(QImage.Format.Format_RGBA8888)
+    data = bytes(image.constBits().asstring(image.sizeInBytes()))
+    read_rgba = bytes(
+        (theme.READ_COLOR.red(), theme.READ_COLOR.green(), theme.READ_COLOR.blue(), 255)
+    )
+    write_rgba = bytes(
+        (theme.WRITE_COLOR.red(), theme.WRITE_COLOR.green(), theme.WRITE_COLOR.blue(), 255)
+    )
+    pixels = [data[i : i + 4] for i in range(0, len(data), 4)]
+    assert read_rgba not in pixels
+    assert write_rgba not in pixels
+
+
+# --------------------------------------------------------------------------
 # Time-lane geometry
 # --------------------------------------------------------------------------
 
@@ -219,11 +613,13 @@ def test_contiguous_points_produce_one_run_per_nonzero_side(qtbot) -> None:
     assert min(y for _, y in reads[0].polygon) == pytest.approx(top, abs=1e-6)
     assert max(y for _, y in writes[0].polygon) == pytest.approx(bottom, abs=1e-6)
     rect_width = right - left
-    # The outer X support spans the whole time extent minus the run inset.
+    # The outer X support is the first and last cross-column fragment midpoints,
+    # clamped inside the run inset; it is not a step spanning the raw extent.
     read_xs = [x for x, _ in reads[0].polygon]
     assert min(read_xs) > left
     assert max(read_xs) < right
-    assert min(read_xs) == pytest.approx(left + min(0.25, rect_width / 4), abs=1e-6)
+    assert min(read_xs) == pytest.approx(left + rect_width / 12, abs=1e-6)
+    assert max(read_xs) == pytest.approx(left + rect_width * 11 / 12, abs=1e-6)
 
 
 def test_one_bucket_hole_splits_runs_without_points_or_edges_in_hole(qtbot) -> None:
@@ -339,21 +735,12 @@ def test_downsampling_preserves_bytes_peak_maxima_and_run_starts(qtbot) -> None:
         )
         for index in range(3 * budget + 5)
     ]
-    first = full[0].bucket_start_mono_ns
-    last_end = full[-1].bucket_start_mono_ns + full[-1].bucket_secs * 10**9
 
-    def bin_of(start_ns: int) -> int:
-        return min(budget - 1, ((start_ns - first) * budget) // (last_end - first))
-
-    # Remove one bucket whose neighbours share a pixel bin: the downsampled
-    # column then holds contributors from both sides of the hole.
-    hole_at = next(
-        index
-        for index in range(1, len(full) - 1)
-        if bin_of(full[index - 1].bucket_start_mono_ns)
-        == bin_of(full[index + 1].bucket_start_mono_ns)
-        and bin_of(full[index - 1].bucket_start_mono_ns) > 0
-    )
+    # Groups are consecutive index anchors of four points here. Remove one
+    # bucket from the middle of a group so that column holds contributors from
+    # both sides of a real hole while the run break lands inside that column.
+    hole_at = 17
+    assert (hole_at - 1) // 4 == hole_at // 4
     points = tuple(full[:hole_at] + full[hole_at + 1 :])
     chart.set_task_points(points)
 
@@ -403,21 +790,10 @@ def test_downsampling_across_gap_never_spans_its_horizontal_interval(qtbot) -> N
         )
         for index in range(3 * budget + 7)
     ]
-    first = full[0].bucket_start_mono_ns
-    last_end = full[-1].bucket_start_mono_ns + full[-1].bucket_secs * 10**9
 
-    def bin_of(start_ns: int) -> int:
-        return min(budget - 1, ((start_ns - first) * budget) // (last_end - first))
-
-    # Remove one bucket whose neighbours share a pixel bin: the downsampled
-    # column then holds contributors from both sides of the hole.
-    hole_at = next(
-        index
-        for index in range(1, len(full) - 1)
-        if bin_of(full[index - 1].bucket_start_mono_ns)
-        == bin_of(full[index + 1].bucket_start_mono_ns)
-        and bin_of(full[index - 1].bucket_start_mono_ns) > 0
-    )
+    # A four-member group spans the hole when its second and third members are
+    # non-adjacent; that column then carries two canonical fragments.
+    hole_at = 17
     points = tuple(full[:hole_at] + full[hole_at + 1 :])
     chart.set_task_points(points)
 
@@ -586,33 +962,35 @@ def test_downsampled_column_rate_divides_by_observed_durations_across_hole(
     budget = width_of(chart.plot_rect())
     assert budget == 40
 
-    # Every retained bucket is identical, so every honestly downsampled column
+    # Every retained bucket is identical, so every honestly aggregated column
     # has the same rate and must reach its own full half-height.
     full = [
         task_point(BASE_NS + index * BUCKET_NS, read_bytes=1024, write_bytes=512)
         for index in range(3 * budget)
     ]
-    # Drop the middle bucket of the first column: its neighbours keep their
-    # bytes and share one pixel column across a real one-bucket hole. That
-    # column's envelope is three buckets wide, but its contributors were only
-    # ever observed for two of them.
+    # Drop one bucket inside the first four-member group: its neighbours keep
+    # their bytes and share one column across a real one-bucket hole. That
+    # column's envelope is five buckets wide, but its contributors were only
+    # ever observed for four of them.
     points = tuple(full[:1] + full[2:])
     chart.set_task_points(points)
 
     columns = chart.columns()
-    assert len(columns) == budget
+    assert len(columns) == 30
+    assert len(columns) <= budget
+    assert chart._group_width == 4
     mixed = columns[0]
     assert mixed.starts_run is True
-    assert mixed.end_mono_ns - mixed.start_mono_ns == 3 * BUCKET_NS
+    assert mixed.end_mono_ns - mixed.start_mono_ns == 5 * BUCKET_NS
     assert (
         sum(
             1
             for point in points
             if mixed.start_mono_ns <= point.bucket_start_mono_ns < mixed.end_mono_ns
         )
-        == 2
+        == 4
     )
-    assert (mixed.read_bytes, mixed.write_bytes) == (2048, 1024)
+    assert (mixed.read_bytes, mixed.write_bytes) == (4096, 2048)
 
     plot = chart.plot_rect()
     _, top, _, bottom = plot
@@ -624,7 +1002,7 @@ def test_downsampled_column_rate_divides_by_observed_durations_across_hole(
 
     # Averaging over the summed observed durations keeps the isolated bucket
     # before the hole at the full rate. Dividing by the envelope would leave
-    # the first run - the one built only from that mixed column - two thirds
+    # the first run - the one built only from that mixed column - four fifths
     # tall, at a height strictly between the centre line and the plot edge.
     for segment in segments:
         ys = [y for _, y in segment.polygon]
@@ -640,7 +1018,7 @@ def test_downsampled_column_rate_divides_by_observed_durations_across_hole(
             ), segment
 
 
-def test_downsampling_bins_points_by_the_full_time_extent(qtbot) -> None:
+def test_grouping_anchors_power_of_two_buckets_at_sequence_start(qtbot) -> None:
     chart = make_chart(DualSeriesChart, qtbot, width=200, height=180)
     budget = width_of(chart.plot_rect())
     assert budget == 40
@@ -657,22 +1035,25 @@ def test_downsampling_bins_points_by_the_full_time_extent(qtbot) -> None:
     )
     chart.set_task_points(points)
 
-    # Section 6.2: bin = min(W - 1, ((start - first_start) * W) //
-    # (last_end - first_start)). With 127 buckets over 40 columns the exact
-    # read prefix below follows from including the final bucket's end in the
-    # denominator; a start-only denominator shifts 26 of the 40 columns.
-    expected_read = [
-        10, 18, 27, 36, 45, 74, 66, 75, 84, 93,
-        102, 150, 123, 132, 141, 150, 159, 226, 180, 189,
-        198, 207, 290, 228, 237, 246, 255, 264, 366, 285,
-        294, 303, 312, 321, 442, 342, 351, 360, 369, 378,
-    ]
+    # The minimal power-of-two group with ceil(127/g) <= 40 is g=4. Group j
+    # holds the consecutive indices 4j .. 4j+3, anchored at the sequence start;
+    # there is no time-pixel bin and the final group is short.
+    expected_read = [16 * index + 10 for index in range(31)] + [125 + 126 + 127]
     expected_write = [3 * value for value in expected_read]
 
     columns = chart.columns()
-    assert len(columns) == budget
+    assert chart._group_width == 4
+    assert len(columns) == 32
+    assert len(columns) <= budget
     assert [column.read_bytes for column in columns] == expected_read
     assert [column.write_bytes for column in columns] == expected_write
+    assert [column.start_mono_ns for column in columns] == [
+        BASE_NS + 4 * index * BUCKET_NS for index in range(32)
+    ]
+    assert [column.end_mono_ns for column in columns] == [
+        BASE_NS + (4 * index + 4) * BUCKET_NS for index in range(31)
+    ] + [BASE_NS + 127 * BUCKET_NS]
+    assert group_bounds(chart) == [(4 * index, 4 * index + 3) for index in range(31)] + [(124, 126)]
     # Every point contributes to exactly one column.
     assert sum(expected_read) == count * (count + 1) // 2
 
@@ -697,40 +1078,45 @@ def test_empty_bins_emit_no_zero_byte_columns(qtbot) -> None:
     assert len(points) > budget
     chart.set_task_points(points)
 
+    assert chart._group_width == 2
     columns = chart.columns()
-    # Only bins 0..3 and 36..39 hold retained buckets; the other 32 bins are
-    # holes and must not become synthetic columns.
-    assert len(columns) == 8
+    # Twenty-five index-anchored pairs. No synthetic column is created for the
+    # 225 unmeasured buckets between the two runs.
+    assert len(columns) == 25
     assert len(columns) <= budget
-    assert [column.read_bytes for column in columns] == [
-        28,
-        77,
-        126,
-        94,
-        1265,
-        1813,
-        1862,
-        1635,
-    ]
+    expected_read = (
+        [4 * index + 3 for index in range(12)]
+        + [25 + 251]
+        + [4 * index + 453 for index in range(13, 25)]
+    )
+    assert [column.read_bytes for column in columns] == expected_read
     assert [column.write_bytes for column in columns] == [
-        56,
-        154,
-        252,
-        188,
-        2530,
-        3626,
-        3724,
-        3270,
+        2 * value for value in expected_read
     ]
     assert all(column.read_bytes > 0 and column.write_bytes > 0 for column in columns)
     assert sum(column.read_bytes for column in columns) == sum(
         point.read_bytes for point in points
     )
-    # The unmeasured gap stays a gap between columns; nothing fills it.
-    assert [column.starts_run for column in columns] == (
-        [True] + [False] * 3 + [True] + [False] * 3
+    assert sum(column.write_bytes for column in columns) == sum(
+        point.write_bytes for point in points
     )
-    assert columns[4].start_mono_ns - columns[3].end_mono_ns == 225 * BUCKET_NS
+    assert [column.starts_run for column in columns] == (
+        [True] + [False] * 11 + [True] + [False] * 12
+    )
+    # The gap is carried inside one column envelope, but its canonical run
+    # intervals stay two separate supports and nothing is filled between them.
+    shared = columns[12]
+    assert shared.start_mono_ns == BASE_NS + 24 * BUCKET_NS
+    assert shared.end_mono_ns == BASE_NS + 251 * BUCKET_NS
+    assert stored_intervals(chart)[12] == [
+        (0, BASE_NS + 24 * BUCKET_NS, BASE_NS + 25 * BUCKET_NS),
+        (1, BASE_NS + 250 * BUCKET_NS, BASE_NS + 251 * BUCKET_NS),
+    ]
+    hole_left = mapped_x(BASE_NS + 25 * BUCKET_NS, points, plot)
+    hole_right = mapped_x(BASE_NS + 250 * BUCKET_NS, points, plot)
+    for segment in chart.segments():
+        xs = [x for x, _ in segment.polygon]
+        assert max(xs) < hole_left or min(xs) > hole_right, segment
 
 
 def test_device_points_map_rbytes_to_read_and_wbytes_to_write(qtbot) -> None:
@@ -820,6 +1206,1244 @@ def test_setters_reject_wrong_point_types_unordered_points_and_invalid_totals(
     with pytest.raises(ValueError):
         lane.set_device("")
     lane.set_device("8:1")
+
+
+# --------------------------------------------------------------------------
+# Live append decision table, grouping, run intervals and cost
+# --------------------------------------------------------------------------
+
+
+def test_live_append_row_1_invalid_preserves_state(qtbot, monkeypatch) -> None:
+    points = dense_points(5)
+    identity = ("task", "app", ("range", 1, 2, 0, 100), 0, "raw")
+    chart = make_chart(SeriesChart, qtbot, width=WIDE, height=180)
+    chart.set_task_points(points, identity=identity)
+    updates = watch_updates(chart, monkeypatch)
+    before = retained_state(chart)
+
+    class DuckSeriesPoint:
+        """Structurally plausible, but not a contract SeriesPoint."""
+
+        bucket_start_mono_ns = 0
+        bucket_secs = 10
+        read_bytes = 1
+        write_bytes = 1
+        peak_read_bps = None
+        peak_write_bps = None
+        peak_total_bps = None
+        wall_start_seconds = None
+        spans_suspend = False
+
+    invalid_sequences = [
+        (object(),),
+        (device_point(0),),
+        (DuckSeriesPoint(),),
+        (points[0], points[0]),
+        (points[1], points[0]),
+        (task_point(0, bucket_secs=20), task_point(BUCKET_NS)),
+    ]
+    for invalid in invalid_sequences:
+        with pytest.raises(ValueError):
+            chart.append_task_points(invalid, identity=identity)  # type: ignore[arg-type]
+        after = retained_state(chart)
+        assert after == before
+        assert chart._samples is before["samples"]
+        assert chart._groups is before["groups"]
+        assert chart._columns is before["columns"]
+        assert chart._curves is before["curves"]
+        assert chart._segments is before["segments"]
+    with pytest.raises(ValueError):
+        chart.append_task_points(None, identity=identity)  # type: ignore[arg-type]
+    assert retained_state(chart) == before
+    assert updates == []
+
+    # An unavailable chart is equally immune to an invalid append.
+    chart.set_unavailable("series unavailable")
+    unavailable = retained_state(chart)
+    unavailable_updates = list(updates)
+    with pytest.raises(ValueError):
+        chart.append_task_points((points[1], points[0]), identity=identity)
+    assert retained_state(chart) == unavailable
+    assert updates == unavailable_updates
+
+    lane = make_chart(DeviceLane, qtbot, width=WIDE, height=180)
+    device = tuple(device_point(index * BUCKET_NS) for index in range(4))
+    lane.set_device_points(device, identity=("device", "a"))
+    lane_updates = watch_updates(lane, monkeypatch)
+    lane_before = retained_state(lane)
+    for invalid in (
+        (task_point(0),),
+        (object(),),
+        (device[0], device[0]),
+        (device[1], device[0]),
+        (None,),
+    ):
+        with pytest.raises(ValueError):
+            lane.append_device_points(invalid, identity=("device", "a"))  # type: ignore[arg-type]
+        assert retained_state(lane) == lane_before
+        assert lane._groups is lane_before["groups"]
+        assert lane._curves is lane_before["curves"]
+        assert lane._segments is lane_before["segments"]
+    assert lane_updates == []
+
+
+def test_live_append_row_2_unavailable_rebuilds_even_empty_or_same_points(
+    qtbot, monkeypatch
+) -> None:
+    points = dense_points(6)
+    identity = ("task", "app", ("since_boot", 3), 0, "raw")
+    chart = make_chart(SeriesChart, qtbot, width=WIDE, height=180)
+    chart.set_task_points(points, identity=identity)
+    chart.set_unavailable("series unavailable")
+    updates = watch_updates(chart, monkeypatch)
+
+    chart.append_task_points(points, identity=identity)
+    assert updates == [True]
+    assert chart.is_available() is True
+    assert chart.unavailable_reason() is None
+    assert chart._identity == identity
+    assert chart.columns() != ()
+    assert chart.curves() != ()
+    assert sum(column.read_bytes for column in chart.columns()) == 6
+    assert sum(column.write_bytes for column in chart.columns()) == 12
+    assert message(chart).isVisible() is False
+
+    chart.set_unavailable("series unavailable")
+    chart.append_task_points((), identity=identity)
+    assert chart.is_available() is True
+    assert chart.unavailable_reason() is None
+    assert chart.columns() == ()
+    assert chart.curves() == ()
+    assert chart.segments() == ()
+    assert chart._samples == ()
+    assert chart._identity == identity
+    assert message(chart).text() == NO_SAMPLES
+    assert message(chart).isVisible() is True
+
+
+def test_live_append_row_3_identity_change_rebuilds(qtbot, monkeypatch) -> None:
+    points = dense_points(10)
+    chart = make_chart(SeriesChart, qtbot, width=WIDE, height=180)
+    chart.set_task_points(points, identity=("task", "a"))
+    before = chart.columns()
+    calls, visits = watch_aggregation(monkeypatch)
+    updates = watch_updates(chart, monkeypatch)
+    chart.append_task_points(points, identity=("task", "b"))
+    assert calls
+    assert visits == list(range(10))
+    assert updates == [True]
+    assert chart._identity == ("task", "b")
+    assert chart.columns() == before
+
+    lane = make_chart(DeviceLane, qtbot, width=WIDE, height=180)
+    lane.set_device("8:0")
+    first = tuple(device_point(index * BUCKET_NS, dev="8:0") for index in range(5))
+    second = tuple(
+        device_point(index * BUCKET_NS, dev="8:1", rbytes=99, wbytes=7)
+        for index in range(3)
+    )
+    lane.set_device_points(first, identity=("device", "a", "8:0"))
+    lane.set_device("8:1")
+    lane.append_device_points(second, identity=("device", "a", "8:1"))
+    assert lane._identity == ("device", "a", "8:1")
+    assert [column.read_bytes for column in lane.columns()] == [99, 99, 99]
+    assert [column.write_bytes for column in lane.columns()] == [7, 7, 7]
+    assert sum(column.read_bytes for column in lane.columns()) == 297
+
+
+def test_live_append_row_4_empty_transition_and_noop(qtbot, monkeypatch) -> None:
+    identity = ("task", "a")
+    points = dense_points(6)
+    chart = make_chart(SeriesChart, qtbot, width=WIDE, height=180)
+    chart.set_task_points(points, identity=identity)
+    updates = watch_updates(chart, monkeypatch)
+
+    chart.append_task_points((), identity=identity)
+    assert updates == [True]
+    assert chart._samples == ()
+    assert chart._groups == ()
+    assert chart._group_width == 1
+    assert chart.columns() == ()
+    assert chart.curves() == ()
+    assert chart.segments() == ()
+    assert chart.is_available() is True
+    assert chart.unavailable_reason() is None
+    assert message(chart).text() == NO_SAMPLES
+    assert message(chart).isVisible() is True
+    assert_no_curve_pixels(chart)
+
+    updates.clear()
+    calls, visits = watch_aggregation(monkeypatch)
+    scale = watch_scale(monkeypatch)
+    chart.append_task_points((), identity=identity)
+    assert updates == []
+    assert calls == [] and visits == [] and scale == []
+
+    # A different identity is not the empty no-op row.
+    chart.append_task_points((), identity=("task", "b"))
+    assert updates == [True]
+    assert chart._identity == ("task", "b")
+    assert chart.columns() == ()
+
+
+def test_live_append_row_5_empty_to_nonempty_has_no_tail(qtbot, monkeypatch) -> None:
+    identity = ("task", "a")
+    chart = make_chart(DualSeriesChart, qtbot, width=WIDE, height=180)
+    chart.set_task_points(())
+    calls, visits = watch_aggregation(monkeypatch)
+    updates = watch_updates(chart, monkeypatch)
+    points = dense_points(5, read_bytes=3, write_bytes=4)
+    chart.append_task_points(points, identity=identity)
+    assert updates == [True]
+    assert visits == [0, 1, 2, 3, 4]
+    assert len(chart.columns()) == 5
+    assert sum(column.read_bytes for column in chart.columns()) == 15
+    assert sum(column.write_bytes for column in chart.columns()) == 20
+    assert chart.curves() != () and chart.segments() != ()
+    assert chart._identity == identity
+    assert message(chart).isVisible() is False
+
+    lane = make_chart(DeviceLane, qtbot, width=WIDE, height=180)
+    lane.set_device_points(())
+    lane.append_device_points(
+        tuple(device_point(index * BUCKET_NS, rbytes=9, wbytes=5) for index in range(4)),
+        identity=("device", "a"),
+    )
+    assert len(lane.columns()) == 4
+    assert sum(column.read_bytes for column in lane.columns()) == 36
+    assert sum(column.write_bytes for column in lane.columns()) == 20
+    assert lane.curves() != ()
+
+
+def test_live_append_row_6_equal_input_is_noop(qtbot, monkeypatch) -> None:
+    points = dense_points(31)
+    identity = ("task", "a")
+    chart = make_chart(DualSeriesChart, qtbot, width=WIDE, height=180)
+    chart.set_task_points(points, identity=identity)
+    state = retained_state(chart)
+    updates = watch_updates(chart, monkeypatch)
+    calls, visits = watch_aggregation(monkeypatch)
+    scale = watch_scale(monkeypatch)
+    builds = watch_build_groups(monkeypatch)
+
+    chart.append_task_points(points, identity=identity)
+    assert updates == []
+    assert calls == [] and visits == [] and scale == [] and builds == []
+    assert retained_state(chart) == state
+    assert chart._samples is state["samples"]
+    assert chart._groups is state["groups"]
+    assert chart._columns is state["columns"]
+    assert chart._curves is state["curves"]
+    assert chart._segments is state["segments"]
+
+    # A full setter followed by an equal append reuses the stored grouping.
+    chart.set_task_points(points, identity=identity)
+    after_setter = retained_state(chart)
+    updates.clear()
+    calls.clear()
+    visits.clear()
+    scale.clear()
+    builds.clear()
+    chart.append_task_points(points, identity=identity)
+    assert updates == []
+    assert calls == [] and visits == [] and scale == [] and builds == []
+    assert retained_state(chart) == after_setter
+    assert chart._groups is after_setter["groups"]
+
+
+def test_live_append_row_7_tail_replacement_rebuilds_one_group(
+    qtbot, monkeypatch
+) -> None:
+    points = list(dense_points(31))
+    points[28] = replace(points[28], peak_read_bps=1000)
+    points[29] = replace(points[29], peak_write_bps=3000)
+    points[30] = replace(points[30], peak_read_bps=9000, peak_write_bps=8000)
+    identity = ("task", "a")
+    chart = make_chart(DualSeriesChart, qtbot, width=WIDE, height=180)
+    chart.set_task_points(tuple(points), identity=identity)
+    assert group_bounds(chart) == [
+        (0, 3),
+        (4, 7),
+        (8, 11),
+        (12, 15),
+        (16, 19),
+        (20, 23),
+        (24, 27),
+        (28, 30),
+    ]
+    before = chart.columns()
+    calls, visits = watch_aggregation(monkeypatch)
+    updates = watch_updates(chart, monkeypatch)
+
+    changed_tail = replace(
+        points[30], read_bytes=5, write_bytes=1, peak_read_bps=100, peak_write_bps=None
+    )
+    chart.append_task_points(tuple(points[:30]) + (changed_tail,), identity=identity)
+    assert calls == [(28, 30)]
+    assert visits == [28, 29, 30]
+    assert updates == [True]
+    after = chart.columns()
+    assert after[:7] == before[:7]
+    tail = after[7]
+    assert (tail.read_bytes, tail.write_bytes) == (7, 5)
+    # The old sole maxima are gone, including a lowered peak and a removed one.
+    assert before[7].peak_read_bps == 9000
+    assert before[7].peak_write_bps == 8000
+    assert tail.peak_read_bps == 1000
+    assert tail.peak_write_bps == 3000
+
+    # A measured zero stays a zero in the retained raw input, while the tail
+    # column's bytes are the exact member sum and its peaks stay defined by
+    # the other members rather than by the zero point.
+    zero_tail = replace(points[30], read_bytes=0, write_bytes=0, peak_read_bps=None, peak_write_bps=None)
+    chart.append_task_points(tuple(points[:30]) + (zero_tail,), identity=identity)
+    zeroed = chart.columns()[7]
+    assert (zeroed.read_bytes, zeroed.write_bytes) == (2, 4)
+    assert (chart._samples[30].read_bytes, chart._samples[30].write_bytes) == (0, 0)
+    assert chart._samples[30].peak_read_bps is None
+    assert zeroed.peak_read_bps == 1000
+    assert zeroed.peak_write_bps == 3000
+    assert chart.columns() == after[:7] + (zeroed,)
+
+
+def test_live_append_row_8_exact_prefix_appends_only(qtbot, monkeypatch) -> None:
+    points = dense_points(31)
+    identity = ("task", "a")
+    chart = make_chart(DualSeriesChart, qtbot, width=WIDE, height=180)
+    chart.set_task_points(points, identity=identity)
+    before = chart.columns()
+    calls, visits = watch_aggregation(monkeypatch)
+    builds = watch_build_groups(monkeypatch)
+    updates = watch_updates(chart, monkeypatch)
+
+    appended = points + (task_point(31 * TEN_NS, read_bytes=5, write_bytes=7),)
+    chart.append_task_points(appended, identity=identity)
+    assert calls == [(28, 31)]
+    assert visits == [28, 29, 30, 31]
+    assert builds == []
+    assert updates == [True]
+    assert chart._group_width == 4
+    assert len(chart.columns()) == 8
+    assert chart.columns()[:7] == before[:7]
+    assert (chart.columns()[7].read_bytes, chart.columns()[7].write_bytes) == (8, 13)
+    assert sum(column.read_bytes for column in chart.columns()) == 36
+    assert sum(column.write_bytes for column in chart.columns()) == 69
+    assert group_bounds(chart)[-1] == (28, 31)
+
+
+def test_live_append_row_9_tail_change_then_append(qtbot, monkeypatch) -> None:
+    original = list(dense_points(31))
+    identity = ("task", "a")
+    chart = make_chart(DualSeriesChart, qtbot, width=WIDE, height=180)
+    chart.set_task_points(tuple(original), identity=identity)
+    calls, visits = watch_aggregation(monkeypatch)
+    builds = watch_build_groups(monkeypatch)
+
+    changed_tail = task_point(30 * TEN_NS, read_bytes=9, write_bytes=3)
+    longer = (
+        tuple(original[:30])
+        + (changed_tail,)
+        + (
+            task_point(31 * TEN_NS, read_bytes=5, write_bytes=7),
+            task_point(32 * TEN_NS, read_bytes=6, write_bytes=8),
+        )
+    )
+    chart.append_task_points(longer, identity=identity)
+    assert calls == [(28, 30), (28, 31), (32, 32)]
+    assert visits == [28, 29, 30, 28, 29, 30, 31, 32]
+    assert builds == []
+    assert chart._group_width == 8
+    assert group_bounds(chart) == [(0, 7), (8, 15), (16, 23), (24, 31), (32, 32)]
+    assert sum(column.read_bytes for column in chart.columns()) == 50
+    assert sum(column.write_bytes for column in chart.columns()) == 78
+
+    # Every raw field participates in exact prefix equality: changing only an
+    # absent wall stamp or an absent total peak is an interior contradiction.
+    other = make_chart(DualSeriesChart, qtbot, width=WIDE, height=180)
+    base = dense_points(6)
+    other.set_task_points(base, identity=identity)
+    builds.clear()
+    with_wall = (replace(base[0], wall_start_seconds=0.0),) + base[1:]
+    other.append_task_points(with_wall, identity=identity)
+    assert builds == [(6, 8)]
+    with_peak_total = (replace(base[0], peak_total_bps=0),) + base[1:]
+    other.append_task_points(with_peak_total, identity=identity)
+    assert builds == [(6, 8), (6, 8)]
+    assert sum(column.read_bytes for column in other.columns()) == 6
+
+
+def test_live_append_row_10_nonempty_shortening_rebuilds(qtbot, monkeypatch) -> None:
+    points = []
+    for index in range(10):
+        start = index * BUCKET_NS + (BUCKET_NS if index >= 7 else 0)
+        points.append(
+            task_point(
+                start,
+                read_bytes=10 + index,
+                write_bytes=20 + index,
+                peak_read_bps=100 + index,
+            )
+        )
+    identity = ("task", "a")
+    chart = make_chart(DualSeriesChart, qtbot, width=WIDE, height=180)
+    chart.set_task_points(tuple(points), identity=identity)
+    assert len({curve.run_index for curve in chart.curves() if curve.side == "read"}) == 2
+
+    calls, visits = watch_aggregation(monkeypatch)
+    builds = watch_build_groups(monkeypatch)
+    short = tuple(points[:6])
+    chart.append_task_points(short, identity=identity)
+    assert builds == [(6, 8)]
+    assert visits == list(range(6))
+    assert chart._group_width == 1
+    assert group_bounds(chart) == [(index, index) for index in range(6)]
+    assert len(chart.columns()) == 6
+    assert [column.peak_read_bps for column in chart.columns()] == [
+        100,
+        101,
+        102,
+        103,
+        104,
+        105,
+    ]
+    assert [column.starts_run for column in chart.columns()] == [True] + [False] * 5
+    assert len({curve.run_index for curve in chart.curves() if curve.side == "read"}) == 1
+    assert sum(column.read_bytes for column in chart.columns()) == sum(
+        point.read_bytes for point in short
+    )
+
+
+def test_live_append_row_11_interior_contradiction_rebuilds(qtbot, monkeypatch) -> None:
+    points = dense_points(31)
+    identity = ("task", "a")
+    chart = make_chart(DualSeriesChart, qtbot, width=WIDE, height=180)
+    chart.set_task_points(points, identity=identity)
+    changed = list(points)
+    changed[5] = task_point(
+        5 * TEN_NS, read_bytes=50, write_bytes=60, spans_suspend=True
+    )
+    calls, visits = watch_aggregation(monkeypatch)
+    builds = watch_build_groups(monkeypatch)
+
+    chart.append_task_points(tuple(changed), identity=identity)
+    assert builds == [(31, 8)]
+    assert len(visits) == 31
+    assert set(visits) == set(range(31))
+    assert [column.starts_run for column in chart.columns()] == [
+        True,
+        True,
+        False,
+        False,
+        False,
+        False,
+        False,
+        False,
+    ]
+    assert sum(column.read_bytes for column in chart.columns()) == 30 + 50
+    assert sum(column.write_bytes for column in chart.columns()) == 30 * 2 + 60
+
+    longer_points = list(changed)
+    longer_points[10] = task_point(10 * TEN_NS, read_bytes=11, write_bytes=12)
+    longer = tuple(longer_points) + (task_point(31 * TEN_NS, read_bytes=7, write_bytes=8),)
+    calls.clear()
+    visits.clear()
+    builds.clear()
+    chart.append_task_points(longer, identity=identity)
+    assert builds == [(32, 8)]
+    assert len(visits) == 32
+    assert set(visits) == set(range(32))
+    assert sum(column.read_bytes for column in chart.columns()) == 29 + 50 + 11 + 7
+
+
+def test_live_tail_replacement_recomputes_duration_peak_and_run_state(
+    qtbot, monkeypatch
+) -> None:
+    points = dense_points(31)
+    identity = ("task", "a")
+    chart = make_chart(DualSeriesChart, qtbot, width=WIDE, height=180)
+    chart.set_task_points(points, identity=identity)
+    assert len(chart.curves()) == 2
+
+    changed_tail = task_point(
+        30 * TEN_NS,
+        bucket_secs=20,
+        read_bytes=10,
+        write_bytes=5,
+        peak_read_bps=7000,
+        peak_write_bps=9000,
+        spans_suspend=True,
+    )
+    appended = tuple(points[:30]) + (
+        changed_tail,
+        task_point(30 * TEN_NS + 20 * 10**9, read_bytes=3, write_bytes=4),
+    )
+    calls, visits = watch_aggregation(monkeypatch)
+    chart.append_task_points(appended, identity=identity)
+    assert calls == [(28, 30), (28, 31)]
+    tail = chart._groups[-1]
+    assert (tail.first_index, tail.last_index) == (28, 31)
+    assert tail.duration_ns == 50 * 10**9
+    assert (tail.peak_read_bps, tail.peak_write_bps) == (7000, 9000)
+    assert tail.starts_run is True
+    assert tail.intervals == (
+        (0, 28 * TEN_NS, 30 * TEN_NS + 20 * 10**9),
+        (1, 30 * TEN_NS + 20 * 10**9, 30 * TEN_NS + 30 * 10**9),
+    )
+    assert {curve.run_index for curve in chart.curves() if curve.side == "read"} == {0, 1}
+    assert sum(column.read_bytes for column in chart.columns()) == 30 + 10 + 3
+    assert sum(column.write_bytes for column in chart.columns()) == 60 + 5 + 4
+
+    # The changed suspension and duration survive a later promotion, and the
+    # next contiguous append joins the changed run rather than the old one.
+    calls.clear()
+    visits.clear()
+    promoted = appended + (
+        task_point(30 * TEN_NS + 30 * 10**9, read_bytes=1, write_bytes=2),
+    )
+    chart.append_task_points(promoted, identity=identity)
+    assert chart._group_width == 8
+    assert group_bounds(chart) == [(0, 7), (8, 15), (16, 23), (24, 31), (32, 32)]
+    assert chart._groups[3].intervals == (
+        (0, 24 * TEN_NS, 30 * TEN_NS + 20 * 10**9),
+        (1, 30 * TEN_NS + 20 * 10**9, 30 * TEN_NS + 30 * 10**9),
+    )
+    assert chart._groups[4].first_run == 1
+    assert chart._groups[4].intervals == (
+        (1, 30 * TEN_NS + 30 * 10**9, 30 * TEN_NS + 40 * 10**9),
+    )
+
+
+def test_live_canonical_intervals_coalesce_only_touching_same_run(qtbot) -> None:
+    identity = ("task", "a")
+    dense = make_chart(SeriesChart, qtbot, width=WIDE, height=180)
+    dense_points_ = dense_points(6)
+    dense.set_task_points(dense_points_, identity=identity)
+    assert stored_intervals(dense) == [
+        [(0, index * TEN_NS, (index + 1) * TEN_NS)] for index in range(6)
+    ]
+
+    fragmented_points = tuple(task_point(index * 2 * TEN_NS) for index in range(31))
+    fragmented = make_chart(SeriesChart, qtbot, width=WIDE, height=180)
+    fragmented.set_task_points(fragmented_points, identity=identity)
+    groups = stored_intervals(fragmented)
+    assert [len(group) for group in groups] == [4] * 7 + [3]
+    all_intervals = [interval for group in groups for interval in group]
+    assert [interval[0] for interval in all_intervals] == list(range(31))
+    assert all(interval[2] - interval[1] == 10 * 10**9 for interval in all_intervals)
+
+    suspended_points = tuple(
+        replace(point, spans_suspend=(index == 2))
+        for index, point in enumerate(dense_points(6))
+    )
+    suspended = make_chart(SeriesChart, qtbot, width=WIDE, height=180)
+    suspended.set_task_points(suspended_points, identity=identity)
+    intervals = [group[0] for group in stored_intervals(suspended)]
+    assert [interval[0] for interval in intervals] == [0, 0, 0, 1, 1, 1]
+    assert intervals[2][2] == intervals[3][1]
+    assert intervals[2][0] != intervals[3][0]
+
+    thirty_two = dense_points(32)
+    merged_dense = make_chart(SeriesChart, qtbot, width=WIDE, height=180)
+    merged_dense.set_task_points(thirty_two, identity=identity)
+    merged_dense.append_task_points(
+        thirty_two + (task_point(32 * TEN_NS),), identity=identity
+    )
+    assert merged_dense._groups[0].intervals == ((0, 0, 8 * TEN_NS),)
+
+    split = tuple(
+        replace(point, spans_suspend=(index == 3))
+        for index, point in enumerate(thirty_two)
+    )
+    merged_split = make_chart(SeriesChart, qtbot, width=WIDE, height=180)
+    merged_split.set_task_points(split, identity=identity)
+    merged_split.append_task_points(split + (task_point(32 * TEN_NS),), identity=identity)
+    assert merged_split._groups[0].intervals == (
+        (0, 0, 4 * TEN_NS),
+        (1, 4 * TEN_NS, 8 * TEN_NS),
+    )
+    assert [len(group.intervals) for group in merged_split._groups] == [2, 1, 1, 1, 1]
+
+
+def test_live_curve_and_fill_support_never_bridge_multiple_runs_in_one_column(
+    qtbot,
+) -> None:
+    times = [0, 10 * 10**9] + [30 * 10**9 + index * 10 * 10**9 for index in range(29)]
+    points = tuple(
+        task_point(start, read_bytes=100 + index, write_bytes=50 + index)
+        for index, start in enumerate(times)
+    )
+    chart = make_chart(SeriesChart, qtbot, width=WIDE, height=180)
+    chart.set_task_points(points, identity=("task", "a"))
+    assert len(points) == 31
+    assert chart._group_width == 4
+    first_group = chart._groups[0]
+    assert [interval[0] for interval in first_group.intervals] == [0, 1]
+    assert first_group.start == 0
+    assert first_group.end == 50 * 10**9
+    assert first_group.starts_run is True
+
+    left, top, right, bottom = chart.plot_rect()
+    first = points[0].bucket_start_mono_ns
+    last_end = points[-1].bucket_start_mono_ns + points[-1].bucket_secs * 10**9
+
+    def mapped(time_ns: int) -> float:
+        return left + (time_ns - first) * (right - left) / (last_end - first)
+
+    supports = {
+        0: (mapped(0), mapped(20 * 10**9)),
+        1: (mapped(30 * 10**9), mapped(last_end)),
+    }
+    hole_left = mapped(20 * 10**9)
+    hole_right = mapped(30 * 10**9)
+    assert hole_left < hole_right
+
+    for side in ("read", "write"):
+        side_curves = [curve for curve in chart.curves() if curve.side == side]
+        side_fills = [segment for segment in chart.segments() if segment.side == side]
+        assert [curve.run_index for curve in side_curves] == [0, 1]
+        assert len(side_fills) == 2
+        for curve, fill in zip(side_curves, side_fills):
+            outer_start, outer_end = supports[curve.run_index]
+            inset = min(0.25, (outer_end - outer_start) / 4.0)
+            xs = [x for x, _ in curve.vertices]
+            assert xs == sorted(xs)
+            assert all(outer_start < x < outer_end for x in xs)
+            assert all(outer_start + inset - 1e-9 <= x <= outer_end - inset + 1e-9 for x in xs)
+            fill_xs = [x for x, _ in fill.polygon]
+            assert all(outer_start < x < outer_end for x in fill_xs)
+            assert min(fill_xs) >= outer_start + inset - 1e-9
+            assert max(fill_xs) <= outer_end - inset + 1e-9
+            assert max(xs) < hole_left or min(xs) > hole_right
+
+
+def test_live_inset_handles_eight_fragment_subpixel_and_two_fragment_runs(qtbot) -> None:
+    # Eight one-second fragments inside a subpixel support, then far-apart
+    # single-bucket runs that make the total time span enormous.
+    starts = list(range(8)) + [1000 + index * 1000 for index in range(32)]
+    points = tuple(
+        task_point(
+            start * 10**9,
+            bucket_secs=1 if index < 8 else 10,
+            read_bytes=500 + index * 100 if index < 8 else 10 + index,
+            write_bytes=300 + index * 50 if index < 8 else 5 + index,
+        )
+        for index, start in enumerate(starts)
+    )
+    chart = make_chart(SeriesChart, qtbot, width=200, height=180)
+    chart.set_task_points(points, identity=("task", "a"))
+    assert chart._group_width == 1
+    assert len(chart.columns()) == 40
+    first = points[0].bucket_start_mono_ns
+    last_end = points[-1].bucket_start_mono_ns + points[-1].bucket_secs * 10**9
+    left, top, right, bottom = chart.plot_rect()
+    centre = (top + bottom) / 2.0
+
+    def mapped(time_ns: int) -> float:
+        return left + (time_ns - first) * (right - left) / (last_end - first)
+
+    run_zero = [curve for curve in chart.curves() if curve.run_index == 0]
+    assert sorted(curve.side for curve in run_zero) == ["read", "write"]
+    outer_start = mapped(0)
+    outer_end = mapped(8 * 10**9)
+    assert outer_end - outer_start < 1.0
+    inset = min(0.25, (outer_end - outer_start) / 4.0)
+    low = outer_start + inset
+    high = outer_end - inset
+    for curve in run_zero:
+        xs = [x for x, _ in curve.vertices]
+        ys = [y for _, y in curve.vertices]
+        assert len(curve.vertices) == 8
+        assert xs == sorted(xs)
+        assert len(set(xs)) < len(xs)
+        assert all(low - 1e-12 <= x <= high + 1e-12 for x in xs)
+        assert all(math.isfinite(y) for y in ys)
+        assert len(set(ys)) > 1
+        if curve.side == "read":
+            assert min(ys) == pytest.approx(top, abs=1e-6)
+        else:
+            assert max(ys) == pytest.approx(bottom, abs=1e-6)
+        fill = next(
+            segment
+            for segment in chart.segments()
+            if segment.run_index == 0 and segment.side == curve.side
+        )
+        expected_polygon = (
+            (curve.vertices[0][0], centre),
+            *curve.vertices,
+            (curve.vertices[-1][0], centre),
+            (curve.vertices[0][0], centre),
+        )
+        assert fill.polygon == expected_polygon
+
+    # A two-fragment run with unequal heights: monotone X inside the inset
+    # support, both support edges reached from the fragment midpoints.
+    two_times = [0, 100 * 10**9, 200 * 10**9, 210 * 10**9, 220 * 10**9, 230 * 10**9, 400 * 10**9, 500 * 10**9, 600 * 10**9]
+    two_reads = [10, 10, 100, 200, 300, 400, 10, 10, 10]
+    two_points = tuple(
+        task_point(start, read_bytes=read, write_bytes=read // 2)
+        for start, read in zip(two_times, two_reads)
+    )
+    two = make_chart(SeriesChart, qtbot, width=WIDE, height=180)
+    two.set_task_points(two_points, identity=("task", "a"))
+    assert two._group_width == 2
+    assert [len(group.intervals) for group in two._groups] == [2, 1, 1, 2, 1]
+    run_two = next(curve for curve in two.curves() if curve.run_index == 2 and curve.side == "read")
+    assert len(run_two.vertices) == 2
+    two_first = two_points[0].bucket_start_mono_ns
+    two_last_end = two_points[-1].bucket_start_mono_ns + two_points[-1].bucket_secs * 10**9
+    left2, top2, right2, bottom2 = two.plot_rect()
+
+    def two_mapped(time_ns: int) -> float:
+        return left2 + (time_ns - two_first) * (right2 - left2) / (two_last_end - two_first)
+
+    run_start = two_mapped(200 * 10**9)
+    run_end = two_mapped(240 * 10**9)
+    run_inset = min(0.25, (run_end - run_start) / 4.0)
+    (x0, y0), (x1, y1) = run_two.vertices
+    assert x0 >= run_start + run_inset - 1e-9
+    assert x1 <= run_end - run_inset + 1e-9
+    assert x0 <= x1
+    assert y0 != y1
+    assert min(y0, y1) >= top2 - 1e-9 and max(y0, y1) <= (top2 + bottom2) / 2.0 + 1e-9
+    assert min(y for curve in two.curves() if curve.side == "read" for _, y in curve.vertices) == pytest.approx(top2, abs=1e-6)
+
+
+def test_live_single_fragment_nonzero_run_draws_tick(qtbot) -> None:
+    points = tuple(
+        task_point(index * 2 * TEN_NS, read_bytes=100 * (index + 1), write_bytes=0)
+        for index in range(6)
+    )
+    chart = make_chart(SeriesChart, qtbot, width=WIDE, height=180)
+    chart.set_task_points(points, identity=("task", "a"))
+    assert chart._group_width == 1
+    left, top, right, bottom = chart.plot_rect()
+    centre = (top + bottom) / 2.0
+    first = points[0].bucket_start_mono_ns
+    last_end = points[-1].bucket_start_mono_ns + points[-1].bucket_secs * 10**9
+    reads = [curve for curve in chart.curves() if curve.side == "read"]
+    assert [curve.run_index for curve in reads] == list(range(6))
+    assert [curve for curve in chart.curves() if curve.side == "write"] == []
+    assert [segment for segment in chart.segments() if segment.side == "write"] == []
+    read_fills = [segment for segment in chart.segments() if segment.side == "read"]
+    assert len(read_fills) == 6
+    for curve, fill in zip(reads, read_fills):
+        start = points[curve.run_index].bucket_start_mono_ns
+        end = start + points[curve.run_index].bucket_secs * 10**9
+        mapped_start = left + (start - first) * (right - left) / (last_end - first)
+        mapped_end = left + (end - first) * (right - left) / (last_end - first)
+        inset = min(0.25, (mapped_end - mapped_start) / 4.0)
+        assert len(curve.vertices) == 2
+        (x0, y0), (x1, y1) = curve.vertices
+        assert x0 == pytest.approx(mapped_start + inset)
+        assert x1 == pytest.approx(mapped_end - inset)
+        assert x0 < x1
+        assert y0 == pytest.approx(y1)
+        assert y0 != pytest.approx(centre)
+        assert fill.polygon == (
+            (x0, centre),
+            (x0, y0),
+            (x1, y1),
+            (x1, centre),
+            (x0, centre),
+        )
+    assert min(y for curve in reads for _, y in curve.vertices) == pytest.approx(top)
+
+
+def test_live_scale_maxima_reach_each_half_after_append_merge_and_tail(
+    qtbot, monkeypatch
+) -> None:
+    base = tuple(
+        task_point(index * TEN_NS, read_bytes=1 + index, write_bytes=2)
+        for index in range(31)
+    )
+    identity = ("task", "a")
+    chart = make_chart(DualSeriesChart, qtbot, width=WIDE, height=180)
+    chart.set_task_points(base, identity=identity)
+    left, top, right, bottom = chart.plot_rect()
+    centre = (top + bottom) / 2.0
+    half = (bottom - top) / 2.0
+
+    def read_y() -> float:
+        return min(
+            y for curve in chart.curves() if curve.side == "read" for _, y in curve.vertices
+        )
+
+    def write_y() -> float:
+        return max(
+            y for curve in chart.curves() if curve.side == "write" for _, y in curve.vertices
+        )
+
+    assert read_y() == pytest.approx(top, abs=1e-6)
+    assert write_y() == pytest.approx(bottom, abs=1e-6)
+
+    appended = base + (task_point(31 * TEN_NS, read_bytes=100000, write_bytes=50000),)
+    chart.append_task_points(appended, identity=identity)
+    assert read_y() == pytest.approx(top, abs=1e-6)
+    assert write_y() == pytest.approx(bottom, abs=1e-6)
+
+    lowered = appended[:31] + (task_point(31 * TEN_NS, read_bytes=1, write_bytes=2),)
+    chart.append_task_points(lowered, identity=identity)
+    assert len(chart._groups) == 8
+    assert read_y() == pytest.approx(top, abs=1e-6)
+    run_curve = next(curve for curve in chart.curves() if curve.side == "read")
+    # Group [24..27] now holds the exact maximum (25+26+27+28 = 106) while the
+    # rebuilt tail group holds 29+30+31+1 = 91. A lingering old 100000 scale
+    # would leave the tail essentially on the centre line.
+    assert run_curve.vertices[-1][1] == pytest.approx(
+        centre - half * (91 / 106), abs=1e-6
+    )
+
+    promoted = lowered + (task_point(32 * TEN_NS, read_bytes=1, write_bytes=2),)
+    chart.append_task_points(promoted, identity=identity)
+    assert chart._group_width == 8
+    assert len(chart._groups) == 5
+    assert read_y() == pytest.approx(top, abs=1e-6)
+    run_curve = next(curve for curve in chart.curves() if curve.side == "read")
+    assert len(run_curve.vertices) == 5
+    assert run_curve.vertices[3][1] == pytest.approx(top, abs=1e-6)
+    assert run_curve.vertices[2][1] == pytest.approx(
+        centre - half * (164 / 197), abs=1e-6
+    )
+    assert all(
+        y == pytest.approx(bottom, abs=1e-6)
+        for curve in chart.curves()
+        if curve.side == "write"
+        for _, y in curve.vertices
+    )
+
+    zero = make_chart(SeriesChart, qtbot, width=WIDE, height=180)
+    zero_points = tuple(
+        task_point(index * TEN_NS, read_bytes=0, write_bytes=5 + index)
+        for index in range(6)
+    )
+    zero.set_task_points(zero_points, identity=("task", "a"))
+    assert [curve for curve in zero.curves() if curve.side == "read"] == []
+    assert [segment for segment in zero.segments() if segment.side == "read"] == []
+    for curve in zero.curves():
+        for _, y in curve.vertices:
+            assert math.isfinite(y)
+            assert top <= y <= bottom
+    assert max(
+        y for curve in zero.curves() if curve.side == "write" for _, y in curve.vertices
+    ) == pytest.approx(bottom, abs=1e-6)
+
+
+def test_live_append_work_stays_inside_changed_groups(qtbot, monkeypatch) -> None:
+    assert "members" not in charts_module._Group.__slots__
+
+    tail_chart = make_chart(DualSeriesChart, qtbot, width=WIDE, height=180)
+    points = dense_points(31)
+    tail_chart.set_task_points(points, identity=("task", "a"))
+    assert group_bounds(tail_chart)[-1] == (28, 30)
+
+    calls, visits = watch_aggregation(monkeypatch)
+    builds = watch_build_groups(monkeypatch)
+    scale = watch_scale(monkeypatch)
+    validation = watch_validation(monkeypatch)
+    updates = watch_updates(tail_chart, monkeypatch)
+    changed = tuple(points[:30]) + (
+        replace(points[30], read_bytes=5, write_bytes=1),
+    )
+    tail_chart.append_task_points(changed, identity=("task", "a"))
+    assert len(validation) == 31
+    assert calls == [(28, 30)]
+    assert visits == [28, 29, 30]
+    assert builds == []
+    assert scale == [8]
+    assert updates == [True]
+    assert sum(column.read_bytes for column in tail_chart.columns()) == 35
+    assert sum(column.write_bytes for column in tail_chart.columns()) == 61
+
+    updates.clear()
+    calls.clear()
+    visits.clear()
+    scale.clear()
+    tail_chart.append_task_points(changed, identity=("task", "a"))
+    # Full raw validation is admitted O(n); no aggregation, scale or paint work.
+    assert len(validation) == 62
+    assert updates == []
+    assert calls == [] and visits == [] and scale == []
+    assert builds == []
+
+    promoted_chart = make_chart(DualSeriesChart, qtbot, width=WIDE, height=180)
+    thirty_two = dense_points(32)
+    promoted_chart.set_task_points(thirty_two, identity=("task", "a"))
+    assert promoted_chart._group_width == 4
+    assert len(promoted_chart.columns()) == 8
+
+    calls, visits = watch_aggregation(monkeypatch)
+    builds = watch_build_groups(monkeypatch)
+    scale = watch_scale(monkeypatch)
+    validation = watch_validation(monkeypatch)
+    updates = watch_updates(promoted_chart, monkeypatch)
+    bound_reads: list[tuple[int, int]] = []
+    original_bound = charts_module._bound_pair
+
+    def watch_bound(group):
+        pair = original_bound(group)
+        bound_reads.append(pair)
+        return pair
+
+    monkeypatch.setattr(charts_module, "_bound_pair", watch_bound)
+
+    promoted_chart.append_task_points(
+        thirty_two + (task_point(32 * TEN_NS, read_bytes=1, write_bytes=2),),
+        identity=("task", "a"),
+    )
+    assert len(validation) == 33
+    assert calls == [(32, 32)]
+    assert visits == [32]
+    assert builds == []
+    assert group_bounds(promoted_chart) == [
+        (0, 7),
+        (8, 15),
+        (16, 23),
+        (24, 31),
+        (32, 32),
+    ]
+    assert promoted_chart._group_width == 8
+    assert len(promoted_chart._groups) == 5
+    assert bound_reads == [
+        (0, 3),
+        (4, 7),
+        (8, 11),
+        (12, 15),
+        (16, 19),
+        (20, 23),
+        (24, 27),
+        (28, 31),
+        (32, 32),
+    ]
+    assert len(bound_reads) == 9
+    assert scale == [5]
+    assert updates == [True]
+    assert sum(column.read_bytes for column in promoted_chart.columns()) == 33
+    assert sum(column.write_bytes for column in promoted_chart.columns()) == 66
+    assert promoted_chart._groups[0].intervals == ((0, 0, 8 * TEN_NS),)
+    assert all(
+        isinstance(group.first_index, int) and isinstance(group.last_index, int)
+        for group in promoted_chart._groups
+    )
+
+
+def test_live_grouping_is_minimal_power_of_two_and_promotes_bounds(
+    qtbot, monkeypatch
+) -> None:
+    # No retained per-sample membership vector exists to copy during promotion.
+    assert "members" not in charts_module._Group.__slots__
+
+    threshold_cases = {
+        8: (1, 8),
+        9: (2, 5),
+        16: (2, 8),
+        17: (4, 5),
+        32: (4, 8),
+        33: (8, 5),
+    }
+    probe = AppendProbe().install(monkeypatch)
+    chart = make_chart(DualSeriesChart, qtbot, width=WIDE, height=180)
+    assert width_of(chart.plot_rect()) == 8
+
+    for length, (group_width, column_count) in threshold_cases.items():
+        points = dense_points(length)
+        chart.set_task_points(points, identity=("task", "grouping"))
+        assert chart._group_width == group_width
+        assert len(chart.columns()) == column_count
+        assert group_bounds(chart) == [
+            (first, min(first + group_width, length) - 1)
+            for first in range(0, length, group_width)
+        ]
+        assert sum(column.read_bytes for column in chart.columns()) == length
+        assert sum(column.write_bytes for column in chart.columns()) == 2 * length
+
+    # §8.7 dense 32 -> 33: g4/C8 -> g8/C5 with exactly five two-integer bounds.
+    thirty_two = dense_points(32)
+    chart.set_task_points(thirty_two, identity=("task", "promotion"))
+    assert chart._group_width == 4
+    assert len(chart.columns()) == 8
+    probe.reset()
+    chart.append_task_points(
+        thirty_two + (task_point(32 * TEN_NS, read_bytes=1, write_bytes=2),),
+        identity=("task", "promotion"),
+    )
+
+    assert chart._group_width == 8
+    assert len(chart.columns()) == 5
+    assert group_bounds(chart) == [(0, 7), (8, 15), (16, 23), (24, 31), (32, 32)]
+    # The append itself aggregates only the new one-point group.
+    assert probe.aggregate_member_indices == [32]
+    assert probe.unaccounted_raw_reads == []
+    assert probe.validation_visits == 33
+    assert probe.comparison_visits <= 132
+    # Promotion reads exactly one two-integer pair per input column.
+    assert probe.bound_reads == [
+        (0, 3),
+        (4, 7),
+        (8, 11),
+        (12, 15),
+        (16, 19),
+        (20, 23),
+        (24, 27),
+        (28, 31),
+        (32, 32),
+    ]
+    assert len(probe.bound_reads) <= 9
+    # Promotion writes merge pairs only: four merged groups, the odd tail kept.
+    assert probe.bound_writes == [(0, 7), (8, 15), (16, 23), (24, 31)]
+    assert len(probe.bound_writes) <= 5
+    assert probe.promotion_output_bounds == [
+        (0, 7),
+        (8, 15),
+        (16, 23),
+        (24, 31),
+        (32, 32),
+    ]
+    assert all(
+        len(bounds) == 2 and all(isinstance(value, int) for value in bounds)
+        for bounds in probe.promotion_output_bounds
+    )
+    # A direct group-bound read or a per-group member range inside promotion
+    # would be a copied member-index vector, not a pair copy.
+    assert probe.direct_promotion_bound_reads == []
+    assert probe.promotion_ranges == [(5, (0, 9, 2))]
+    assert probe.merge_interval_visits <= 9
+    assert sum(column.read_bytes for column in chart.columns()) == 33
+    assert sum(column.write_bytes for column in chart.columns()) == 66
+
+
+def test_live_append_cost_counts_fragmented_output_and_cached_aggregation(
+    qtbot, monkeypatch
+) -> None:
+    probe = AppendProbe().install(monkeypatch)
+
+    # -- dense 31 buckets: replace the tail, then the equal-input no-op ----
+    dense = make_chart(DualSeriesChart, qtbot, width=WIDE, height=180)
+    assert width_of(dense.plot_rect()) == 8
+    thirty_one = dense_points(31)
+    dense.set_task_points(thirty_one, identity=("task", "cost"))
+    assert dense._group_width == 4
+    assert group_bounds(dense) == [
+        (0, 3),
+        (4, 7),
+        (8, 11),
+        (12, 15),
+        (16, 19),
+        (20, 23),
+        (24, 27),
+        (28, 30),
+    ]
+    changed = thirty_one[:30] + (
+        replace(thirty_one[30], read_bytes=5, write_bytes=1),
+    )
+    probe.reset()
+    dense.append_task_points(changed, identity=("task", "cost"))
+
+    assert probe.validation_visits == 31
+    assert probe.comparison_visits <= 124
+    assert probe.aggregate_member_indices == [28, 29, 30]
+    assert probe.unaccounted_raw_reads == []
+    assert probe.bound_reads == [] and probe.bound_writes == []
+    assert probe.promotion_output_bounds == []
+    assert probe.promotion_ranges == []
+    assert probe.scale_column_visits == 8
+    assert sum(column.read_bytes for column in dense.columns()) == 35
+    assert sum(column.write_bytes for column in dense.columns()) == 61
+    expected_e = 8
+    expected_r = 2
+    expected_v = 16
+    assert sum(len(group.intervals) for group in dense._groups) == expected_e
+    assert len(dense.curves()) == expected_r
+    assert sum(len(curve.vertices) for curve in dense.curves()) == expected_v
+    assert [len(segment.polygon) for segment in dense.segments()] == [11, 11]
+    assert probe.geometry_column_visits == 16
+    assert probe.interval_visits == expected_e
+    assert probe.interval_visits <= 16
+    assert probe.vertex_emit == expected_v
+    assert probe.closure_emit == 6
+    assert (
+        probe.geometry_column_visits
+        + probe.interval_visits
+        + probe.vertex_emit
+        + probe.closure_emit
+        <= 54
+    )
+
+    # Equal input is a no-op: validation/comparison only, no cache work.
+    probe.reset()
+    dense.append_task_points(changed, identity=("task", "cost"))
+    assert probe.validation_visits == 31
+    assert probe.comparison_visits <= 124
+    assert probe.aggregate_member_indices == []
+    assert probe.unaccounted_raw_reads == []
+    assert probe.scale_column_visits == 0
+    assert probe.bound_reads == [] and probe.promotion_ranges == []
+    assert probe.geometry_column_visits == 0
+    assert probe.interval_visits == 0
+    assert probe.vertex_emit == 0
+    assert probe.closure_emit == 0
+
+    # Painting reads cached geometry only: no raw member aggregation.
+    probe.reset()
+    grab = dense.grab()
+    assert grab is not None and not grab.isNull()
+    assert probe.aggregate_member_indices == []
+    assert probe.unaccounted_raw_reads == []
+    assert probe.scale_column_visits == 0
+    assert probe.geometry_column_visits == 0
+    assert probe.vertex_emit == 0 and probe.closure_emit == 0
+
+    # -- dense 32 -> 33 promotion: only index 32 is reaggregated ----------
+    dense.set_task_points(dense_points(32), identity=("task", "cost"))
+    probe.reset()
+    dense.append_task_points(
+        dense_points(32) + (task_point(32 * TEN_NS, read_bytes=1, write_bytes=2),),
+        identity=("task", "cost"),
+    )
+    assert probe.validation_visits == 33
+    assert probe.comparison_visits <= 132
+    assert probe.aggregate_member_indices == [32]
+    assert probe.unaccounted_raw_reads == []
+    assert len(probe.bound_reads) <= 9
+    assert len(probe.bound_writes) <= 5
+    assert probe.promotion_output_bounds == [
+        (0, 7),
+        (8, 15),
+        (16, 23),
+        (24, 31),
+        (32, 32),
+    ]
+    assert probe.direct_promotion_bound_reads == []
+    assert probe.promotion_ranges == [(5, (0, 9, 2))]
+    assert probe.merge_interval_visits <= 9
+    assert probe.scale_column_visits == 5
+    assert sum(column.read_bytes for column in dense.columns()) == 33
+    assert sum(column.write_bytes for column in dense.columns()) == 66
+    assert sum(len(group.intervals) for group in dense._groups) == 5
+    assert len(dense.curves()) == 2
+    assert sum(len(curve.vertices) for curve in dense.curves()) == 10
+    assert [len(segment.polygon) for segment in dense.segments()] == [8, 8]
+    assert probe.geometry_column_visits == 10
+    assert probe.interval_visits == 5
+    assert probe.interval_visits <= 10
+    assert probe.vertex_emit == 10
+    assert probe.closure_emit == 6
+    assert (
+        probe.geometry_column_visits
+        + probe.interval_visits
+        + probe.vertex_emit
+        + probe.closure_emit
+        <= 36
+    )
+
+    # -- fragmented 31 buckets: every measured run keeps its own fragment --
+    fragmented = make_chart(DualSeriesChart, qtbot, width=WIDE, height=180)
+    fragmented_thirty_one = tuple(
+        task_point(index * 2 * TEN_NS, read_bytes=1, write_bytes=2)
+        for index in range(31)
+    )
+    fragmented.set_task_points(fragmented_thirty_one, identity=("task", "fragmented"))
+    assert fragmented._group_width == 4
+    assert len(fragmented.columns()) == 8
+    fragmented_changed = fragmented_thirty_one[:30] + (
+        replace(fragmented_thirty_one[30], read_bytes=5, write_bytes=1),
+    )
+    probe.reset()
+    fragmented.append_task_points(
+        fragmented_changed, identity=("task", "fragmented")
+    )
+
+    assert probe.validation_visits == 31
+    assert probe.comparison_visits <= 124
+    assert probe.aggregate_member_indices == [28, 29, 30]
+    assert probe.unaccounted_raw_reads == []
+    assert probe.bound_reads == [] and probe.promotion_ranges == []
+    assert probe.scale_column_visits == 8
+    assert sum(column.read_bytes for column in fragmented.columns()) == 35
+    assert sum(column.write_bytes for column in fragmented.columns()) == 61
+    expected_e = 31
+    expected_r = 62
+    expected_v = 124
+    assert sum(len(group.intervals) for group in fragmented._groups) == expected_e
+    assert len(fragmented.curves()) == expected_r
+    assert sum(len(curve.vertices) for curve in fragmented.curves()) == expected_v
+    assert [len(segment.polygon) for segment in fragmented.segments()] == [5] * expected_r
+    assert probe.merge_interval_visits == 0
+    assert probe.geometry_column_visits == 16
+    assert probe.interval_visits == expected_e
+    assert probe.interval_visits <= 62
+    assert probe.vertex_emit == expected_v
+    assert probe.closure_emit == 3 * expected_r
+    assert probe.closure_emit == 186
+    assert (
+        probe.geometry_column_visits
+        + probe.interval_visits
+        + probe.vertex_emit
+        + probe.closure_emit
+        <= 388
+    )
+    assert expected_v > 8 and expected_e > 8  # F and E are not capped at W
+
+
+def test_live_rebuild_resize_and_unavailable_reset_preserve_honesty(
+    qtbot, monkeypatch
+) -> None:
+    task, _ = chart_points(120, hole_at=60)
+    identity = ("task", "a")
+    chart = make_chart(DualSeriesChart, qtbot, width=600, height=200)
+    chart.set_totals(4096, 2048)
+    chart.set_task_points(task, identity=identity)
+    wide = chart.columns()
+    assert len(wide) == len(task) == 120
+    assert chart._group_width == 1
+
+    chart.resize(240, 200)
+    narrow = chart.columns()
+    assert chart._group_width == 2
+    assert len(narrow) == 60
+    assert sum(column.read_bytes for column in narrow) == sum(
+        point.read_bytes for point in task
+    )
+
+    chart.resize(120, 200)
+    assert width_of(chart.plot_rect()) == 0
+    assert chart.columns() == ()
+    assert chart.curves() == ()
+    assert chart.segments() == ()
+    assert len(chart._samples) == 120
+    assert chart._identity == identity
+    assert chart._groups == ()
+
+    chart.resize(300, 180)
+    restored = chart.columns()
+    assert chart._group_width == 1
+    assert len(restored) == 120
+    assert chart.curves() != () and chart.segments() != ()
+    assert sum(column.read_bytes for column in restored) == sum(
+        point.read_bytes for point in task
+    )
+
+    chart.set_unavailable("series unavailable")
+    assert chart._identity is None
+    assert chart._samples == ()
+    assert chart._groups == ()
+    assert chart._group_width == 1
+    assert chart.columns() == ()
+    assert chart.curves() == ()
+    assert chart.segments() == ()
+    assert chart._totals is None
+    assert chart.unavailable_reason() == "series unavailable"
+    assert message(chart).text() == "unavailable: series unavailable"
+    assert_no_curve_pixels(chart)
+
+    fresh = chart_points(6)[0]
+    chart.append_task_points(fresh, identity=("task", "b"))
+    assert chart.is_available() is True
+    assert chart.unavailable_reason() is None
+    assert chart._identity == ("task", "b")
+    assert chart.curves() != ()
+    assert sum(column.read_bytes for column in chart.columns()) == sum(
+        point.read_bytes for point in fresh
+    )
 
 
 # --------------------------------------------------------------------------
