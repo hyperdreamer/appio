@@ -8,6 +8,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import replace
 import json
 import threading
+import time
 
 import pytest
 
@@ -31,10 +32,11 @@ from appio.iodclient import (
     ClientState,
     ClientUnavailable,
     ConnectionLost,
+    QueryTransportState,
     RemoteError,
     RequestRejected,
 )
-from appio.ipc_models import Capabilities, QueryRequest, validate_request
+from appio.ipc_models import Capabilities, QueryRequest, StreamCursor, validate_request
 from appio.query import QueryService
 from appio.store import AppIoStore
 from appio.ui.files_view import FilesView
@@ -102,6 +104,26 @@ def id_for(router, key=APP):
     return router.registry.id_for(key)
 
 
+def drive(router, future, *, timeout=15.0):
+    """Owner-thread drain loop for one outward Files Future.
+
+    Files settlement is lazy by design (spec §§3.3-3.4): a worker only enqueues
+    an immutable outcome, and the owner's ``drain`` performs the closing reads
+    and publishes. A fixture that blocks on the outward Future therefore has to
+    act as the owner thread. Every assertion still observes the same published
+    result or failure; only the delivery driver changed.
+    """
+
+    deadline = time.monotonic() + timeout
+    while not future.done():
+        router.drain()
+        if future.done():
+            break
+        assert time.monotonic() < deadline, "the outward Files future never settled"
+        time.sleep(0.001)
+    return future.result(timeout=0)
+
+
 @pytest.mark.parametrize("sort", SORTS)
 @pytest.mark.parametrize("direction", ["asc", "desc"])
 def test_local_file_futures_delegate_every_sort_and_NFC_casefold_search(retained, sort, direction):
@@ -109,7 +131,8 @@ def test_local_file_futures_delegate_every_sort_and_NFC_casefold_search(retained
     try:
         expected = QueryService(retained.db).file_table(1, WINDOW, sort, direction, "CAFÉ")
         expected_cov = QueryService(retained.db).file_coverage(1, WINDOW)
-        view = router.request_file_view(id_for(router), WINDOW, sort, direction, "CAFÉ").result(timeout=10)
+        view = drive(router, router.request_file_view(
+            id_for(router), WINDOW, sort, direction, "CAFÉ"))
         assert isinstance(view, FileViewResult)
         assert view.table == replace(expected, app_id=id_for(router))
         assert view.coverage == replace(expected_cov, app_id=id_for(router))
@@ -136,7 +159,14 @@ def test_local_query_runs_on_bounded_executor_and_invalidated_future_cannot_publ
     try:
         future = router.request_file_view(id_for(router), WINDOW, "bytes_total", "desc", None)
         assert entered.wait(5)
-        assert ui_sql == [], "a Files request must not execute even metadata SQL on the UI connection"
+        # Admission captures one O(1) owner-thread position PRAGMA for its token;
+        # no Files query (table/coverage/facts) may touch the UI connection.
+        assert all(statement.startswith("PRAGMA main.data_version") for statement in ui_sql), ui_sql
+        assert not any(
+            keyword in statement.upper()
+            for statement in ui_sql
+            for keyword in ("SELECT", "FROM", "ROWID")
+        ), ui_sql
         router.invalidate()
         release.set()
         with pytest.raises((WindowUnavailableError, RemoteError)) as caught:
@@ -156,7 +186,8 @@ def test_local_SQL_failure_settles_as_explicit_unavailable_not_an_empty_table(re
     monkeypatch.setattr(QueryService, "file_table", broken)
     try:
         with pytest.raises(WindowUnavailableError) as caught:
-            router.request_file_view(id_for(router), WINDOW, "bytes_total", "desc", None).result(timeout=10)
+            drive(router, router.request_file_view(
+                id_for(router), WINDOW, "bytes_total", "desc", None))
         assert caught.value.reason == "file_source_unavailable"
         assert not router.file_source_status().available
     finally:
@@ -170,7 +201,8 @@ def test_zero_F_is_complete_only_with_authoritative_hour_and_missing_or_pruned_i
         retained.db.execute("DELETE FROM sample_dev")
         retained.db.commit()
         # F remains representable when 24-hour raw process observations are gone.
-        zero = router.request_file_view(id_for(router, ZERO), WINDOW, "bytes_total", "desc", None).result(timeout=10)
+        zero = drive(router, router.request_file_view(
+            id_for(router, ZERO), WINDOW, "bytes_total", "desc", None))
         assert zero.table.rows == () and zero.coverage.observed_bytes_r == 0
         assert zero.table.coverage.complete and zero.coverage.coverage.complete
         retained.db.execute("DELETE FROM file_coverage WHERE app_id=2")
@@ -182,7 +214,8 @@ def test_zero_F_is_complete_only_with_authoritative_hour_and_missing_or_pruned_i
         router._local_future.result(timeout=10)
         assert router.ready(scoped)
         with pytest.raises(WindowUnavailableError) as caught:
-            router.request_file_view(id_for(router, ZERO), scoped, "bytes_total", "desc", None).result(timeout=10)
+            drive(router, router.request_file_view(
+                id_for(router, ZERO), scoped, "bytes_total", "desc", None))
         assert caught.value.reason == "not_retained"
     finally:
         router.close()
@@ -195,7 +228,8 @@ def test_missing_F_capability_is_not_a_zero_table_and_A22_precedes_bad_app_id(tm
     router = local_router(f)
     try:
         with pytest.raises(WindowUnavailableError) as caught:
-            router.request_file_view(id_for(router), WINDOW, "bytes_total", "desc", None).result(timeout=10)
+            drive(router, router.request_file_view(
+                id_for(router), WINDOW, "bytes_total", "desc", None))
         assert caught.value.reason == "file_source_unavailable"
         assert not router.file_source_status().available
         with pytest.raises(WindowUnavailableError) as disabled:
@@ -220,7 +254,8 @@ def test_mixed_or_excluded_ownership_never_merges_database_local_paths(retained,
         router._local_future.result(timeout=10)
         assert router.ready(WINDOW)
         with pytest.raises(WindowUnavailableError) as caught:
-            router.request_file_view(id_for(router), WINDOW, "basename", "asc", None).result(timeout=10)
+            drive(router, router.request_file_view(
+                id_for(router), WINDOW, "basename", "asc", None))
         assert caught.value.reason == "file_source_unavailable"
     finally:
         router.close()
@@ -233,7 +268,14 @@ def test_retained_local_file_history_is_queried_without_answering_daemon(retaine
     qtbot.addWidget(view)
     try:
         view.set_window(WINDOW)
-        qtbot.waitUntil(lambda: view.state != "loading", timeout=10_000)
+
+        def settled():
+            # The Files view has no poll of its own: the owner thread (here the
+            # test) must drain the lazy settlement that publishes its Future.
+            router.drain()
+            return view.state != "loading"
+
+        qtbot.waitUntil(settled, timeout=10_000)
         assert view.state == "ready", (
             f"screen_state={view.state}; request_count={len(view.requests)}"
         )
@@ -285,6 +327,9 @@ class Remote:
             self.replies.append(reply)
             self.h.send(reply)
         self.h.client.pump()
+        # Files settlement is lazy: the owner drain admits the next page and
+        # publishes the outward Future. Drive it in the same turn as the reply.
+        self.router.drain()
 
     def finish(self, future):
         for _ in range(20):
@@ -370,14 +415,26 @@ def test_remote_scope_snapshot_stale_cursor_and_invalidate_fail_closed(retained,
             remote.respond(corrupt)
             if future.done():
                 break
-        with pytest.raises((WindowUnavailableError, RemoteError)) as caught:
+        # Fail-closed is the invariant. A malformed answer the client's own
+        # pre-cache validator now rightly refuses surfaces as the typed
+        # invalid_result refusal; faults that only the router's Files owner
+        # predicates can see stay WindowUnavailableError; a forged server HMAC
+        # stays the daemon's stale_cursor RemoteError. No arm may publish a
+        # partial or zero-filled table.
+        with pytest.raises((WindowUnavailableError, RemoteError, RequestRejected)) as caught:
             future.result(timeout=5)
-        assert caught.value.reason in ("file_source_unavailable", "stale_cursor")
+        client_refused = ("snapshot", "coverage_snapshot", "scope", "app",
+                          "coverage_app", "page_requested_window")
         if fault == "cursor":
             assert caught.value.reason == "stale_cursor"
+        elif fault in client_refused:
+            assert isinstance(caught.value, RequestRejected), fault
+            assert caught.value.reason == "invalid_result"
+        else:
+            assert caught.value.reason == "file_source_unavailable", fault
+        assert future.exception() is caught.value
         if fault in ("page_served_scope", "page_requested_window"):
             assert files_seen > 1, "the later-page fault must have been delivered"
-            assert caught.value.reason == "file_source_unavailable"
     finally:
         remote.close()
 
@@ -423,11 +480,11 @@ def test_local_cancellation_cannot_turn_bounded_executor_into_unbounded_queue(re
     entered, release = threading.Event(), threading.Event()
     original = router._read_local_files
     calls = []
-    def held(*args):
+    def held(*args, **kwargs):
         calls.append(1)
         entered.set()
         assert release.wait(5)
-        return original(*args)
+        return original(*args, **kwargs)
     monkeypatch.setattr(router, "_read_local_files", held)
     futures = []
     try:
@@ -440,7 +497,11 @@ def test_local_cancellation_cannot_turn_bounded_executor_into_unbounded_queue(re
             future = router.request_file_view(id_for(router), WINDOW, "bytes_total", "desc", None)
             futures.append(future)
             future.cancel()
+        # One bounded ledger is shared by the frame lane and the background
+        # Files lane: canceled outward jobs never admit an unbounded queue.
         assert router._executor._work_queue.qsize() <= 8
+        assert router._background_charge("files") <= 8
+        assert len(router._worker_jobs) <= 10
     finally:
         release.set()
         router.close()
@@ -458,15 +519,24 @@ def test_remote_query_errors_are_typed_without_rewriting_data_reason(tmp_path):
     )
 
     class FailedQueryClient:
-        state = ClientState(verified=True, answering=True)
+        generation = 0
+        state = ClientState(
+            verified=True, answering=True, cursor=StreamCursor("boot-A", 1, 1))
 
         def __init__(self, error):
             self.error = error
+            self.bound = {}
 
-        def query(self, _request):
+        def query(self, request):
             future = Future()
+            self.bound[future] = request
             future.set_exception(self.error)
             return future
+
+        def query_transport(self, future):
+            # A terminal issue-time failure owns no wire slot and no source.
+            return QueryTransportState(
+                self.bound[future], 0, None, "terminal", None, None, None)
 
     for index, (error, kind, reason) in enumerate(cases):
         store, _ = source(tmp_path / f"remote-{index}.db")
@@ -533,14 +603,22 @@ def test_retirement_and_cancellation_do_not_set_history_failure_flags(retained):
     )
 
     class UnavailableQueryClient:
-        state = ClientState(verified=True, answering=True)
+        generation = 0
+        state = ClientState(
+            verified=True, answering=True, cursor=StreamCursor("boot-A", 1, 1))
 
         def __init__(self):
             self.calls = 0
+            self.bound = {}
 
-        def query(self, _request):
+        def query(self, request):
             self.calls += 1
+            self.bound[unavailable] = request
             return unavailable
+
+        def query_transport(self, future):
+            return QueryTransportState(
+                self.bound[future], 0, None, "terminal", None, None, None)
 
     unavailable_client = UnavailableQueryClient()
     router = HistoryRouter(QueryService(retained.db), unavailable_client, AppRegistry())
@@ -559,14 +637,22 @@ def test_retirement_and_cancellation_do_not_set_history_failure_flags(retained):
     cancelled.cancel()
 
     class CancelledQueryClient:
-        state = ClientState(verified=True, answering=True)
+        generation = 0
+        state = ClientState(
+            verified=True, answering=True, cursor=StreamCursor("boot-A", 1, 1))
 
         def __init__(self):
             self.calls = 0
+            self.bound = {}
 
-        def query(self, _request):
+        def query(self, request):
             self.calls += 1
+            self.bound[cancelled] = request
             return cancelled
+
+        def query_transport(self, future):
+            return QueryTransportState(
+                self.bound[future], 0, None, "terminal", None, None, None)
 
     cancelled_client = CancelledQueryClient()
     router = HistoryRouter(QueryService(retained.db), cancelled_client, AppRegistry())

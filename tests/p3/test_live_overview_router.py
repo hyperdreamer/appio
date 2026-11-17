@@ -8,18 +8,23 @@ neutral module stays free of the client, router, query service and Qt.
 from __future__ import annotations
 
 from concurrent.futures import Future
+import copy
 from dataclasses import FrozenInstanceError, fields, replace
 import os
 import sqlite3
 import subprocess
 import sys
 import threading
+import time
 
 import pytest
 
+from appio.bpf_fileio import BpfFileSource, VectorLoader
 from appio.contracts import (
+    FILE_HOUR_NS,
     DeviceShareRow,
     FileCoverage,
+    FileRow,
     FileTable,
     HistoryPending,
     HookHits,
@@ -27,7 +32,10 @@ from appio.contracts import (
     Window,
     WindowUnavailableError,
 )
+from appio.file_runtime import FileRuntime
+from appio.files import FileIdentityResolver
 from appio.history_router import (
+    FileViewResult,
     HistoryRouter,
     HistorySegment,
     LocalFilesOutcome,
@@ -62,12 +70,14 @@ from appio.iodclient import (
     RemoteError,
     RequestRejected,
 )
-from appio.ipc_models import QueryRequest, StreamCursor
+from appio.ipc_models import Capabilities, QueryRequest, StreamCursor
 from appio.procs import AppKeyInputs, IoReadOutcome, ProcessIdentity, StableProcRecord
 from appio.query import QueryService
 from appio.sampler import TickInput, aggregate_tick
 from appio.store import AppIoStore
 from live_overview_support import Clock, coverage, series, share, total
+from tests.p4.test_file_runtime import Frames as FileFrames
+from tests.p4.test_file_runtime import event as file_event
 
 KEY = "unit:alpha.service"
 OTHER_KEY = "unit:beta.service"
@@ -1333,16 +1343,29 @@ def test_local_detail_is_lazy_selected_subject_only(tmp_path, monkeypatch):
         assert router._submit_background_worker(extra_files, held_helper_files) is None
 
         files_release.set()
-        for future in files_futures:
-            future.exception(timeout=15)
-        helper_token, helper_settlement = router._completed.get(timeout=15)
-        assert helper_token is helper_files
+        # Worker threads only enqueue immutable settlements; the outward Files
+        # Futures publish solely on the owner drain. A terminal worker therefore
+        # keeps its charge until that owner path reaps it.
+        for _owner, job in list(router._worker_jobs.values()):
+            if job is not None:
+                job.result(timeout=15)
+        assert router._background_charge("files") == 8
+        assert all(not future.done() for future in files_futures)
+        queued = []
+        while not router._completed.empty():
+            queued.append(router._completed.get_nowait())
+        helper_token, helper_settlement = next(
+            item for item in queued if item[0] is helper_files)
         assert isinstance(helper_settlement, LocalSettlement)
         assert isinstance(helper_settlement.error, WindowUnavailableError)
-        # Terminal Files charges stay charged until an owner reap: the same ledger
-        # that admitted them releases them, never a worker-thread done callback.
-        assert router._background_charge("files") == 8
-        router._reap_terminal_background_workers()
+        for item in queued:
+            router._completed.put(item)
+        while not all(future.done() for future in files_futures):
+            router.drain()
+        for future in files_futures:
+            future.exception(timeout=0)
+        # The same ledger that admitted every worker releases it on the owner
+        # drain; the ignored helper charge is reaped through that path too.
         assert router._background_charge("files") == 0
         assert not router._worker_jobs
 
@@ -2267,7 +2290,10 @@ class _BoundClient:
     def __init__(self, *, boot=BOOT, epoch=3, seq=7, clock=None):
         self.clock = Clock(50) if clock is None else clock
         self.cursor = StreamCursor(boot, epoch, seq)
-        self.state = ClientState(verified=True, answering=True, cursor=self.cursor)
+        self.state = ClientState(
+            verified=True, answering=True, cursor=self.cursor,
+            capabilities=Capabilities(proc_all=True, dev_stat=True,
+                                      file_io=True, bpf_loaded=True))
         self._generation = 0
         self._serial = 0
         self.requests = []
@@ -3164,3 +3190,541 @@ def test_authority_change_clears_details_without_conflating_cursor_advance(tmp_p
     finally:
         router.close()
         store.connection.close()
+
+
+# ---------------------------------------------------------------------------
+# Files settlement integration (§§3.3-3.4, 5.1, 5.4, 12.2)
+# ---------------------------------------------------------------------------
+
+FILE_APP = "exe:/demo"
+FILE_ZERO = "exe:/zero"
+FILE_BOOT = "boot-A"
+FILE_WINDOW = Window("since_boot", FILE_BOOT, end_mono_ns=FILE_HOUR_NS)
+
+
+def _file_frames(tmp_path, name="files-settlement.db"):
+    """One committed file-capable store: T/D receipts plus hourly F rows."""
+
+    frames = FileFrames(tmp_path / name)
+    loader = VectorLoader()
+    runtime = FileRuntime(
+        frames.db,
+        source_factory=lambda: BpfFileSource(loader),
+        identity_resolver=FileIdentityResolver(lambda dev: "fs"),
+    )
+    runtime.start()
+    loader.queue(0, events=[
+        replace(file_event(inode=index, amount=10 + index), basename=basename,
+                name_len=len(basename), reads=index, writes=8 - index)
+        for index, basename in enumerate(
+            [b"Cafe\xcc\x81", b"Caf\xc3\xa9", b"alpha", b"zeta"])])
+    runtime.consume(*frames.tick(0))
+    runtime.consume(*frames.tick(FILE_HOUR_NS, amount=200))
+    return frames
+
+
+class _LocalCountingClient:
+    """A verified-not-answering client: a local outcome must issue no query."""
+
+    state = ClientState()
+
+    def __init__(self):
+        self.queries = 0
+        self.transports = 0
+
+    def query(self, request):  # pragma: no cover - local work never asks
+        self.queries += 1
+        raise AssertionError(f"a local outcome must not query: {request}")
+
+    def query_transport(self, future):  # pragma: no cover - local has no transport
+        self.transports += 1
+        raise AssertionError("a local outcome has no remote transport")
+
+
+def _drain_until(router, predicate, timeout=20.0):
+    """Owner-thread drain loop with a fixed bound; never a worker-thread wait."""
+
+    deadline = time.monotonic() + timeout
+    while not predicate():
+        router.drain()
+        if predicate():
+            break
+        assert time.monotonic() < deadline, "drain never satisfied the predicate"
+        time.sleep(0.001)
+
+
+def _collect_settlement(router):
+    """Read one queued local settlement on the owner thread."""
+
+    _drain_until(router, lambda: not router._completed.empty())
+    return router._completed.get_nowait()
+
+
+def _forged_frame_settlement(router, window, field, value):
+    """One valid frame admission with exactly one routing field corrupted."""
+
+    router.prepare(window)
+    outcome = router._local_future.result(timeout=20)
+    assert isinstance(outcome, LocalFrameOutcome)
+    token = router._frame.local_token
+    binding = router._worker_bindings[token.token_id]
+    bracket = LocalBracket(binding.opening, router._closing_vector(binding))
+    settlement = LocalSettlement(token.token_id, outcome=outcome, local_bracket=bracket)
+    forged = copy.copy(outcome)
+    object.__setattr__(forged, field, value)
+    object.__setattr__(settlement, "outcome", forged)
+    return token, settlement
+
+
+def test_local_outcomes_share_settlement_for_frame_part_and_files(tmp_path):
+    """Every local variant publishes once through the sole settlement writer.
+
+    A real frame copy publishes all routing/file-availability evidence together,
+    a selected part publishes its exact Window and canonical digest, and a local
+    Files result publishes its unchanged table/coverage/served_gap_count. A
+    malformed worker association or evidence fails that owner alone before any
+    of its facts publish; stale drained outcomes change nothing.
+    """
+
+    frames = _file_frames(tmp_path)
+    client = _LocalCountingClient()
+    router = HistoryRouter(QueryService(frames.db), client, AppRegistry())
+    window = FILE_WINDOW
+    scope = retention_scope(FILE_APP, window)
+    other_window = Window("range", FILE_BOOT, 200 * NS, 300 * NS)
+    settlements: list[tuple[int, str, bool]] = []
+    settle_impl = router._settle
+
+    def settle_spy(token, outcome=None, *, retiring=False):
+        changed = settle_impl(token, outcome, retiring=retiring)
+        settlements.append((token.token_id, token.owner, changed))
+        return changed
+
+    router._settle = settle_spy
+    try:
+        # -- positive frame arm: every evidence field publishes atomically ---
+        router.prepare(window)
+        outcome = router._local_future.result(timeout=20)
+        assert isinstance(outcome, LocalFrameOutcome)
+        expected_ranking = [replace(row, app_id=router.registry.id_for(row.app_key))
+                            for row in outcome.ranking]
+        assert router.ready(window) is True
+        presentation = router.registry.id_for(FILE_APP)
+        assert router._ranking == expected_ranking
+        assert router.segments == outcome.segments
+        assert router.boundaries == outcome.boundaries
+        assert router._gap_ranges == list(outcome.gaps)
+        assert router._known_gap_ranges == list(outcome.known_gaps)
+        assert router._overlap_ranges == list(outcome.overlaps)
+        assert router._has_local_history is outcome.has_local_history
+        assert router._not_retained is outcome.not_retained
+        assert router._chronology_unproved is outcome.chronology_unproved
+        assert router._file_status.available is outcome.file_available
+        frame_token = router._frame.local_token
+        assert router._frame.local_settled is True
+        assert [entry for entry in settlements
+                if entry[0] == frame_token.token_id] == [
+                    (frame_token.token_id, "frame", True)]
+        assert client.queries == 0 and client.transports == 0
+        # A frame proves routing only: no eager first-subject/all-row detail.
+        assert router._worker_jobs == {} and router._unscheduled == {}
+
+        # -- positive selected-part arm: exact Window and canonical digest ---
+        router.select_detail(FILE_APP, window)
+        assert router.request_detail("totals", presentation, window).state == "pending"
+        _drain_until(router, lambda: router.part_state("totals", FILE_APP, scope).state
+                     != "pending")
+        state = router.part_state("totals", FILE_APP, scope)
+        assert state.state == "ok" and state.requested_window == window
+        record = router.retained("totals", FILE_APP, scope, window.end_mono_ns)
+        assert record is not None
+        assert record.provenance.measured_window == window
+        assert record.value.window == window
+        assert record.value.app_id == presentation
+        assert record.provenance.accepted_identity.data_digest == local_answer_digest(
+            "totals", FILE_APP, window, record.value)
+        assert [entry for entry in settlements
+                if entry[0] == state.request_id] == [
+                    (state.request_id, "detail", True)]
+        assert client.queries == 0 and client.transports == 0
+
+        # -- positive local Files arm: unchanged table/coverage/served gap ---
+        paths = (("local", frames.db.execute("PRAGMA database_list").fetchone()[2],
+                  "gui"),)
+        expected = HistoryRouter._read_local_files(
+            paths, window, FILE_APP, presentation, "bytes_total", "desc", None)
+        future = router.request_file_view(presentation, window, "bytes_total", "desc", None)
+        _drain_until(router, future.done)
+        view = future.result(timeout=0)
+        assert isinstance(view, FileViewResult)
+        assert view.table == expected.table
+        assert view.coverage == expected.coverage
+        assert view.served_gap_count == expected.served_gap_count
+        assert type(view.served_gap_count) is int and view.served_gap_count == 0
+        assert client.queries == 0 and client.transports == 0
+        assert router._worker_jobs == {}
+        files_calls = [entry for entry in settlements if entry[1] == "files"]
+        assert len(files_calls) == 1 and files_calls[0][2] is True
+        assert [entry for entry in settlements
+                if entry[0] == files_calls[0][0]] == files_calls
+
+        # -- malformed frame arms: association then routing evidence ---------
+        for label, field, value in (
+            ("worker", "worker_id", 9001),
+            ("request", "request", QueryRequest("ranking", Window("lifetime"))),
+            ("evidence", "boundaries", ((BOOT, 0, "gui", "gui"),)),
+        ):
+            token, settlement = _forged_frame_settlement(router, window, field, value)
+            assert router._settle(token, settlement) is True, label
+            # No routing evidence from the malformed outcome published.
+            assert router._ranking == [], label
+            assert router.segments == () and router.boundaries == (), label
+            assert router._file_status.available is False, label
+            assert router.view_state == "unavailable: local history evidence", label
+            assert router._frame.local_settled is False, label
+            assert [entry for entry in settlements
+                    if entry[0] == token.token_id] == [
+                        (token.token_id, "frame", True)], label
+            with pytest.raises(ValueError):
+                router.ready(window)
+
+        # A clean frame restores the supported readiness context the remaining
+        # arms need; the malformed frames changed only their own owner.
+        router.prepare(window)
+        assert router._local_future.result(timeout=20) is not None
+        assert router.ready(window) is True
+
+        # -- malformed part arms: key, type, Window and digest ---------------
+        def malformed_part(field, value):
+            router.select_detail(FILE_APP, window)
+            assert router.request_detail("totals", presentation, window).state == "pending"
+            token, settlement = _collect_settlement(router)
+            assert token.owner == "detail"
+            assert isinstance(settlement, LocalSettlement)
+            assert settlement.local_bracket is None
+            binding = router._worker_bindings[token.token_id]
+            settlement = router._close_local_settlement(settlement, binding=binding)
+            forged = copy.copy(settlement.outcome)
+            if field == "window":
+                value_copy = copy.copy(forged.value)
+                object.__setattr__(value_copy, "window", value)
+                object.__setattr__(forged, "value", value_copy)
+            else:
+                object.__setattr__(forged, field, value)
+            object.__setattr__(settlement, "outcome", forged)
+            return token, settlement
+
+        for label, field, value in (
+            ("key", "app_key", OTHER_KEY),
+            ("type", "value", series(1, window)),
+            ("window", "window", other_window),
+            ("digest", "data_digest", "b" * 64),
+        ):
+            token, settlement = malformed_part(field, value)
+            assert router._settle(token, settlement) is True, label
+            failed = router.part_state("totals", FILE_APP, scope)
+            assert failed.state == "failed" and failed.reason == "invalid_result", label
+            assert failed.requested_window == window, label
+            assert router.retained("totals", FILE_APP, scope, window.end_mono_ns) is None, label
+            assert [entry for entry in settlements
+                    if entry[0] == token.token_id] == [
+                        (token.token_id, "detail", True)], label
+            router._reap_background_worker(token.token_id)
+
+        # -- malformed Files arms: table, coverage and served evidence -------
+        def malformed_files(field, value):
+            future = router.request_file_view(
+                presentation, window, "bytes_total", "desc", None)
+            token, settlement = _collect_settlement(router)
+            assert token.owner == "files"
+            assert isinstance(settlement.outcome, LocalFilesOutcome)
+            forged = copy.copy(settlement.outcome)
+            object.__setattr__(forged, field, value)
+            object.__setattr__(settlement, "outcome", forged)
+            return future, token, settlement
+
+        ranking_before = list(router._ranking)
+        for label, field, value in (
+            ("table", "table", replace(expected.table, window=Window("lifetime"))),
+            ("coverage", "coverage", replace(expected.coverage, window=Window("lifetime"))),
+            ("served", "served_gap_count", -1),
+        ):
+            future, token, settlement = malformed_files(field, value)
+            assert router._settle(token, settlement) is True, label
+            with pytest.raises(RequestRejected) as caught:
+                future.result(timeout=0)
+            assert caught.value.reason == "invalid_result", label
+            assert router._not_retained is False, label
+            assert router.daemon_answer_error is None, label
+            assert router._ranking == ranking_before, label
+            assert [entry for entry in settlements
+                    if entry[0] == token.token_id] == [
+                        (token.token_id, "files", True)], label
+            router._reap_background_worker(token.token_id)
+        assert router._file_owners == {}
+
+        # -- a stale drained success and error publish nothing --------------
+        stale_token, stale_outcome, stale_settlement = None, None, None
+        router.prepare(window)
+        stale_outcome = router._local_future.result(timeout=20)
+        stale_token = router._frame.local_token
+        assert router.ready(window) is True
+        stale_settlement = router._local_settlement
+        router.prepare(window)
+        assert router._local_future.result(timeout=20) is not None
+        before = (list(router._ranking), router.segments, router.boundaries,
+                  router._not_retained, router.view_state)
+        assert router._settle(stale_token, stale_settlement) is False
+        assert router._settle(
+            stale_token, LocalSettlement(stale_token.token_id,
+                                         error=ValueError("stale local copy"))) is False
+        assert (list(router._ranking), router.segments, router.boundaries,
+                router._not_retained, router.view_state) == before
+        assert client.queries == 0 and client.transports == 0
+    finally:
+        del router._settle
+        router.close()
+        frames.db.close()
+
+
+def _remote_files_page(window, *, rows=1, app_id=1):
+    """One structurally valid remote Files page for the scheduler arms."""
+
+    overflow = UnknownOwnerOverflow(window, "overflow_owner_unknown", 0, 0, 0, coverage())
+    row = FileRow(0, "alpha.txt", "resolved", False, "8:0", 11, 1, 1, 1, 17, 5, 22, BOOT, 1)
+    return FileTable(app_id, window, tuple(replace(row) for _ in range(rows)),
+                     "bytes_total", "desc", None, overflow, coverage())
+
+
+def test_ranking_readiness_excludes_all_detail_and_files_work(tmp_path):
+    """Ranking/ownership readiness is terminal before any held detail or Files.
+
+    Each arm holds exactly one independent dependency after the frame's ranking
+    and ownership evidence has settled: a remote series, remote totals, a real
+    local detail computation, a Files first page, a Files continuation or the
+    final file coverage. ``ready`` stays true and the held Future stays pending;
+    a successful frame never prefetches a subject's parts.
+    """
+
+    for index, arm in enumerate(
+            ("series", "totals", "local-detail", "files-page",
+             "files-continuation", "files-coverage")):
+        window = Window("since_boot", BOOT, end_mono_ns=140 * NS)
+        router = store = None
+        release = threading.Event()
+        try:
+            if arm == "local-detail":
+                local = _committed_store(
+                    tmp_path / f"ready-{index}.db", ((ALPHA, 17, 20),))
+                store = local
+                router = HistoryRouter(QueryService(local), _IdleClient(), AppRegistry())
+                router.prepare(window)
+                assert router._local_future.result(timeout=20) is not None
+                assert router.ready(window) is True
+                assert router._worker_jobs == {} and router._unscheduled == {}
+                presentation = router.registry.id_for(ALPHA)
+                entered = threading.Event()
+                original = router._read_local_part
+
+                def held_part(*args, **kwargs):
+                    entered.set()
+                    assert release.wait(20), "the local detail worker was never released"
+                    return original(*args, **kwargs)
+
+                router._read_local_part = held_part
+                router.select_detail(ALPHA, window)
+                assert router.request_detail("series", presentation, window).state == "pending"
+                assert entered.wait(10)
+                held = None
+                assert router.ready(window) is True
+                assert router._background_charge("detail") == 1
+                assert router.pending_work is True
+                release.set()
+                _drain_until(router, lambda: router._background_charge("detail") == 0)
+                continue
+
+            client = _BoundClient()
+            router, store = _empty_router(tmp_path, client, name=f"ready-{index}.db")
+            presentation = _remote_frame(router, client, window)
+            # A completed frame proves only ranking/ownership; no part exists.
+            assert router._worker_jobs == {} and router._unscheduled == {}
+            assert router._background_charge("detail") == 0
+
+            if arm in ("series", "totals"):
+                router.select_detail(KEY, window)
+                assert router.request_detail(arm, presentation, window).state == "pending"
+                held = client.only(arm)
+            else:
+                future = router.request_file_view(
+                    presentation, window, "bytes_total", "desc", None)
+                assert future.done() is False
+                first = client.only("files")
+                if arm == "files-page":
+                    held = first
+                elif arm == "files-continuation":
+                    client.settle(first, {
+                        "kind": "files", "result": _remote_files_page(window),
+                        "snapshot": DIGEST, "next_cursor": "opaque-page-2",
+                        "app_key": KEY,
+                    })
+                    assert router.ready(window) is True
+                    held = client.only("files")
+                    assert client.query_transport(held).request.cursor == "opaque-page-2"
+                else:
+                    client.settle(first, {
+                        "kind": "files", "result": _remote_files_page(window),
+                        "snapshot": DIGEST, "next_cursor": None, "app_key": KEY,
+                    })
+                    assert router.ready(window) is True
+                    held = client.only("coverage")
+                    continuation = client.query_transport(held).request
+                    assert continuation.kind == "coverage"
+                    assert continuation.coverage_kind == "file"
+
+            assert held.done() is False, arm
+            # The held dependency is not a readiness gate and is not settled by
+            # the readiness/drain path itself.
+            assert router.ready(window) is True, arm
+            assert router.ready(window) is True, arm
+            assert held.done() is False, arm
+            assert router.pending_work is True, arm
+        finally:
+            release.set()
+            if router is not None:
+                router.close()
+            if store is not None:
+                store.connection.close()
+
+
+def test_local_worker_capacity_counts_retired_jobs_and_keeps_frame_independent(tmp_path):
+    """The background ledger is bounded and the frame lane stays independent.
+
+    Two charged detail jobs and eight Files workers, retired jobs included,
+    fill the ten-job ceiling; repeated selection changes submit no eleventh
+    Future and keep at most one waiting successor per kind. Releasing one charge
+    admits exactly one eligible replacement, and a retired-but-running frame
+    keeps the frozen not-done gate closed instead of queueing a duplicate copy.
+    """
+
+    frames = _file_frames(tmp_path, "capacity.db")
+    router = HistoryRouter(QueryService(frames.db), _IdleClient(), AppRegistry())
+    window = FILE_WINDOW
+    release_detail = threading.Event()
+    detail_entered = threading.Event()
+    release_files = threading.Event()
+    files_entered = threading.Event()
+    frame_release = threading.Event()
+    frame_entered = threading.Event()
+    original_part = router._read_local_part
+    original_files = router._read_local_files
+    original_read = router._read_local
+
+    def held_part(*args, **kwargs):
+        detail_entered.set()
+        assert release_detail.wait(20), "the detail worker was never released"
+        return original_part(*args, **kwargs)
+
+    def held_files(*args, **kwargs):
+        files_entered.set()
+        assert release_files.wait(20), "the Files worker was never released"
+        return original_files(*args, **kwargs)
+
+    def held_frame(paths, window_arg):
+        frame_entered.set()
+        assert frame_release.wait(20), "the frame worker was never released"
+        return original_read(paths, window_arg)
+
+    router._read_local_part = held_part
+    router._read_local_files = held_files
+    submitted: list[object] = []
+    real_submit = router._background_executor.submit
+
+    def counted_submit(work, /, *args, **kwargs):
+        submitted.append(work)
+        return real_submit(work, *args, **kwargs)
+
+    router._background_executor.submit = counted_submit
+    try:
+        router.prepare(window)
+        assert router._local_future.result(timeout=20) is not None
+        assert router.ready(window) is True
+        presentation = router.registry.id_for(FILE_APP)
+        assert router._worker_jobs == {} and router._background_charge("detail") == 0
+        assert router._frame_executor is not router._background_executor
+
+        # Two charged detail jobs for the selected lifetime.
+        router.select_detail(FILE_APP, window)
+        assert router.request_detail("series", presentation, window).state == "pending"
+        assert router.request_detail("totals", presentation, window).state == "pending"
+        assert detail_entered.wait(10)
+        assert router._background_charge("detail") == 2
+        assert len(submitted) == 2 and router._unscheduled == {}
+
+        # Eight Files workers fill the Files budget and the ten-job ceiling.
+        # They queue behind the held detail worker; admission, not execution, is
+        # what the ledger bounds here.
+        files_futures = [
+            router.request_file_view(presentation, window, "bytes_total", "desc", None)
+            for _ in range(8)
+        ]
+        assert router._background_charge("files") == 8
+        assert len(router._worker_jobs) == 10
+        assert len(submitted) == 10
+
+        # Repeated selection changes retire owners but never grow the queue: the
+        # waiting current detail stays unscheduled with at most one successor.
+        for iteration in range(6):
+            key = FILE_ZERO if iteration % 2 == 0 else FILE_APP
+            forward = Window("since_boot", FILE_BOOT,
+                             end_mono_ns=FILE_HOUR_NS + (10 + iteration) * NS)
+            router.select_detail(key, forward)
+            state = router.request_detail(
+                "series", router.registry.id_for(key), forward)
+            assert state.state == "pending", iteration
+            assert len(submitted) == 10, iteration
+            assert len(router._worker_jobs) <= 10, iteration
+            assert router._background_charge("detail") <= 2, iteration
+            assert len(router._unscheduled) <= 1, iteration
+
+        # Releasing the charged detail jobs admits exactly one replacement, not
+        # an unbounded catch-up batch for every retired selection. The held Files
+        # workers keep the background lane busy, so the replacement stays queued
+        # on its own charge rather than running out of budget.
+        release_detail.set()
+        _drain_until(router, lambda: router._background_charge("detail") == 1)
+        assert len(submitted) == 11, "exactly one waiting detail was admitted"
+        assert router._background_charge("files") == 8
+        assert len(router._worker_jobs) == 9
+        assert router._unscheduled == {}
+
+        # The frame lane keeps its own single Future. A retired-but-running
+        # frame copy keeps the frozen not-done gate closed: no duplicate frame
+        # worker is queued behind it.
+        router._read_local = held_frame
+        frame_window = Window("range", FILE_BOOT, 0, FILE_HOUR_NS)
+        router.prepare(frame_window)
+        assert frame_entered.wait(10)
+        running = router._local_future
+        assert router.local_read_in_flight is True
+        router.invalidate()
+        assert router.local_read_in_flight is True
+        assert router._local_future is running
+        assert router._frame_executor._work_queue.qsize() == 0
+
+        def shell_gate(wanted):
+            if router.local_read_in_flight is not False:
+                return False
+            router.prepare(wanted)
+            return True
+
+        assert shell_gate(frame_window) is False
+        assert router._local_future is running
+        frame_release.set()
+        _drain_until(router, lambda: router.local_read_in_flight is False)
+        assert router.local_read_in_flight is False
+    finally:
+        release_detail.set()
+        release_files.set()
+        frame_release.set()
+        router.close()
+        frames.db.close()
