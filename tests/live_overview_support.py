@@ -637,16 +637,19 @@ class LiveOverviewHarness:
         self.age_clock = Clock(ns=100 * 10**9)
         self.recovery_clock = Clock(ns=100 * 10**9)
         self.stores = LocalPositionStores(directory)
-        self.transport = QueryTransportHarness(clock=self.recovery_clock)
+        self.transport = QueryTransportHarness(clock=self.age_clock)
         self.registry = AppRegistry()
         for key in (DEFAULT_KEY, "unit:beta.service"):
             app_id = self.registry.id_for(key)
             self.transport.register_subject(app_id, key)
-        self.router = HistoryRouter(self.stores.services["local"], self.transport.client, self.registry)
+        self.router = HistoryRouter(
+            self.stores.services["local"], self.transport.client, self.registry,
+            clock_ns=self.age_clock)
         self.stores.attach(self.router)
         self.events: list[tuple] = []
         self.worker_charges: list[tuple] = []
         self._futures: dict[object, object] = {}
+        self._wire_query_index = len(self.transport.query_frames)
         self._held: set[str] = set()
         self.responses: dict[str, object] = {}
         self._barriers: list[_Barrier] = []
@@ -707,15 +710,33 @@ class LiveOverviewHarness:
                              ("_reserve_background_worker", "reserve"),
                              ("_reap_background_worker", "reap")):
             self._spy(self.router, method, name)
+        drain_peer = self.transport._drain_peer
+
+        def observe_peer(server):
+            try:
+                return drain_peer(server)
+            finally:
+                self._record_wire_query_frames()
+
+        self.transport._drain_peer = observe_peer
         original = self.transport.client.query
 
         def query(request):
+            self.events.append(("query", (request,), {}))
             future = original(request)
-            self.events.append(("send", (request,), {}))
             self._futures[future] = request
             return future
 
         self.transport.client.query = query
+
+    def _record_wire_query_frames(self) -> None:
+        # Only complete frames decoded from real socket bytes count as sends;
+        # buffered partial writes are observed when a later peer drain completes.
+        frames = self.transport.query_frames
+        while self._wire_query_index < len(frames):
+            frame = frames[self._wire_query_index]
+            self._wire_query_index += 1
+            self.events.append(("send", (frame,), {}))
 
     def _answer(self, request):
         from appio.contracts import FileCoverage, FileTable, UnknownOwnerOverflow
@@ -768,8 +789,18 @@ class LiveOverviewHarness:
     def apply(self, window: Window) -> None:
         if self.shell._pending != window:
             raise ValueError("request the window before applying its ready frame")
-        self.shell.apply_ready_frame(now=self.recovery_clock(), context="ordinary")
-        self._stop_timers()
+        before = sum(event[0] == "apply" for event in self.events)
+        try:
+            applied = self.shell.apply_ready_frame(
+                now=self.recovery_clock(), context="ordinary")
+        finally:
+            self._stop_timers()
+        after = sum(event[0] == "apply" for event in self.events)
+        if not applied or self.shell._displayed != window or after != before + 1:
+            raise RuntimeError(
+                "production readiness gate did not apply the requested frame "
+                f"{window!r} (returned {applied!r}, displayed={self.shell._displayed!r}, "
+                f"apply events={after - before})")
 
     def ordinary_refresh(self) -> None:
         self.shell.refresh()
