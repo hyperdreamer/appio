@@ -3395,9 +3395,12 @@ def test_overview_direct_metadata_validates_series_coverage_and_requested_endpoi
         f"; share measured: since_boot {BOOT_A} through 20000000000 ns"
         in model.detail_line
     )
-    # B's series is now beyond A's requested endpoint.
-    with pytest.raises(ValueError, match="after the requested"):
-        replace(model, requested_window=WINDOW_A)
+    # A ranking row from another applied frame cannot be replaced in place.
+    with pytest.raises(ValueError, match="exactly at the requested"):
+        replace(
+            model,
+            ranking_provenance=measured_provenance("ranking", SUBJECT_KEY, WINDOW_A),
+        )
 
     # An otherwise eligible model with populated lanes cannot claim a
     # device-incomplete successful series.
@@ -3476,14 +3479,13 @@ def test_overview_direct_metadata_validates_series_coverage_and_requested_endpoi
                 "totals", "unit:/beta.service", WINDOW_A
             ),
         )
-    # Successful chronology without typed metadata is not a certificate.
+    # A series provenance cannot outlive its typed metadata (the successful
+    # chronology guard itself is isolated in its own test below).
     with pytest.raises(ValueError, match="series metadata"):
         replace(eligible, series_metadata=None)
     # A missing dependency cannot keep that dependency's provenance.
     with pytest.raises(ValueError, match="missing share"):
         replace(eligible, share=None, device_lanes=(), more_devices=0, reconciliation=None)
-    with pytest.raises(ValueError, match="series metadata"):
-        replace(eligible, series_provenance=None, series_metadata=None)
 
     # The frozen all-default direct shape stays a valid legacy model.
     legacy = OverviewModel(
@@ -3507,6 +3509,104 @@ def test_overview_direct_metadata_validates_series_coverage_and_requested_endpoi
     assert legacy.device_lanes_unavailable is None
     assert legacy.series_metadata is None
     assert legacy.task_points == ()
+
+
+def test_overview_direct_future_endpoint_rejected_without_ranking_provenance() -> None:
+    """The endpoint guard rejects on its own, with no ranking row to mask it."""
+
+    model = build_overview(
+        1,
+        WINDOW_B,
+        app_total(1, SUBJECT_KEY, "Alpha", 22, peak_bps=None),
+        measured_series(WINDOW_B),
+        measured_share(WINDOW_A),
+        series_provenance=measured_provenance("series", SUBJECT_KEY, WINDOW_B),
+        share_provenance=measured_provenance("totals", SUBJECT_KEY, WINDOW_A),
+    )
+    no_ranking = replace(model, ranking_provenance=None)
+    assert no_ranking.ranking_provenance is None
+    assert no_ranking.device_lanes == () and no_ranking.more_devices == 0
+    # B's series ends after A's requested endpoint. With the endpoint guard
+    # removed this replacement would construct, so the failure is direct.
+    with pytest.raises(ValueError, match="after the requested"):
+        replace(no_ranking, requested_window=WINDOW_A)
+
+
+def test_overview_direct_available_empty_series_requires_metadata_alone() -> None:
+    """The metadata guard fails alone when no lane reason can mask it."""
+
+    model = build_overview(
+        1,
+        WINDOW_A,
+        app_total(1, SUBJECT_KEY, "Alpha", 22),
+        measured_series(WINDOW_A),
+        measured_share(WINDOW_A),
+    )
+    assert model.series_metadata is not None
+    assert model.device_lanes and model.device_lanes_unavailable is None
+    # An available-empty series keeps the lane reason that the missing series
+    # measurement itself implies, and exposes no lanes or points, so only the
+    # typed-metadata guard can reject this shape.
+    with pytest.raises(ValueError, match="typed series metadata"):
+        replace(
+            model,
+            ranking_provenance=None,
+            task_points=(),
+            series_provenance=None,
+            series_metadata=None,
+            device_lanes=(),
+            more_devices=0,
+            device_lanes_unavailable=SERIES_REASON,
+        )
+
+
+def test_build_overview_rejects_ranking_total_for_another_subject() -> None:
+    """The subject identity must agree across the ranking and detail inputs."""
+
+    with pytest.raises(ValueError, match="ranking total app_id 2"):
+        build_overview(
+            1,
+            WINDOW_A,
+            app_total(2, SUBJECT_KEY, "Alpha", 22),
+            measured_series(WINDOW_A),
+            measured_share(WINDOW_A),
+        )
+
+
+def test_overview_direct_early_outcome_rejects_task_points() -> None:
+    """A subjectless early outcome cannot expose accepted task points."""
+
+    file_only = build_overview(1, WINDOW_A, None, None, None)
+    assert file_only.app_key is None
+    assert file_only.series_metadata is None
+    with pytest.raises(ValueError, match="task points"):
+        replace(
+            file_only,
+            task_points=measured_series(WINDOW_A).points,
+            series_unavailable=None,
+        )
+
+
+def test_overview_direct_lifetime_rejects_task_points() -> None:
+    """Lifetime policy withholds chronology even when points are injected."""
+
+    lifetime = Window(kind="lifetime")
+    eternal = build_overview(
+        1,
+        lifetime,
+        app_total(1, SUBJECT_KEY, "Alpha", 22),
+        measured_series(lifetime),
+        measured_share(lifetime, boot=BOOT_A),
+    )
+    assert eternal.series_unavailable == LIFETIME_REASON
+    assert eternal.task_points == ()
+    assert eternal.series_metadata is not None
+    with pytest.raises(ValueError, match="lifetime chronology cannot project"):
+        replace(
+            eternal,
+            task_points=measured_series(lifetime).points,
+            series_unavailable=None,
+        )
 
 
 def test_new_share_device_unavailability_removes_old_device_values() -> None:

@@ -540,6 +540,10 @@ class OverviewModel:
                 raise ValueError(
                     "an early overview outcome carries no device lane reason"
                 )
+            if self.task_points:
+                raise ValueError(
+                    "an early overview outcome carries no task points"
+                )
             if self.device_lanes or self.more_devices:
                 raise ValueError(
                     "an early overview outcome carries no device lanes"
@@ -596,6 +600,18 @@ class OverviewModel:
         if series_unavailable is None and series_metadata is None:
             raise ValueError(
                 "successful series chronology requires typed series metadata"
+            )
+
+        # Points carry no per-point boot identity, so a lifetime measurement
+        # cannot be drawn as one continuous task timeline (spec §7.1). The
+        # metadata and provenance stay valid; only the projected points fail.
+        if (
+            requested_window.kind == "lifetime"
+            and series_unavailable is None
+            and self.task_points
+        ):
+            raise ValueError(
+                "lifetime chronology cannot project task points"
             )
 
         if ranking_provenance is not None:
@@ -833,6 +849,14 @@ def build_overview(
             raise ValueError("share provenance cannot be supplied without its value")
         if share_reason is not None:
             raise ValueError("share provenance cannot accompany a share error")
+
+    # Every supplied input describes the same presentation subject: a ranking
+    # row for another ID cannot supply this subject's key, ranking provenance
+    # or PEAK.
+    if total is not None and total.app_id != app_id:
+        raise ValueError(
+            f"ranking total app_id {total.app_id} does not match subject {app_id}"
+        )
 
     if series is not None:
         if series.app_id != app_id:
