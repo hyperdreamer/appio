@@ -673,6 +673,11 @@ class HistoryRouter:
         #: re-added under the stale connection either.
         self._connection_bindings: dict[int, tuple[sqlite3.Connection,
                                                     tuple[int, int] | None]] = {}
+        #: Every database path this router has bound a connection to, retired
+        #: registrations included. A first registration for an unseen path
+        #: establishes that binding; any later connection offered for a known
+        #: path or an existing source name must be proven to read that file.
+        self._path_bindings: set[str] = set()
         # Capture identity only when a source is registered, never in a Files
         # request on the UI thread. Worker connections stay read-only.
         self._source_paths: dict[str, str] = {}
@@ -753,6 +758,90 @@ class HistoryRouter:
             return None
         return (info.st_dev, info.st_ino)
 
+    def _rebinding(self, name: str, path: str) -> bool:
+        """Whether an unseen connection would replace an existing file binding.
+
+        A source name keeps its registration across replacement, and one
+        database path keeps the file the router already bound even after that
+        source was removed. Either case means the incoming connection is
+        claiming an identity the router has already certified, so it must be
+        proven (§4.2).
+        """
+
+        return name in self._registrations or (bool(path) and path in self._path_bindings)
+
+    @staticmethod
+    def _image_matches_file(path: str, image: bytes) -> bool:
+        """Whether ``image`` is exactly the current byte content of ``path``."""
+
+        view = memoryview(image)
+        offset = 0
+        with open(path, "rb") as handle:
+            while True:
+                chunk = handle.read(1 << 20)
+                if not chunk:
+                    return offset == len(view)
+                if offset + len(chunk) > len(view) or view[offset:offset + len(chunk)] != chunk:
+                    return False
+                offset += len(chunk)
+
+    @staticmethod
+    def _image_matches_database(path: str, image: bytes) -> bool:
+        """Whether a read-only connection to ``path`` serializes to ``image``.
+
+        A journal-mode-independent equality: the main file of a WAL source does
+        not carry its uncheckpointed frames, so a byte comparison cannot speak
+        for that source.
+        """
+
+        try:
+            probe = sqlite3.connect(Path(path).as_uri() + "?mode=ro", uri=True, timeout=0.0)
+        except sqlite3.Error:
+            return False
+        try:
+            return probe.serialize(name="main") == image
+        except (AttributeError, NotImplementedError, sqlite3.Error):
+            return False
+        finally:
+            probe.close()
+
+    def _prove_file_binding(self, name: str, connection: sqlite3.Connection,
+                            path: str) -> None:
+        """Prove an unseen connection reads the file now at ``path`` (§4.2).
+
+        ``stat`` identifies the file at a pathname, not the file a connection
+        holds. A connection opened before an ``os.replace`` keeps reading the
+        unlinked original, so stamping it with the pathname's identity would let
+        its counters certify a copy of the replacement. The owner-side proof is
+        the connection's own committed database image: it must be exactly the
+        bytes of the file at the path, or - for a source whose journal keeps some
+        committed frames outside the main file - the image a read-only connection
+        to that path reads. Anything that cannot be proven that way - a missing
+        image, an unreadable or non-file source, or a source that reads another
+        database - is refused rather than guessed. This runs only when an existing
+        source is rebound to an unseen connection, never per observation.
+        """
+
+        if connection.in_transaction:
+            raise ValueError(
+                f"history source {name!r} has an uncommitted transaction")
+        if not path:
+            raise ValueError(f"history source {name!r} has no provable file binding")
+        try:
+            image = connection.serialize(name="main")
+        except (AttributeError, NotImplementedError, sqlite3.Error) as error:
+            raise ValueError(
+                f"history source {name!r} has no provable file binding") from error
+        try:
+            matched = self._image_matches_file(path, image)
+        except OSError as error:
+            raise ValueError(f"history source {name!r} is unavailable") from error
+        if not matched:
+            matched = self._image_matches_database(path, image)
+        if not matched:
+            raise ValueError(
+                f"history source {name!r} is no longer bound to its registered file")
+
     def _install_registration(self, name: str, service: QueryService,
                               owner: str) -> _SourceRegistration:
         """Bind one source to a fresh, never-reused registration epoch.
@@ -788,6 +877,17 @@ class HistoryRouter:
                     f"history source {name!r} is no longer bound to its "
                     "registered file")
         else:
+            # The epoch is chosen here, not when the connection was opened, so
+            # an unseen connection cannot inherit the pathname's identity: it
+            # may predate the file now at that path. Replacing an existing
+            # source binding therefore requires proof, and a failed proof keeps
+            # the previous registration and allocates no epoch.
+            if self._rebinding(name, path):
+                self._prove_file_binding(name, connection, path)
+                if self._physical_identity(path) != current:
+                    raise ValueError(
+                        f"history source {name!r} is no longer bound to its "
+                        "registered file")
             physical = current
         epoch = self._next_registration_epoch
         self._next_registration_epoch = epoch + 1
@@ -796,6 +896,8 @@ class HistoryRouter:
         self._registrations[name] = registration
         self._source_paths[name] = path
         self._connection_bindings[id(connection)] = (connection, physical)
+        if path:
+            self._path_bindings.add(path)
         return registration
 
     def _current_registration(self, name: str) -> _SourceRegistration:

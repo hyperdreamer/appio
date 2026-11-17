@@ -1740,7 +1740,9 @@ def test_local_registration_add_remove_replace_and_reopen_never_repeat_token(tmp
 
     Replacement under the same name/owner can repeat both raw counters, so the
     epoch is the identity. An unlinked connection whose path now denotes another
-    file refuses observation until an explicit rebinding replaces it.
+    file refuses observation until an explicit rebinding replaces it, and a
+    connection the router has never registered is only accepted once its own
+    database image proves it reads the file now at that path.
     """
 
     local, imported = _source_stores(tmp_path)
@@ -1816,12 +1818,22 @@ def test_local_registration_add_remove_replace_and_reopen_never_repeat_token(tmp
         # the old (unlinked) one. Stat alone cannot certify that connection, so
         # observation and preparation refuse until an explicit rebinding.
         replacement = _committed_store(
-            tmp_path / "replacement.db", ((ALPHA, 6, 50),))
+            tmp_path / "replacement.db", ((ALPHA, 6, 50),), owner="iod", start=110, end=120)
         try:
             third_path = _db_path(third)
+            row_total = ("SELECT coalesce(sum(read_bytes), 0) "
+                         "FROM app_lifetime_total")
+            # A connection opened on the original file before the replacement
+            # keeps reading the unlinked original forever. The router has never
+            # seen it, so its first registration is where the epoch is chosen.
+            preopened = sqlite3.connect(third_path)
+            extra.append(preopened)
+            assert preopened.execute(row_total).fetchone()[0] == 40
+            assert id(preopened) not in history._connection_bindings
             prior_epoch = history._registrations["imported"].registration_epoch
             prior_physical = history._registrations["imported"].physical
             os.replace(tmp_path / "replacement.db", third_path)
+            assert preopened.execute(row_total).fetchone()[0] == 40
             assert history.local_position("local").name == "local"
             with pytest.raises(ValueError, match="history source"):
                 history.local_position("imported")
@@ -1840,8 +1852,6 @@ def test_local_registration_add_remove_replace_and_reopen_never_repeat_token(tmp
             # would record the replacement inode and let a later equal bracket
             # certify the old observer against a copy of the other file.
             stale_service, stale_owner = history._sources["imported"]
-            row_total = ("SELECT coalesce(sum(read_bytes), 0) "
-                         "FROM app_lifetime_total")
             observer_total = third_connection.execute(row_total).fetchone()[0]
             copied = sqlite3.connect(third_path)
             try:
@@ -1859,6 +1869,25 @@ def test_local_registration_add_remove_replace_and_reopen_never_repeat_token(tmp
             with pytest.raises(ValueError, match="history source"):
                 history.local_position("imported")
 
+            # A connection the router has never registered is no proof either:
+            # opened before the replacement it still reads the unlinked original,
+            # and first registration would stamp it with the replacement inode.
+            # Both the explicit add_source and the automatic service-replacement
+            # route must refuse it instead of allocating an epoch for it.
+            with pytest.raises(ValueError, match="history source"):
+                history.add_source(
+                    QueryService(preopened), collector_id="imported", owner="iod")
+            history._sources["imported"] = (QueryService(preopened), stale_owner)
+            try:
+                with pytest.raises(ValueError, match="history source"):
+                    history.local_position("imported")
+            finally:
+                history._sources["imported"] = (stale_service, stale_owner)
+            assert id(preopened) not in history._connection_bindings
+            assert history._sources["imported"][0] is stale_service
+            assert history._registrations["imported"].registration_epoch == prior_epoch
+            assert history._registrations["imported"].physical == prior_physical
+
             # Rebinding to a connection opened on the replacement file restores
             # observation with a fresh, never-reused epoch.
             recovered_connection = sqlite3.connect(third_path)
@@ -1868,11 +1897,85 @@ def test_local_registration_add_remove_replace_and_reopen_never_repeat_token(tmp
             recovered = history.local_position("imported")
             epochs.append(recovered.registration_epoch)
             assert recovered.registration_epoch > prior_epoch
+
+            # The same proven rebinding through the automatic route, and the
+            # certified bracket that follows it: the copied replacement file and
+            # the registered observer carry the same ALPHA total.
+            automatic_connection = sqlite3.connect(third_path)
+            extra.append(automatic_connection)
+            history._sources["imported"] = (QueryService(automatic_connection), "iod")
+            automatic = history.local_position("imported")
+            epochs.append(automatic.registration_epoch)
+            assert automatic.registration_epoch > recovered.registration_epoch
+            assert (automatic.data_version, automatic.total_changes) == (1, 0)
+            scope = Window("range", BOOT, 100 * NS, 140 * NS)
+            history.prepare(scope)
+            outcome = history._local_future.result(timeout=10)
+            assert history.ready(scope)
+            bracket = history._local_settlement.local_bracket
+            assert bracket is not None
+            assert bracket.opening == bracket.closing
+            imported_alpha = automatic_connection.execute(row_total).fetchone()[0]
+            local_alpha = local.connection.execute(
+                row_total + " WHERE app_id=17").fetchone()[0]
+            assert imported_alpha == 50
+            assert next(row.read_bytes for row in outcome.ranking
+                        if row.app_key == ALPHA) == local_alpha + imported_alpha
         finally:
             replacement.connection.close()
 
         assert len(epochs) == len(set(epochs))
         assert all(later > earlier for earlier, later in zip(epochs, epochs[1:]))
+
+        # A retired source keeps its path bound. An unseen connection opened
+        # before that path's file was replaced is refused even under a new name,
+        # a refusal spends no epoch, and a connection opened afterwards is
+        # proven and accepted.
+        other = _committed_store(tmp_path / "other.db", ((ALPHA, 7, 60),))
+        other_path = _db_path(other)
+        unseen_stale = sqlite3.connect(other_path)
+        extra.append(unseen_stale)
+        assert unseen_stale.execute(row_total).fetchone()[0] == 60
+        history.add_source(
+            QueryService(other.connection), collector_id="retired", owner="iod")
+        other.connection.close()
+        history.remove_source("retired")
+        stale_other = _committed_store(tmp_path / "stale.db", ((ALPHA, 8, 70),))
+        stale_other.connection.close()
+        os.replace(tmp_path / "stale.db", other_path)
+        assert unseen_stale.execute(row_total).fetchone()[0] == 60
+        next_epoch = history._next_registration_epoch
+        with pytest.raises(ValueError, match="history source"):
+            history.add_source(
+                QueryService(unseen_stale), collector_id="retired2", owner="iod")
+        assert history._next_registration_epoch == next_epoch
+        assert id(unseen_stale) not in history._connection_bindings
+        fresh_other = sqlite3.connect(other_path)
+        extra.append(fresh_other)
+        history.add_source(
+            QueryService(fresh_other), collector_id="retired2", owner="iod")
+        assert history.local_position("retired2").registration_epoch == next_epoch
+        assert history._next_registration_epoch == next_epoch + 1
+
+        # A source whose journal keeps committed frames outside its main file is
+        # not byte-identical to that file, so the database-image comparison keeps
+        # a correctly bound rebinding working instead of refusing it.
+        wal = _committed_store(tmp_path / "wal.db", ((ALPHA, 9, 80),))
+        wal_path = _db_path(wal)
+        wal.connection.execute("PRAGMA journal_mode=WAL")
+        wal.connection.execute("PRAGMA wal_autocheckpoint=0")
+        wal.connection.execute(
+            "UPDATE app_lifetime_total SET read_bytes = read_bytes + 1")
+        wal.connection.commit()
+        with open(wal_path, "rb") as handle:
+            wal_bytes = handle.read()
+        assert wal.connection.serialize(name="main") != wal_bytes
+        history.add_source(QueryService(wal.connection), collector_id="wal", owner="iod")
+        wal_rebound = sqlite3.connect(wal_path)
+        extra.append(wal_rebound)
+        history.add_source(QueryService(wal_rebound), collector_id="wal", owner="iod")
+        assert history.local_position("wal").name == "wal"
+        wal.connection.close()
     finally:
         history.close()
         for connection in extra:
