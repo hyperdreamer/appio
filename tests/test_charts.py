@@ -9,6 +9,7 @@ inspected for the "no zero line" rule and for visible reason text.
 from __future__ import annotations
 
 import math
+from contextlib import contextmanager
 from dataclasses import replace
 
 import pytest
@@ -263,14 +264,14 @@ def watch_build_groups(monkeypatch):
 
 
 def watch_scale(monkeypatch):
-    visits: list[tuple[str, int]] = []
-    original = charts_module._rate_maximum
+    visits: list[int] = []
+    original = charts_module._scale_maxima
 
-    def wrapper(columns, durations, field):
-        visits.append((field, len(columns)))
-        return original(columns, durations, field)
+    def wrapper(columns, durations):
+        visits.append(len(columns))
+        return original(columns, durations)
 
-    monkeypatch.setattr(charts_module, "_rate_maximum", wrapper)
+    monkeypatch.setattr(charts_module, "_scale_maxima", wrapper)
     return visits
 
 
@@ -290,6 +291,265 @@ def watch_updates(chart, monkeypatch):
     calls: list[bool] = []
     monkeypatch.setattr(chart, "update", lambda: calls.append(True))
     return calls
+
+
+class AppendProbe:
+    """Charge the actual production work of one §8.7 append fixture.
+
+    Every counter is raised by a production primitive or by a raw
+    ``_Sample``/``_Group`` attribute read, never by a test-side hand count:
+
+    * ``_admit_task_point`` validates an incoming point;
+    * ``_samples_equal_at`` compares one full raw prefix position;
+    * ``_aggregate_members`` visits the raw members of one group;
+    * ``_scale_maxima`` reads one cached column's rate pair;
+    * ``_bound_pair`` reads one promotion input pair and ``_merge_groups``
+      writes one promotion output pair;
+    * ``_mapped_y`` reads one cached column for geometry, cached interval
+      iteration is charged to geometry or to promotion merging, and emitted
+      curve/closure coordinates are counted from the returned geometry.
+
+    Raw member reads performed while no aggregation, comparison or geometry
+    phase is active land in ``unaccounted_raw_reads``. That is what charges an
+    alternate full-prefix reducer inserted in ``_append_members`` even though
+    it never calls ``_aggregate_members``. A group bound read made while
+    ``_promote_groups`` is running outside ``_bound_pair`` lands in
+    ``direct_promotion_bound_reads``, and a per-group member range built during
+    promotion lands in ``promotion_ranges``, so a copied member-index vector
+    cannot hide behind the expected pair counts.
+    """
+
+    RAW_FIELDS = (
+        "start",
+        "end",
+        "read_bytes",
+        "write_bytes",
+        "peak_read_bps",
+        "peak_write_bps",
+        "peak_total_bps",
+        "wall_start_seconds",
+        "spans_suspend",
+    )
+
+    def __init__(self) -> None:
+        self.reset()
+
+    def reset(self) -> None:
+        self.validation_visits = 0
+        self.comparison_visits = 0
+        self.aggregate_member_indices: list[int] = []
+        self.scale_column_visits = 0
+        self.bound_reads: list[tuple[int, int]] = []
+        self.bound_writes: list[tuple[int, int]] = []
+        self.promotion_output_bounds: list[tuple[int, int]] = []
+        self.merge_interval_visits = 0
+        self.geometry_column_visits = 0
+        self.interval_visits = 0
+        self.vertex_emit = 0
+        self.closure_emit = 0
+        self.unaccounted_raw_reads: list[str] = []
+        self.direct_promotion_bound_reads: list[str] = []
+        self.promotion_ranges: list[tuple[int, tuple[int, ...]]] = []
+        self._phase: str | None = None
+        self._promotions = 0
+
+    # -- installation ---------------------------------------------------
+
+    def install(self, monkeypatch) -> "AppendProbe":
+        probe = self
+        base_sample = charts_module._Sample
+        base_group = charts_module._Group
+        builtin_range = range
+
+        class CountedSample(base_sample):  # type: ignore[misc, valid-type]
+            __slots__ = ()
+
+        for field in self.RAW_FIELDS:
+            descriptor = getattr(base_sample, field)
+
+            def counted_read(sample, field=field, descriptor=descriptor):
+                probe._raw_read(field)
+                return descriptor.__get__(sample, type(sample))
+
+            def counted_write(sample, value, descriptor=descriptor):
+                descriptor.__set__(sample, value)
+
+            setattr(CountedSample, field, property(counted_read, counted_write))
+
+        class CountedIntervals(tuple):
+            __slots__ = ()
+
+            def __iter__(self):
+                for position in builtin_range(len(self)):
+                    probe._interval_visit()
+                    yield tuple.__getitem__(self, position)
+
+        class CountedGroup(base_group):  # type: ignore[misc, valid-type]
+            __slots__ = ()
+
+            @property
+            def first_index(self):
+                probe._bound_read("first_index")
+                return base_group.first_index.__get__(self, type(self))
+
+            @first_index.setter
+            def first_index(self, value):
+                base_group.first_index.__set__(self, value)
+
+            @property
+            def last_index(self):
+                probe._bound_read("last_index")
+                return base_group.last_index.__get__(self, type(self))
+
+            @last_index.setter
+            def last_index(self, value):
+                base_group.last_index.__set__(self, value)
+
+            @property
+            def intervals(self):
+                return base_group.intervals.__get__(self, type(self))
+
+            @intervals.setter
+            def intervals(self, value):
+                base_group.intervals.__set__(self, CountedIntervals(value))
+
+        monkeypatch.setattr(charts_module, "_Sample", CountedSample)
+        monkeypatch.setattr(charts_module, "_Group", CountedGroup)
+
+        original_admit = charts_module._admit_task_point
+
+        def counted_admit(point):
+            probe.validation_visits += 1
+            return original_admit(point)
+
+        monkeypatch.setattr(charts_module, "_admit_task_point", counted_admit)
+
+        original_equal = charts_module._samples_equal_at
+
+        def counted_equal(left, right, index):
+            probe.comparison_visits += 1
+            with probe._phase_of("compare"):
+                return original_equal(left, right, index)
+
+        monkeypatch.setattr(charts_module, "_samples_equal_at", counted_equal)
+
+        original_aggregate = charts_module._aggregate_members
+
+        def counted_aggregate(samples, first, last, first_run):
+            probe.aggregate_member_indices.extend(builtin_range(first, last + 1))
+            with probe._phase_of("aggregate"):
+                return original_aggregate(samples, first, last, first_run)
+
+        monkeypatch.setattr(charts_module, "_aggregate_members", counted_aggregate)
+
+        original_scale = charts_module._scale_maxima
+
+        def counted_scale(columns, durations):
+            probe.scale_column_visits += len(columns)
+            return original_scale(columns, durations)
+
+        monkeypatch.setattr(charts_module, "_scale_maxima", counted_scale)
+
+        original_bound = charts_module._bound_pair
+
+        def counted_bound(group):
+            with probe._phase_of("bound_pair"):
+                pair = original_bound(group)
+            probe.bound_reads.append(pair)
+            return pair
+
+        monkeypatch.setattr(charts_module, "_bound_pair", counted_bound)
+
+        original_merge = charts_module._merge_groups
+
+        def counted_merge(left, right, first_index, last_index):
+            with probe._phase_of("merge"):
+                merged = original_merge(left, right, first_index, last_index)
+            probe.bound_writes.append(
+                (
+                    base_group.first_index.__get__(merged, type(merged)),
+                    base_group.last_index.__get__(merged, type(merged)),
+                )
+            )
+            return merged
+
+        monkeypatch.setattr(charts_module, "_merge_groups", counted_merge)
+
+        original_promote = charts_module._promote_groups
+
+        def counted_promote(groups):
+            probe._promotions += 1
+            try:
+                with probe._phase_of("promote"):
+                    promoted = original_promote(groups)
+            finally:
+                probe._promotions -= 1
+            probe.promotion_output_bounds.extend(
+                (
+                    base_group.first_index.__get__(group, type(group)),
+                    base_group.last_index.__get__(group, type(group)),
+                )
+                for group in promoted
+            )
+            return promoted
+
+        monkeypatch.setattr(charts_module, "_promote_groups", counted_promote)
+
+        original_mapped = charts_module._mapped_y
+
+        def counted_mapped(*args):
+            probe.geometry_column_visits += 1
+            return original_mapped(*args)
+
+        monkeypatch.setattr(charts_module, "_mapped_y", counted_mapped)
+
+        original_geometry = charts_module._curve_geometry
+
+        def counted_geometry(columns, durations, groups, samples, plot):
+            with probe._phase_of("geometry"):
+                curves, segments = original_geometry(
+                    columns, durations, groups, samples, plot
+                )
+            probe.vertex_emit = sum(len(curve.vertices) for curve in curves)
+            probe.closure_emit = 3 * len(segments)
+            return curves, segments
+
+        monkeypatch.setattr(charts_module, "_curve_geometry", counted_geometry)
+
+        def counted_range(*args):
+            result = builtin_range(*args)
+            if probe._promotions:
+                probe.promotion_ranges.append((len(result), args))
+            return result
+
+        monkeypatch.setattr(charts_module, "range", counted_range, raising=False)
+        return self
+
+    # -- counters --------------------------------------------------------
+
+    @contextmanager
+    def _phase_of(self, phase: str):
+        previous = self._phase
+        self._phase = phase
+        try:
+            yield
+        finally:
+            self._phase = previous
+
+    def _raw_read(self, field: str) -> None:
+        if self._phase in ("aggregate", "compare", "geometry"):
+            return
+        self.unaccounted_raw_reads.append(field)
+
+    def _bound_read(self, field: str) -> None:
+        if self._promotions and self._phase != "bound_pair":
+            self.direct_promotion_bound_reads.append(field)
+
+    def _interval_visit(self) -> None:
+        if self._phase == "merge":
+            self.merge_interval_visits += 1
+        elif self._phase == "geometry":
+            self.interval_visits += 1
 
 
 def assert_no_curve_pixels(chart) -> None:
@@ -1789,7 +2049,7 @@ def test_live_append_work_stays_inside_changed_groups(qtbot, monkeypatch) -> Non
     assert calls == [(28, 30)]
     assert visits == [28, 29, 30]
     assert builds == []
-    assert scale == [("read_bytes", 8), ("write_bytes", 8)]
+    assert scale == [8]
     assert updates == [True]
     assert sum(column.read_bytes for column in tail_chart.columns()) == 35
     assert sum(column.write_bytes for column in tail_chart.columns()) == 61
@@ -1855,7 +2115,7 @@ def test_live_append_work_stays_inside_changed_groups(qtbot, monkeypatch) -> Non
         (32, 32),
     ]
     assert len(bound_reads) == 9
-    assert scale == [("read_bytes", 5), ("write_bytes", 5)]
+    assert scale == [5]
     assert updates == [True]
     assert sum(column.read_bytes for column in promoted_chart.columns()) == 33
     assert sum(column.write_bytes for column in promoted_chart.columns()) == 66
@@ -1864,6 +2124,264 @@ def test_live_append_work_stays_inside_changed_groups(qtbot, monkeypatch) -> Non
         isinstance(group.first_index, int) and isinstance(group.last_index, int)
         for group in promoted_chart._groups
     )
+
+
+def test_live_grouping_is_minimal_power_of_two_and_promotes_bounds(
+    qtbot, monkeypatch
+) -> None:
+    # No retained per-sample membership vector exists to copy during promotion.
+    assert "members" not in charts_module._Group.__slots__
+
+    threshold_cases = {
+        8: (1, 8),
+        9: (2, 5),
+        16: (2, 8),
+        17: (4, 5),
+        32: (4, 8),
+        33: (8, 5),
+    }
+    probe = AppendProbe().install(monkeypatch)
+    chart = make_chart(DualSeriesChart, qtbot, width=WIDE, height=180)
+    assert width_of(chart.plot_rect()) == 8
+
+    for length, (group_width, column_count) in threshold_cases.items():
+        points = dense_points(length)
+        chart.set_task_points(points, identity=("task", "grouping"))
+        assert chart._group_width == group_width
+        assert len(chart.columns()) == column_count
+        assert group_bounds(chart) == [
+            (first, min(first + group_width, length) - 1)
+            for first in range(0, length, group_width)
+        ]
+        assert sum(column.read_bytes for column in chart.columns()) == length
+        assert sum(column.write_bytes for column in chart.columns()) == 2 * length
+
+    # §8.7 dense 32 -> 33: g4/C8 -> g8/C5 with exactly five two-integer bounds.
+    thirty_two = dense_points(32)
+    chart.set_task_points(thirty_two, identity=("task", "promotion"))
+    assert chart._group_width == 4
+    assert len(chart.columns()) == 8
+    probe.reset()
+    chart.append_task_points(
+        thirty_two + (task_point(32 * TEN_NS, read_bytes=1, write_bytes=2),),
+        identity=("task", "promotion"),
+    )
+
+    assert chart._group_width == 8
+    assert len(chart.columns()) == 5
+    assert group_bounds(chart) == [(0, 7), (8, 15), (16, 23), (24, 31), (32, 32)]
+    # The append itself aggregates only the new one-point group.
+    assert probe.aggregate_member_indices == [32]
+    assert probe.unaccounted_raw_reads == []
+    assert probe.validation_visits == 33
+    assert probe.comparison_visits <= 132
+    # Promotion reads exactly one two-integer pair per input column.
+    assert probe.bound_reads == [
+        (0, 3),
+        (4, 7),
+        (8, 11),
+        (12, 15),
+        (16, 19),
+        (20, 23),
+        (24, 27),
+        (28, 31),
+        (32, 32),
+    ]
+    assert len(probe.bound_reads) <= 9
+    # Promotion writes merge pairs only: four merged groups, the odd tail kept.
+    assert probe.bound_writes == [(0, 7), (8, 15), (16, 23), (24, 31)]
+    assert len(probe.bound_writes) <= 5
+    assert probe.promotion_output_bounds == [
+        (0, 7),
+        (8, 15),
+        (16, 23),
+        (24, 31),
+        (32, 32),
+    ]
+    assert all(
+        len(bounds) == 2 and all(isinstance(value, int) for value in bounds)
+        for bounds in probe.promotion_output_bounds
+    )
+    # A direct group-bound read or a per-group member range inside promotion
+    # would be a copied member-index vector, not a pair copy.
+    assert probe.direct_promotion_bound_reads == []
+    assert probe.promotion_ranges == [(5, (0, 9, 2))]
+    assert probe.merge_interval_visits <= 9
+    assert sum(column.read_bytes for column in chart.columns()) == 33
+    assert sum(column.write_bytes for column in chart.columns()) == 66
+
+
+def test_live_append_cost_counts_fragmented_output_and_cached_aggregation(
+    qtbot, monkeypatch
+) -> None:
+    probe = AppendProbe().install(monkeypatch)
+
+    # -- dense 31 buckets: replace the tail, then the equal-input no-op ----
+    dense = make_chart(DualSeriesChart, qtbot, width=WIDE, height=180)
+    assert width_of(dense.plot_rect()) == 8
+    thirty_one = dense_points(31)
+    dense.set_task_points(thirty_one, identity=("task", "cost"))
+    assert dense._group_width == 4
+    assert group_bounds(dense) == [
+        (0, 3),
+        (4, 7),
+        (8, 11),
+        (12, 15),
+        (16, 19),
+        (20, 23),
+        (24, 27),
+        (28, 30),
+    ]
+    changed = thirty_one[:30] + (
+        replace(thirty_one[30], read_bytes=5, write_bytes=1),
+    )
+    probe.reset()
+    dense.append_task_points(changed, identity=("task", "cost"))
+
+    assert probe.validation_visits == 31
+    assert probe.comparison_visits <= 124
+    assert probe.aggregate_member_indices == [28, 29, 30]
+    assert probe.unaccounted_raw_reads == []
+    assert probe.bound_reads == [] and probe.bound_writes == []
+    assert probe.promotion_output_bounds == []
+    assert probe.promotion_ranges == []
+    assert probe.scale_column_visits == 8
+    assert sum(column.read_bytes for column in dense.columns()) == 35
+    assert sum(column.write_bytes for column in dense.columns()) == 61
+    expected_e = 8
+    expected_r = 2
+    expected_v = 16
+    assert sum(len(group.intervals) for group in dense._groups) == expected_e
+    assert len(dense.curves()) == expected_r
+    assert sum(len(curve.vertices) for curve in dense.curves()) == expected_v
+    assert [len(segment.polygon) for segment in dense.segments()] == [11, 11]
+    assert probe.geometry_column_visits == 16
+    assert probe.interval_visits == expected_e
+    assert probe.interval_visits <= 16
+    assert probe.vertex_emit == expected_v
+    assert probe.closure_emit == 6
+    assert (
+        probe.geometry_column_visits
+        + probe.interval_visits
+        + probe.vertex_emit
+        + probe.closure_emit
+        <= 54
+    )
+
+    # Equal input is a no-op: validation/comparison only, no cache work.
+    probe.reset()
+    dense.append_task_points(changed, identity=("task", "cost"))
+    assert probe.validation_visits == 31
+    assert probe.comparison_visits <= 124
+    assert probe.aggregate_member_indices == []
+    assert probe.unaccounted_raw_reads == []
+    assert probe.scale_column_visits == 0
+    assert probe.bound_reads == [] and probe.promotion_ranges == []
+    assert probe.geometry_column_visits == 0
+    assert probe.interval_visits == 0
+    assert probe.vertex_emit == 0
+    assert probe.closure_emit == 0
+
+    # Painting reads cached geometry only: no raw member aggregation.
+    probe.reset()
+    grab = dense.grab()
+    assert grab is not None and not grab.isNull()
+    assert probe.aggregate_member_indices == []
+    assert probe.unaccounted_raw_reads == []
+    assert probe.scale_column_visits == 0
+    assert probe.geometry_column_visits == 0
+    assert probe.vertex_emit == 0 and probe.closure_emit == 0
+
+    # -- dense 32 -> 33 promotion: only index 32 is reaggregated ----------
+    dense.set_task_points(dense_points(32), identity=("task", "cost"))
+    probe.reset()
+    dense.append_task_points(
+        dense_points(32) + (task_point(32 * TEN_NS, read_bytes=1, write_bytes=2),),
+        identity=("task", "cost"),
+    )
+    assert probe.validation_visits == 33
+    assert probe.comparison_visits <= 132
+    assert probe.aggregate_member_indices == [32]
+    assert probe.unaccounted_raw_reads == []
+    assert len(probe.bound_reads) <= 9
+    assert len(probe.bound_writes) <= 5
+    assert probe.promotion_output_bounds == [
+        (0, 7),
+        (8, 15),
+        (16, 23),
+        (24, 31),
+        (32, 32),
+    ]
+    assert probe.direct_promotion_bound_reads == []
+    assert probe.promotion_ranges == [(5, (0, 9, 2))]
+    assert probe.merge_interval_visits <= 9
+    assert probe.scale_column_visits == 5
+    assert sum(column.read_bytes for column in dense.columns()) == 33
+    assert sum(column.write_bytes for column in dense.columns()) == 66
+    assert sum(len(group.intervals) for group in dense._groups) == 5
+    assert len(dense.curves()) == 2
+    assert sum(len(curve.vertices) for curve in dense.curves()) == 10
+    assert [len(segment.polygon) for segment in dense.segments()] == [8, 8]
+    assert probe.geometry_column_visits == 10
+    assert probe.interval_visits == 5
+    assert probe.interval_visits <= 10
+    assert probe.vertex_emit == 10
+    assert probe.closure_emit == 6
+    assert (
+        probe.geometry_column_visits
+        + probe.interval_visits
+        + probe.vertex_emit
+        + probe.closure_emit
+        <= 36
+    )
+
+    # -- fragmented 31 buckets: every measured run keeps its own fragment --
+    fragmented = make_chart(DualSeriesChart, qtbot, width=WIDE, height=180)
+    fragmented_thirty_one = tuple(
+        task_point(index * 2 * TEN_NS, read_bytes=1, write_bytes=2)
+        for index in range(31)
+    )
+    fragmented.set_task_points(fragmented_thirty_one, identity=("task", "fragmented"))
+    assert fragmented._group_width == 4
+    assert len(fragmented.columns()) == 8
+    fragmented_changed = fragmented_thirty_one[:30] + (
+        replace(fragmented_thirty_one[30], read_bytes=5, write_bytes=1),
+    )
+    probe.reset()
+    fragmented.append_task_points(
+        fragmented_changed, identity=("task", "fragmented")
+    )
+
+    assert probe.validation_visits == 31
+    assert probe.comparison_visits <= 124
+    assert probe.aggregate_member_indices == [28, 29, 30]
+    assert probe.unaccounted_raw_reads == []
+    assert probe.bound_reads == [] and probe.promotion_ranges == []
+    assert probe.scale_column_visits == 8
+    assert sum(column.read_bytes for column in fragmented.columns()) == 35
+    assert sum(column.write_bytes for column in fragmented.columns()) == 61
+    expected_e = 31
+    expected_r = 62
+    expected_v = 124
+    assert sum(len(group.intervals) for group in fragmented._groups) == expected_e
+    assert len(fragmented.curves()) == expected_r
+    assert sum(len(curve.vertices) for curve in fragmented.curves()) == expected_v
+    assert [len(segment.polygon) for segment in fragmented.segments()] == [5] * expected_r
+    assert probe.merge_interval_visits == 0
+    assert probe.geometry_column_visits == 16
+    assert probe.interval_visits == expected_e
+    assert probe.interval_visits <= 62
+    assert probe.vertex_emit == expected_v
+    assert probe.closure_emit == 3 * expected_r
+    assert probe.closure_emit == 186
+    assert (
+        probe.geometry_column_visits
+        + probe.interval_visits
+        + probe.vertex_emit
+        + probe.closure_emit
+        <= 388
+    )
+    assert expected_v > 8 and expected_e > 8  # F and E are not capped at W
 
 
 def test_live_rebuild_resize_and_unavailable_reset_preserve_honesty(

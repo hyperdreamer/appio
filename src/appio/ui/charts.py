@@ -576,19 +576,32 @@ class ChartCurve:
         object.__setattr__(self, "vertices", tuple(points))
 
 
-def _rate_maximum(
-    columns: Sequence[ChartColumn], durations: Sequence[int], field: str
-) -> tuple[int, int] | None:
-    """Return the largest (bytes, duration) rate as an exact pair."""
+def _scale_maxima(
+    columns: Sequence[ChartColumn], durations: Sequence[int]
+) -> tuple[tuple[int, int] | None, tuple[int, int] | None]:
+    """Read each cached column's rate pair once for both exact maxima.
 
-    best: tuple[int, int] | None = None
+    One traversal reads ``read_bytes`` and ``write_bytes`` together, so a
+    changed append recomputes both scales in O(columns) aggregate-cache reads
+    and never rescans raw members.
+    """
+
+    read_best: tuple[int, int] | None = None
+    write_best: tuple[int, int] | None = None
     for column, duration in zip(columns, durations):
-        amount = getattr(column, field)
-        if amount <= 0 or duration <= 0:
+        if duration <= 0:
             continue
-        if best is None or amount * best[1] > best[0] * duration:
-            best = (amount, duration)
-    return best
+        if column.read_bytes > 0 and (
+            read_best is None
+            or column.read_bytes * read_best[1] > read_best[0] * duration
+        ):
+            read_best = (column.read_bytes, duration)
+        if column.write_bytes > 0 and (
+            write_best is None
+            or column.write_bytes * write_best[1] > write_best[0] * duration
+        ):
+            write_best = (column.write_bytes, duration)
+    return read_best, write_best
 
 
 def _mapped_y(
@@ -636,8 +649,7 @@ def _curve_geometry(
     x_span = right - left
     centre = (top + bottom) / 2.0
     half = (bottom - top) / 2.0
-    read_scale = _rate_maximum(columns, durations, "read_bytes")
-    write_scale = _rate_maximum(columns, durations, "write_bytes")
+    read_scale, write_scale = _scale_maxima(columns, durations)
     heights = {
         "read": tuple(
             _mapped_y(column.read_bytes, duration, read_scale, centre, -half, top, centre)
