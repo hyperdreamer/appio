@@ -4452,3 +4452,115 @@ def test_task4_m089_invalid_file_result_preserves_inner_failure_reason(qtbot, mo
     assert window.files_view.unavailable_text() == (
         "not_retained: file history is not available for this window"
     )
+
+
+def test_typed_refusal_transitions_own_category_and_preserve_frame(qtbot):
+    from appio.ui.render_model import PresentationRefusal
+
+    window, _, history, _ = controlled_build(qtbot)
+    window._timer.stop()
+    now = [END - RAW_BUCKET_NS // 2]
+    window._clock_ns = lambda: now[0]
+    window._tick_target()
+    first = window._pending
+    assert first is not None
+    apply_scope(window, history, first)
+    assert window._displayed == first
+    ranking_reads = history.ranking_reads
+    launch = Window("launch", BOOT, launch_id=1)
+    launch_text = (
+        "Launch window disabled: device and file activity are not stored per launch."
+    )
+    refusal_error = WindowUnavailableError("launch_attribution", launch_text)
+
+    # A shell prepare precheck refusal is typed, keeps the last applied frame,
+    # creates no pending/floor/PrepareRetry and rethrows through the seam.
+    history.prepare_failures.extend([refusal_error, refusal_error])
+    with pytest.raises(WindowUnavailableError):
+        window.show_window(launch)
+    record = window._presentation_refusal
+    assert isinstance(record, PresentationRefusal)
+    assert (record.origin, record.window, record.reason) == (
+        "shell_prepare",
+        launch,
+        "launch_attribution",
+    )
+    assert record.text == str(refusal_error)
+    assert window.error_label.text() == str(refusal_error)
+    assert window._displayed == first
+    assert window._pending is None and window._pending_since is None
+    assert window._prepare_retry is None and window._retry_after is None
+    assert history.ranking_reads == ranking_reads
+    attempts = list(history.prepare_calls)
+    assert attempts[-1] == launch
+
+    # The ordinary deferred tick re-encounters the same typed refusal and
+    # preserves category, Window, text and frame; it never clears it.
+    with pytest.raises(WindowUnavailableError):
+        window._tick_target()
+    assert window._presentation_refusal == record
+    assert window.error_label.text() == str(refusal_error)
+    assert window._displayed == first
+    assert len(history.prepare_calls) == len(attempts) + 1
+    assert history.prepare_calls[-1] == launch
+
+    # An operational preparation failure supersedes only the shell_prepare
+    # refusal; the frozen seam owns the PrepareRetry/error widget.
+    supported = Window("since_boot", BOOT, end_mono_ns=END + RAW_BUCKET_NS)
+    history.prepare_failures.append(OSError("disk read failed"))
+    with pytest.raises(OSError, match="disk read failed"):
+        window.show_window(supported)
+    assert window._presentation_refusal is None
+    retry = window._prepare_retry
+    assert retry is not None and retry.owner == "explicit"
+    assert retry.window == supported
+    assert window._prepare_error == "appio: disk read failed"
+    assert window._displayed == first
+    assert window._retry_after is None
+
+    # The named retry is the only retry seam; acceptance clears the operational
+    # marker and its own mirrored error, not a detached label.
+    window.show_window(supported)
+    assert history.prepare_calls[-1] == supported
+    assert window._pending == supported and window._prepare_retry is None
+    assert window.error_label.text() == ""
+    apply_scope(window, history, supported)
+    assert window._displayed == supported
+
+    # A direct set_window refusal emits direct_view to the shell before the
+    # supported adoption; the shell's retained _displayed never recreates it.
+    view = window.view
+    assert view is not None
+    reads_before_direct = history.ranking_reads
+    view.set_window(launch)
+    direct = window._presentation_refusal
+    assert isinstance(direct, PresentationRefusal)
+    assert (direct.origin, direct.window, direct.reason, direct.text) == (
+        "direct_view",
+        launch,
+        "launch_attribution",
+        str(refusal_error),
+    )
+    assert view.overview_age.isHidden() is True
+    assert window._displayed == supported
+    assert history.ranking_reads == reads_before_direct
+
+    # A supported shell request does not clear a direct_view refusal; only the
+    # supported view adoption does.
+    adopted = Window("since_boot", BOOT, end_mono_ns=END + 2 * RAW_BUCKET_NS)
+    window.show_window(adopted)
+    assert window._pending == adopted
+    assert window._presentation_refusal == direct
+    apply_scope(window, history, adopted)
+    assert window._presentation_refusal is None
+    assert window._displayed == adopted
+
+    # The frozen no-target reset clears the typed presentation state too.
+    view.set_window(launch)
+    assert window._presentation_refusal is not None
+    window._deferred_target = None
+    window._deferred_origin = None
+    window._current_window = lambda *_args: None
+    window._tick_target()
+    assert window._presentation_refusal is None
+    assert window._displayed is None
