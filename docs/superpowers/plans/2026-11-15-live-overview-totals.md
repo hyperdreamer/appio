@@ -12,6 +12,8 @@
 
 **Authority:** `docs/superpowers/specs/2026-11-15-live-overview-totals-spec.md`, approved revision 7, SHA-256 `526acaf2ce14aa8c13de530457d43efe5ff4583682d3c0a701a4a3931ae5c948`; approved design `docs/superpowers/specs/2026-11-15-live-overview-totals-design.md`, SHA-256 `8d6941b545ba15c9338f94df63d9d5c6b0b861e7cc7f14f8e85e2a675a6d70d9`. Inspected implementation baseline: `6624162ea8594021de74c0bae5ec26fedee36e30`. Section references below mean the approved specification unless explicitly prefixed “recovery”. Baseline source line ranges are navigation anchors; locate the named symbols again after earlier tasks land.
 
+> **Epoch 2 recovery note:** This is a plan-only repair within the approved design/specification and the existing controller fence. The frozen task bodies remain unchanged except for Task 14's predecessor line. Tasks 17 and 18 are serial regression prerequisites for the existing acceptance sequence: they repair fixture ownership and settlement evidence before Task 14 is dispatched. This session adds no implementation, test, controller-state, design, specification, runtime/package dependency, or host-transition change.
+
 ## Global Constraints
 
 - “No dependency, schema migration, sampling change, device-attribution relaxation, new scope control, privileged action, service repair, or host transition is part of this change.” (§1.2.) Preserve Python >=3.14 and PyQt6>=6.6 from `pyproject.toml`; do not edit its runtime dependencies.
@@ -949,7 +951,7 @@ git commit -m "feat(ui): append timelines with series metadata identities"
 **Implementer tier:** Capable
 
 **Lane:** `acceptance`
-**Depends on:** Task 12, Task 13
+**Depends on:** Task 12, Task 13, Task 18
 **Specification:** §§12.1–12.4, 12.8–12.9, especially D01/D02/D03/D05/D06/D07. This is the first full router/client/source discriminator pass after implementation sequencing is complete.
 
 **Files:**
@@ -1308,3 +1310,205 @@ If chart code changed, explicitly add `src/appio/ui/charts.py` before committing
 ### Specification coverage and final review index
 
 This is part of Task16's acceptance brief, not another scheduler task. It is also the planning self-review map: §§1–2→1/2; §§3–4→4/5/6/7; §5→2/3/6/7; §6→9/12; §7→8; §8→10/13; §9→11/12; §10 and §§12.1–12.8→14/15/16; §12.9 gates→14/15/16; §13 exclusions→Global Constraints. Amendment coverage: A01/A02/A05/A06→10/13/16; A03/A04→6/8/9/15; A07→11/12/15; A08→5/6/12/14; A09/A10→1/4/6/14; A11→1/8/9/13/15; A12/A18→5/14; A13→9/12/14; A14/A15/A16→2/3/6/14; A17→7/14. D01→6/12/14; D02/D03→4/6/7/14; D04→1/8/13/15; D05/D06→2/3/6/14; D07→12/14; D08→11/12/15; D09→9/11/15; D10→15; D11→10/12/15/16. All execution evidence is prospective until those tasks run.
+## Task 17: Repair P3 fixture clock and production settlement ownership
+
+**Implementer tier:** Capable
+
+**Lane:** `regression`
+**Depends on:** Task 12, Task 13
+**Specification:** §§3.1, 3.3-3.4, 5.1-5.2, 6, 9.1, 12.1-12.4 and 12.8-12.9 (D01/D02/D03/D05/D06/D07); recovery §§4.4-4.5. This is a fixture and acceptance-consumer repair. It does not change the approved async policy, wire protocol, producer, schema, sampling, or accounting behavior.
+
+**Files:**
+
+- Modify/Test: `tests/p3/acceptance_harness.py:1-674`, `tests/p3/test_history_overlap_entry.py:1-228`, `tests/p3/test_p3_acceptance.py:1-224`, `tests/p3/test_p3_adversarial.py:1-468`
+- Read-only: `src/appio/iod.py`, `src/appio/iod_history.py`, `src/appio/iodclient.py`, `src/appio/history_router.py`, `src/appio/ui/collector_window.py`, `tests/p3/test_iodclient.py`, `tests/p3/test_history_router.py`, and the approved design/specification
+- Files/protocol/producers are not edit scope. Do not modify any production module, daemon payload schema, socket framing, fixture store schema, or producer to make these tests pass.
+
+**Interfaces:**
+
+- Consumes the real `P3Harness` fixture lifecycle: `enable()`, `open_gui()`, `pump()`, `until()`, `settle()`, `rpc()`, `query()`, and `wire()`. The harness must continue to use its real daemon, AF_UNIX socket, `IodClient`, `HistoryRouter`, `CollectorWindow`, SQLite fixture, and original daemon payload assertions.
+- Consumes `IodClient.query_transport(future) -> QueryTransportState` and `retire_query_connection(future) -> bool`; observe the phase and request identity of every router-owned historical Future instead of inferring completion from `Future.done()` alone. A direct test-owned RPC is allowed only after the shell/router and every associated historical operation have reached terminal ownership.
+- Consumes `HistoryRouter.drain() -> bool`, `HistoryRouter.ready(window) -> bool`, `HistoryRouter.pending_work`, `CollectorWindow.refresh()`, `CollectorWindow.apply_ready_frame()`, and the existing production poll/readiness path. Do not add a synchronous production getter, a fixture-completed record, a fake successful response/certificate, a global scheduler bypass, an increased timeout, or a `query_busy` retry that hides unsolicited overlap.
+- Produces one test-only bounded settlement observation, if a helper is needed, that records progress, submitted request identities, and per-request transport phases. It drives one initial production `refresh()` (including its normal probe), never resubmits probes while waiting, never calls direct detail getters, and never fabricates readiness. It must stop with a diagnostic when GUI timers/probes keep enqueueing work instead of looping forever.
+- The supplied client age clock is forwarded to `IodClient` exactly once. The fixture has separate BOOTTIME recovery and MONOTONIC age/transport clocks. In the production `run_interactive` factory, preserve the supplied `clock_ns` already present in `IodClient` kwargs; `client_factory` must not pass a second `clock_ns=` alongside `**kwargs`. In `P3Harness.open_gui()`, use one test-controlled age-clock callable for `IodClient(clock_ns=...)`, `HistoryRouter(clock_ns=...)`, and `CollectorWindow(age_clock_ns=...)`, while `CollectorWindow(clock_ns=...)` remains the recovery clock. Preserve the daemon-only `HistoryRpc` execution-clock partial at `P3Harness.__enter__` and the overlap-entry test; it controls the daemon query budget and is not the duplicate keyword source. Do not collapse BOOTTIME recovery and MONOTONIC age/transport domains.
+
+- Never execute `reboot`, `shutdown`, `poweroff`, `halt`, `kexec`, any `systemctl` power or sleep verb, `init 0|6`, or `telinit 0|6`; never restart or stop the display manager or `graphical.target`; never terminate your session or signal the process tree that hosts the PM. If you conclude a host transition is required, write `reboot-required.json` with `{schema: 1, trigger, evidence: [{path, sha256}], provenance: {run_id, lane, attempt, dispatch_key, observed_boot_id}}`, then report it and stop.
+
+- Add this concrete owner-thread trace to the fixture helper or the focused mechanism test without turning it into a production API:
+
+```python
+def settle_production_owner(self, *, gui=None):
+    gui = gui or self.gui
+    window, history, client = gui.window, gui.history, gui.client
+    observed = []
+    real_query = client.query
+
+    def remember(future):
+        if not any(bound is future for bound, initial in observed):
+            observed.append((future, client.query_transport(future)))
+
+    def capture_router_query(request):
+        future = real_query(request)
+        remember(future)
+        return future
+
+    # MAX_INFLIGHT is one; retain any occupant admitted before this helper.
+    if history._occupant is not None:
+        remember(history._occupant[1])
+    client.query = capture_router_query
+    try:
+        window._timer.stop()
+        window._poll_timer.stop()
+        after = window.facts_applied
+        window.refresh()              # one production admission, never an idle-loop refresh
+        deadline = time.monotonic() + 5.0
+        last_progress = None
+
+        def owner_step():
+            nonlocal last_progress
+            QApplication.processEvents()
+            floor = window._retry_after
+            clock_ns = window._clock_ns
+            if floor is not None and clock_ns() < floor:
+                # Preserve the harness's existing virtual BOOTTIME floor driver.
+                window._clock_ns = lambda clock_ns=clock_ns, floor=floor: max(clock_ns(), floor)
+                if window._pending is None:
+                    window._tick_target()
+            # This production path drains and notifies even without a pending frame.
+            window.apply_ready_frame(context="poll")
+            window._poll_timer.stop()  # the fixture explicitly drives this stopped timer's path
+            trace = []
+            for index, (future, initial) in enumerate(observed):
+                state = client.query_transport(future)
+                assert (state.request, state.connection_generation, state.request_id) == (
+                    initial.request, initial.connection_generation, initial.request_id)
+                if future.done() and not future.cancelled():
+                    error = future.exception()
+                    assert getattr(error, "reason", None) != "query_busy", (state, error)
+                trace.append((index, state.request_id, state.phase))
+            progress = (window.facts_applied, window._pending, window._prepare_retry,
+                        history.pending_work, window._displayed, window._target,
+                        window._probe_inflight, window._probe_successor, tuple(trace))
+            previous = last_progress
+            last_progress = progress
+            if time.monotonic() >= deadline:
+                raise AssertionError({"previous": previous, "current": progress,
+                                      "last_request_phase": trace})
+            if (window._pending is not None or history.pending_work
+                    or window._probe_inflight is not None or window._probe_successor is not None):
+                return False
+            displayed = window._displayed
+            ready = (window._target is None or (
+                displayed is not None and displayed == window._target
+                and history.ready(displayed)))
+            return (window.facts_applied > after and ready
+                    and window._prepare_retry is None and previous == progress
+                    and all(phase == "terminal" for _, _, phase in trace))
+
+        self.until(owner_step, seconds=5.0, process_events=True)
+        window._timer.stop()
+        window._poll_timer.stop()
+        states = tuple(client.query_transport(future) for future, initial in observed)
+        assert all(state.phase == "terminal" for state in states), states
+        return states
+    finally:
+        client.query = real_query
+```
+
+The test-owned wrapper binds each observed Future to its actual initial `QueryTransportState`, seeds any existing wire occupant, and is removed before a direct test RPC. `P3Harness.until()` supplies the real `self.pump(2)` transport turns, Qt delivery, and existing worker yield between owner steps; `time` and `QApplication` are the existing harness imports. Preserve the existing virtual retry-floor driver without advancing the age clock. Do not consume `history.drain()`'s change bit before the shell sees it: unconditional `apply_ready_frame(context="poll")` owns that drain and its refresh notification, including pending-frame-free lazy detail delivery. Two identical quiescent progress observations must have an intervening real `until()` pump/yield. The focused sent-request arm must assert a nonempty observation and an actual request id, so an empty cache/no-request path cannot be its evidence; legitimate no-target refusal cases retain their existing assertions. For disconnect/refusal arms, bind an explicitly expected `lost`/`not_sent` outcome to its real request and original assertion rather than demanding an impossible terminal reply or accepting `active`/`expired`. `Future.done()` above only diagnoses a completed error; it never grants RPC permission. A `query_busy` result is an assertion failure, not a retry.
+
+- Preserve every existing test name and substantive assertion in all four files, including the byte/ownership/A22/cursor/restart/baseline/paging assertions. In particular, retain `test_live_incomplete_reply_cannot_resurrect_export_overlap_in_production_entry`, all six `test_p3_acceptance` tests, all adversarial test names and parameter cases, the exact daemon payload fields, the single-owner-thread assertion, the `[unit:acceptance-0100..0600] + [APP]` continuation order, and the mutation-path confinement check.
+- Add exactly these focused regression names once: `test_p3_fixture_settlement_drives_production_owner_to_terminal_before_rpc` in `tests/p3/test_history_overlap_entry.py` and `test_p3_fixture_uses_one_age_clock_without_duplicate_constructor_keywords` in `tests/p3/test_p3_acceptance.py`. They are mechanism probes, not replacements for existing acceptance tests.
+
+- [ ] **Step 1: Reproduce and classify the existing fixture failures without changing source.** Run `python -m pytest -q tests/p3/test_history_overlap_entry.py tests/p3/test_p3_acceptance.py tests/p3/test_p3_adversarial.py`. Record the duplicate `clock_ns` constructor failure separately from empty-ranking/`HistoryPending` failures. If a named observation is already green in the current checkout, record it as a preservation control and use the mutations in Step 5; never fabricate a RED run.
+- [ ] **Step 2: Repair the harness clock composition.** Adapt the four named P3 consumers to current symbols and line locations, not stale report lines. In the live `run_interactive` factory test, keep the `clock_ns` callable supplied through `kwargs` and remove the second `clock_ns=` argument from `client_factory`; assert the exact callable identity survives into `IodClient`. Catch constructor `TypeError` at that test-owned boundary and assert its absence before returning the client. Share that test-only construction boundary with the focused clock regression so restoring the duplicate keyword fails its owned constructor-success assertion, not an uncaught setup error. Inside the existing factory, using its existing `raw_client`, `socket_path`, `kwargs`, `verify`, and `Peer` bindings:
+
+```python
+supplied_clock = kwargs["clock_ns"]
+constructor_error = None
+client = None
+try:
+    client = raw_client(socket_path, **kwargs, peer_reader=lambda sock: Peer(88, 0, 987),
+                        path_verifier=verify)
+except TypeError as error:
+    constructor_error = error
+assert constructor_error is None, ("client constructor rejected supplied clock", constructor_error)
+assert client is not None and client._clock_ns is supplied_clock
+```
+
+In `P3Harness.open_gui()`, provide one injected MONOTONIC age clock to `IodClient`, `HistoryRouter`, and `CollectorWindow(age_clock_ns=...)`, with the BOOTTIME fixture clock passed only as `CollectorWindow(clock_ns=...)`. Preserve the separate `HistoryRpc` `clock_ns=lambda: 0` patch used for deterministic daemon query-budget tests; it is not the duplicate constructor keyword. Keep the real daemon-side `HistoryRpc` construction, query execution, socket peer identity, virtual filesystem, SQLite writes, restart/disable commands-as-data, and all existing schema/payload checks. Do not replace a clock with wall time or make the age clock serve BOOTTIME recovery predicates.
+- [ ] **Step 3: Make settlement an owner-thread production trace.** Before `P3Harness.rpc()` or a test-owned `client.query()` is used, drive the live shell through its actual `refresh()`/poll path, pump the real client, drain the real router through the shell owner path, and apply a stored frame only through `apply_ready_frame()`. Await lazy detail/series/totals work through `HistoryRouter.drain()` and `ready(window)`; direct getters remain lazy and are not used as a wait primitive. The terminal precondition must show a new applied fact, `_pending is None`, `_prepare_retry is None`, `history.pending_work is False`, no outstanding/successor probe, the displayed target is ready (or the original no-target refusal), and every observed historical request has the expected identity and terminal `QueryTransportState`. Preserve explicitly expected disconnect/refusal outcomes as described above. Do not call `refresh()` on every loop turn when a pending frame is waiting for readiness, and do not re-submit a probe that would retire the preparation being settled.
+- [ ] **Step 4: Prevent unsolicited overlap while preserving the real transport.** Keep the existing stopped test timers and explicit Qt driving only where the fixture already owns them; do not disable the production router drain or replace the shell poll path with a global event/scheduler bypass. A bounded helper may use a monotonic safety deadline, but it must assert a progress token and report the newly submitted request and its `QueryTransportState` when progress stalls. A `query_busy` response is a test failure with the observed state, not a reason to retry until the overlap disappears. Direct test-owned RPC is performed once after the terminal precondition, then its original wire/client result and payload assertions run unchanged.
+- [ ] **Step 5: Add falsifiable controls in a disposable copy.** In one disposable copy, restore the duplicate `clock_ns=` argument inside the Step 2 `try` while `kwargs` already contains the supplied callable; prove the focused clock regression fails at the owned `assert constructor_error is None`, after catching the expected `TypeError`. Its green/restored arms also assert exact clock identity. For settlement, use controlled Events/Futures at the existing real worker/completion-delivery boundary and observe an actual sent request before checking the RPC gate. Assert that completed-but-undrained work still forbids RPC, that `active` and `expired` request identities still forbid RPC, and that no new request/probe appears on an owner-only turn. In separate disposable copies remove the owner drain, substitute `Future.done()` for readiness, submit a fresh probe on every loop turn, or admit RPC during `active`/`expired`; each must fail the corresponding owned publication/phase/submission assertion under that controlled schedule, not merely exhaust the deadline. Factor the helper's owner step/predicate into test-only observations if necessary to inspect these states before releasing each barrier in `finally`. Restore each mutation and rerun its green control. No uncaught constructor/setup/collection/import error, timeout-only result, inflated timeout, fake certificate/response, or unobserved transport counts as a kill. Return at least two important negatives with their baseline/mutated/restored assertion evidence to the independent task review.
+- [ ] **Step 6: Run the focused P3 gate and verify the preserved inventory.** Run `python -m pytest -q tests/p3/test_history_overlap_entry.py tests/p3/test_p3_acceptance.py tests/p3/test_p3_adversarial.py`, then `python -m pytest --collect-only -q` for those files. Confirm the two new names occur exactly once, all original names remain collected, no daemon payload/schema/socket assertions were removed, and the terminal-observation helper cannot enqueue work indefinitely. The full-project gate remains Task 16's unchanged command; this task does not add a timeout or a scheduler bypass.
+- [ ] **Step 7: Commit only the P3 fixture/consumer repair.**
+
+```bash
+git add tests/p3/acceptance_harness.py tests/p3/test_history_overlap_entry.py tests/p3/test_p3_acceptance.py tests/p3/test_p3_adversarial.py
+git commit -m "test(p3): settle live fixture ownership before acceptance RPCs"
+```
+
+Return the duplicate-clock diagnosis, terminal transport-state traces, focused results, preserved-name inventory, disposable mutation results, and the exact revision to the deterministic controller. Do not edit or claim a fix in production files, files/protocol code, producers, the approved design/specification, or the plan.
+
+## Task 18: Pin P4 owner-thread Files settlement and committed-store provenance
+
+**Implementer tier:** Capable
+
+**Lane:** `regression`
+**Depends on:** Task 17
+**Specification:** §§3.1, 3.3-3.4, 5.4, 6.4, 12.8-12.9 (D02/D03/D05/D06/D07); recovery §§4.4-4.5. This task repairs only P4 regression ownership and test settlement evidence before Task 14; it does not redefine Files coverage, served intervals, store schemas, or the wire protocol. Do not add production timers/getters or edit the FilesView, query, or store contracts; shorten/remove required real-store assertions; or fabricate a capture.
+
+- Never execute `reboot`, `shutdown`, `poweroff`, `halt`, `kexec`, any `systemctl` power or sleep verb, `init 0|6`, or `telinit 0|6`; never restart or stop the display manager or `graphical.target`; never terminate your session or signal the process tree that hosts the PM. If you conclude a host transition is required, write `reboot-required.json` with `{schema: 1, trigger, evidence: [{path, sha256}], provenance: {run_id, lane, attempt, dispatch_key, observed_boot_id}}`, then report it and stop.
+
+**Files:**
+
+- Modify/Test: `tests/p4/test_file_history_isolation.py:1-194`, `tests/p4/test_file_served_interval.py:1-260`, `tests/p4/test_files_tab_real_store.py:1-193`
+- Read-only: `tests/p4/test_file_history_router.py:1-807` for its existing owner-drain pattern; `src/appio/history_router.py`, `src/appio/ui/files_view.py`, `tests/p4/acceptance/files_tab_pivot_case.sqlite.gz`, its manifest/capture/oracle artifacts, `src/appio/files.py`, the file store/BPF producers, `tests/p4/test_files_tab_local_result.py`, `tests/p4/test_files_tab_no_matches.py`, `tests/p4/test_files_tab_unavailable.py`, and the approved design/specification
+- Do not change file protocol fields, SQLite schema/migrations, BPF/file producers, capture bytes, oracle expectations, or any P3 source/fixture file. If correctly driven consumers contradict a production contract, stop and report the exact failing boundary evidence for a separate reviewed plan change; this task authorizes no production edits.
+
+**Interfaces:**
+
+- Consumes `HistoryRouter.request_file_view(...)`, `HistoryRouter.drain()`, `HistoryRouter.ready(window)`, `HistoryRouter.pending_work`, `_consume_local()`, and the real local/remote transport state. `HistoryRouter.drain()` is the owner-thread settlement point: worker callbacks only enqueue immutable outcomes; the owner drain observes completion, performs closing reads, publishes the result, reaps work, and notifies.
+- Consumes `FilesView.request_refresh()`, `FilesView.flush_refresh()`, `_deliver(...)`, `set_window(...)`, `FileViewResult(table, coverage, served_gap_count)`, and the existing failure boundary. Files has no independent poll loop. Direct detail getters, including `_exact_part`, remain lazy and must be awaited through the production drain/readiness gate rather than made synchronous.
+- Produces exactly these focused regression names once: `test_files_settlement_requires_owner_thread_drain_before_publication` in `tests/p4/test_file_served_interval.py` and `test_committed_files_capture_preserves_served_interval_and_watermark_isolation` in `tests/p4/test_files_tab_real_store.py`. Preserve every existing test name and substantive assertion in the three modified files and the read-only router control, including `test_R01_boot_lookup_failure_preserves_process_T_D_history`, both `bad_first` cases, all R02/prepare-failure cases, `test_real_router_disclosure_names_the_served_interval`, `test_gap_covered_mid_hour_unproved_segment_is_served`, and `test_real_capture_serves_the_same_interval_when_available`.
+
+```python
+def await_files_result(router, future, qtbot, *, request):
+    deadline = time.monotonic() + 5.0
+    progress = []
+
+    def owner_step():
+        changed = router.drain()      # publication and reaping on the test owner thread
+        progress.append((changed, router.pending_work, future.done()))
+        assert time.monotonic() < deadline, {"request": request, "progress": progress[-2:]}
+        return future.done() and not router.pending_work
+
+    qtbot.waitUntil(owner_step, timeout=5_000)  # yields Qt/worker delivery between turns
+    return future.result(timeout=0)
+
+future = router.request_file_view(router.registry.id_for(APP), REQUESTED,
+                                  "bytes_total", "desc", None)
+result = await_files_result(router, future, qtbot,
+                            request=(APP, REQUESTED, "bytes_total", "desc", None))
+assert router.pending_work is False
+assert result.coverage.window == REQUESTED
+assert result.served_gap_count is None or isinstance(result.served_gap_count, int)
+```
+
+Use the existing `time`/`qtbot` bindings (add the test-only import/fixture parameter where needed); no tight fixed-iteration or busy-wait loop. For a `FilesView` fixture, call `view.set_window(window)`/`view.request_refresh()` through the real scope path, provide the owner pump that calls `router.drain()`, and let Qt deliver `_deliver(...)` before inspecting `view.last_result`; include the view's settled state in that predicate. Do not use private worker `Future.done()` as publication. The helper must report the last request, owner-thread drain result, and pending state when the safety deadline expires; these bounded diagnostics are not mutation-kill evidence.
+
+- [ ] **Step 1: Reproduce the P4 failures at the owning boundary.** Run `env -u APPIO_ACCEPTANCE_REQUIRED -u APPIO_ACCEPTANCE_CAPTURE python -m pytest -q tests/p4/test_file_history_router.py tests/p4/test_file_history_isolation.py tests/p4/test_file_served_interval.py tests/p4/test_files_tab_real_store.py`. Separate lazy-publication/owner-drain failures from watermark isolation and committed-capture/oracle failures. The committed gzip fixture already fails for absence/hash drift without required mode. Preserve the distinct optional external-capture test and its existing skip/required-failure semantics; never set the required flag on the full module or require a new `/tmp` capture.
+- [ ] **Step 2: Pin local Files settlement to the real owner drain.** Use the actual `request_file_view()` or `FilesView` refresh/flush path, then drive the owner thread with `router.drain()` until the registered outward Future is published. A private worker Future becoming done is only worker completion; the outward Future is completed by owner publication. Assert the owner-thread drain observes the immutable outcome, performs the final scope/position checks, and leaves no pending work before reading `FileViewResult`. A bounded yielding test safety deadline is allowed; no Qt-thread production wait/sleep, direct synchronous getter, fake result, or scheduler bypass is allowed.
+- [ ] **Step 3: Pin FilesView delivery and failure semantics.** Exercise `request_refresh()`/`flush_refresh()` and `_deliver()` with the production scope/generation path. Prove that a pending local Files page is delivered only after owner-thread drain, stale generation results cannot publish, an unavailable source is not an empty successful table, and a current file-source failure clears availability without suppressing independent process history. Keep the exact `served_gap_count` None-versus-integer contract and `FileViewResult` field inventory.
+- [ ] **Step 4: Preserve watermark isolation and served-interval disclosure.** Keep the authorizer-based denial of `boot.file_finalized_through_mono_ns` and assert process ranking/T/D history, task/device shares, series totals, and the exact `file_source_unavailable` reason remain visible. Keep the `bad_first` ordering cases. For the served-interval fixtures, retain `SERVED = [T0=2h,T1=4h]` versus `REQUESTED = [T0=0,T1=6h]`, the eight footer labels containing `served interval only` and `T0=2h 0m 0s through T1=4h 0m 0s after boot`, the `rows retained;` disclosure, gap evidence 0, coverage scalar 2, `view.state == "incomplete"`, and the requested-window result/coverage bindings.
+- [ ] **Step 5: Verify the committed acceptance fixture independently of the app implementation.** Preserve the committed `tests/p4/acceptance/files_tab_pivot_case.sqlite.gz` bytes and manifest digest. Re-run its standard-library-only oracle without importing `appio`; open the snapshot through a read-only SQLite URI, use the real router local preparation and `_consume_local() is True`, and drive the Files view through the owner drain until its loading state settles. Assert the oracle's served interval, unknown-owner overflow window, retained rows, gap evidence, coverage disclosures, and application set exactly. Keep committed absence/digest/oracle failures loud without required mode, and do not add/remove/relabel any existing skip. Separately, inside the new committed-fixture regression run an isolated subprocess selected ONLY at `tests/p4/test_files_tab_real_store.py::test_real_capture_serves_the_same_interval_when_available`: give that child `APPIO_ACCEPTANCE_REQUIRED=1` and `APPIO_ACCEPTANCE_CAPTURE` pointing at a deliberately absent directory under its test `tmp_path` (so its `iod.sqlite` is absent). Use `subprocess.run([sys.executable, "-m", "pytest", "-q", nodeid], env=child_env, capture_output=True, text=True, check=False, timeout=10)` with that exact single-test node id; set `child_env = dict(os.environ)` explicitly before import (the module reads required mode at import), set the two child-only values, and do not mutate the parent's environment or recursively select the new regression. Assert return code 1, exactly that test's `FAILED` result, and the existing `frozen capture missing at` diagnostic, with no skip, collection/import error, or timeout credited. The counterpart child with the flag removed from its environment and the SAME absent directory must report its existing skip and exit 0. This preserves the external-capture policy without creating a capture, touching a service, or imposing it on committed-fixture tests.
+- [ ] **Step 6: Falsify the ownership and provenance mechanisms in disposable copies.** Remove the owner-thread `router.drain()` publication step and prove the new settlement test fails its owned publication assertion after a controlled worker-completion barrier, not just a timeout; substitute the requested interval for the served interval and prove the disclosure test fails; make a file watermark lookup failure suppress process history and prove both R01 ordering cases fail; turn an unavailable source into an empty success and prove the explicit-unavailable tests fail. Separately mutate required external-capture absence to skip and prove Step 5's parent assertion on the selected child's failure/diagnostic rejects it; committed-gzip absence/hash controls remain flag-independent. Restore each mutation and rerun its green control. Return at least two important negatives with baseline/mutated/restored owned-assertion evidence to the independent task review. Do not count setup/collection/import errors, timeout-only results, fake tables, direct worker Future waits, or altered oracle/capture data as kills.
+- [ ] **Step 7: Run the focused P4 gate and exact name inventory.** Run `env -u APPIO_ACCEPTANCE_REQUIRED -u APPIO_ACCEPTANCE_CAPTURE python -m pytest -q tests/p4/test_file_history_router.py tests/p4/test_file_history_isolation.py tests/p4/test_file_served_interval.py tests/p4/test_files_tab_real_store.py`, then `env -u APPIO_ACCEPTANCE_REQUIRED -u APPIO_ACCEPTANCE_CAPTURE python -m pytest --collect-only -q` for the same files. The required-mode flag belongs only to Step 5's isolated single-node negative control, never this full-module command. Confirm both new names occur exactly once, all original names and parameter cases remain collected, `HistoryRouter.pending_work` is false only after owner settlement, and no Files-specific poll or synchronous detail getter was introduced.
+- [ ] **Step 8: Commit only the three P4 regression consumer files.**
+
+```bash
+git add tests/p4/test_file_history_isolation.py tests/p4/test_file_served_interval.py tests/p4/test_files_tab_real_store.py
+git commit -m "test(files): pin owner drain and served interval provenance"
+```
+
+Return the owner-drain trace, isolation/provenance assertions, committed-fixture digest/oracle evidence, focused results, preserved-name inventory, disposable mutation results, and the exact revision to the deterministic controller. Do not change or claim a fix in production, the design/specification, protocol/schema/producers, P3 files, or the plan.
