@@ -1,12 +1,12 @@
 # appio live Overview lane execution manifest — derived from the signed plan.
-# Seven lanes; every task maps exactly once to a source-plan task.
+# 8 lanes; every task maps exactly once to a source-plan task.
 schema_version: 1
-epoch: 1
+epoch: 2
 source_plan:
   path: "docs/superpowers/plans/2026-11-15-live-overview-totals.md"
-  sha256: "8b24e6bbaaeb14a19a25b21a19ec28af5fac6d13bf0005231eb70777f95c3b1c"
-  commit: "2a0dcc57283aac6c546ca77deef33608df72390a"
-  tasks: 16
+  sha256: "29519208a94a42f47523bf2af2db51e7b507b24b729fb0f435986d6cd83765a8"
+  commit: "de853b3d78607de8368e0f45145a926b1bcf8e87"
+  tasks: 18
 source_documents:
   - path: "docs/superpowers/specs/2026-11-15-live-overview-totals-spec.md"
     sha256: "526acaf2ce14aa8c13de530457d43efe5ff4583682d3c0a701a4a3931ae5c948"
@@ -29,6 +29,8 @@ lanes:
     task_ids: [T-001, T-002]
   - id: presentation
     task_ids: [T-008, T-009, T-011, T-013]
+  - id: regression
+    task_ids: [T-017, T-018]
   - id: router
     task_ids: [T-004, T-005, T-006, T-007]
   - id: shell
@@ -84,7 +86,7 @@ tasks:
     produces: ["appio.history.records.v1"]
     consumes: []
     validation:
-      - argv: [python, -m, pytest, -q, tests/live_overview_support.py, tests/p3/test_live_overview_router.py]
+      - argv: ["python", "-m", "pytest", "-q", "tests/live_overview_support.py", "tests/p3/test_live_overview_router.py"]
         env:
           PYTHONDONTWRITEBYTECODE: "1"
           QT_QPA_PLATFORM: "offscreen"
@@ -103,7 +105,7 @@ tasks:
     produces: ["appio.history.validation.v1"]
     consumes: ["appio.history.records.v1"]
     validation:
-      - argv: [python, -m, pytest, -q, tests/p3/test_live_overview_client.py]
+      - argv: ["python", "-m", "pytest", "-q", "tests/p3/test_live_overview_client.py"]
         env:
           PYTHONDONTWRITEBYTECODE: "1"
           QT_QPA_PLATFORM: "offscreen"
@@ -127,7 +129,7 @@ tasks:
     produces: ["appio.client.query_transport.v1"]
     consumes: ["appio.history.validation.v1"]
     validation:
-      - argv: [python, -m, pytest, -q, tests/live_overview_transport.py, tests/p3/test_live_overview_client.py, tests/p3/test_iodclient.py:59-250]
+      - argv: ["python", "-m", "pytest", "-q", "tests/live_overview_transport.py", "tests/p3/test_live_overview_client.py", "tests/p3/test_iodclient.py:59-250"]
         env:
           PYTHONDONTWRITEBYTECODE: "1"
           QT_QPA_PLATFORM: "offscreen"
@@ -150,7 +152,7 @@ tasks:
     produces: []
     consumes: ["appio.history.records.v1"]
     validation:
-      - argv: [python, -m, pytest, -q, tests/p3/test_live_overview_router.py]
+      - argv: ["python", "-m", "pytest", "-q", "tests/p3/test_live_overview_router.py"]
         env:
           PYTHONDONTWRITEBYTECODE: "1"
           QT_QPA_PLATFORM: "offscreen"
@@ -171,7 +173,7 @@ tasks:
     produces: ["appio.router.source_position.v1"]
     consumes: ["appio.history.records.v1", "appio.client.query_transport.v1"]
     validation:
-      - argv: [python, -m, pytest, -q, tests/p3/test_live_overview_router.py]
+      - argv: ["python", "-m", "pytest", "-q", "tests/p3/test_live_overview_router.py"]
         env:
           PYTHONDONTWRITEBYTECODE: "1"
           QT_QPA_PLATFORM: "offscreen"
@@ -194,7 +196,7 @@ tasks:
     produces: ["appio.router.retained.v1"]
     consumes: ["appio.history.records.v1", "appio.history.validation.v1", "appio.client.query_transport.v1", "appio.router.source_position.v1"]
     validation:
-      - argv: [python, -m, pytest, -q, tests/p3/test_live_overview_router.py, tests/p3/test_history_router.py:20-80, tests/p3/test_history_router.py:254-326]
+      - argv: ["python", "-m", "pytest", "-q", "tests/p3/test_live_overview_router.py", "tests/p3/test_history_router.py:20-80", "tests/p3/test_history_router.py:254-326"]
         env:
           PYTHONDONTWRITEBYTECODE: "1"
           QT_QPA_PLATFORM: "offscreen"
@@ -218,7 +220,7 @@ tasks:
     produces: []
     consumes: ["appio.history.validation.v1"]
     validation:
-      - argv: [python, -m, pytest, -q, tests/p3/test_live_overview_router.py, tests/p3/test_live_overview_client.py, tests/p4/test_file_history_router.py, tests/p4/test_files_tab_local_result.py, tests/p4/test_files_tab_remote_result.py]
+      - argv: ["python", "-m", "pytest", "-q", "tests/p3/test_live_overview_router.py", "tests/p3/test_live_overview_client.py", "tests/p4/test_file_history_router.py", "tests/p4/test_files_tab_local_result.py", "tests/p4/test_files_tab_remote_result.py"]
         env:
           PYTHONDONTWRITEBYTECODE: "1"
           QT_QPA_PLATFORM: "offscreen"
@@ -239,7 +241,7 @@ tasks:
     produces: ["appio.ui.overview_provenance.v1"]
     consumes: ["appio.history.records.v1"]
     validation:
-      - argv: [python, -m, pytest, -q, tests/test_ui.py:88-248]
+      - argv: ["python", "-m", "pytest", "-q", "tests/test_ui.py:88-248"]
         env:
           PYTHONDONTWRITEBYTECODE: "1"
           QT_QPA_PLATFORM: "offscreen"
@@ -263,7 +265,7 @@ tasks:
     produces: []
     consumes: ["appio.router.retained.v1", "appio.ui.overview_provenance.v1"]
     validation:
-      - argv: [python, -m, pytest, -q, tests/test_ui.py]
+      - argv: ["python", "-m", "pytest", "-q", "tests/test_ui.py"]
         env:
           PYTHONDONTWRITEBYTECODE: "1"
           QT_QPA_PLATFORM: "offscreen"
@@ -283,7 +285,7 @@ tasks:
     produces: ["appio.ui.chart.append.v1"]
     consumes: []
     validation:
-      - argv: [python, -m, pytest, -q, tests/test_charts.py:180-694]
+      - argv: ["python", "-m", "pytest", "-q", "tests/test_charts.py:180-694"]
         env:
           PYTHONDONTWRITEBYTECODE: "1"
           QT_QPA_PLATFORM: "offscreen"
@@ -312,7 +314,7 @@ tasks:
     produces: ["appio.ui.status.age.v1"]
     consumes: ["appio.history.records.v1", "appio.ui.overview_provenance.v1"]
     validation:
-      - argv: [python, -m, pytest, -q, tests/test_ui.py, tests/p3/test_collector_window.py]
+      - argv: ["python", "-m", "pytest", "-q", "tests/test_ui.py", "tests/p3/test_collector_window.py"]
         env:
           PYTHONDONTWRITEBYTECODE: "1"
           QT_QPA_PLATFORM: "offscreen"
@@ -335,7 +337,7 @@ tasks:
     produces: []
     consumes: ["appio.router.source_position.v1", "appio.ui.status.age.v1"]
     validation:
-      - argv: [python, -m, pytest, -q, tests/p3/test_collector_window.py:80-171]
+      - argv: ["python", "-m", "pytest", "-q", "tests/p3/test_collector_window.py:80-171"]
         env:
           PYTHONDONTWRITEBYTECODE: "1"
           QT_QPA_PLATFORM: "offscreen"
@@ -355,7 +357,7 @@ tasks:
     produces: []
     consumes: ["appio.router.retained.v1", "appio.ui.overview_provenance.v1", "appio.ui.chart.append.v1"]
     validation:
-      - argv: [python, -m, pytest, -q, tests/test_ui.py, tests/live_overview_support.py]
+      - argv: ["python", "-m", "pytest", "-q", "tests/test_ui.py", "tests/live_overview_support.py"]
         env:
           PYTHONDONTWRITEBYTECODE: "1"
           QT_QPA_PLATFORM: "offscreen"
@@ -366,7 +368,7 @@ tasks:
     implementer_tier: "capable"
     lane: acceptance
     sequence: 1
-    depends_on: ["T-012", "T-013"]
+    depends_on: ["T-012", "T-013", "T-018"]
     owns:
       - "tests/p3/test_live_overview_router.py"
       - "tests/p3/test_live_overview_client.py"
@@ -382,7 +384,7 @@ tasks:
     produces: []
     consumes: ["appio.client.query_transport.v1", "appio.router.source_position.v1"]
     validation:
-      - argv: [python, -m, pytest, -q, tests/p3/test_live_overview_router.py, tests/p3/test_live_overview_client.py, tests/p3/test_collector_window.py, tests/live_overview_support.py, tests/live_overview_transport.py]
+      - argv: ["python", "-m", "pytest", "-q", "tests/p3/test_live_overview_router.py", "tests/p3/test_live_overview_client.py", "tests/p3/test_collector_window.py", "tests/live_overview_support.py", "tests/live_overview_transport.py"]
         env:
           PYTHONDONTWRITEBYTECODE: "1"
           QT_QPA_PLATFORM: "offscreen"
@@ -404,7 +406,7 @@ tasks:
     produces: []
     consumes: ["appio.router.retained.v1", "appio.ui.overview_provenance.v1", "appio.ui.status.age.v1"]
     validation:
-      - argv: [python, -m, pytest, -q, tests/test_ui.py, tests/p3/test_collector_window.py]
+      - argv: ["python", "-m", "pytest", "-q", "tests/test_ui.py", "tests/p3/test_collector_window.py"]
         env:
           PYTHONDONTWRITEBYTECODE: "1"
           QT_QPA_PLATFORM: "offscreen"
@@ -423,7 +425,48 @@ tasks:
     produces: []
     consumes: ["appio.ui.chart.append.v1"]
     validation:
-      - argv: [python, -m, pytest, -q, tests/test_charts.py]
+      - argv: ["python", "-m", "pytest", "-q", "tests/test_charts.py"]
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+          QT_QPA_PLATFORM: "offscreen"
+          PYTEST_QT_API: "pyqt6"
+  - id: T-017
+    plan_task: 17
+    title: "Repair P3 fixture clock and production settlement ownership"
+    implementer_tier: "capable"
+    lane: regression
+    sequence: 1
+    depends_on: ["T-012", "T-013"]
+    owns:
+      - "tests/p3/acceptance_harness.py:1-674"
+      - "tests/p3/test_history_overlap_entry.py:1-228"
+      - "tests/p3/test_p3_acceptance.py:1-224"
+      - "tests/p3/test_p3_adversarial.py:1-468"
+    resources: []
+    produces: []
+    consumes: ["appio.client.query_transport.v1", "appio.router.source_position.v1", "appio.router.retained.v1"]
+    validation:
+      - argv: ["python", "-m", "pytest", "-q", "tests/p3/acceptance_harness.py:1-674", "tests/p3/test_history_overlap_entry.py:1-228", "tests/p3/test_p3_acceptance.py:1-224", "tests/p3/test_p3_adversarial.py:1-468"]
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+          QT_QPA_PLATFORM: "offscreen"
+          PYTEST_QT_API: "pyqt6"
+  - id: T-018
+    plan_task: 18
+    title: "Pin P4 owner-thread Files settlement and committed-store provenance"
+    implementer_tier: "capable"
+    lane: regression
+    sequence: 2
+    depends_on: ["T-017"]
+    owns:
+      - "tests/p4/test_file_history_isolation.py:1-194"
+      - "tests/p4/test_file_served_interval.py:1-260"
+      - "tests/p4/test_files_tab_real_store.py:1-193"
+    resources: []
+    produces: []
+    consumes: ["appio.router.source_position.v1", "appio.router.retained.v1"]
+    validation:
+      - argv: ["python", "-m", "pytest", "-q", "tests/p4/test_file_history_isolation.py:1-194", "tests/p4/test_file_served_interval.py:1-260", "tests/p4/test_files_tab_real_store.py:1-193"]
         env:
           PYTHONDONTWRITEBYTECODE: "1"
           QT_QPA_PLATFORM: "offscreen"

@@ -19,6 +19,10 @@ digraph execution {
     T011 [label="T-011 Establish typed refusal, measurement observation, and independent age [advanced]"];
     T013 [label="T-013 Use series metadata for append identities and finish integration fixtures [advanced]"];
   }
+  subgraph cluster_regression { label="regression";
+    T017 [label="T-017 Repair P3 fixture clock and production settlement ownership [capable]"];
+    T018 [label="T-018 Pin P4 owner-thread Files settlement and committed-store provenance [capable]"];
+  }
   subgraph cluster_router { label="router";
     T004 [label="T-004 Split typed local workers and independent execution capacity [capable]"];
     T005 [label="T-005 Observe registered local positions and bind copy brackets [advanced]"];
@@ -48,6 +52,10 @@ digraph execution {
   T011 -> T013;
   T012 -> T014;
   T013 -> T014;
+  T018 -> T014;
   T014 -> T015;
   T015 -> T016;
+  T012 -> T017;
+  T013 -> T017;
+  T017 -> T018;
 }
