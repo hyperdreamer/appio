@@ -1,11 +1,11 @@
 # appio live Overview lane execution manifest — derived from the signed plan.
 # 8 lanes; every task maps exactly once to a source-plan task.
 schema_version: 1
-epoch: 2
+epoch: 3
 source_plan:
   path: "docs/superpowers/plans/2026-11-15-live-overview-totals.md"
-  sha256: "29519208a94a42f47523bf2af2db51e7b507b24b729fb0f435986d6cd83765a8"
-  commit: "de853b3d78607de8368e0f45145a926b1bcf8e87"
+  sha256: "39ea1dffc42dfb6ed3d288083afdbf3d317c11e77c9e5166f2e252cfc95f0075"
+  commit: "250e16b4db228249c0a559d8dd6dbe99c434ef0c"
   tasks: 18
 source_documents:
   - path: "docs/superpowers/specs/2026-11-15-live-overview-totals-spec.md"
@@ -438,15 +438,17 @@ tasks:
     sequence: 1
     depends_on: ["T-012", "T-013"]
     owns:
+      - "src/appio/history_router.py"
       - "tests/p3/acceptance_harness.py:1-674"
       - "tests/p3/test_history_overlap_entry.py:1-228"
       - "tests/p3/test_p3_acceptance.py:1-224"
       - "tests/p3/test_p3_adversarial.py:1-468"
+      - "tests/p3/test_live_overview_router.py"
     resources: []
     produces: []
     consumes: ["appio.client.query_transport.v1", "appio.router.source_position.v1", "appio.router.retained.v1"]
     validation:
-      - argv: ["python", "-m", "pytest", "-q", "tests/p3/acceptance_harness.py:1-674", "tests/p3/test_history_overlap_entry.py:1-228", "tests/p3/test_p3_acceptance.py:1-224", "tests/p3/test_p3_adversarial.py:1-468"]
+      - argv: ["python", "-m", "pytest", "-q", "tests/p3/acceptance_harness.py:1-674", "tests/p3/test_history_overlap_entry.py:1-228", "tests/p3/test_p3_acceptance.py:1-224", "tests/p3/test_p3_adversarial.py:1-468", "tests/p3/test_live_overview_router.py"]
         env:
           PYTHONDONTWRITEBYTECODE: "1"
           QT_QPA_PLATFORM: "offscreen"
