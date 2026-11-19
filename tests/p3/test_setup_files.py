@@ -995,6 +995,33 @@ def test_period_preexisting_directories_restore_fixed_modes(
     assert stat.S_IMODE(directory.stat().st_mode) == expected_mode
 
 
+def test_period_existing_writable_directory_is_refused_without_mode_change(root):
+    fs = SafeRootFS(make_deps(root))
+    fs.prepare_period_directories()
+    directory = rebase(root, STATE_ROOT)
+    directory.chmod(0o733)
+
+    with pytest.raises(SafeRootFSError, match="untrusted_parent:writable"):
+        fs.prepare_period_directories()
+
+    assert stat.S_IMODE(directory.stat().st_mode) == 0o733
+
+
+def test_period_existing_non_root_owned_directory_is_refused_without_mode_change(root):
+    fs = SafeRootFS(make_deps(root))
+    fs.prepare_period_directories()
+    directory = rebase(root, STATE_ROOT)
+    directory.chmod(0o700)
+    metadata = FakeMetadata()
+    metadata.override(directory, uid=1000)
+    untrusted_fs = SafeRootFS(make_deps(root, metadata=metadata))
+
+    with pytest.raises(SafeRootFSError, match="untrusted_parent:not_root_owned"):
+        untrusted_fs.prepare_period_directories()
+
+    assert stat.S_IMODE(directory.stat().st_mode) == 0o700
+
+
 @pytest.mark.parametrize("directory", [
     SAMPLE_TARGET.parent.parent, STATE_ROOT.parent, SAMPLE_TARGET.parent, STATE_ROOT,
 ])

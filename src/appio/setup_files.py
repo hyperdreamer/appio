@@ -419,13 +419,15 @@ class SafeRootFS:
                 f"untrusted_parent:{_open_word(exc, parent=parent, name=part)}"
             ) from exc
         try:
-            if raced:
-                self._verify_directory(child, "untrusted_parent", expected_mode=fixed_mode)
-            else:
-                # Restore the fixed mode on paths this call opened normally.
-                # A directory won by the mkdir race must already match it.
+            self._verify_directory(
+                child,
+                "untrusted_parent",
+                expected_mode=fixed_mode if raced else None,
+            )
+            if not raced:
+                # Normalize only after the directory has passed the trust checks.
                 os.fchmod(child, fixed_mode)
-                self._verify_directory(child, "untrusted_parent")
+                self._verify_directory(child, "untrusted_parent", expected_mode=fixed_mode)
             # A failed mkdir fsync may have left an existing directory behind.
             # Re-sync its parent on the next period traversal as well.
             if sync_created and not created:
