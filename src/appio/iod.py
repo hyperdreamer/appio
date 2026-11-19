@@ -104,7 +104,13 @@ def configured_sample_ns(environ: Mapping[str, str] | None = None) -> int:
         return SAMPLE_NS
     seconds = parse_sample_seconds(raw)
     if seconds is None:
-        _LOG.warning("sample_period_invalid value=%s", repr(raw)[:64])
+        try:
+            value = str.__str__(repr(raw))[:64]
+        except BaseException:
+            value = "<unrepresentable>"
+        if not value.isprintable():
+            value = value.encode("unicode_escape").decode("ascii")[:64]
+        _LOG.warning("sample_period_invalid value=%s", value)
         return SAMPLE_NS
     return seconds * NS
 
@@ -568,12 +574,15 @@ class Daemon:
             return False
 
     def _status(self, client, request_id):
-        return {"protocol": 1, "type": "status", "request_id": request_id,
-                "enabled": True, "answering": self.last_error is None,
-                "pending_activation": self._pending(client.peer.uid),
-                "ownership_start_mono_ns": self._ownership_start,
-                "cursor": None if self.committed_cursor is None else asdict(self.committed_cursor),
-                "sample_ns": self._sample_ns}
+        status = {"protocol": 1, "type": "status", "request_id": request_id,
+                  "enabled": True, "answering": self.last_error is None,
+                  "pending_activation": self._pending(client.peer.uid),
+                  "ownership_start_mono_ns": self._ownership_start,
+                  "cursor": None if self.committed_cursor is None else asdict(self.committed_cursor)}
+        # Embedded daemons may use periods beyond the protocol's maximum.
+        if self._sample_ns <= 30 * NS:
+            status["sample_ns"] = self._sample_ns
+        return status
 
     def _pending(self, uid):
         # Protocol 1 requires a bool. Unknown fails closed as pending, never as

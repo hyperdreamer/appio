@@ -10,8 +10,10 @@ import sqlite3
 import pytest
 
 import appio.iod as iod
-from appio.ipc_models import validate_server_message
+import appio.iodclient as iodclient
+from appio.ipc_models import _require_keys, validate_server_message
 from appio.ipc_protocol import ProtocolError
+from appio.ipc_security import Peer
 from appio.quota import PruneResult, QuotaPruner, SkippedUnit
 from test_iod import NS, PollSelector, pump, receive, request, runtime, total, write_io
 
@@ -294,6 +296,40 @@ def test_configured_sample_ns_absent_empty_and_non_string_values(caplog, raw):
     assert [record.getMessage() for record in caplog.records] == [f"sample_period_invalid value={repr(raw)[:64]}"]
 
 
+@pytest.mark.parametrize("unsafe_repr", ["raises", "raises_base_exception", "non_string", "controls"])
+def test_invalid_sample_values_with_unsafe_repr_warn_once_and_fall_back(caplog, unsafe_repr):
+    class RaisingRepr(str):
+        def __repr__(self):
+            raise ValueError("cannot represent value")
+
+    class RaisingBaseExceptionRepr(str):
+        def __repr__(self):
+            raise BaseException("cannot represent value")
+
+    class NonStringRepr(str):
+        def __repr__(self):
+            return None
+
+    class ControlRepr(str):
+        def __repr__(self):
+            return "bad\nline\r\x1b\x85\u2028" + "x" * 100
+
+    cases = {
+        "raises": (RaisingRepr("invalid"), "<unrepresentable>"),
+        "raises_base_exception": (RaisingBaseExceptionRepr("invalid"), "<unrepresentable>"),
+        "non_string": (NonStringRepr("invalid"), "<unrepresentable>"),
+        "controls": (ControlRepr("invalid"), (r"bad\nline\r\x1b\x85\u2028" + "x" * 100)[:64]),
+    }
+    raw, expected = cases[unsafe_repr]
+    with caplog.at_level(logging.WARNING, logger="appio.iod"):
+        assert iod.configured_sample_ns({"APPIO_SAMPLE_SECONDS": raw}) == 10 * NS
+    assert len(caplog.records) == 1
+    message = caplog.records[0].getMessage()
+    assert message == f"sample_period_invalid value={expected}"
+    assert len(expected) <= 64
+    assert message.isprintable()
+
+
 def _run_main_on_runtime(monkeypatch, runtime):
     """Run the real startup and shutdown on the rootless temporary runtime."""
     daemon_type = iod.Daemon
@@ -376,6 +412,87 @@ def test_status_reports_constructor_sample_ns(runtime):
     pump(runtime)
     status = next(row for row in receive(client) if row["type"] == "status")
     assert status["sample_ns"] == 2 * NS
+
+
+@pytest.mark.parametrize(
+    "runtime,expected",
+    [({"sample_ns": 30 * NS, "flush_ns": 90 * NS}, 30 * NS),
+     ({"sample_ns": 30 * NS + 1, "flush_ns": 90 * NS}, None),
+     ({"sample_ns": 31 * NS, "flush_ns": 93 * NS}, None)],
+    indirect=["runtime"],
+)
+def test_status_preserves_clients_for_longer_constructor_periods(runtime, expected):
+    runtime.daemon.start()
+    client = runtime.connect()[0]
+    for request_id in ("first", "second"):
+        request(client, request_id=request_id)
+        pump(runtime)
+        replies = receive(client)
+        assert len(replies) == 1
+        assert replies[0]["request_id"] == request_id
+        assert replies[0].get("sample_ns") == expected
+        assert ("sample_ns" in replies[0]) is (expected is not None)
+
+
+def test_older_client_reports_unavailable_until_restarted(runtime, monkeypatch):
+    # The base client is unchanged, but its old status validator permitted only
+    # these eight keys. Apply that exact key gate to the real client transport.
+    legacy_keys = {
+        "protocol", "type", "request_id", "enabled", "answering",
+        "pending_activation", "ownership_start_mono_ns", "cursor",
+    }
+
+    def validate_legacy_response(message):
+        if message.get("type") == "status":
+            _require_keys(message, legacy_keys, legacy_keys, "status")
+        return validate_server_message(message)
+
+    monkeypatch.setattr(iodclient, "validate_server_message", validate_legacy_response)
+    runtime.daemon.start()
+
+    def connect_client():
+        sock = runtime.connect()[0]
+        client = iodclient.IodClient(
+            runtime.paths.socket,
+            peer_reader=lambda _: Peer(1, 0, 0),
+            path_verifier=lambda _: None,
+            clock_ns=lambda: runtime.clock()[0],
+            on_gap=lambda _: None,
+            on_change=lambda: None,
+            connector=lambda _: sock,
+        )
+        client.connect()
+        pump(runtime)
+        client.pump()
+        return client
+
+    original_status = runtime.daemon._status
+    with monkeypatch.context() as old_server:
+        old_server.setattr(
+            runtime.daemon, "_status",
+            lambda client, request_id: {
+                key: value for key, value in original_status(client, request_id).items()
+                if key != "sample_ns"
+            },
+        )
+        client = connect_client()
+        assert client.state.verified
+        assert client.state.answering
+        client.close()
+
+    client = connect_client()
+    assert not client.state.verified
+    assert not client.state.answering
+    assert client.state.last_error == "unknown_key"
+    assert client._sock is None
+    client.close()
+
+    monkeypatch.setattr(iodclient, "validate_server_message", validate_server_message)
+    restarted = connect_client()
+    assert restarted.state.verified
+    assert restarted.state.answering
+    assert restarted.state.last_error is None
+    restarted.close()
 
 
 @pytest.mark.parametrize("runtime", [{}], indirect=True)
