@@ -3,12 +3,17 @@
 Use the rootless runtime's real collector, SQLite store and socket loop. These
 pins deliberately use production Daemon defaults, unlike fast behavioural vectors.
 """
+import logging
+import signal
 import sqlite3
 
 import pytest
 
+import appio.iod as iod
+from appio.ipc_models import validate_server_message
+from appio.ipc_protocol import ProtocolError
 from appio.quota import PruneResult, QuotaPruner, SkippedUnit
-from test_iod import NS, pump, receive, request, runtime, total, write_io
+from test_iod import NS, PollSelector, pump, receive, request, runtime, total, write_io
 
 
 @pytest.mark.parametrize("runtime", [{}], indirect=True)
@@ -254,3 +259,288 @@ def test_a_skipped_unit_still_reports_retention_incomplete(runtime, monkeypatch)
     r.daemon._next_maintenance = r.clock()[0]
     pump(r)
     assert r.daemon.last_error == "retention_incomplete"
+
+
+@pytest.mark.parametrize("raw,seconds", [("2", 2), ("9", 9), ("10", 10), ("29", 29), ("30", 30)])
+def test_parse_sample_seconds_acceptance_table(raw, seconds, caplog):
+    with caplog.at_level(logging.WARNING, logger="appio.iod"):
+        assert iod.parse_sample_seconds(raw) == seconds
+        assert iod.configured_sample_ns({"APPIO_SAMPLE_SECONDS": raw}) == seconds * NS
+    assert not caplog.records
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [None, 5, True, "", "0", "1", "31", "02", "+5", "5.0", " 5", "abc", "\n", "2\n", "٢", "9" * 4000],
+)
+def test_parse_sample_seconds_refusal_table(raw):
+    assert iod.parse_sample_seconds(raw) is None
+
+
+def test_parse_sample_seconds_rejects_string_subclasses():
+    class StringSubclass(str):
+        pass
+
+    assert iod.parse_sample_seconds(StringSubclass("2")) is None
+
+
+@pytest.mark.parametrize("raw", [5, None, False])
+def test_configured_sample_ns_absent_empty_and_non_string_values(caplog, raw):
+    with caplog.at_level(logging.WARNING, logger="appio.iod"):
+        assert iod.configured_sample_ns({}) == 10 * NS
+        assert iod.configured_sample_ns({"APPIO_SAMPLE_SECONDS": ""}) == 10 * NS
+        assert not caplog.records
+        assert iod.configured_sample_ns({"APPIO_SAMPLE_SECONDS": raw}) == 10 * NS
+    assert [record.getMessage() for record in caplog.records] == [f"sample_period_invalid value={repr(raw)[:64]}"]
+
+
+def _run_main_on_runtime(monkeypatch, runtime):
+    """Run the real startup and shutdown on the rootless temporary runtime."""
+    daemon_type = iod.Daemon
+    handlers = {}
+    constructed = []
+    started = []
+
+    def construct(**kwargs):
+        daemon = daemon_type(
+            runtime.paths, clock=runtime.clock, peer_reader=runtime.daemon.peer_reader,
+            group_lookup=runtime.daemon.group_lookup, filesystem=runtime.fs,
+            selector=PollSelector(), query_worker=runtime.worker, **kwargs,
+        )
+        constructed.append((daemon, kwargs))
+        return daemon
+
+    def install_handler(signum, handler):
+        previous = handlers.get(signum, signal.SIG_DFL)
+        handlers[signum] = handler
+        return previous
+
+    def finish_step(daemon):
+        started.append(daemon._running)
+        handlers[signal.SIGTERM](signal.SIGTERM, None)
+
+    monkeypatch.setattr(iod.os, "geteuid", lambda: 0)
+    monkeypatch.setattr(iod.signal, "signal", install_handler)
+    monkeypatch.setattr(daemon_type, "step", finish_step)
+    monkeypatch.setattr(iod, "Daemon", construct)
+    result = iod.main([])
+    assert started == [True]
+    assert len(constructed) == 1
+    return result, constructed[0]
+
+
+@pytest.mark.parametrize("runtime", [{}], indirect=True)
+@pytest.mark.parametrize("raw", ["0", "1", "31", "abc", "02", "+5", "5.0", " 5", "\n", "x" * 4000], ids=[
+    "zero", "one", "thirty-one", "letters", "leading-zero", "signed", "decimal", "space", "control", "long",
+])
+def test_configured_sample_ns_invalid_values_warn_once_and_start(runtime, monkeypatch, caplog, raw):
+    monkeypatch.setenv("APPIO_SAMPLE_SECONDS", raw)
+    with caplog.at_level(logging.WARNING, logger="appio.iod"):
+        result, (daemon, kwargs) = _run_main_on_runtime(monkeypatch, runtime)
+    assert result == 0
+    assert kwargs == {"sample_ns": 10 * NS, "flush_ns": 30 * NS, "maintenance_ns": 30 * NS}
+    assert daemon.committed_cursor is not None
+    messages = [record.getMessage() for record in caplog.records if record.getMessage().startswith("sample_period_invalid")]
+    assert messages == [f"sample_period_invalid value={repr(raw)[:64]}"]
+    assert "\n" not in messages[0]
+
+
+@pytest.mark.parametrize("seconds,expected", [(2, 30), (10, 30), (11, 33), (30, 90)])
+def test_flush_ns_for_uses_three_periods_at_two_ten_eleven_and_thirty(seconds, expected):
+    assert iod.flush_ns_for(seconds * NS) == expected * NS
+
+
+@pytest.mark.parametrize("seconds,expected", [(2, 15), (5, 15), (10, 30), (20, 60), (30, 60)])
+def test_maintenance_ns_for_clamps_all_supported_periods(seconds, expected):
+    assert iod.maintenance_ns_for(seconds * NS) == expected * NS
+
+
+@pytest.mark.parametrize("function_name", ["flush_ns_for", "maintenance_ns_for"])
+@pytest.mark.parametrize("value", [None, False, True, 0, -1, 1.0, "1"])
+def test_derived_windows_reject_non_positive_or_non_integer_values(function_name, value):
+    with pytest.raises(ValueError, match="^sample_ns must be a positive integer$"):
+        getattr(iod, function_name)(value)
+
+
+@pytest.mark.parametrize("value", [None, False, True, 0, -1, 1.0, "1"])
+def test_maintenance_interval_rejects_non_positive_or_non_integer_values(value):
+    with pytest.raises(ValueError, match="^maintenance_ns must be a positive integer$"):
+        iod.Daemon(maintenance_ns=value)
+
+
+@pytest.mark.parametrize("runtime", [{"sample_ns": 2 * NS}], indirect=True)
+def test_status_reports_constructor_sample_ns(runtime):
+    runtime.daemon.start()
+    client = runtime.connect()[0]
+    request(client)
+    pump(runtime)
+    status = next(row for row in receive(client) if row["type"] == "status")
+    assert status["sample_ns"] == 2 * NS
+
+
+@pytest.mark.parametrize("runtime", [{}], indirect=True)
+@pytest.mark.parametrize("seconds,flush,maintenance", [(2, 30, 15), (30, 90, 60)])
+def test_production_main_passes_valid_period_and_derived_windows(runtime, monkeypatch, seconds, flush, maintenance):
+    monkeypatch.setenv("APPIO_SAMPLE_SECONDS", str(seconds))
+    result, (daemon, kwargs) = _run_main_on_runtime(monkeypatch, runtime)
+    assert result == 0
+    assert daemon.committed_cursor is not None
+    assert kwargs == {"sample_ns": seconds * NS, "flush_ns": flush * NS, "maintenance_ns": maintenance * NS}
+
+
+@pytest.mark.parametrize("runtime", [{}], indirect=True)
+def test_production_main_uses_ten_second_default_when_environment_is_absent(runtime, monkeypatch, caplog):
+    monkeypatch.delenv("APPIO_SAMPLE_SECONDS", raising=False)
+    with caplog.at_level(logging.WARNING, logger="appio.iod"):
+        result, (_, kwargs) = _run_main_on_runtime(monkeypatch, runtime)
+    assert result == 0
+    assert kwargs == {"sample_ns": 10 * NS, "flush_ns": 30 * NS, "maintenance_ns": 30 * NS}
+    assert not any(record.getMessage().startswith("sample_period_invalid") for record in caplog.records)
+
+
+@pytest.mark.parametrize("runtime", [{}], indirect=True)
+def test_main_empty_environment_starts_with_default_period(runtime, monkeypatch, caplog):
+    monkeypatch.setenv("APPIO_SAMPLE_SECONDS", "")
+    with caplog.at_level(logging.WARNING, logger="appio.iod"):
+        result, (daemon, kwargs) = _run_main_on_runtime(monkeypatch, runtime)
+    assert result == 0
+    assert daemon.committed_cursor is not None
+    assert kwargs == {"sample_ns": 10 * NS, "flush_ns": 30 * NS, "maintenance_ns": 30 * NS}
+    assert not any(record.getMessage().startswith("sample_period_invalid") for record in caplog.records)
+
+
+def test_status_validator_accepts_period_and_older_status():
+    class IntegerSubclass(int):
+        pass
+
+    status = {
+        "protocol": 1, "type": "status", "request_id": "r", "enabled": True,
+        "answering": True, "pending_activation": False,
+        "ownership_start_mono_ns": None, "cursor": None,
+    }
+    assert validate_server_message(status).get("sample_ns") is None
+    for value in (1, 2 * NS, 30 * NS):
+        assert validate_server_message({**status, "sample_ns": value})["sample_ns"] == value
+    for value in (None, True, False, 1.0, "2", 0, -1, 30 * NS + 1, 2**63, IntegerSubclass(1)):
+        with pytest.raises(ProtocolError) as error:
+            validate_server_message({**status, "sample_ns": value})
+        assert error.value.reason == "invalid_field"
+    with pytest.raises(ProtocolError) as error:
+        validate_server_message({**status, "unexpected": 1})
+    assert error.value.reason == "unknown_key"
+
+
+@pytest.mark.parametrize(
+    "runtime,seconds",
+    [({"sample_ns": 2 * NS, "flush_ns": 30 * NS}, 2),
+     ({"sample_ns": 30 * NS, "flush_ns": 90 * NS}, 30)],
+    indirect=["runtime"],
+)
+def test_configured_periods_persist_requested_observed_intervals(runtime, seconds):
+    runtime.daemon.start()
+    start = runtime.daemon._committed_mono
+    for tick in (1, 2):
+        write_io(runtime.proc, 100 + tick)
+        runtime.clock.advance(seconds)
+        pump(runtime)
+    rows = runtime.daemon.collector.store.connection.execute(
+        "SELECT DISTINCT seq, observed_mono_ns FROM sample ORDER BY seq"
+    ).fetchall()
+    assert rows == [(1, start + seconds * NS), (2, start + 2 * seconds * NS)]
+    assert runtime.daemon.committed_cursor.iod_epoch == 1
+
+
+@pytest.mark.parametrize("runtime", [{"sample_ns": 30 * NS, "flush_ns": 90 * NS}], indirect=True)
+@pytest.mark.parametrize("elapsed,overdue", [(89, False), (90, False), (91, True)])
+def test_sampling_overdue_gate_uses_derived_flush_window(runtime, monkeypatch, elapsed, overdue):
+    runtime.daemon.start()
+    baseline = runtime.daemon.committed_cursor
+    tick = runtime.daemon.collector.tick
+
+    def delayed_tick():
+        runtime.clock.advance(elapsed)
+        return tick()
+
+    monkeypatch.setattr(runtime.daemon.collector, "tick", delayed_tick)
+    runtime.daemon._sample()
+    assert runtime.daemon.committed_cursor.iod_epoch == baseline.iod_epoch
+    assert runtime.daemon.committed_cursor.seq == 1
+    assert runtime.daemon._recover is overdue
+    assert runtime.daemon.last_error == ("collection_overdue" if overdue else None)
+    if overdue:
+        runtime.daemon._sample()
+        assert runtime.daemon.committed_cursor.iod_epoch == baseline.iod_epoch + 1
+        assert runtime.daemon.committed_cursor.seq == 0
+        assert runtime.daemon.last_error is None
+
+
+@pytest.mark.parametrize("runtime", [{"sample_ns": 30 * NS, "flush_ns": 90 * NS}], indirect=True)
+@pytest.mark.parametrize("elapsed,overdue", [(89, False), (90, False), (91, True)])
+def test_step_overdue_gate_uses_derived_flush_window(runtime, elapsed, overdue):
+    runtime.daemon.start()
+    baseline = runtime.daemon.committed_cursor
+    write_io(runtime.proc, 101)
+    runtime.clock.advance(elapsed)
+    runtime.daemon.step()
+    assert runtime.daemon.committed_cursor.iod_epoch == baseline.iod_epoch + int(overdue)
+    assert runtime.daemon.committed_cursor.seq == (0 if overdue else 1)
+    assert total(runtime.paths.database) == ((0, 0, 0, 0) if overdue else (40, 20, 12, 8))
+
+
+@pytest.mark.parametrize("runtime", [{"sample_ns": 30 * NS, "flush_ns": 90 * NS}], indirect=True)
+@pytest.mark.parametrize("elapsed,overdue", [(89, False), (90, False), (91, True)])
+def test_shutdown_recovery_gate_uses_derived_flush_window(runtime, elapsed, overdue):
+    runtime.daemon.start()
+    baseline = runtime.daemon.committed_cursor
+    write_io(runtime.proc, 101)
+    runtime.clock.advance(elapsed)
+    runtime.daemon.stop()
+    assert runtime.daemon.committed_cursor.iod_epoch == baseline.iod_epoch + int(overdue)
+    assert runtime.daemon.committed_cursor.seq == (0 if overdue else 1)
+    assert total(runtime.paths.database) == ((0, 0, 0, 0) if overdue else (40, 20, 12, 8))
+
+
+@pytest.mark.parametrize("runtime", [{"sample_ns": 2 * NS, "flush_ns": 30 * NS, "maintenance_ns": 15 * NS}], indirect=True)
+def test_maintenance_deadlines_follow_the_instance_interval(runtime, monkeypatch):
+    runtime.daemon.start()
+    assert runtime.daemon._next_maintenance == runtime.clock()[0] + 15 * NS
+    runtime.clock.advance(15)
+    runtime.daemon.step()
+    assert runtime.daemon._next_maintenance == runtime.clock()[0] + 15 * NS
+
+    # A failed storage window that does not advance the committed endpoint must
+    # defer its next recovery using the same configured maintenance interval.
+    runtime.daemon._storage_error = "retention_incomplete"
+    monkeypatch.setattr(runtime.daemon.collector, "tick", lambda: runtime.daemon.collector.last_result)
+    runtime.daemon._sample()
+    assert runtime.daemon._next_recovery == runtime.clock()[0] + 15 * NS
+
+
+@pytest.mark.parametrize("runtime", [{"sample_ns": 2 * NS, "flush_ns": 30 * NS, "maintenance_ns": 15 * NS}], indirect=True)
+@pytest.mark.parametrize("failure", [False, True])
+def test_quota_recovery_deadlines_follow_the_instance_interval(runtime, monkeypatch, failure):
+    runtime.daemon.start()
+    runtime.daemon._quota_paused = True
+    runtime.daemon._storage_error = "quota_exhausted"
+    runtime.daemon._next_sample = runtime.clock()[0]
+    runtime.daemon._next_recovery = 0
+
+    def shrink():
+        if failure:
+            raise sqlite3.OperationalError("injected failure")
+        return PruneResult((), False, True, 4096, "quota_exhausted")
+
+    monkeypatch.setattr(runtime.daemon._pruner, "shrink_if_needed", shrink)
+    runtime.daemon.step()
+    assert runtime.daemon._next_recovery == runtime.clock()[0] + 15 * NS
+    assert runtime.daemon.last_error == ("maintenance_failed" if failure else None)
+
+
+@pytest.mark.parametrize("runtime", [{"sample_ns": 2 * NS, "flush_ns": 30 * NS, "maintenance_ns": 15 * NS}], indirect=True)
+def test_shutdown_storage_recovery_uses_the_instance_interval(runtime, monkeypatch):
+    runtime.daemon.start()
+    runtime.daemon._storage_error = "retention_incomplete"
+    monkeypatch.setattr(runtime.daemon.collector, "tick", lambda: runtime.daemon.collector.last_result)
+    runtime.clock.advance(1)
+    runtime.daemon.stop()
+    assert runtime.daemon._next_recovery == runtime.clock()[0] + 15 * NS

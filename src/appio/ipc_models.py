@@ -613,7 +613,7 @@ def _status(message: dict[str, Any]) -> dict[str, Any]:
             "cursor",
         }
     )
-    _require_keys(message, names, names, "status")
+    _require_keys(message, names, names | {"sample_ns"}, "status")
     normalized = dict(message)
     normalized["request_id"] = _request_id(message["request_id"])
     for name in ("enabled", "answering", "pending_activation"):
@@ -622,6 +622,14 @@ def _status(message: dict[str, Any]) -> dict[str, Any]:
         message["ownership_start_mono_ns"], "status.ownership_start_mono_ns"
     )
     normalized["cursor"] = _optional_cursor(message["cursor"], "status.cursor")
+    if "sample_ns" in message:
+        value = message["sample_ns"]
+        if type(value) is not int:
+            raise ProtocolError("invalid_field", "status.sample_ns must be an integer")
+        value = _integer(value, "status.sample_ns", minimum=1)
+        if value > 30 * 1_000_000_000:
+            raise ProtocolError("invalid_field", "status.sample_ns exceeds 30 seconds")
+        normalized["sample_ns"] = value
     return normalized
 
 
