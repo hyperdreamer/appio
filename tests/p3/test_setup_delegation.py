@@ -117,8 +117,8 @@ class RecordingFS:
             self.timeline.append(("write", path))
         self.inner.atomic_write(path, content, mode=mode, owner=owner)
 
-    def read_bounded(self, path: str, *, max_bytes: int) -> bytes:
-        return self.inner.read_bounded(path, max_bytes=max_bytes)
+    def read_bounded(self, path: str, *, max_bytes: int, create_parents: bool = True) -> bytes:
+        return self.inner.read_bounded(path, max_bytes=max_bytes, create_parents=create_parents)
 
     @contextlib.contextmanager
     def locked(self):
@@ -129,6 +129,62 @@ class RecordingFS:
     # Convenience for assertions.
     def written_paths(self) -> list[str]:
         return [path for path, _content, _mode, _owner in self.writes]
+
+
+@pytest.mark.parametrize("options", [{}, {"create_parents": True}])
+def test_load_setup_state_creating_mode_supports_legacy_adapters(root: Path, options):
+    class LegacyReadFS:
+        def __init__(self, inner: SafeRootFS):
+            self.inner = inner
+
+        def read_bounded(self, path: str, *, max_bytes: int) -> bytes:
+            return self.inner.read_bounded(path, max_bytes=max_bytes)
+
+    fs = SafeRootFS(make_deps(root))
+    legacy_fs = LegacyReadFS(fs)
+    assert not rebase(root, STATE_ROOT).exists()
+    assert dict(load_setup_state(legacy_fs, **options).pending_by_uid) == {}
+    assert rebase(root, STATE_ROOT).is_dir()
+
+    set_pending(fs, 1000, True)
+    assert dict(load_setup_state(legacy_fs, **options).pending_by_uid) == {1000: True}
+
+
+def test_load_setup_state_noncreating_mode_and_default(root: Path):
+    fs = RecordingFS(SafeRootFS(make_deps(root)))
+    assert not rebase(root, STATE_ROOT).exists()
+    assert dict(load_setup_state(fs, create_parents=False).pending_by_uid) == {}
+    assert not rebase(root, STATE_ROOT).exists()
+    assert dict(load_setup_state(fs).pending_by_uid) == {}
+    assert rebase(root, STATE_ROOT).is_dir()
+    assert not rebase(root, STATE_FILE).exists()
+
+
+@pytest.mark.parametrize("options", [{}, {"create_parents": False}])
+@pytest.mark.parametrize("state", ["present", "missing_leaf", "missing_parent"])
+def test_load_setup_state_preserves_existing_directory_modes(root: Path, options, state):
+    path = rebase(root, STATE_FILE)
+    path.parent.parent.mkdir(parents=True, exist_ok=True)
+    if state != "missing_parent":
+        path.parent.mkdir()
+    if state == "present":
+        path.write_bytes(CANONICAL_PENDING)
+        path.chmod(0o600)
+    directories = [root / "var", root / "var/lib"]
+    if path.parent.exists():
+        directories.append(path.parent)
+    for directory in directories:
+        directory.chmod(0o700)
+
+    result = load_setup_state(SafeRootFS(make_deps(root)), **options)
+
+    assert dict(result.pending_by_uid) == ({1000: True} if state == "present" else {})
+    assert all(stat.S_IMODE(directory.stat().st_mode) == 0o700 for directory in directories)
+    if state == "missing_parent":
+        if options.get("create_parents") is False:
+            assert not path.parent.exists()
+        else:
+            assert stat.S_IMODE(path.parent.stat().st_mode) == 0o711
 
 
 def results(delegate: str = "cpu io memory pids", *, getent=0, usermod=0, reload=0):

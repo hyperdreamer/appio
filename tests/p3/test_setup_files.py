@@ -17,6 +17,7 @@ writes outside its temporary tree.
 
 from __future__ import annotations
 
+import errno
 import os
 import stat
 import threading
@@ -25,6 +26,8 @@ from types import SimpleNamespace
 
 import pytest
 
+import appio.setup_boundary as boundary
+import appio.setup_files as files
 from appio.setup_boundary import SetupDeps
 from appio.setup_files import (
     LOCK_FILE,
@@ -429,6 +432,9 @@ def test_mode_is_fixed_even_under_an_untrusted_umask(root: Path):
         os.umask(previous_umask)
     assert stat.S_IMODE(os.stat(rebase(root, SERVICE_DROPIN)).st_mode) == 0o644
     assert stat.S_IMODE(os.stat(rebase(root, STATE_FILE)).st_mode) == 0o600
+    assert stat.S_IMODE((root / "var").stat().st_mode) == 0o755
+    assert stat.S_IMODE((root / "var/lib").stat().st_mode) == 0o755
+    assert stat.S_IMODE(rebase(root, STATE_ROOT).stat().st_mode) == 0o711
 
 
 def test_repeated_write_is_idempotent_and_keeps_the_fixed_mode(root: Path):
@@ -667,3 +673,573 @@ def test_lock_file_is_root_owned_0600_and_a_symlink_is_refused(root: Path):
             pass
     assert "symlink" in caught.value.reason
     assert victim.read_bytes() == b"preserve"
+
+
+SAMPLE_TARGET = Path("/etc/systemd/system/appio-iod.service.d/20-sample-period.conf")
+PENDING_TARGET = Path("/var/lib/appio/sample-period.pending.json")
+COMPLETE_TARGET = Path("/var/lib/appio/sample-period.complete.json")
+
+
+def test_sample_period_payload_and_parser_round_trip():
+    for seconds, expected in (
+        (2, b"[Service]\nEnvironment=APPIO_SAMPLE_SECONDS=2\n"),
+        (10, b"[Service]\nEnvironment=APPIO_SAMPLE_SECONDS=10\n"),
+        (30, b"[Service]\nEnvironment=APPIO_SAMPLE_SECONDS=30\n"),
+    ):
+        assert files.sample_period_payload(seconds) == expected
+        assert files.parse_sample_period_dropin(expected) == seconds
+    for invalid in (True, False, 1, 31, 2.0, "2", None):
+        with pytest.raises(ValueError, match="sample period must be an integer from 2 through 30"):
+            files.sample_period_payload(invalid)
+    for invalid in (None, "[Service]\n", b"", b"\xff"):
+        assert files.parse_sample_period_dropin(invalid) is None
+
+
+def test_sample_period_payload_accepts_integer_subclasses():
+    class IntegerSeconds(int):
+        pass
+
+    assert files.sample_period_payload(IntegerSeconds(2)) == b"[Service]\nEnvironment=APPIO_SAMPLE_SECONDS=2\n"
+
+
+def test_sample_period_target_is_in_both_allowlists():
+    assert boundary.require_fixed_target(SAMPLE_TARGET).key == "sample-period-dropin"
+    assert SAMPLE_TARGET in files.FIXED_CONFIG_TARGETS
+
+
+@pytest.mark.parametrize(
+    "target,parser_target",
+    [
+        (SERVICE_DROPIN, "SERVICE_DROPIN"),
+        (USER_MANAGER_DROPIN, "USER_MANAGER_DROPIN"),
+        (SAMPLE_TARGET, "SAMPLE_PERIOD_DROPIN"),
+    ],
+)
+@pytest.mark.parametrize("existing", [None, b"", b"administrator data"])
+def test_missing_config_target_and_missing_parser_have_distinct_refusals(
+    root, monkeypatch, target, parser_target, existing
+):
+    path = rebase(root, target)
+    if existing is not None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(existing)
+    parent_existed = path.parent.exists()
+    events = EventLog()
+    fs = SafeRootFS(make_deps(root, events=events))
+    monkeypatch.setattr(files, "FIXED_CONFIG_TARGETS", files.FIXED_CONFIG_TARGETS - {target})
+    with pytest.raises(SafeRootFSError, match="target:not_fixed_path"):
+        fs.atomic_write(target, b"new")
+    monkeypatch.setattr(files, "FIXED_CONFIG_TARGETS", files.FIXED_CONFIG_TARGETS | {target})
+    monkeypatch.setattr(files, parser_target, Path("/unused"))
+    with pytest.raises(SafeRootFSError, match="unexpected_content:not_a_config_target"):
+        fs.atomic_write(target, b"new")
+    assert "mkstemp" not in events.names
+    if existing is None:
+        assert not path.exists()
+        assert path.parent.exists() == parent_existed
+    else:
+        assert path.read_bytes() == existing
+
+
+@pytest.mark.parametrize("foreign", [
+    b"[Service]\nEnvironment=APPIO_SAMPLE_SECONDS=10",
+    b"[Service]\nEnvironment=APPIO_SAMPLE_SECONDS=10\n\n",
+    b"[Service]\nEnvironment=APPIO_SAMPLE_SECONDS=02\n",
+    b"[Service]\nEnvironment=APPIO_SAMPLE_SECONDS=1\n",
+    b"[Unit]\nEnvironment=APPIO_SAMPLE_SECONDS=10\n",
+    b"[Service]\nEnvironment=OTHER=10\n",
+    b"[Service]\nEnvironment=APPIO_SAMPLE_SECONDS=10\nOther=yes\n",
+    b"[Service]\nEnvironment=APPIO_SAMPLE_SECONDS=10 \n",
+    b"\xff",
+])
+def test_foreign_sample_dropin_preserves_bytes(root, foreign):
+    path = rebase(root, SAMPLE_TARGET)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(foreign)
+    assert files.parse_sample_period_dropin(foreign) is None
+    with pytest.raises(SafeRootFSError, match="unexpected_content"):
+        SafeRootFS(make_deps(root)).atomic_write(SAMPLE_TARGET, files.sample_period_payload(2))
+    assert path.read_bytes() == foreign
+
+
+def test_empty_sample_dropin_is_replaced(root):
+    path = rebase(root, SAMPLE_TARGET)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"")
+    SafeRootFS(make_deps(root)).atomic_write(SAMPLE_TARGET, files.sample_period_payload(2))
+    assert path.read_bytes() == b"[Service]\nEnvironment=APPIO_SAMPLE_SECONDS=2\n"
+    assert stat.S_IMODE(path.stat().st_mode) == 0o644
+
+
+def test_read_bounded_without_creating_missing_parents(root):
+    fs = SafeRootFS(make_deps(root))
+    with pytest.raises(FileNotFoundError):
+        fs.read_bounded(SAMPLE_TARGET, max_bytes=1024, create_parents=False)
+    assert not rebase(root, SAMPLE_TARGET.parent).exists()
+    with pytest.raises(FileNotFoundError):
+        fs.read_bounded(PENDING_TARGET, max_bytes=1024, create_parents=False)
+    assert not rebase(root, STATE_ROOT).exists()
+    with pytest.raises(FileNotFoundError):
+        fs.read_bounded(PENDING_TARGET, max_bytes=1024)
+    assert rebase(root, STATE_ROOT).is_dir()
+
+
+@pytest.mark.parametrize("target_state", ["present", "missing_leaf", "missing_parent"])
+def test_noncreating_read_preserves_existing_directory_modes(root, target_state):
+    path = rebase(root, SAMPLE_TARGET)
+    if target_state != "missing_parent":
+        path.parent.mkdir(parents=True, exist_ok=True)
+    if target_state == "present":
+        path.write_bytes(b"[Service]\nEnvironment=APPIO_SAMPLE_SECONDS=10\n")
+        path.chmod(0o644)
+    directories = [
+        root / "etc", root / "etc/systemd", root / "etc/systemd/system", path.parent,
+    ]
+    existing = [directory for directory in directories if directory.exists()]
+    for directory in existing:
+        directory.chmod(0o700)
+
+    fs = SafeRootFS(make_deps(root))
+    if target_state == "present":
+        assert fs.read_bounded(SAMPLE_TARGET, max_bytes=1024, create_parents=False) == (
+            b"[Service]\nEnvironment=APPIO_SAMPLE_SECONDS=10\n"
+        )
+    else:
+        with pytest.raises(FileNotFoundError):
+            fs.read_bounded(SAMPLE_TARGET, max_bytes=1024, create_parents=False)
+
+    assert all(stat.S_IMODE(directory.stat().st_mode) == 0o700 for directory in existing)
+    if target_state == "missing_parent":
+        assert not path.parent.exists()
+
+
+@pytest.mark.parametrize(
+    "target,ancestors",
+    [
+        (SAMPLE_TARGET, ("etc", "etc/systemd", "etc/systemd/system")),
+        (STATE_FILE, ("var", "var/lib")),
+    ],
+)
+def test_atomic_write_preserves_existing_directory_modes(root, target, ancestors):
+    path = rebase(root, target)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    directories = [root / ancestor for ancestor in ancestors] + [path.parent]
+    for directory in directories:
+        directory.chmod(0o700)
+
+    if target == SAMPLE_TARGET:
+        SafeRootFS(make_deps(root)).atomic_write(target, files.sample_period_payload(10))
+    else:
+        SafeRootFS(make_deps(root)).atomic_write(target, b"{}", mode=0o600)
+
+    assert all(stat.S_IMODE(directory.stat().st_mode) == 0o700 for directory in directories)
+
+
+def test_period_preparation_preserves_system_ancestor_modes(root):
+    sample_directory = rebase(root, SAMPLE_TARGET.parent)
+    state_directory = rebase(root, STATE_ROOT)
+    sample_directory.mkdir(parents=True, exist_ok=True)
+    state_directory.mkdir(parents=True, exist_ok=True)
+    ancestors = [
+        root / "etc", root / "etc/systemd", root / "etc/systemd/system",
+        root / "var", root / "var/lib",
+    ]
+    for directory in ancestors:
+        directory.chmod(0o700)
+    sample_directory.chmod(0o700)
+    state_directory.chmod(0o755)
+
+    SafeRootFS(make_deps(root)).prepare_period_directories()
+
+    assert all(stat.S_IMODE(directory.stat().st_mode) == 0o700 for directory in ancestors)
+    assert stat.S_IMODE(sample_directory.stat().st_mode) == 0o755
+    assert stat.S_IMODE(state_directory.stat().st_mode) == 0o711
+
+
+def test_period_ancestor_directory_sync_repeats_for_existing_parent(root, monkeypatch):
+    synced = []
+    real_fsync = os.fsync
+
+    def record(fd):
+        if stat.S_ISDIR(os.fstat(fd).st_mode):
+            synced.append(Path(os.readlink(f"/proc/self/fd/{fd}")))
+        real_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", record)
+    fs = SafeRootFS(make_deps(root))
+    fs.prepare_period_directories()
+    required = [
+        rebase(root, SAMPLE_TARGET.parent.parent),
+        rebase(root, STATE_ROOT.parent),
+        rebase(root, SAMPLE_TARGET.parent),
+        rebase(root, STATE_ROOT),
+    ]
+    assert all(path in synced for path in required)
+    synced.clear()
+    fs.prepare_period_directories()
+    assert all(path in synced for path in required)
+    assert [synced.index(path) for path in required] == sorted(synced.index(path) for path in required)
+
+
+def test_period_journal_targets_are_fixed_state_only():
+    assert files.SAMPLE_PERIOD_PENDING == PENDING_TARGET
+    assert files.SAMPLE_PERIOD_COMPLETE == COMPLETE_TARGET
+    assert {PENDING_TARGET, COMPLETE_TARGET} <= files.FIXED_STATE_TARGETS
+    assert not {PENDING_TARGET, COMPLETE_TARGET} & files.FIXED_CONFIG_TARGETS
+
+
+def test_period_journal_pending_and_complete_codec_is_exact():
+    record = files.PeriodJournalRecord("a" * 32, str(SAMPLE_TARGET), 10, "b" * 64)
+    expected = (b'{"version":1,"operation_id":"' + b'a' * 32
+                + b'","target":"/etc/systemd/system/appio-iod.service.d/20-sample-period.conf",'
+                + b'"sample_seconds":10,"target_sha256":"' + b'b' * 64 + b'"}\n')
+    assert files.encode_period_journal(record) == expected
+    assert files.decode_period_journal(expected) == record
+    invalid = [
+        expected[:-1], expected + b"\n", b" " + expected, expected.replace(b'"version":1', b'"version":1.0'),
+        expected.replace(b'"version":1', b'"version":1,"version":1'),
+        expected.replace(b'{"version":1,"operation_id":"' + b'a' * 32 + b'"',
+                         b'{"operation_id":"' + b'a' * 32 + b'","version":1'),
+        expected.replace(b'"version":1,', b''),
+        expected.replace(b'"version":1,', b'"extra":0,"version":1,'),
+        expected.replace(b'"sample_seconds":10', b'"sample_seconds":true'),
+        expected.replace(b'"sample_seconds":10', b'"sample_seconds":31'),
+        expected.replace(b'"operation_id":"' + b'a' * 32, b'"operation_id":"' + b'A' * 32),
+        expected.replace(b'"target_sha256":"' + b'b' * 64, b'"target_sha256":"bad'),
+        expected.replace(str(SAMPLE_TARGET).encode(), b'/etc/other'),
+        expected + b' ' * 1024, b'\xff',
+    ]
+    for data in invalid:
+        with pytest.raises(ValueError):
+            files.decode_period_journal(data)
+    for bad in (
+        files.PeriodJournalRecord("A" * 32, str(SAMPLE_TARGET), 10, "b" * 64),
+        files.PeriodJournalRecord("a" * 32, str(SAMPLE_TARGET), True, "b" * 64),
+        files.PeriodJournalRecord("a" * 32, "/etc/other", 10, "b" * 64),
+        files.PeriodJournalRecord("a" * 32, str(SAMPLE_TARGET), 10, "b" * 63),
+    ):
+        with pytest.raises(ValueError):
+            files.encode_period_journal(bad)
+
+
+@pytest.mark.parametrize("target,publish", [
+    (PENDING_TARGET, "publish_period_pending"),
+    (COMPLETE_TARGET, "publish_period_complete"),
+])
+def test_period_journal_atomic_publish_syncs_parent(root, monkeypatch, target, publish):
+    record = files.PeriodJournalRecord("a" * 32, str(SAMPLE_TARGET), 2, "b" * 64)
+    fs = SafeRootFS(make_deps(root))
+    fs.prepare_period_directories()
+    synced = []
+    real_fsync = os.fsync
+
+    def record_sync(fd):
+        synced.append((stat.S_ISDIR(os.fstat(fd).st_mode), Path(os.readlink(f"/proc/self/fd/{fd}"))))
+        real_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", record_sync)
+    getattr(files, publish)(fs, record)
+    path = rebase(root, target)
+    assert files.decode_period_journal(path.read_bytes()) == record
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    assert synced[-1] == (True, path.parent)
+    assert synced[-2][0] is False
+    previous = path.read_bytes()
+    failing = SafeRootFS(make_deps(root, events=EventLog(failures=("rename",))))
+    with pytest.raises(InjectedFault):
+        getattr(files, publish)(failing, files.PeriodJournalRecord("c" * 32, str(SAMPLE_TARGET), 30, "d" * 64))
+    assert path.read_bytes() == previous
+
+
+def test_period_journal_remove_syncs_parent(root, monkeypatch):
+    fs = SafeRootFS(make_deps(root))
+    fs.prepare_period_directories()
+    record = files.PeriodJournalRecord("a" * 32, str(SAMPLE_TARGET), 10, "b" * 64)
+    files.publish_period_pending(fs, record)
+    synced = []
+    real_fsync = os.fsync
+
+    def record_sync(fd):
+        synced.append(Path(os.readlink(f"/proc/self/fd/{fd}")))
+        real_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", record_sync)
+    files.remove_period_pending(fs)
+    assert not rebase(root, PENDING_TARGET).exists()
+    assert synced == [rebase(root, STATE_ROOT)]
+    files.remove_period_pending(fs)
+    assert synced == [rebase(root, STATE_ROOT), rebase(root, STATE_ROOT)]
+
+
+@pytest.mark.parametrize("fault", ["symlink", "hardlink", "owner", "mode", "oversize", "fifo"])
+def test_period_journal_rejects_unsafe_files(root, fault):
+    fs = SafeRootFS(make_deps(root))
+    fs.prepare_period_directories()
+    path = rebase(root, PENDING_TARGET)
+    victim = root.parent / "journal-victim"
+    victim.write_bytes(b"x" * (1025 if fault == "oversize" else 1))
+    if fault == "symlink":
+        path.symlink_to(victim)
+    elif fault == "hardlink":
+        os.link(victim, path)
+    elif fault == "fifo":
+        os.mkfifo(path)
+    else:
+        path.write_bytes(victim.read_bytes())
+        path.chmod(0o600)
+    metadata = FakeMetadata()
+    if fault == "owner":
+        metadata.override(path, uid=1000)
+    if fault == "mode":
+        metadata.override(path, mode=0o644)
+    fs = SafeRootFS(make_deps(root, metadata=metadata))
+    with pytest.raises(SafeRootFSError):
+        fs.read_bounded(PENDING_TARGET, max_bytes=1024, create_parents=False)
+    with pytest.raises(SafeRootFSError):
+        files.publish_period_pending(fs, files.PeriodJournalRecord("a" * 32, str(SAMPLE_TARGET), 10, "b" * 64))
+    with pytest.raises(SafeRootFSError):
+        files.remove_period_pending(fs)
+    assert victim.read_bytes() == b"x" * (1025 if fault == "oversize" else 1)
+
+
+@pytest.mark.parametrize("fault", ["symlink", "hardlink", "owner", "mode", "oversize", "fifo"])
+def test_sample_dropin_refuses_unsafe_existing_target(root, fault):
+    path = rebase(root, SAMPLE_TARGET)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    victim = root.parent / "sample-victim"
+    victim.write_bytes(b"x" * (65537 if fault == "oversize" else 1))
+    if fault == "symlink":
+        path.symlink_to(victim)
+    elif fault == "hardlink":
+        os.link(victim, path)
+    elif fault == "fifo":
+        os.mkfifo(path)
+    else:
+        path.write_bytes(victim.read_bytes())
+        path.chmod(0o644)
+    metadata = FakeMetadata()
+    if fault == "owner":
+        metadata.override(path, uid=1000)
+    if fault == "mode":
+        metadata.override(path, mode=0o600)
+    fs = SafeRootFS(make_deps(root, metadata=metadata))
+    with pytest.raises(SafeRootFSError):
+        fs.atomic_write(SAMPLE_TARGET, files.sample_period_payload(2))
+    assert victim.read_bytes() == b"x" * (65537 if fault == "oversize" else 1)
+
+
+def test_period_read_creation_syncs_directory_entry(root, monkeypatch):
+    synced = []
+    real_fsync = os.fsync
+
+    def record(fd):
+        if stat.S_ISDIR(os.fstat(fd).st_mode):
+            synced.append(Path(os.readlink(f"/proc/self/fd/{fd}")))
+        real_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", record)
+    with pytest.raises(FileNotFoundError):
+        SafeRootFS(make_deps(root)).read_bounded(SAMPLE_TARGET, max_bytes=1024)
+    assert rebase(root, SAMPLE_TARGET.parent).is_dir()
+    assert rebase(root, SAMPLE_TARGET.parent.parent) in synced
+
+
+@pytest.mark.parametrize(
+    "directory,expected_mode",
+    [
+        (Path("/etc"), 0o755),
+        (Path("/etc/systemd"), 0o755),
+        (Path("/etc/systemd/system"), 0o755),
+        (SAMPLE_TARGET.parent, 0o755),
+        (Path("/var"), 0o755),
+        (Path("/var/lib"), 0o755),
+        (STATE_ROOT, 0o711),
+    ],
+)
+def test_created_period_directory_mode_survives_parent_sync_failure_and_retry(
+    tmp_path, monkeypatch, directory, expected_mode
+):
+    root = tmp_path / "root"
+    root.mkdir()
+    target = rebase(root, directory)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.parent.chmod(0o750)
+    fs = SafeRootFS(make_deps(root))
+    synced = []
+    real_fsync = os.fsync
+    failed = False
+
+    def fail_after_creation(fd):
+        nonlocal failed
+        path = Path(os.readlink(f"/proc/self/fd/{fd}"))
+        synced.append(path)
+        if path == target.parent and target.is_dir() and not failed:
+            failed = True
+            raise OSError(errno.EIO, "injected parent sync failure")
+        real_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", fail_after_creation)
+    previous_umask = os.umask(0o077)
+    try:
+        with pytest.raises(OSError, match="injected parent sync failure") as caught:
+            fs.prepare_period_directories()
+        assert caught.value.errno == errno.EIO
+        failed_mode = stat.S_IMODE(target.stat().st_mode)
+        synced.clear()
+        fs.prepare_period_directories()
+        retried_mode = stat.S_IMODE(target.stat().st_mode)
+    finally:
+        os.umask(previous_umask)
+
+    assert failed_mode == expected_mode
+    assert retried_mode == expected_mode
+    assert target.parent in synced
+    assert stat.S_IMODE(target.parent.stat().st_mode) == 0o750
+
+
+def test_period_retry_syncs_a_previously_failed_created_ancestor(root, monkeypatch):
+    synced = []
+    real_fsync = os.fsync
+    fail = True
+
+    def record(fd):
+        nonlocal fail
+        path = Path(os.readlink(f"/proc/self/fd/{fd}"))
+        synced.append(path)
+        if path == root and (root / "var").exists() and not rebase(root, STATE_ROOT.parent).exists() and fail:
+            fail = False
+            raise OSError("injected ancestor sync failure")
+        real_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", record)
+    fs = SafeRootFS(make_deps(root))
+    with pytest.raises(OSError, match="injected ancestor sync failure"):
+        fs.prepare_period_directories()
+    assert (root / "var").is_dir()
+    synced.clear()
+    fs.prepare_period_directories()
+    assert root in synced
+    assert rebase(root, SAMPLE_TARGET.parent.parent) in synced
+    assert rebase(root, STATE_ROOT.parent) in synced
+
+
+@pytest.mark.parametrize(
+    "fixed_path,initial_mode,expected_mode",
+    [
+        (STATE_ROOT, 0o755, 0o711),
+        (SAMPLE_TARGET.parent, 0o700, 0o755),
+    ],
+)
+def test_period_preexisting_directories_restore_fixed_modes(
+    root, fixed_path, initial_mode, expected_mode
+):
+    fs = SafeRootFS(make_deps(root))
+    fs.prepare_period_directories()
+    directory = rebase(root, fixed_path)
+    directory.chmod(initial_mode)
+
+    fs.prepare_period_directories()
+
+    assert stat.S_IMODE(directory.stat().st_mode) == expected_mode
+
+
+def test_period_existing_writable_directory_is_refused_without_mode_change(root):
+    fs = SafeRootFS(make_deps(root))
+    fs.prepare_period_directories()
+    directory = rebase(root, STATE_ROOT)
+    directory.chmod(0o733)
+
+    with pytest.raises(SafeRootFSError, match="untrusted_parent:writable"):
+        fs.prepare_period_directories()
+
+    assert stat.S_IMODE(directory.stat().st_mode) == 0o733
+
+
+def test_period_existing_non_root_owned_directory_is_refused_without_mode_change(root):
+    fs = SafeRootFS(make_deps(root))
+    fs.prepare_period_directories()
+    directory = rebase(root, STATE_ROOT)
+    directory.chmod(0o700)
+    metadata = FakeMetadata()
+    metadata.override(directory, uid=1000)
+    untrusted_fs = SafeRootFS(make_deps(root, metadata=metadata))
+
+    with pytest.raises(SafeRootFSError, match="untrusted_parent:not_root_owned"):
+        untrusted_fs.prepare_period_directories()
+
+    assert stat.S_IMODE(directory.stat().st_mode) == 0o700
+
+
+@pytest.mark.parametrize("directory", [
+    SAMPLE_TARGET.parent.parent, STATE_ROOT.parent, SAMPLE_TARGET.parent, STATE_ROOT,
+])
+def test_period_directory_sync_failure_is_retried(root, monkeypatch, directory):
+    fs = SafeRootFS(make_deps(root))
+    target = rebase(root, directory)
+    synced = []
+    fail = True
+    real_fsync = os.fsync
+
+    def record(fd):
+        nonlocal fail
+        path = Path(os.readlink(f"/proc/self/fd/{fd}"))
+        synced.append(path)
+        if path == target and fail:
+            fail = False
+            raise OSError("injected directory sync failure")
+        real_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", record)
+    with pytest.raises(OSError, match="injected directory sync failure"):
+        fs.prepare_period_directories()
+    synced.clear()
+    fs.prepare_period_directories()
+    assert target in synced
+
+
+def test_period_sync_parent_and_unlink_failure_retry(root, monkeypatch):
+    fs = SafeRootFS(make_deps(root))
+    fs.prepare_period_directories()
+    files.publish_period_pending(fs, files.PeriodJournalRecord("a" * 32, str(SAMPLE_TARGET), 2, "b" * 64))
+    synced = []
+    real_fsync = os.fsync
+    fail = True
+
+    def record(fd):
+        nonlocal fail
+        path = Path(os.readlink(f"/proc/self/fd/{fd}"))
+        synced.append(path)
+        if fail:
+            fail = False
+            raise OSError("injected unlink sync failure")
+        real_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", record)
+    with pytest.raises(OSError, match="injected unlink sync failure"):
+        files.remove_period_pending(fs)
+    assert not rebase(root, PENDING_TARGET).exists()
+    files.remove_period_pending(fs)
+    fs.sync_period_parent(SAMPLE_TARGET)
+    assert synced == [rebase(root, STATE_ROOT), rebase(root, STATE_ROOT), rebase(root, SAMPLE_TARGET.parent)]
+    with pytest.raises(SafeRootFSError, match="target:not_fixed_path"):
+        fs.sync_period_parent(STATE_FILE)
+
+
+def test_period_directory_creation_race_rejects_mismatched_mode(root, monkeypatch):
+    directory = rebase(root, SAMPLE_TARGET.parent)
+    directory.mkdir(mode=0o700, parents=True)
+    directory.chmod(0o700)
+    real_open = os.open
+    first = True
+
+    def raced_open(path, flags, *args, **kwargs):
+        nonlocal first
+        if path == SAMPLE_TARGET.parent.name and first:
+            first = False
+            raise FileNotFoundError(path)
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", raced_open)
+    with pytest.raises(SafeRootFSError, match="untrusted_parent:mode_mismatch"):
+        SafeRootFS(make_deps(root)).prepare_period_directories()
+    assert stat.S_IMODE(directory.stat().st_mode) == 0o700

@@ -9,7 +9,7 @@ only defensible contract is a fixed one:
 * the beneficiary is ``PKEXEC_UID`` (``getuid()`` inside pkexec is root),
   resolved through ``getpwuid``; ``$USER``, ``$HOME``, ``$PATH``, the environment
   and argv never select it;
-* file targets are the two fixed configuration drop-ins in :data:`FIXED_TARGETS`.
+* file targets are the three fixed configuration drop-ins in :data:`FIXED_TARGETS`.
   They and every parent directory are opened component by component with
   ``O_NOFOLLOW``, must be root-owned, and must not be writable by group or other;
 * a write is ``mkstemp`` + ``write`` + ``fsync`` + ``fchown`` + ``rename`` +
@@ -222,7 +222,16 @@ FIXED_TARGETS: tuple[FixedTarget, ...] = (
         path=Path("/etc/systemd/user.conf.d/10-appio.conf"),
         description="user-manager DefaultIOAccounting/DefaultTasksMax drop-in",
     ),
+    FixedTarget(
+        key="sample-period-dropin",
+        path=Path("/etc/systemd/system/appio-iod.service.d/20-sample-period.conf"),
+        description="system service sample-period drop-in",
+    ),
 )
+
+SAMPLE_PERIOD_PENDING = Path("/var/lib/appio/sample-period.pending.json")
+SAMPLE_PERIOD_COMPLETE = Path("/var/lib/appio/sample-period.complete.json")
+FIXED_STATE_TARGETS = frozenset((SAMPLE_PERIOD_PENDING, SAMPLE_PERIOD_COMPLETE))
 
 FIXED_TARGET_PATHS: frozenset[Path] = frozenset(target.path for target in FIXED_TARGETS)
 
@@ -512,7 +521,7 @@ def validate_trusted_runtime(
 
 
 def require_fixed_target(candidate: object) -> FixedTarget:
-    """Map a caller value onto one of the two fixed drop-ins or refuse it."""
+    """Map a caller value onto one of the three fixed drop-ins or refuse it."""
 
     if isinstance(candidate, FixedTarget):
         for target in FIXED_TARGETS:
