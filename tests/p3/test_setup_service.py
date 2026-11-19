@@ -17,7 +17,7 @@ import appio.setup_files as setup_files
 from appio.activation import ActivationResult, STATE_UNKNOWN
 from appio.ipc_protocol import FrameDecoder, encode_frame
 from appio.ipc_security import Peer
-from appio.setup_boundary import CommandResult, Invocation, InvocationError, VERBS
+from appio.setup_boundary import CommandResult, Invocation, InvocationError, RunnerError, VERBS
 from appio.setup_files import (
     SAMPLE_PERIOD_COMPLETE,
     SAMPLE_PERIOD_DROPIN,
@@ -609,6 +609,99 @@ def test_restart_failure_that_leaves_service_inactive_reports_not_running(lifecy
     assert result["error"] == "service_not_running"
     assert host(env, SAMPLE_PERIOD_PENDING).exists()
     assert not host(env, SAMPLE_PERIOD_COMPLETE).exists()
+
+
+@pytest.mark.parametrize(
+    "failed_step", range(4), ids=["initial-configuration", "reload", "restart", "verification"],
+)
+@pytest.mark.parametrize("command_exit", [1, 17, None], ids=["exit-one", "exit-seventeen", "runner-error"])
+@pytest.mark.parametrize("stop", [False, True], ids=["stable", "stop-race"])
+def test_period_command_failure_observes_final_lifecycle(
+    lifecycle, monkeypatch, capsys, failed_step, command_exit, stop,
+):
+    env = lifecycle
+    _patch_period_probe(monkeypatch)
+    if failed_step == 0:
+        target_parent, state_parent = _remove_period_parents(env)
+
+    operations = [SAMPLE_SHOW, DAEMON_RELOAD, TRY_RESTART, SAMPLE_SHOW]
+    failed_command = operations[failed_step]
+    expected_operations = operations[:failed_step + 1]
+    failed_attempt = expected_operations.count(failed_command)
+    if failed_command == TRY_RESTART:
+        expected_operations.append(SAMPLE_SHOW)
+    original_run = env.runner.run
+    attempts = 0
+
+    def run(argv, **kwargs):
+        nonlocal attempts
+        if tuple(argv) == failed_command:
+            attempts += 1
+            if attempts == failed_attempt:
+                env.runner.calls.append((failed_command, kwargs))
+                if stop:
+                    env.runner.active = False
+                if command_exit is None:
+                    raise RunnerError(1, "spawn_failed:permission_denied")
+                return CommandResult(command_exit, "", "injected command failure\n")
+        return original_run(argv, **kwargs)
+
+    monkeypatch.setattr(env.runner, "run", run)
+    code, result, diagnostic = invoke(env, "set-sample-period", capsys, period=10)
+    manager_reason = {
+        DAEMON_RELOAD: "daemon_reload_failed",
+        TRY_RESTART: "service_restart_failed",
+    }.get(failed_command)
+    if stop:
+        expected_reason = expected_state = "service_not_running"
+        expected_diagnostic = "service_not_running\n"
+    elif command_exit is None:
+        expected_reason = manager_reason or "spawn_failed:permission_denied"
+        expected_state = None
+        expected_diagnostic = "spawn_failed:permission_denied\n"
+    else:
+        expected_reason = manager_reason or f"sample_period_show:exit_{command_exit}"
+        expected_state = None
+        expected_diagnostic = "injected command failure\n"
+    assert (code, result["error"], result["sample_period_state"]) == (1, expected_reason, expected_state)
+    assert diagnostic == expected_diagnostic
+    # The last three reads are the pair in step 10 and dispatch's exception observer.
+    expected_calls = [service.SHOW_ARGV, *expected_operations] + [service.SHOW_ARGV] * 3
+    assert [argv for argv, _ in env.runner.calls] == expected_calls
+    assert not host(env, SAMPLE_PERIOD_COMPLETE).exists()
+    assert host(env, SAMPLE_PERIOD_PENDING).exists() == (failed_step != 0)
+    if failed_step == 0:
+        assert not target_parent.exists()
+        assert not state_parent.exists()
+
+
+@pytest.mark.parametrize("journal_path", [SAMPLE_PERIOD_PENDING, SAMPLE_PERIOD_COMPLETE], ids=["pending", "complete"])
+@pytest.mark.parametrize("stop", [False, True], ids=["stable", "stop-race"])
+def test_unsafe_period_journal_observes_final_lifecycle(lifecycle, monkeypatch, capsys, journal_path, stop):
+    env = lifecycle
+    _patch_period_probe(monkeypatch)
+    _write_period_record(env, journal_path)
+    journal = host(env, journal_path)
+    journal.chmod(0o644)
+    original_bytes = journal.read_bytes()
+    original_run = env.runner.run
+
+    def run(argv, **kwargs):
+        response = original_run(argv, **kwargs)
+        if stop and tuple(argv) == service.SHOW_ARGV and len(env.runner.calls) == 1:
+            env.runner.active = False
+        return response
+
+    monkeypatch.setattr(env.runner, "run", run)
+    code, result, diagnostic = invoke(env, "set-sample-period", capsys, period=10)
+    reason = "service_not_running" if stop else "sample_period_state_unsafe"
+    assert (code, result["error"], result["sample_period_state"]) == (1, reason, reason if stop else None)
+    assert diagnostic == f"{reason}\n"
+    assert [argv for argv, _ in env.runner.calls] == [service.SHOW_ARGV] * 4
+    assert list(journal.parent.iterdir()) == [journal]
+    assert journal.read_bytes() == original_bytes
+    assert journal.stat().st_mode & 0o777 == 0o644
+    assert not host(env, SAMPLE_PERIOD_DROPIN).parent.exists()
 
 
 def test_malformed_journal_is_reconciled_by_replaying_transaction(lifecycle, monkeypatch, capsys):

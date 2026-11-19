@@ -287,9 +287,12 @@ def _sample_seconds(payload: object) -> int | None:
 
 
 def _period_view(deps) -> dict[str, object]:
-    command = deps.runner.run(SAMPLE_SHOW_ARGV, timeout_seconds=STATUS_TIMEOUT_SECONDS)
+    try:
+        command = deps.runner.run(SAMPLE_SHOW_ARGV, timeout_seconds=STATUS_TIMEOUT_SECONDS)
+    except BoundaryError as error:
+        raise ServiceError(error.reason, stderr=getattr(error, "stderr", "")) from error
     if command.returncode != 0:
-        raise _command_error("sample_period_show", command)
+        raise ServiceError(f"sample_period_show:exit_{command.returncode}", stderr=command.stderr)
     try:
         return _parse_sample_show(command.stdout)
     except (TypeError, UnicodeError, ValueError) as error:
@@ -357,8 +360,8 @@ def _period_active_observation(view: dict[str, object], observed: object, second
     return configured if configured != str(seconds) else observed
 
 
-def _period_final_lifecycle(deps):
-    """Read lifecycle twice, with status between the reads when active."""
+def _period_final_lifecycle(deps, *, result, active_before):
+    """Observe the final lifecycle and give a current-call stop precedence."""
     observation_failure = None
     try:
         preceding = _period_unit_state(deps)
@@ -376,6 +379,13 @@ def _period_final_lifecycle(deps):
         final = None
         if observation_failure is None:
             observation_failure = ServiceError(error.reason, stderr=getattr(error, "stderr", ""))
+    if final is not None:
+        active_after = final.get("ActiveState") == "active"
+        answering = active_after and status is not None and status.get("answering") is True
+        _period_result_unit(result, final, answering=answering)
+        if active_before and not active_after:
+            result["sample_period_state"] = "service_not_running"
+            raise _period_failure("service_not_running", result=result)
     return preceding, final, status, observation_failure
 
 
@@ -412,32 +422,21 @@ def _set_sample_period(identity, deps, fs, result):
     needs_write = existing_for_compare != canonical
 
     try:
-        pending, pending_malformed = _read_period_record(fs, SAMPLE_PERIOD_PENDING)
-        complete, complete_malformed = _read_period_record(fs, SAMPLE_PERIOD_COMPLETE)
-    except (OSError, PermissionError) as error:
-        raise _period_failure("sample_period_state_unsafe", result=result) from error
-    reconciliation = pending_malformed or complete_malformed
-    completed_matches = _period_record_matches(complete, digest, seconds)
-    pending_matches = _period_record_matches(pending, digest, seconds)
-    recovery_pair = (
-        pending is not None and complete is not None
-        and pending == complete and _period_record_matches(pending, digest, seconds)
-    )
-
-    try:
+        try:
+            pending, pending_malformed = _read_period_record(fs, SAMPLE_PERIOD_PENDING)
+            complete, complete_malformed = _read_period_record(fs, SAMPLE_PERIOD_COMPLETE)
+        except OSError as error:
+            raise _period_failure("sample_period_state_unsafe", result=result) from error
+        reconciliation = pending_malformed or complete_malformed
+        completed_matches = _period_record_matches(complete, digest, seconds)
+        pending_matches = _period_record_matches(pending, digest, seconds)
+        recovery_pair = (
+            pending is not None and complete is not None
+            and pending == complete and _period_record_matches(pending, digest, seconds)
+        )
         initial_view = _period_view(deps)
     except ServiceError:
-        _, final_unit, final_status, final_failure = _period_final_lifecycle(deps)
-        if final_unit is not None:
-            answering = bool(
-                final_unit.get("ActiveState") == "active"
-                and final_status is not None
-                and final_status.get("answering") is True
-            )
-            _period_result_unit(result, final_unit, answering=answering)
-            if active_before and final_unit.get("ActiveState") != "active":
-                result["sample_period_state"] = "service_not_running"
-                raise _period_failure("service_not_running", result=result)
+        _, _, _, final_failure = _period_final_lifecycle(deps, result=result, active_before=active_before)
         if final_failure is not None:
             raise final_failure
         raise
@@ -498,13 +497,17 @@ def _set_sample_period(identity, deps, fs, result):
     if manager_required and not recovered and operation_failure is None:
         try:
             _run(deps, DAEMON_RELOAD_ARGV, "daemon_reload")
-        except ServiceError as error:
-            operation_failure = _period_failure("daemon_reload_failed", stderr=error.stderr, result=result)
+        except BoundaryError as error:
+            operation_failure = _period_failure(
+                "daemon_reload_failed", stderr=getattr(error, "stderr", error.reason), result=result,
+            )
         if operation_failure is None and active_before:
             try:
                 _run(deps, TRY_RESTART_ARGV, "service_restart")
-            except ServiceError as error:
-                operation_failure = _period_failure("service_restart_failed", stderr=error.stderr, result=result)
+            except BoundaryError as error:
+                operation_failure = _period_failure(
+                    "service_restart_failed", stderr=getattr(error, "stderr", error.reason), result=result,
+                )
 
     verification_view = None
     verification_failure: ServiceError | None = None
@@ -540,20 +543,12 @@ def _set_sample_period(identity, deps, fs, result):
         except ServiceError as error:
             verification_failure = error
 
-    after_verification, final_unit, final_status, final_failure = _period_final_lifecycle(deps)
+    after_verification, final_unit, final_status, final_failure = _period_final_lifecycle(
+        deps, result=result, active_before=active_before,
+    )
     final_observed = _sample_seconds(final_status)
-    if final_unit is not None:
-        answering = bool(
-            final_unit.get("ActiveState") == "active"
-            and final_status is not None
-            and final_status.get("answering") is True
-        )
-        _period_result_unit(result, final_unit, answering=answering)
     active_after = final_unit is not None and final_unit.get("ActiveState") == "active"
 
-    if final_unit is not None and active_before and not active_after:
-        result["sample_period_state"] = "service_not_running"
-        raise _period_failure("service_not_running", result=result)
     if operation_failure is not None and operation_failure.reason == "service_restart_failed" and active_after:
         raise operation_failure
     if final_failure is not None:
