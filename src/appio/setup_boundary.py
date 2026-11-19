@@ -9,7 +9,7 @@ only defensible contract is a fixed one:
 * the beneficiary is ``PKEXEC_UID`` (``getuid()`` inside pkexec is root),
   resolved through ``getpwuid``; ``$USER``, ``$HOME``, ``$PATH``, the environment
   and argv never select it;
-* file targets are the two fixed configuration drop-ins in :data:`FIXED_TARGETS`.
+* file targets are the three fixed configuration drop-ins in :data:`FIXED_TARGETS`.
   They and every parent directory are opened component by component with
   ``O_NOFOLLOW``, must be root-owned, and must not be writable by group or other;
 * a write is ``mkstemp`` + ``write`` + ``fsync`` + ``fchown`` + ``rename`` +
@@ -521,7 +521,7 @@ def validate_trusted_runtime(
 
 
 def require_fixed_target(candidate: object) -> FixedTarget:
-    """Map a caller value onto one of the two fixed drop-ins or refuse it."""
+    """Map a caller value onto one of the three fixed drop-ins or refuse it."""
 
     if isinstance(candidate, FixedTarget):
         for target in FIXED_TARGETS:

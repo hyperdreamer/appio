@@ -759,7 +759,7 @@ def _open_word(exc: OSError, *, parent: int | None = None, name: str | None = No
 
 
 # --------------------------------------------------------------------------- #
-# The two fixed drop-in formats
+# The three fixed drop-in formats
 # --------------------------------------------------------------------------- #
 
 MANAGER_PAYLOAD: bytes = b"[Manager]\nDefaultIOAccounting=yes\n"

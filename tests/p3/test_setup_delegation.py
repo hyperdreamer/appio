@@ -131,6 +131,25 @@ class RecordingFS:
         return [path for path, _content, _mode, _owner in self.writes]
 
 
+@pytest.mark.parametrize("options", [{}, {"create_parents": True}])
+def test_load_setup_state_creating_mode_supports_legacy_adapters(root: Path, options):
+    class LegacyReadFS:
+        def __init__(self, inner: SafeRootFS):
+            self.inner = inner
+
+        def read_bounded(self, path: str, *, max_bytes: int) -> bytes:
+            return self.inner.read_bounded(path, max_bytes=max_bytes)
+
+    fs = SafeRootFS(make_deps(root))
+    legacy_fs = LegacyReadFS(fs)
+    assert not rebase(root, STATE_ROOT).exists()
+    assert dict(load_setup_state(legacy_fs, **options).pending_by_uid) == {}
+    assert rebase(root, STATE_ROOT).is_dir()
+
+    set_pending(fs, 1000, True)
+    assert dict(load_setup_state(legacy_fs, **options).pending_by_uid) == {1000: True}
+
+
 def test_load_setup_state_noncreating_mode_and_default(root: Path):
     fs = RecordingFS(SafeRootFS(make_deps(root)))
     assert not rebase(root, STATE_ROOT).exists()
