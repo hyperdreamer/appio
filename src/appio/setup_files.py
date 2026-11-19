@@ -428,8 +428,6 @@ class SafeRootFS:
                 raced = True
             except OSError as exc:
                 raise SafeRootFSError(f"create_parent:{_open_word(exc)}") from exc
-            if created and sync_created:
-                os.fsync(parent)
             try:
                 child = os.open(part, flags, dir_fd=parent)
             except OSError as exc:
@@ -449,9 +447,10 @@ class SafeRootFS:
                 # after they have passed the trust checks.
                 os.fchmod(child, fixed_mode)
                 self._verify_directory(child, "untrusted_parent", expected_mode=fixed_mode)
-            # A failed mkdir fsync may have left an existing directory behind.
-            # Re-sync its parent on the next period traversal as well.
-            if sync_created and not created:
+            # Sync immediately after creation and mode verification, before
+            # descending. Repeat the parent sync for existing directories so a
+            # retry repairs a previous sync failure without changing their modes.
+            if sync_created:
                 os.fsync(parent)
         except BaseException:
             os.close(child)

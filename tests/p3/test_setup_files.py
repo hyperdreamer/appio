@@ -17,6 +17,7 @@ writes outside its temporary tree.
 
 from __future__ import annotations
 
+import errno
 import os
 import stat
 import threading
@@ -1041,6 +1042,59 @@ def test_period_read_creation_syncs_directory_entry(root, monkeypatch):
         SafeRootFS(make_deps(root)).read_bounded(SAMPLE_TARGET, max_bytes=1024)
     assert rebase(root, SAMPLE_TARGET.parent).is_dir()
     assert rebase(root, SAMPLE_TARGET.parent.parent) in synced
+
+
+@pytest.mark.parametrize(
+    "directory,expected_mode",
+    [
+        (Path("/etc"), 0o755),
+        (Path("/etc/systemd"), 0o755),
+        (Path("/etc/systemd/system"), 0o755),
+        (SAMPLE_TARGET.parent, 0o755),
+        (Path("/var"), 0o755),
+        (Path("/var/lib"), 0o755),
+        (STATE_ROOT, 0o711),
+    ],
+)
+def test_created_period_directory_mode_survives_parent_sync_failure_and_retry(
+    tmp_path, monkeypatch, directory, expected_mode
+):
+    root = tmp_path / "root"
+    root.mkdir()
+    target = rebase(root, directory)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.parent.chmod(0o750)
+    fs = SafeRootFS(make_deps(root))
+    synced = []
+    real_fsync = os.fsync
+    failed = False
+
+    def fail_after_creation(fd):
+        nonlocal failed
+        path = Path(os.readlink(f"/proc/self/fd/{fd}"))
+        synced.append(path)
+        if path == target.parent and target.is_dir() and not failed:
+            failed = True
+            raise OSError(errno.EIO, "injected parent sync failure")
+        real_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", fail_after_creation)
+    previous_umask = os.umask(0o077)
+    try:
+        with pytest.raises(OSError, match="injected parent sync failure") as caught:
+            fs.prepare_period_directories()
+        assert caught.value.errno == errno.EIO
+        failed_mode = stat.S_IMODE(target.stat().st_mode)
+        synced.clear()
+        fs.prepare_period_directories()
+        retried_mode = stat.S_IMODE(target.stat().st_mode)
+    finally:
+        os.umask(previous_umask)
+
+    assert failed_mode == expected_mode
+    assert retried_mode == expected_mode
+    assert target.parent in synced
+    assert stat.S_IMODE(target.parent.stat().st_mode) == 0o750
 
 
 def test_period_retry_syncs_a_previously_failed_created_ancestor(root, monkeypatch):
