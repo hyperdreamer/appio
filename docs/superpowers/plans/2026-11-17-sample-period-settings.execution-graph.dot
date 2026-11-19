@@ -1,0 +1,27 @@
+digraph execution_graph {
+  rankdir=LR;
+  subgraph cluster_runtime_cadence {
+    label="runtime-cadence";
+    "T-001" [label="Task 1: Implement daemon cadence and compatible status\nAdvanced"];
+  }
+  subgraph cluster_setup_transaction {
+    label="setup-transaction";
+    "T-002" [label="Task 2: Add durable sample configuration and journal primitives\nCapable"];
+    "T-003" [label="Task 3: Implement the import-safe seventh helper operation\nFrontier"];
+  }
+  subgraph cluster_settings {
+    label="settings";
+    "T-004" [label="Task 4: Connect observed period to the settings UI\nCapable"];
+  }
+  subgraph cluster_acceptance {
+    label="acceptance";
+    "T-005" [label="Task 5: Implement acceptance phases and document unrun evidence\nAdvanced"];
+  }
+  "T-001" -> "T-003";
+  "T-002" -> "T-003";
+  "T-001" -> "T-004";
+  "T-003" -> "T-004";
+  "T-001" -> "T-005";
+  "T-003" -> "T-005";
+  "T-004" -> "T-005";
+}
