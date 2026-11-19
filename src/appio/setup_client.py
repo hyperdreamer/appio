@@ -37,6 +37,25 @@ MAX_STDERR_BYTES = 4 * 1024
 
 _BOOLEAN_OR_NONE = ("enabled", "answering", "pending_activation")
 _TEXT_OR_NONE = ("state", "export_path", "error")
+_SAMPLE_PERIOD_STATES = frozenset(
+    {"applied", "applied_not_running", "repair", "unchanged", "service_not_running"}
+)
+_RESULT_KEYS = frozenset(
+    {
+        "version",
+        "verb",
+        "uid",
+        "enabled",
+        "answering",
+        "pending_activation",
+        "state",
+        "export_path",
+        "export_cutoff",
+        "error",
+        "sample_period",
+        "sample_period_state",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -91,6 +110,8 @@ def decode_body(text: str, verb: str, expected_uid: int) -> dict | None:
         return None
     if not isinstance(document, dict):
         return None
+    if set(document) != _RESULT_KEYS:
+        return None
     if document.get("version") != 1 or type(document.get("version")) is not int:
         return None
     if document.get("verb") != verb:
@@ -105,6 +126,17 @@ def decode_body(text: str, verb: str, expected_uid: int) -> dict | None:
             value = document.get(field)
             if value is not None and not isinstance(value, str):
                 return None
+        sample_period = document.get("sample_period")
+        if sample_period is not None:
+            if type(sample_period) is not int or not 2 <= sample_period <= 30:
+                return None
+        sample_period_state = document.get("sample_period_state")
+        if sample_period_state is not None and not isinstance(sample_period_state, str):
+            return None
+        if sample_period_state is not None and sample_period_state not in _SAMPLE_PERIOD_STATES:
+            return None
+        if verb != "set-sample-period" and (sample_period is not None or sample_period_state is not None):
+            return None
         cutoff = document.get("export_cutoff")
         if cutoff is not None and not isinstance(cutoff, dict):
             return None
@@ -146,21 +178,29 @@ class SetupClient:
     def pending(self) -> bool:
         return self._pending is not None and not self._pending.done()
 
-    def invoke(self, verb: str) -> Future:
-        """Run exactly ``verb`` through the fixed vector, one at a time."""
+    def invoke(self, verb: str, *, period_seconds: int | None = None) -> Future:
+        """Run one fixed helper vector, with a payload only for the period verb."""
 
         if not isinstance(verb, str) or verb not in VERBS:
             raise ValueError("verb is not one of the fixed setup verbs")
+        if verb == "set-sample-period":
+            if type(period_seconds) is not int or not 2 <= period_seconds <= 30:
+                raise ValueError("set-sample-period requires a period from 2 to 30 seconds")
+        elif period_seconds is not None:
+            raise ValueError("period_seconds is only valid for set-sample-period")
         if self.pending:
             raise RuntimeError("a setup operation is already in progress")
         reply: Future = Future()
         self._pending = reply
+        payload = (str(period_seconds),) if verb == "set-sample-period" else ()
         try:
-            result = self._launch(HELPER_ARGV + (verb,))
+            result = self._launch(HELPER_ARGV + (verb,) + payload)
         except BaseException as error:  # a launcher that cannot even start
             reply.set_exception(error)
             return reply
-        result.add_done_callback(lambda done: self._finish(reply, verb, done))
+        result.add_done_callback(
+            lambda done: self._finish(reply, verb, period_seconds, done)
+        )
         return reply
 
     def refresh(self) -> ServiceFacts:
@@ -171,7 +211,9 @@ class SetupClient:
             raise TypeError("probe must return ServiceFacts")
         return facts
 
-    def _finish(self, reply: Future, verb: str, done: Future) -> None:
+    def _finish(
+        self, reply: Future, verb: str, period_seconds: int | None, done: Future
+    ) -> None:
         if reply.done():  # the caller cancelled; still release the slot below
             self._release(reply)
             return
@@ -179,10 +221,15 @@ class SetupClient:
             result = done.result()
             if not isinstance(result, CommandResult):
                 raise TypeError("launch must produce CommandResult")
+            body = decode_body(result.stdout, verb, self._expected_uid)
+            if period_seconds is not None and (
+                body is None or body.get("sample_period") != period_seconds
+            ):
+                body = None
             reply.set_result(SetupReply(
                 exit_code=result.returncode,
                 stderr_first_line=first_stderr_line(result.stderr),
-                body=decode_body(result.stdout, verb, self._expected_uid),
+                body=body,
             ))
         except BaseException as error:
             if not reply.done():

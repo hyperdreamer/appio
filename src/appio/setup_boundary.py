@@ -93,6 +93,7 @@ VERBS: frozenset[str] = frozenset(
         "status",
         "restart-user-manager",
         "export-history",
+        "set-sample-period",
     }
 )
 """The complete verb set. Any other word is an invalid invocation, not a fallback."""
@@ -114,6 +115,7 @@ _WRITABLE_BITS = 0o022
 _MAX_COMPONENTS = 64
 
 _CANONICAL_UID = re.compile(r"(?:0|[1-9][0-9]{0,9})", re.ASCII)
+_CANONICAL_PERIOD = re.compile(r"(?:0|[1-9][0-9]{0,7})", re.ASCII)
 _SAFE_USERNAME = re.compile(r"[A-Za-z_][A-Za-z0-9_.-]{0,31}", re.ASCII)
 _SAFE_ENV_KEY = re.compile(r"[A-Z_][A-Z0-9_]{0,63}", re.ASCII)
 _CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
@@ -189,6 +191,7 @@ class SetupIdentity:
 class Invocation:
     verb: str
     identity: SetupIdentity
+    period_seconds: int | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -307,12 +310,26 @@ def parse_invocation(
 
     if isinstance(argv, (str, bytes)) or not isinstance(argv, Sequence):
         raise InvocationError(2, "invalid_verb_or_argument_count")
-    if len(argv) != 2:
+    if len(argv) not in (2, 3):
         raise InvocationError(2, "invalid_verb_or_argument_count")
-    executable, verb = argv
+    executable, verb = argv[:2]
     _require_executable(executable)
     if not isinstance(verb, str) or verb not in VERBS:
         raise InvocationError(2, "invalid_verb_or_argument_count")
+
+    period_seconds = None
+    if verb == "set-sample-period":
+        if len(argv) != 3:
+            raise InvocationError(2, "invalid_verb_or_argument_count")
+        raw_period = argv[2]
+        if not isinstance(raw_period, str) or not _CANONICAL_PERIOD.fullmatch(raw_period):
+            raise InvocationError(2, "invalid_verb_or_argument_count")
+        period_seconds = int(raw_period)
+        if not 2 <= period_seconds <= 30:
+            raise InvocationError(2, "sample_period_out_of_range")
+    elif len(argv) != 2:
+        raise InvocationError(2, "invalid_verb_or_argument_count")
+
     if euid != 0:
         raise InvocationError(1, "root_required")
 
@@ -325,7 +342,7 @@ def parse_invocation(
         raise InvocationError(1, "unknown_caller_uid")
 
     identity = _identity_from_record(record, uid)
-    return Invocation(verb=verb, identity=identity)
+    return Invocation(verb=verb, identity=identity, period_seconds=period_seconds)
 
 
 def accept_invocation(
