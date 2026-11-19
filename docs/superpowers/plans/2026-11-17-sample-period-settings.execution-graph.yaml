@@ -1,9 +1,9 @@
 source_plan:
   path: docs/superpowers/plans/2026-11-17-sample-period-settings.md
-  sha256: b2708d95e34d35d8bd3ab1ae63a9fd81ec3324d29e6c3226f2e19a4563a170a9
-  commit: fd640e4c58f81c11c70bdc48a9cf7c0a76b390f7
+  sha256: 0ad910f9cfa422d83edc3730390e41093c4a5612cb012f915983c28a2a1f4308
+  commit: 274b2f78a9ba189a3a0e580f6728ca5dd11731e4
 schema_version: 1
-epoch: 2
+epoch: 3
 interfaces:
   produces:
     - id: sample_config
@@ -18,30 +18,24 @@ interfaces:
     - id: status_period
       signature: "validate_server_message(message: dict[str, Any]) -> dict[str, Any]"
       sha256: eeee1dd283a589ca712e04eea1855f8a6278e6c40a1b63cd19f1edb7767d0c61
-    - id: period_invocation
-      signature: "Invocation(verb: str, identity: SetupIdentity, period_seconds: int | None = None)"
-      sha256: 2918c73585381f0f7eef1e77b7fc978582129689e9686521a86e25f8cb457b52
-    - id: period_client
-      signature: "SetupClient.invoke(self, verb: str, *, period_seconds: int | None = None) -> Future"
-      sha256: 3237437d2c2e51675cda5237da97707e74e9ea7b711258823861a48885815238
-    - id: period_decode
-      signature: "decode_body(text: str, verb: str, expected_uid: int) -> dict | None"
-      sha256: 7ef8ec36844c49685354a3e454f26908550086b9f7aecb54499835f5e2c46354
     - id: fixed_targets
       signature: "FIXED_TARGETS: tuple[FixedTarget, ...]"
       sha256: adac253d8a86ed251255b518f819f44ef1887a44c416c99e77a760ebf8362e01
-    - id: setup_verbs
-      signature: "VERBS: frozenset[str]"
-      sha256: 5e905734b53881ab3b320d2f3f04da76e6c5aa63a8f6c5644ade038ae3c27e6e
+    - id: period_target
+      signature: "SAMPLE_PERIOD_DROPIN: Path"
+      sha256: 209eca0fe95e1bd3aee7ac9a4073d75d9e6ed35738184e622ebcb3385ccbe9ad
+    - id: period_directory_prepare
+      signature: "prepare_sample_period_directories(fs: SafeRootFS) -> None"
+      sha256: 431f3730c2cc05833b354470e6d7b4dd913e9fca8c403e75525c6bb39f882e1e
+    - id: period_directory_sync
+      signature: "sync_sample_period_directories(fs: SafeRootFS) -> None"
+      sha256: bcd6263ccf7340cd149a058c09d18d712c71776b062644b85c3bbe347099c5f9
     - id: safe_read
       signature: "SafeRootFS.read_bounded(path: str, *, max_bytes: int, create_parents: bool = True) -> bytes"
       sha256: e0fbc669df5ec92c40f8086651daf4bbb12f8795dbf7a01e52e86453c50b2158
     - id: setup_state
       signature: "load_setup_state(fs: SafeRootFS, *, create_parents: bool = True) -> SetupState"
       sha256: 73319c84d69b3b2d90fdcda7807b0a07a213602dc86945e863d96ee3142453a6
-    - id: period_target
-      signature: "SAMPLE_PERIOD_DROPIN: Path"
-      sha256: 209eca0fe95e1bd3aee7ac9a4073d75d9e6ed35738184e622ebcb3385ccbe9ad
     - id: period_journal_record
       signature: "PeriodJournalRecord(operation_id: str, target: str, sample_seconds: int, target_sha256: str)"
       sha256: 4e2c52fee503c18d0573982e1325991d925a465e7380657e40b350922bd76453
@@ -66,9 +60,24 @@ interfaces:
     - id: journal_remove
       signature: "remove_period_pending(fs: SafeRootFS) -> None"
       sha256: 8d5886aba9ed698f9d279ecb786b53637a5a6c797e683eb64bed317862c5b774
+    - id: period_invocation
+      signature: "Invocation(verb: str, identity: SetupIdentity, period_seconds: int | None = None)"
+      sha256: 2918c73585381f0f7eef1e77b7fc978582129689e9686521a86e25f8cb457b52
+    - id: setup_verbs
+      signature: "VERBS: frozenset[str]"
+      sha256: 5e905734b53881ab3b320d2f3f04da76e6c5aa63a8f6c5644ade038ae3c27e6e
     - id: period_dispatch
       signature: "dispatch(invocation: Invocation, *, deps: SetupDeps) -> dict"
       sha256: 0417f1132d53d2af8751f3b23558704472e5ecede7c3f606782c73e333b2557c
+    - id: period_result
+      signature: "sample_period_result: {sample_period: int | None, sample_period_state: str | None}"
+      sha256: 32fb20ab121a3556af1a24df36958fe41fe580ce3878914b90ca992cdb2b872c
+    - id: period_client
+      signature: "SetupClient.invoke(self, verb: str, *, period_seconds: int | None = None) -> Future"
+      sha256: 3237437d2c2e51675cda5237da97707e74e9ea7b711258823861a48885815238
+    - id: period_decode
+      signature: "decode_body(text: str, verb: str, expected_uid: int) -> dict | None"
+      sha256: 7ef8ec36844c49685354a3e454f26908550086b9f7aecb54499835f5e2c46354
     - id: service_facts_period
       signature: "ServiceFacts.sample_ns: int | None = None"
       sha256: 8efc7a6ea60dbc73acf6a94d0755825618b7b5995e64034c0bf6c18e760dc50c
@@ -78,20 +87,46 @@ interfaces:
   consumes:
     - id: status_period
       sha256: eeee1dd283a589ca712e04eea1855f8a6278e6c40a1b63cd19f1edb7767d0c61
+    - id: fixed_targets
+      sha256: adac253d8a86ed251255b518f819f44ef1887a44c416c99e77a760ebf8362e01
+    - id: period_target
+      sha256: 209eca0fe95e1bd3aee7ac9a4073d75d9e6ed35738184e622ebcb3385ccbe9ad
+    - id: period_directory_prepare
+      sha256: 431f3730c2cc05833b354470e6d7b4dd913e9fca8c403e75525c6bb39f882e1e
+    - id: period_directory_sync
+      sha256: bcd6263ccf7340cd149a058c09d18d712c71776b062644b85c3bbe347099c5f9
+    - id: safe_read
+      sha256: e0fbc669df5ec92c40f8086651daf4bbb12f8795dbf7a01e52e86453c50b2158
+    - id: setup_state
+      sha256: 73319c84d69b3b2d90fdcda7807b0a07a213602dc86945e863d96ee3142453a6
+    - id: period_journal_record
+      sha256: 4e2c52fee503c18d0573982e1325991d925a465e7380657e40b350922bd76453
+    - id: period_payload
+      sha256: f1d8ed4e4dfd2dfeb886fe0c3926a504b7198b543c553199c5abc78df3edbcb0
+    - id: period_parser
+      sha256: 163d55b274927ccadac4a6556b1cb3dc555745a5733e56d261245843c591dd94
+    - id: journal_encode
+      sha256: d88993620fb1d482da1a6eea84d3b8f36269f2b8e7fa260139d3b70ea09c6d18
+    - id: journal_decode
+      sha256: 264c5f730d45a73e5a24a2f8c63502430140188cf8383c1c197863c3773c4500
+    - id: journal_pending
+      sha256: 3be7a1c28a6b69d4073635e82a800e9304b1bacf5ea334c9845125aa5bdd73d1
+    - id: journal_complete
+      sha256: b0d3b12cf058fff495427d2be458a4a712869a8c164960adde3caabd88f8b525
+    - id: journal_remove
+      sha256: 8d5886aba9ed698f9d279ecb786b53637a5a6c797e683eb64bed317862c5b774
     - id: period_client
       sha256: 3237437d2c2e51675cda5237da97707e74e9ea7b711258823861a48885815238
     - id: period_decode
       sha256: 7ef8ec36844c49685354a3e454f26908550086b9f7aecb54499835f5e2c46354
     - id: period_dispatch
       sha256: 0417f1132d53d2af8751f3b23558704472e5ecede7c3f606782c73e333b2557c
+    - id: period_result
+      sha256: 32fb20ab121a3556af1a24df36958fe41fe580ce3878914b90ca992cdb2b872c
     - id: sample_flush
       sha256: 31e3bfa1124980134e0961588ddd32fefc81a865e551acc946cba7aea3203251
     - id: sample_maintenance
       sha256: dbf50f1c201784814b4a55f3304c2a60177050aeeb88b7663ad740c23b1d65ab
-    - id: period_invocation
-      sha256: 2918c73585381f0f7eef1e77b7fc978582129689e9686521a86e25f8cb457b52
-    - id: service_facts_period
-      sha256: 8efc7a6ea60dbc73acf6a94d0755825618b7b5995e64034c0bf6c18e760dc50c
 produces:
   - id: sample_config
     signature: "configured_sample_ns(environ: Mapping[str, str] | None = None) -> int"
@@ -105,30 +140,24 @@ produces:
   - id: status_period
     signature: "validate_server_message(message: dict[str, Any]) -> dict[str, Any]"
     sha256: eeee1dd283a589ca712e04eea1855f8a6278e6c40a1b63cd19f1edb7767d0c61
-  - id: period_invocation
-    signature: "Invocation(verb: str, identity: SetupIdentity, period_seconds: int | None = None)"
-    sha256: 2918c73585381f0f7eef1e77b7fc978582129689e9686521a86e25f8cb457b52
-  - id: period_client
-    signature: "SetupClient.invoke(self, verb: str, *, period_seconds: int | None = None) -> Future"
-    sha256: 3237437d2c2e51675cda5237da97707e74e9ea7b711258823861a48885815238
-  - id: period_decode
-    signature: "decode_body(text: str, verb: str, expected_uid: int) -> dict | None"
-    sha256: 7ef8ec36844c49685354a3e454f26908550086b9f7aecb54499835f5e2c46354
   - id: fixed_targets
     signature: "FIXED_TARGETS: tuple[FixedTarget, ...]"
     sha256: adac253d8a86ed251255b518f819f44ef1887a44c416c99e77a760ebf8362e01
-  - id: setup_verbs
-    signature: "VERBS: frozenset[str]"
-    sha256: 5e905734b53881ab3b320d2f3f04da76e6c5aa63a8f6c5644ade038ae3c27e6e
+  - id: period_target
+    signature: "SAMPLE_PERIOD_DROPIN: Path"
+    sha256: 209eca0fe95e1bd3aee7ac9a4073d75d9e6ed35738184e622ebcb3385ccbe9ad
+  - id: period_directory_prepare
+    signature: "prepare_sample_period_directories(fs: SafeRootFS) -> None"
+    sha256: 431f3730c2cc05833b354470e6d7b4dd913e9fca8c403e75525c6bb39f882e1e
+  - id: period_directory_sync
+    signature: "sync_sample_period_directories(fs: SafeRootFS) -> None"
+    sha256: bcd6263ccf7340cd149a058c09d18d712c71776b062644b85c3bbe347099c5f9
   - id: safe_read
     signature: "SafeRootFS.read_bounded(path: str, *, max_bytes: int, create_parents: bool = True) -> bytes"
     sha256: e0fbc669df5ec92c40f8086651daf4bbb12f8795dbf7a01e52e86453c50b2158
   - id: setup_state
     signature: "load_setup_state(fs: SafeRootFS, *, create_parents: bool = True) -> SetupState"
     sha256: 73319c84d69b3b2d90fdcda7807b0a07a213602dc86945e863d96ee3142453a6
-  - id: period_target
-    signature: "SAMPLE_PERIOD_DROPIN: Path"
-    sha256: 209eca0fe95e1bd3aee7ac9a4073d75d9e6ed35738184e622ebcb3385ccbe9ad
   - id: period_journal_record
     signature: "PeriodJournalRecord(operation_id: str, target: str, sample_seconds: int, target_sha256: str)"
     sha256: 4e2c52fee503c18d0573982e1325991d925a465e7380657e40b350922bd76453
@@ -153,9 +182,24 @@ produces:
   - id: journal_remove
     signature: "remove_period_pending(fs: SafeRootFS) -> None"
     sha256: 8d5886aba9ed698f9d279ecb786b53637a5a6c797e683eb64bed317862c5b774
+  - id: period_invocation
+    signature: "Invocation(verb: str, identity: SetupIdentity, period_seconds: int | None = None)"
+    sha256: 2918c73585381f0f7eef1e77b7fc978582129689e9686521a86e25f8cb457b52
+  - id: setup_verbs
+    signature: "VERBS: frozenset[str]"
+    sha256: 5e905734b53881ab3b320d2f3f04da76e6c5aa63a8f6c5644ade038ae3c27e6e
   - id: period_dispatch
     signature: "dispatch(invocation: Invocation, *, deps: SetupDeps) -> dict"
     sha256: 0417f1132d53d2af8751f3b23558704472e5ecede7c3f606782c73e333b2557c
+  - id: period_result
+    signature: "sample_period_result: {sample_period: int | None, sample_period_state: str | None}"
+    sha256: 32fb20ab121a3556af1a24df36958fe41fe580ce3878914b90ca992cdb2b872c
+  - id: period_client
+    signature: "SetupClient.invoke(self, verb: str, *, period_seconds: int | None = None) -> Future"
+    sha256: 3237437d2c2e51675cda5237da97707e74e9ea7b711258823861a48885815238
+  - id: period_decode
+    signature: "decode_body(text: str, verb: str, expected_uid: int) -> dict | None"
+    sha256: 7ef8ec36844c49685354a3e454f26908550086b9f7aecb54499835f5e2c46354
   - id: service_facts_period
     signature: "ServiceFacts.sample_ns: int | None = None"
     sha256: 8efc7a6ea60dbc73acf6a94d0755825618b7b5995e64034c0bf6c18e760dc50c
@@ -165,33 +209,59 @@ produces:
 consumes:
   - id: status_period
     sha256: eeee1dd283a589ca712e04eea1855f8a6278e6c40a1b63cd19f1edb7767d0c61
+  - id: fixed_targets
+    sha256: adac253d8a86ed251255b518f819f44ef1887a44c416c99e77a760ebf8362e01
+  - id: period_target
+    sha256: 209eca0fe95e1bd3aee7ac9a4073d75d9e6ed35738184e622ebcb3385ccbe9ad
+  - id: period_directory_prepare
+    sha256: 431f3730c2cc05833b354470e6d7b4dd913e9fca8c403e75525c6bb39f882e1e
+  - id: period_directory_sync
+    sha256: bcd6263ccf7340cd149a058c09d18d712c71776b062644b85c3bbe347099c5f9
+  - id: safe_read
+    sha256: e0fbc669df5ec92c40f8086651daf4bbb12f8795dbf7a01e52e86453c50b2158
+  - id: setup_state
+    sha256: 73319c84d69b3b2d90fdcda7807b0a07a213602dc86945e863d96ee3142453a6
+  - id: period_journal_record
+    sha256: 4e2c52fee503c18d0573982e1325991d925a465e7380657e40b350922bd76453
+  - id: period_payload
+    sha256: f1d8ed4e4dfd2dfeb886fe0c3926a504b7198b543c553199c5abc78df3edbcb0
+  - id: period_parser
+    sha256: 163d55b274927ccadac4a6556b1cb3dc555745a5733e56d261245843c591dd94
+  - id: journal_encode
+    sha256: d88993620fb1d482da1a6eea84d3b8f36269f2b8e7fa260139d3b70ea09c6d18
+  - id: journal_decode
+    sha256: 264c5f730d45a73e5a24a2f8c63502430140188cf8383c1c197863c3773c4500
+  - id: journal_pending
+    sha256: 3be7a1c28a6b69d4073635e82a800e9304b1bacf5ea334c9845125aa5bdd73d1
+  - id: journal_complete
+    sha256: b0d3b12cf058fff495427d2be458a4a712869a8c164960adde3caabd88f8b525
+  - id: journal_remove
+    sha256: 8d5886aba9ed698f9d279ecb786b53637a5a6c797e683eb64bed317862c5b774
   - id: period_client
     sha256: 3237437d2c2e51675cda5237da97707e74e9ea7b711258823861a48885815238
   - id: period_decode
     sha256: 7ef8ec36844c49685354a3e454f26908550086b9f7aecb54499835f5e2c46354
   - id: period_dispatch
     sha256: 0417f1132d53d2af8751f3b23558704472e5ecede7c3f606782c73e333b2557c
+  - id: period_result
+    sha256: 32fb20ab121a3556af1a24df36958fe41fe580ce3878914b90ca992cdb2b872c
   - id: sample_flush
     sha256: 31e3bfa1124980134e0961588ddd32fefc81a865e551acc946cba7aea3203251
   - id: sample_maintenance
     sha256: dbf50f1c201784814b4a55f3304c2a60177050aeeb88b7663ad740c23b1d65ab
-  - id: period_invocation
-    sha256: 2918c73585381f0f7eef1e77b7fc978582129689e9686521a86e25f8cb457b52
-  - id: service_facts_period
-    sha256: 8efc7a6ea60dbc73acf6a94d0755825618b7b5995e64034c0bf6c18e760dc50c
 lanes:
   - id: runtime-cadence
     task_ids: [T-001]
   - id: setup-transaction
-    task_ids: [T-002]
-  - id: gui-ownership
-    task_ids: [T-003]
-  - id: acceptance-documentation
+    task_ids: [T-002, T-003]
+  - id: settings
     task_ids: [T-004]
+  - id: acceptance
+    task_ids: [T-005]
 tasks:
   - id: T-001
     plan_task: 1
-    title: "Resolve configurable cadence and status protocol"
+    title: "Implement daemon cadence and compatible status"
     implementer_tier: advanced
     lane: runtime-cadence
     sequence: 1
@@ -212,50 +282,46 @@ tasks:
         sha256: eeee1dd283a589ca712e04eea1855f8a6278e6c40a1b63cd19f1edb7767d0c61
     consumes: []
     validation:
-      - argv: ["python", "-m", "pytest", "-q", "tests/p3/test_iod_cadence_pins.py", "tests/p3/test_iod.py", "tests/p3/test_ipc_protocol.py"]
+      - argv: ["python", "-m", "pytest", "-q", "tests/p3/test_iod_cadence_pins.py", "tests/p3/test_iod.py", "tests/p3/test_iod_service.py", "tests/p3/test_iodclient.py", "tests/p3/test_ipc_protocol.py"]
         cwd: .
         timeout_seconds: 1800
         env:
           QT_QPA_PLATFORM: offscreen
           PYTEST_QT_API: pyqt6
           PYTHONDONTWRITEBYTECODE: "1"
+      - argv: ["python", "-c", "import appio.iod, appio.ipc_models, appio.setup_service"]
+        cwd: .
+        timeout_seconds: 60
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
   - id: T-002
     plan_task: 2
-    title: "Implement the sample period setup transaction"
-    implementer_tier: frontier
+    title: "Add durable sample configuration and journal primitives"
+    implementer_tier: capable
     lane: setup-transaction
     sequence: 1
-    depends_on: [T-001]
+    depends_on: []
     owns:
       - src/appio/setup_boundary.py
-      - data/libexec/appio-setup
-      - src/appio/setup_client.py
-      - tests/p3/test_setup_boundary.py
-      - tests/p3/test_setup_client.py
       - src/appio/setup_files.py
       - src/appio/setup_delegation.py
+      - tests/p3/test_setup_boundary.py
       - tests/p3/test_setup_files.py
       - tests/p3/test_setup_delegation.py
-      - src/appio/setup_service.py
-      - tests/p3/test_setup_service.py
     exclusive_resources: []
     produces:
-      - id: period_invocation
-        sha256: 2918c73585381f0f7eef1e77b7fc978582129689e9686521a86e25f8cb457b52
-      - id: period_client
-        sha256: 3237437d2c2e51675cda5237da97707e74e9ea7b711258823861a48885815238
-      - id: period_decode
-        sha256: 7ef8ec36844c49685354a3e454f26908550086b9f7aecb54499835f5e2c46354
       - id: fixed_targets
         sha256: adac253d8a86ed251255b518f819f44ef1887a44c416c99e77a760ebf8362e01
-      - id: setup_verbs
-        sha256: 5e905734b53881ab3b320d2f3f04da76e6c5aa63a8f6c5644ade038ae3c27e6e
+      - id: period_target
+        sha256: 209eca0fe95e1bd3aee7ac9a4073d75d9e6ed35738184e622ebcb3385ccbe9ad
+      - id: period_directory_prepare
+        sha256: 431f3730c2cc05833b354470e6d7b4dd913e9fca8c403e75525c6bb39f882e1e
+      - id: period_directory_sync
+        sha256: bcd6263ccf7340cd149a058c09d18d712c71776b062644b85c3bbe347099c5f9
       - id: safe_read
         sha256: e0fbc669df5ec92c40f8086651daf4bbb12f8795dbf7a01e52e86453c50b2158
       - id: setup_state
         sha256: 73319c84d69b3b2d90fdcda7807b0a07a213602dc86945e863d96ee3142453a6
-      - id: period_target
-        sha256: 209eca0fe95e1bd3aee7ac9a4073d75d9e6ed35738184e622ebcb3385ccbe9ad
       - id: period_journal_record
         sha256: 4e2c52fee503c18d0573982e1325991d925a465e7380657e40b350922bd76453
       - id: period_payload
@@ -272,30 +338,105 @@ tasks:
         sha256: b0d3b12cf058fff495427d2be458a4a712869a8c164960adde3caabd88f8b525
       - id: journal_remove
         sha256: 8d5886aba9ed698f9d279ecb786b53637a5a6c797e683eb64bed317862c5b774
-      - id: period_dispatch
-        sha256: 0417f1132d53d2af8751f3b23558704472e5ecede7c3f606782c73e333b2557c
-    consumes:
-      - id: status_period
-        sha256: eeee1dd283a589ca712e04eea1855f8a6278e6c40a1b63cd19f1edb7767d0c61
+    consumes: []
     validation:
-      - argv: ["python", "-m", "pytest", "-q", "tests/p3/test_setup_service.py", "tests/p3/test_setup_files.py", "tests/p3/test_setup_boundary.py", "tests/p3/test_setup_delegation.py", "tests/p3/test_setup_client.py"]
+      - argv: ["python", "-m", "pytest", "-q", "tests/p3/test_setup_files.py", "tests/p3/test_setup_delegation.py", "tests/p3/test_setup_boundary.py", "tests/p3/test_setup_service.py"]
         cwd: .
         timeout_seconds: 1800
         env:
           QT_QPA_PLATFORM: offscreen
           PYTEST_QT_API: pyqt6
           PYTHONDONTWRITEBYTECODE: "1"
+      - argv: ["python", "-c", "import appio.setup_boundary, appio.setup_files, appio.setup_delegation, appio.setup_service"]
+        cwd: .
+        timeout_seconds: 60
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
   - id: T-003
     plan_task: 3
-    title: "Add observed period state to ownership and GUI settings"
-    implementer_tier: capable
-    lane: gui-ownership
-    sequence: 1
+    title: "Implement the import-safe seventh helper operation"
+    implementer_tier: frontier
+    lane: setup-transaction
+    sequence: 2
     depends_on: [T-001, T-002]
+    owns:
+      - src/appio/setup_boundary.py
+      - src/appio/setup_service.py
+      - src/appio/setup_client.py
+      - data/libexec/appio-setup
+      - tests/p3/test_setup_boundary.py
+      - tests/p3/test_setup_service.py
+      - tests/p3/test_setup_client.py
+    exclusive_resources: []
+    produces:
+      - id: period_invocation
+        sha256: 2918c73585381f0f7eef1e77b7fc978582129689e9686521a86e25f8cb457b52
+      - id: setup_verbs
+        sha256: 5e905734b53881ab3b320d2f3f04da76e6c5aa63a8f6c5644ade038ae3c27e6e
+      - id: period_dispatch
+        sha256: 0417f1132d53d2af8751f3b23558704472e5ecede7c3f606782c73e333b2557c
+      - id: period_result
+        sha256: 32fb20ab121a3556af1a24df36958fe41fe580ce3878914b90ca992cdb2b872c
+      - id: period_client
+        sha256: 3237437d2c2e51675cda5237da97707e74e9ea7b711258823861a48885815238
+      - id: period_decode
+        sha256: 7ef8ec36844c49685354a3e454f26908550086b9f7aecb54499835f5e2c46354
+    consumes:
+      - id: status_period
+        sha256: eeee1dd283a589ca712e04eea1855f8a6278e6c40a1b63cd19f1edb7767d0c61
+      - id: fixed_targets
+        sha256: adac253d8a86ed251255b518f819f44ef1887a44c416c99e77a760ebf8362e01
+      - id: period_target
+        sha256: 209eca0fe95e1bd3aee7ac9a4073d75d9e6ed35738184e622ebcb3385ccbe9ad
+      - id: period_directory_prepare
+        sha256: 431f3730c2cc05833b354470e6d7b4dd913e9fca8c403e75525c6bb39f882e1e
+      - id: period_directory_sync
+        sha256: bcd6263ccf7340cd149a058c09d18d712c71776b062644b85c3bbe347099c5f9
+      - id: safe_read
+        sha256: e0fbc669df5ec92c40f8086651daf4bbb12f8795dbf7a01e52e86453c50b2158
+      - id: setup_state
+        sha256: 73319c84d69b3b2d90fdcda7807b0a07a213602dc86945e863d96ee3142453a6
+      - id: period_journal_record
+        sha256: 4e2c52fee503c18d0573982e1325991d925a465e7380657e40b350922bd76453
+      - id: period_payload
+        sha256: f1d8ed4e4dfd2dfeb886fe0c3926a504b7198b543c553199c5abc78df3edbcb0
+      - id: period_parser
+        sha256: 163d55b274927ccadac4a6556b1cb3dc555745a5733e56d261245843c591dd94
+      - id: journal_encode
+        sha256: d88993620fb1d482da1a6eea84d3b8f36269f2b8e7fa260139d3b70ea09c6d18
+      - id: journal_decode
+        sha256: 264c5f730d45a73e5a24a2f8c63502430140188cf8383c1c197863c3773c4500
+      - id: journal_pending
+        sha256: 3be7a1c28a6b69d4073635e82a800e9304b1bacf5ea334c9845125aa5bdd73d1
+      - id: journal_complete
+        sha256: b0d3b12cf058fff495427d2be458a4a712869a8c164960adde3caabd88f8b525
+      - id: journal_remove
+        sha256: 8d5886aba9ed698f9d279ecb786b53637a5a6c797e683eb64bed317862c5b774
+    validation:
+      - argv: ["python", "-m", "pytest", "-q", "tests/p3/test_setup_boundary.py", "tests/p3/test_setup_files.py", "tests/p3/test_setup_delegation.py", "tests/p3/test_setup_service.py", "tests/p3/test_setup_client.py"]
+        cwd: .
+        timeout_seconds: 1800
+        env:
+          QT_QPA_PLATFORM: offscreen
+          PYTEST_QT_API: pyqt6
+          PYTHONDONTWRITEBYTECODE: "1"
+      - argv: ["python", "-c", "import appio.setup_boundary, appio.setup_service, appio.setup_client"]
+        cwd: .
+        timeout_seconds: 60
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+  - id: T-004
+    plan_task: 4
+    title: "Connect observed period to the settings UI"
+    implementer_tier: capable
+    lane: settings
+    sequence: 1
+    depends_on: [T-001, T-003]
     owns:
       - src/appio/collector_owner.py
       - src/appio/ui/collector_window.py
       - tests/p3/test_collector_window.py
+      - tests/p3/test_collector_owner.py
     exclusive_resources: []
     produces:
       - id: service_facts_period
@@ -309,25 +450,32 @@ tasks:
         sha256: 7ef8ec36844c49685354a3e454f26908550086b9f7aecb54499835f5e2c46354
       - id: period_dispatch
         sha256: 0417f1132d53d2af8751f3b23558704472e5ecede7c3f606782c73e333b2557c
+      - id: period_result
+        sha256: 32fb20ab121a3556af1a24df36958fe41fe580ce3878914b90ca992cdb2b872c
     validation:
-      - argv: ["python", "-m", "pytest", "-q", "tests/p3/test_collector_window.py", "tests/p3/test_collector_owner.py", "tests/p3/test_setup_client.py"]
+      - argv: ["python", "-m", "pytest", "-q", "tests/p3/test_collector_owner.py", "tests/p3/test_collector_window.py", "tests/p3/test_setup_client.py"]
         cwd: .
         timeout_seconds: 1800
         env:
           QT_QPA_PLATFORM: offscreen
           PYTEST_QT_API: pyqt6
           PYTHONDONTWRITEBYTECODE: "1"
-  - id: T-004
-    plan_task: 4
-    title: "Add isolated host acceptance phases and documentation"
-    implementer_tier: capable
-    lane: acceptance-documentation
+      - argv: ["python", "-c", "import appio.collector_owner, appio.ui.collector_window, appio.setup_service"]
+        cwd: .
+        timeout_seconds: 60
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+  - id: T-005
+    plan_task: 5
+    title: "Implement acceptance phases and document unrun evidence"
+    implementer_tier: advanced
+    lane: acceptance
     sequence: 1
-    depends_on: [T-001, T-002, T-003]
+    depends_on: [T-001, T-003, T-004]
     owns:
       - tools/acceptance/appio-p3-root.py
-      - docs/acceptance/appio-p3-root.md
       - tests/p3/test_p3_acceptance.py
+      - docs/acceptance/appio-p3-root.md
     exclusive_resources: []
     produces:
       - id: acceptance_helper
@@ -339,12 +487,8 @@ tasks:
         sha256: dbf50f1c201784814b4a55f3304c2a60177050aeeb88b7663ad740c23b1d65ab
       - id: status_period
         sha256: eeee1dd283a589ca712e04eea1855f8a6278e6c40a1b63cd19f1edb7767d0c61
-      - id: period_invocation
-        sha256: 2918c73585381f0f7eef1e77b7fc978582129689e9686521a86e25f8cb457b52
-      - id: period_dispatch
-        sha256: 0417f1132d53d2af8751f3b23558704472e5ecede7c3f606782c73e333b2557c
-      - id: service_facts_period
-        sha256: 8efc7a6ea60dbc73acf6a94d0755825618b7b5995e64034c0bf6c18e760dc50c
+      - id: period_result
+        sha256: 32fb20ab121a3556af1a24df36958fe41fe580ce3878914b90ca992cdb2b872c
     validation:
       - argv: ["python", "-m", "pytest", "-q", "tests/p3/test_p3_acceptance.py"]
         cwd: .
@@ -352,6 +496,16 @@ tasks:
         env:
           QT_QPA_PLATFORM: offscreen
           PYTEST_QT_API: pyqt6
+          PYTHONDONTWRITEBYTECODE: "1"
+      - argv: ["python", "tools/acceptance/appio-p3-root.py", "--phase", "period-runtime"]
+        cwd: .
+        timeout_seconds: 1800
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+      - argv: ["python", "tools/acceptance/appio-p3-root.py", "--phase", "period-capacity"]
+        cwd: .
+        timeout_seconds: 1800
+        env:
           PYTHONDONTWRITEBYTECODE: "1"
       - argv: ["python", "-m", "pytest", "-q"]
         cwd: .
