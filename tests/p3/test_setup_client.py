@@ -101,6 +101,15 @@ def test_period_payload_pairing_refuses_before_launch():
     assert launch.calls == []
 
 
+def test_decode_body_rejects_null_service_state_for_complete_period_result():
+    body = _body(verb="set-sample-period", sample_period=10,
+                 sample_period_state="applied", state=None)
+    assert decode_body(body, "set-sample-period", 1000) is None
+    assert decode_body(_body(verb="set-sample-period", sample_period=10,
+                             sample_period_state="applied", state="unknown",
+                             export_path=None, error=None), "set-sample-period", 1000) is not None
+
+
 def test_decode_body_validates_period_result_fields():
     accepted = _body(verb="set-sample-period", sample_period=10, sample_period_state="applied")
     assert decode_body(accepted, "set-sample-period", 1000) is not None

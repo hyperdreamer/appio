@@ -339,21 +339,25 @@ def _period_active_observation(view: dict[str, object], observed: object, second
 
 
 def _period_final_lifecycle(deps):
-    """Perform the final lifecycle/status observation while preserving an earlier failure."""
+    """Read lifecycle twice, with status between the reads when active."""
+    observation_failure = None
     try:
-        _unit_state(deps)
-    except Exception:
-        return None
+        preceding = _unit_state(deps)
+    except BoundaryError as error:
+        preceding = None
+        observation_failure = ServiceError(error.reason, stderr=getattr(error, "stderr", ""))
+
+    status = None
+    if preceding is not None and preceding.get("ActiveState") == "active":
+        status = probe_daemon_status_payload(deps=deps, timeout_seconds=STATUS_TIMEOUT_SECONDS)
+
     try:
         final = _unit_state(deps)
-    except Exception:
-        return None
-    if final.get("ActiveState") == "active":
-        try:
-            probe_daemon_status_payload(deps=deps, timeout_seconds=STATUS_TIMEOUT_SECONDS)
-        except Exception:
-            pass
-    return final
+    except BoundaryError as error:
+        final = None
+        if observation_failure is None:
+            observation_failure = ServiceError(error.reason, stderr=getattr(error, "stderr", ""))
+    return preceding, final, status, observation_failure
 
 
 def _period_failure(
@@ -404,10 +408,19 @@ def _set_sample_period(identity, deps, fs, result):
     try:
         initial_view = _period_view(deps)
     except ServiceError:
-        final_unit = _period_final_lifecycle(deps)
-        if active_before and final_unit is not None and final_unit.get("ActiveState") != "active":
-            result["sample_period_state"] = "service_not_running"
-            raise _period_failure("service_not_running", result=result)
+        _, final_unit, final_status, final_failure = _period_final_lifecycle(deps)
+        if final_unit is not None:
+            answering = bool(
+                final_unit.get("ActiveState") == "active"
+                and final_status is not None
+                and final_status.get("answering") is True
+            )
+            _period_result_unit(result, final_unit, answering=answering)
+            if active_before and final_unit.get("ActiveState") != "active":
+                result["sample_period_state"] = "service_not_running"
+                raise _period_failure("service_not_running", result=result)
+        if final_failure is not None:
+            raise final_failure
         raise
     configured = _configured_period(initial_view["Environment"])
     initial_status = None
@@ -431,38 +444,39 @@ def _set_sample_period(identity, deps, fs, result):
     if recovered:
         manager_required = False
 
+    operation_failure: ServiceError | None = None
     try:
         fs.prepare_period_directories()
         if needs_write is False and manager_required:
             fs.sync_period_parent(SAMPLE_PERIOD_DROPIN)
-    except (OSError, PermissionError) as error:
-        raise _period_failure("sample_period_state_write_failed", result=result) from error
+    except (OSError, PermissionError):
+        operation_failure = _period_failure("sample_period_state_write_failed", result=result)
 
     operation_id = None
-    if manager_required:
-        if pending_matches and not pending_malformed:
+    if manager_required and operation_failure is None:
+        if pending_matches and not recovery_pair and not reconciliation:
             operation_id = pending.operation_id
         else:
             operation_id = _period_operation_id()
         record = PeriodJournalRecord(operation_id, str(SAMPLE_PERIOD_DROPIN), seconds, digest)
         try:
             publish_period_pending(fs, record)
-        except (OSError, PermissionError, ValueError) as error:
-            raise _period_failure("sample_period_state_write_failed", result=result) from error
-        incomplete_pending = True
-        if needs_write:
-            try:
-                fs.atomic_write(SAMPLE_PERIOD_DROPIN, canonical, mode=0o644)
-            except (OSError, PermissionError, ValueError) as error:
-                raise _period_failure("sample_period_write_failed", result=result) from error
-        else:
-            try:
-                fs.sync_period_parent(SAMPLE_PERIOD_DROPIN)
-            except (OSError, PermissionError) as error:
-                raise _period_failure("sample_period_state_write_failed", result=result) from error
+        except (OSError, PermissionError, ValueError):
+            operation_failure = _period_failure("sample_period_state_write_failed", result=result)
+        if operation_failure is None:
+            incomplete_pending = True
+            if needs_write:
+                try:
+                    fs.atomic_write(SAMPLE_PERIOD_DROPIN, canonical, mode=0o644)
+                except (OSError, PermissionError, ValueError):
+                    operation_failure = _period_failure("sample_period_write_failed", result=result)
+            else:
+                try:
+                    fs.sync_period_parent(SAMPLE_PERIOD_DROPIN)
+                except (OSError, PermissionError):
+                    operation_failure = _period_failure("sample_period_state_write_failed", result=result)
 
-    operation_failure: ServiceError | None = None
-    if manager_required and not recovered:
+    if manager_required and not recovered and operation_failure is None:
         try:
             _run(deps, DAEMON_RELOAD_ARGV, "daemon_reload")
         except ServiceError as error:
@@ -475,7 +489,7 @@ def _set_sample_period(identity, deps, fs, result):
 
     verification_view = None
     verification_failure: ServiceError | None = None
-    if operation_failure is None:
+    if operation_failure is None or operation_failure.reason == "service_restart_failed":
         try:
             verification_view = _period_view(deps)
             configured_after = _configured_period(verification_view["Environment"])
@@ -503,33 +517,15 @@ def _set_sample_period(identity, deps, fs, result):
         except ServiceError as error:
             verification_failure = error
 
-    try:
-        after_verification = _unit_state(deps)
-    except ServiceError as error:
-        after_verification = None
-        final_failure = error
-    else:
-        final_failure = None
-
-    final_status = None
-    final_observed = None
-    if after_verification is not None and after_verification.get("ActiveState") == "active":
-        final_status = probe_daemon_status_payload(deps=deps, timeout_seconds=STATUS_TIMEOUT_SECONDS)
-        final_observed = _sample_seconds(final_status)
-
-    try:
-        final_unit = _unit_state(deps)
-    except ServiceError as error:
-        final_unit = None
-        if final_failure is None:
-            final_failure = error
-
-    if final_unit is not None and final_unit.get("ActiveState") == "active":
-        final_status = probe_daemon_status_payload(deps=deps, timeout_seconds=STATUS_TIMEOUT_SECONDS)
-        final_observed = _sample_seconds(final_status)
-
+    after_verification, final_unit, final_status, final_failure = _period_final_lifecycle(deps)
+    final_observed = _sample_seconds(final_status)
     if final_unit is not None:
-        _period_result_unit(result, final_unit, answering=(final_observed == seconds) if final_unit.get("ActiveState") == "active" else False)
+        answering = bool(
+            final_unit.get("ActiveState") == "active"
+            and final_status is not None
+            and final_status.get("answering") is True
+        )
+        _period_result_unit(result, final_unit, answering=answering)
     active_after = final_unit is not None and final_unit.get("ActiveState") == "active"
 
     if final_unit is not None and active_before and not active_after:
@@ -545,20 +541,17 @@ def _set_sample_period(identity, deps, fs, result):
         raise verification_failure
     if final_unit is None or "ActiveState" not in final_unit or "Result" not in final_unit:
         raise _period_failure("sample_period_final_observation_failed", result=result)
-    if active_after:
-        if final_unit.get("Result") != "success" or final_observed != seconds:
-            diagnostic = _period_diagnostic_active(
-                verification_view or initial_view,
-                _period_active_observation(verification_view or initial_view, final_observed, seconds),
-            )
-            raise _period_failure(
-                "service_lifecycle_failed" if final_unit.get("Result") != "success" else "sample_period_overridden",
-                stderr=diagnostic,
-                result=result,
-            )
+    if active_after and final_unit.get("Result") != "success":
+        raise _period_failure("service_lifecycle_failed", result=result)
+    preceding_active = after_verification is not None and after_verification.get("ActiveState") == "active"
+    if (active_after or preceding_active) and (not preceding_active or final_observed != seconds):
+        diagnostic = _period_diagnostic_active(
+            verification_view or initial_view,
+            _period_active_observation(verification_view or initial_view, final_observed, seconds),
+        )
+        raise _period_failure("sample_period_overridden", stderr=diagnostic, result=result)
 
-    # The unit is inactive here. A unit-wide historical Result is deliberately
-    # ignored once the requested configuration is verified.
+    # For an inactive unit, a historical Result does not block a verified apply.
     if operation_id is None:
         if recovered:
             operation_id = pending.operation_id
@@ -599,7 +592,9 @@ def _set_sample_period(identity, deps, fs, result):
 
 
 def _sample_unset(value: object) -> bool:
-    return isinstance(value, str) and "APPIO_SAMPLE_SECONDS" in value.split()
+    return isinstance(value, str) and any(
+        token.partition("=")[0] == "APPIO_SAMPLE_SECONDS" for token in value.split()
+    )
 
 
 # One literal route for every accepted verb, with no default or shell dispatcher.

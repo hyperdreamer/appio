@@ -36,7 +36,7 @@ MAX_STDOUT_BYTES = 64 * 1024
 MAX_STDERR_BYTES = 4 * 1024
 
 _BOOLEAN_OR_NONE = ("enabled", "answering", "pending_activation")
-_TEXT_OR_NONE = ("state", "export_path", "error")
+_TEXT_OR_NONE = ("export_path", "error")
 _SAMPLE_PERIOD_STATES = frozenset(
     {"applied", "applied_not_running", "repair", "unchanged", "service_not_running"}
 )
@@ -118,6 +118,8 @@ def decode_body(text: str, verb: str, expected_uid: int) -> dict | None:
         return None
     uid = document.get("uid")
     if type(uid) is not int or uid != expected_uid:
+        return None
+    if not isinstance(document.get("state"), str):
         return None
     try:
         for field in _BOOLEAN_OR_NONE:

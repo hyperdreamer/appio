@@ -343,35 +343,79 @@ def _replace_sample_show(env, monkeypatch, output):
         "Environment=APPIO_SAMPLE_SECONDS=10\nUnknown=value\nDropInPaths=/etc/x\nUnitFileState=enabled\nActiveState=active\n",
         "Environment=APPIO_SAMPLE_SECONDS=10\n\nDropInPaths=/etc/x\nUnitFileState=enabled\nActiveState=active\n",
         "Environment=APPIO_SAMPLE_SECONDS=10\nDropInPaths=/etc/x\nUnitFileState=enabled\n",
+        "DropInPaths=/etc/x\nUnitFileState=enabled\nActiveState=active\n",
+        "Environment=APPIO_SAMPLE_SECONDS=10\nUnitFileState=enabled\nActiveState=active\n",
+        "Environment=APPIO_SAMPLE_SECONDS=10\nDropInPaths=/etc/x\nActiveState=active\n",
+        "Environment=APPIO_SAMPLE_SECONDS=10\nUnsetEnvironment=\nUnsetEnvironment=\nDropInPaths=/etc/x\nUnitFileState=enabled\nActiveState=active\n",
+        "Environment=APPIO_SAMPLE_SECONDS=10\nDropInPaths=/etc/x\nDropInPaths=/etc/y\nUnitFileState=enabled\nActiveState=active\n",
+        "Environment=APPIO_SAMPLE_SECONDS=10\nDropInPaths=/etc/x\nUnitFileState=enabled\nUnitFileState=disabled\nActiveState=active\n",
+        "Environment=APPIO_SAMPLE_SECONDS=10\nDropInPaths=/etc/x\nUnitFileState=enabled\nActiveState=active\nActiveState=inactive\n",
+        "Environment=APPIO_SAMPLE_SECONDS=10\nDropInPaths=" + "x" * (64 * 1024) + "\nUnitFileState=enabled\nActiveState=active\n",
     ],
 )
-def test_sample_show_malformed_fields_fail_closed(lifecycle, monkeypatch, capsys, output):
+@pytest.mark.parametrize("invalid_read", [1, 2], ids=["initial", "verification"])
+def test_sample_show_malformed_fields_fail_closed(lifecycle, monkeypatch, capsys, output, invalid_read):
     env = lifecycle
-    _replace_sample_show(env, monkeypatch, output)
-    code, result, _ = invoke(env, "set-sample-period", capsys, period=10)
-    assert code != 0
+    _patch_period_probe(monkeypatch)
+    original = env.runner.run
+    original_write = service.SafeRootFS.atomic_write
+    sample_reads = []
+    writes = []
+
+    def record_write(fs, path, payload, **kwargs):
+        writes.append(Path(path))
+        return original_write(fs, path, payload, **kwargs)
+
+    def malformed_on_selected_read(argv, **kwargs):
+        if tuple(argv) == SAMPLE_SHOW:
+            sample_reads.append(True)
+            if len(sample_reads) == invalid_read:
+                env.runner.calls.append((tuple(argv), kwargs))
+                return CommandResult(0, output, "")
+        return original(argv, **kwargs)
+
+    monkeypatch.setattr(env.runner, "run", malformed_on_selected_read)
+    monkeypatch.setattr(service.SafeRootFS, "atomic_write", record_write)
+    code, result, diagnostic = invoke(env, "set-sample-period", capsys, period=10)
+    assert code == 1
     assert result["error"] == "sample_period_show_invalid"
-    assert not host(env, SAMPLE_PERIOD_DROPIN).exists()
-    assert not host(env, SAMPLE_PERIOD_PENDING).exists()
-    assert DAEMON_RELOAD not in [argv for argv, _ in env.runner.calls]
-    assert TRY_RESTART not in [argv for argv, _ in env.runner.calls]
+    assert diagnostic == "sample_period_show_invalid\n"
+    assert result["sample_period_state"] is None
+    assert len(sample_reads) == invalid_read
+    assert writes == ([SAMPLE_PERIOD_PENDING, SAMPLE_PERIOD_DROPIN] if invalid_read == 2 else [])
+    assert host(env, SAMPLE_PERIOD_DROPIN).exists() is (invalid_read == 2)
+    assert host(env, SAMPLE_PERIOD_PENDING).exists() is (invalid_read == 2)
+    assert not host(env, SAMPLE_PERIOD_COMPLETE).exists()
+    calls = [argv for argv, _ in env.runner.calls]
+    assert (DAEMON_RELOAD in calls) is (invalid_read == 2)
+    assert (TRY_RESTART in calls) is (invalid_read == 2)
+    assert calls.count(service.SHOW_ARGV) >= 3
+
+
+def _remove_period_parents(env):
+    target_parent = host(env, SAMPLE_PERIOD_DROPIN).parent
+    state_parent = host(env, SAMPLE_PERIOD_PENDING).parent
+    state_parent.rmdir()
+    assert not target_parent.exists()
+    assert not state_parent.exists()
+    return target_parent, state_parent
 
 
 def test_malformed_initial_show_does_not_create_missing_preflight_directories(lifecycle, monkeypatch, capsys):
     env = lifecycle
+    target_parent, state_parent = _remove_period_parents(env)
     _replace_sample_show(
         env,
         monkeypatch,
         "Environment=APPIO_SAMPLE_SECONDS=10\nDropInPaths=/etc/x\nUnitFileState=enabled\n",
     )
-    monkeypatch.setattr(
-        service.SafeRootFS,
-        "prepare_period_directories",
-        lambda *args, **kwargs: pytest.fail("period directories were prepared after invalid initial show"),
-    )
-    code, result, _ = invoke(env, "set-sample-period", capsys, period=10)
-    assert code != 0
+    code, result, diagnostic = invoke(env, "set-sample-period", capsys, period=10)
+    assert code == 1
     assert result["error"] == "sample_period_show_invalid"
+    assert diagnostic == "sample_period_show_invalid\n"
+    assert result["sample_period_state"] is None
+    assert not target_parent.exists()
+    assert not state_parent.exists()
 
 
 @pytest.mark.parametrize("active,expected_code", [(True, 0), (False, 1)])
@@ -427,7 +471,7 @@ def test_active_override_reports_value_and_dropin_paths(lifecycle, monkeypatch, 
 def test_inactive_environment_override_is_unverifiable_with_value_and_dropin_paths(lifecycle, monkeypatch, capsys):
     env = lifecycle
     env.runner.active = False
-    env.runner.sample_seconds = 11
+    env.runner.sample_seconds = 7
     env.runner.environment_files = []
     env.runner.unset_environment = ""
     env.runner.drop_in_paths = (
@@ -436,10 +480,11 @@ def test_inactive_environment_override_is_unverifiable_with_value_and_dropin_pat
     )
     _patch_period_probe(monkeypatch)
     code, result, diagnostic = invoke(env, "set-sample-period", capsys, period=10)
-    assert code != 0
+    assert code == 1
     assert result["error"] == "sample_period_unverifiable"
+    assert result["sample_period_state"] is None
     assert diagnostic == (
-        "sample_period_unverifiable observed=11 EnvironmentFiles=(none) "
+        "sample_period_unverifiable observed=7 EnvironmentFiles=(none) "
         "UnsetEnvironment=(none) DropInPaths=/etc/systemd/system/appio-iod.service.d/20-sample-period.conf "
         "/etc/systemd/system/appio-iod.service.d/30-conflict.conf\n"
     )
@@ -1178,19 +1223,31 @@ def test_the_probe_waits_for_a_runtime_directory_that_appears_mid_budget(tmp_pat
 
 def test_final_lifecycle_activation_race_requires_fresh_sample_probe(lifecycle, monkeypatch, capsys):
     env = lifecycle
+    env.runner.active = False
+    original = env.runner.run
     observations = []
+    lifecycle_reads = []
+
+    def run(argv, **kwargs):
+        if tuple(argv) == service.SHOW_ARGV:
+            lifecycle_reads.append(True)
+            if len(lifecycle_reads) == 3:
+                env.runner.active = True
+        return original(argv, **kwargs)
 
     def status_probe(**_kwargs):
-        observations.append(True)
-        seconds = 10 if len(observations) < 4 else 11
-        return {"sample_ns": seconds * 1_000_000_000}
+        observations.append(len(lifecycle_reads))
+        return {"sample_ns": 10 * 1_000_000_000, "answering": True}
 
+    monkeypatch.setattr(env.runner, "run", run)
     monkeypatch.setattr(service, "probe_daemon_status_payload", status_probe)
     code, result, _ = invoke(env, "set-sample-period", capsys, period=10)
-    assert code != 0
+    assert code == 1
     assert result["error"] == "sample_period_overridden"
     assert result["sample_period_state"] is None
-    assert len(observations) >= 4
+    assert host(env, SAMPLE_PERIOD_PENDING).exists()
+    assert not host(env, SAMPLE_PERIOD_COMPLETE).exists()
+    assert not any(read == 2 for read in observations)
 
 
 def test_pending_unlink_sync_failure_rechecks_absence_before_unchanged(lifecycle, monkeypatch, capsys):
@@ -1326,7 +1383,173 @@ def test_final_lifecycle_read_failure_cannot_return_success(lifecycle, monkeypat
 
     monkeypatch.setattr(env.runner, "run", fail_final_lifecycle_read)
     code, result, _ = invoke(env, "set-sample-period", capsys, period=10)
-    assert code != 0
+    assert code == 1
     assert result["error"] == "inspect-service:exit_17"
     assert result["sample_period_state"] is None
     assert len(lifecycle_reads) >= 3
+
+
+def test_failed_recovery_replay_gets_fresh_id_and_retry_replays(lifecycle, monkeypatch, capsys):
+    env = lifecycle
+    target = host(env, SAMPLE_PERIOD_DROPIN)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(b"[Service]\nEnvironment=APPIO_SAMPLE_SECONDS=10\n")
+    _write_period_record(env, SAMPLE_PERIOD_PENDING)
+    _write_period_record(env, SAMPLE_PERIOD_COMPLETE)
+    _patch_period_probe(monkeypatch)
+    env.runner.sample_seconds = 11
+    env.runner.failed[DAEMON_RELOAD] = CommandResult(17, "", "reload failed\n")
+
+    code, result, _ = invoke(env, "set-sample-period", capsys, period=10)
+    assert code == 1
+    assert result["error"] == "daemon_reload_failed"
+    pending = setup_files.decode_period_journal(host(env, SAMPLE_PERIOD_PENDING).read_bytes())
+    complete = setup_files.decode_period_journal(host(env, SAMPLE_PERIOD_COMPLETE).read_bytes())
+    assert complete.operation_id == "a" * 32
+    assert pending.operation_id != complete.operation_id
+
+    env.runner.sample_seconds = 10
+    del env.runner.failed[DAEMON_RELOAD]
+    env.runner.calls.clear()
+    code, result, diagnostic = invoke(env, "set-sample-period", capsys, period=10)
+    assert code == 0, diagnostic
+    assert result["sample_period_state"] == "repair"
+    calls = [argv for argv, _ in env.runner.calls]
+    assert calls.count(DAEMON_RELOAD) == 1
+    assert calls.count(TRY_RESTART) == 1
+    complete = setup_files.decode_period_journal(host(env, SAMPLE_PERIOD_COMPLETE).read_bytes())
+    assert complete.operation_id == pending.operation_id
+    assert not host(env, SAMPLE_PERIOD_PENDING).exists()
+
+
+@pytest.mark.parametrize("unset", ["APPIO_SAMPLE_SECONDS", "OTHER=1 APPIO_SAMPLE_SECONDS=10"])
+def test_inactive_unset_sample_period_is_unverifiable(lifecycle, capsys, unset):
+    env = lifecycle
+    env.runner.active = False
+    env.runner.unset_environment = unset
+    code, result, diagnostic = invoke(env, "set-sample-period", capsys, period=10)
+    assert code == 1
+    assert result["error"] == "sample_period_unverifiable"
+    assert diagnostic == (
+        f"sample_period_unverifiable observed=10 EnvironmentFiles=(none) UnsetEnvironment={unset} "
+        "DropInPaths=/etc/systemd/system/appio-iod.service.d/20-sample-period.conf\n"
+    )
+    assert host(env, SAMPLE_PERIOD_PENDING).exists()
+    assert not host(env, SAMPLE_PERIOD_COMPLETE).exists()
+
+
+def test_post_lifecycle_mismatch_cannot_be_overwritten(lifecycle, monkeypatch, capsys):
+    env = lifecycle
+    observations = []
+
+    def status_probe(**_kwargs):
+        observations.append(True)
+        seconds = 11 if len(observations) == 3 else 10
+        return {"sample_ns": seconds * 1_000_000_000, "answering": True}
+
+    monkeypatch.setattr(service, "probe_daemon_status_payload", status_probe)
+    code, result, diagnostic = invoke(env, "set-sample-period", capsys, period=10)
+    assert code == 1
+    assert result["error"] == "sample_period_overridden"
+    assert "observed=11" in diagnostic
+    assert result["sample_period_state"] is None
+    assert len(observations) >= 3
+    assert host(env, SAMPLE_PERIOD_PENDING).exists()
+    assert not host(env, SAMPLE_PERIOD_COMPLETE).exists()
+
+
+@pytest.mark.parametrize("failure_stage", ["prepare", "sync_target", "pending", "dropin"])
+def test_early_write_failure_observes_inactive_final_state(lifecycle, monkeypatch, capsys, failure_stage):
+    env = lifecycle
+    _patch_period_probe(monkeypatch)
+    if failure_stage == "sync_target":
+        target = host(env, SAMPLE_PERIOD_DROPIN)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"[Service]\nEnvironment=APPIO_SAMPLE_SECONDS=10\n")
+
+    def stop_and_fail(*args, **kwargs):
+        env.runner.active = False
+        raise OSError("injected transaction failure")
+
+    if failure_stage == "prepare":
+        monkeypatch.setattr(service.SafeRootFS, "prepare_period_directories", stop_and_fail)
+    elif failure_stage == "sync_target":
+        monkeypatch.setattr(service.SafeRootFS, "sync_period_parent", stop_and_fail)
+    elif failure_stage == "pending":
+        monkeypatch.setattr(service, "publish_period_pending", stop_and_fail)
+    else:
+        original_write = service.SafeRootFS.atomic_write
+
+        def write(fs, path, payload, **kwargs):
+            if Path(path) == SAMPLE_PERIOD_DROPIN:
+                return stop_and_fail()
+            return original_write(fs, path, payload, **kwargs)
+
+        monkeypatch.setattr(service.SafeRootFS, "atomic_write", write)
+
+    code, result, _ = invoke(env, "set-sample-period", capsys, period=10)
+    assert code == 1
+    assert result["error"] == "service_not_running"
+    assert result["sample_period_state"] == "service_not_running"
+    calls = [argv for argv, _ in env.runner.calls]
+    assert calls.count(service.SHOW_ARGV) >= 3
+    assert DAEMON_RELOAD not in calls
+    assert TRY_RESTART not in calls
+    assert not host(env, SAMPLE_PERIOD_COMPLETE).exists()
+
+
+def test_invalid_initial_show_reports_failed_final_lifecycle_without_creating_parents(
+    lifecycle, monkeypatch, capsys,
+):
+    env = lifecycle
+    target_parent, state_parent = _remove_period_parents(env)
+    original = env.runner.run
+    lifecycle_reads = []
+
+    def run(argv, **kwargs):
+        if tuple(argv) == SAMPLE_SHOW:
+            return CommandResult(0, "Environment=bad\n", "")
+        if tuple(argv) == service.SHOW_ARGV:
+            lifecycle_reads.append(True)
+            if len(lifecycle_reads) == 3:
+                env.runner.calls.append((tuple(argv), kwargs))
+                return CommandResult(17, "", "final lifecycle unavailable\n")
+        return original(argv, **kwargs)
+
+    monkeypatch.setattr(env.runner, "run", run)
+    code, result, _ = invoke(env, "set-sample-period", capsys, period=10)
+    assert code == 1
+    assert result["error"] == "inspect-service:exit_17"
+    assert result["sample_period_state"] is None
+    assert not target_parent.exists()
+    assert not state_parent.exists()
+
+
+@pytest.mark.parametrize("answering", [False, True])
+def test_period_result_answering_comes_from_status(lifecycle, monkeypatch, capsys, answering):
+    env = lifecycle
+    monkeypatch.setattr(
+        service, "probe_daemon_status_payload",
+        lambda **kwargs: {"sample_ns": 10 * 1_000_000_000, "answering": answering},
+    )
+    code, result, diagnostic = invoke(env, "set-sample-period", capsys, period=10)
+    assert code == 0, diagnostic
+    assert result["answering"] is answering
+    assert result["state"] == ("on, needs activation" if answering else "enabled, not answering")
+
+
+def test_failed_restart_still_verifies_configuration_and_final_lifecycle(lifecycle, monkeypatch, capsys):
+    env = lifecycle
+    _patch_period_probe(monkeypatch)
+    env.runner.failed[TRY_RESTART] = CommandResult(17, "", "restart failed\n")
+    code, result, _ = invoke(env, "set-sample-period", capsys, period=10)
+    assert code == 1
+    assert result["error"] == "service_restart_failed"
+    assert result["sample_period_state"] is None
+    calls = [argv for argv, _ in env.runner.calls]
+    assert calls.count(SAMPLE_SHOW) == 2
+    restart = calls.index(TRY_RESTART)
+    assert calls.index(SAMPLE_SHOW, restart + 1) > restart
+    assert sum(argv == service.SHOW_ARGV for argv in calls[restart + 1:]) >= 2
+    assert host(env, SAMPLE_PERIOD_PENDING).exists()
+    assert not host(env, SAMPLE_PERIOD_COMPLETE).exists()
