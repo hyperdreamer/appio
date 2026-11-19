@@ -99,14 +99,14 @@ Python 3.14, PyQt6, pytest, pytest-qt, SQLite-backed history, systemd command se
 - [ ] Run `git add src/appio/iod.py src/appio/ipc_models.py tests/p3/test_iod_cadence_pins.py`.
 - [ ] Run `git commit -m "feat: configure daemon sampling cadence"` and report the commit SHA.
 
-## Task 2: Extend fixed argv and helper result contracts
+## Task 2: Implement the sample period setup transaction
 
-**Implementer tier:** Advanced
+**Implementer tier:** Frontier
 
 **Lane/category**
 
-- Lane `boundary-contract`.
-- Depends on Task 1 for the status/result compatibility assumptions. Its boundary code can be implemented before the service handler, but Task 4 consumes the completed interfaces.
+- Lane `setup-transaction`.
+- Depends on Task 1. Boundary, safe-filesystem, client, and service changes are one task because `setup_service` asserts that its literal dispatch table equals `VERBS` at import time. Commit the combined result only after all of these components and their tests pass.
 
 **Files**
 
@@ -115,19 +115,39 @@ Python 3.14, PyQt6, pytest, pytest-qt, SQLite-backed history, systemd command se
 - Modify `src/appio/setup_client.py`.
 - Modify `tests/p3/test_setup_boundary.py`.
 - Modify `tests/p3/test_setup_client.py`.
+- Modify `src/appio/setup_files.py`.
+- Modify `src/appio/setup_delegation.py`.
+- Modify `tests/p3/test_setup_files.py`.
+- Modify `tests/p3/test_setup_delegation.py`.
+- Modify `src/appio/setup_service.py`.
+- Modify `tests/p3/test_setup_service.py`.
 
 **Interfaces**
 
-- Consumes the existing `SetupDeps`, `FixedTarget`, `InvocationError`, `CommandResult`, `VERBS`, and bounded-launch seams.
+- Consumes Task 1 status validation and `sample_ns` observations, together with the existing `SetupDeps`, `FixedTarget`, `InvocationError`, `CommandResult`, `SetupIdentity`, and rootless dependency seams.
 - Produces `Invocation(verb: str, identity: SetupIdentity, period_seconds: int | None = None)`.
 - Produces a seven-element `VERBS` set with the six legacy verbs and `set-sample-period`.
 - Produces `SetupClient.invoke(self, verb: str, *, period_seconds: int | None = None) -> Future`.
 - Produces `decode_body(text: str, verb: str, expected_uid: int) -> dict | None` that validates `sample_period` and `sample_period_state` as part of the whole result document. For each of the six legacy verbs, require both new fields to be `None`. For a trusted `set-sample-period` result, require an exact integer period from 2 through 30 and require the invoke completion path to match it to the requested seconds. Require `sample_period_state=None` when the result has a non-`None` error, and otherwise accept only the closed success-state set or `None` where the result contract permits it.
 - Produces fixed target declarations in `setup_boundary.FIXED_TARGETS` for the sample drop-in and `/var/lib/appio/sample-period.pending.json` and `/var/lib/appio/sample-period.complete.json`. Journal targets remain fixed state targets and are separate from configuration target membership.
+- Produces `SAMPLE_PERIOD_DROPIN: Path = Path("/etc/systemd/system/appio-iod.service.d/20-sample-period.conf")`.
+- Produces `sample_period_payload(seconds: int) -> bytes` and `parse_sample_period_dropin(data: bytes) -> int | None` with the exact canonical-byte contract.
+- Produces `SafeRootFS.read_bounded(path: str, *, max_bytes: int, create_parents: bool = True) -> bytes` with the legacy creating default and a pinned, non-creating mode.
+- Produces `load_setup_state(fs: SafeRootFS, *, create_parents: bool = True) -> SetupState`, preserving the creating default while forwarding the flag to `read_bounded`.
+- Produces a strict journal record type `PeriodJournalRecord(operation_id: str, target: str, sample_seconds: int, target_sha256: str)` and exact codec and durability functions `encode_period_journal(record: PeriodJournalRecord) -> bytes`, `decode_period_journal(data: bytes) -> PeriodJournalRecord`, `publish_period_pending(fs: SafeRootFS, record: PeriodJournalRecord) -> None`, `publish_period_complete(fs: SafeRootFS, record: PeriodJournalRecord) -> None`, and `remove_period_pending(fs: SafeRootFS) -> None`.
+- Produces fixed constants `SAMPLE_PERIOD_PENDING` and `SAMPLE_PERIOD_COMPLETE` for the two `/var/lib/appio` journal paths. Journal records are root-owned, single-link regular files, mode `0600`, at most 1 KiB, canonical ASCII JSON plus one LF, and use exactly ordered keys `version`, `operation_id`, `target`, `sample_seconds`, and `target_sha256`.
+- Produces `SAMPLE_SHOW_ARGV = ("/usr/bin/systemctl", "show", "appio-iod.service", "--property=Environment,EnvironmentFiles,UnsetEnvironment,DropInPaths,UnitFileState,ActiveState", "--no-pager")`.
+- Preserves `SHOW_ARGV = ("/usr/bin/systemctl", "show", "appio-iod.service", "--property=UnitFileState,ActiveState,SubState,Result,ExecMainCode,ExecMainStatus", "--no-pager")` for lifecycle operations.
+- Produces a seven-entry literal `VERB_HANDLERS` and `dispatch(invocation: Invocation, *, deps: SetupDeps) -> dict` with complete period-payload revalidation before the helper lock or any operation.
+- Preserves `main(argv: list[str] | None = None, *, deps: SetupDeps | None = None) -> int`.
+- Produces `_valid_syntax(argv: list[str]) -> str | None`, where `None` means valid syntax and a returned string is the exact exit-2 reason.
+- Produces `_pending(identity: SetupIdentity, fs: SafeRootFS, *, create_parents: bool = True) -> bool | None` and `_observe(result: dict, *, deps: SetupDeps, fs: SafeRootFS, identity: SetupIdentity, strict: bool = False, create_parents: bool = True) -> dict[str, str] | None`, preserving creating observation for legacy verbs and using `create_parents=False` for period-handler exception observation.
+- Produces the complete result document with keys `version`, `verb`, `uid`, `enabled`, `answering`, `pending_activation`, `state`, `export_path`, `export_cutoff`, `error`, `sample_period`, and `sample_period_state` in every encoded result.
+- Produces period outcomes only from `None`, `applied`, `applied_not_running`, `repair`, `unchanged`, and `service_not_running`, while retaining the existing service-state meaning in `state`.
 
 ### Step 1: Add boundary, shim, and client contract tests
 
-- [ ] Update `tests/p3/test_setup_boundary.py::test_verb_set_is_exactly_seven_design_verbs` and add `test_every_design_verb_is_accepted`. Keep the six legacy two-element vectors separate from the period three-element vector.
+- [ ] Update the existing six-verb and fixed-target equality assertions for the seventh verb, the sample drop-in, and separately identified fixed journal state targets. Update `tests/p3/test_setup_boundary.py::test_verb_set_is_exactly_seven_design_verbs` and `test_every_design_verb_is_accepted`. Keep the six legacy two-element vectors separate from the period three-element vector.
 - [ ] Add `test_period_argv_forms_are_checked_before_account_lookup`, `test_period_payload_range_table`, `test_dispatch_preserves_period_payload`, and `test_forged_period_invocation_without_payload_is_rejected`.
 - [ ] Verify the shim table with canonical shape `(?:0|[1-9][0-9]{0,7})` using ASCII full-match semantics. Cover `2` and `30`, out-of-range `0`, `1`, `31`, and `12345678`, and shim-only rejection of `abc`, `02`, ` 5`, empty, signed, decimal, and nine-digit values.
 - [ ] Update `tests/p3/test_setup_client.py::test_existing_verbs_keep_legacy_vectors_and_period_verb_carries_payload` and add `test_period_payload_pairing_refuses_before_launch` and `test_decode_body_validates_period_result_fields`.
@@ -150,43 +170,8 @@ Python 3.14, PyQt6, pytest, pytest-qt, SQLite-backed history, systemd command se
 - [ ] Preserve `HELPER_ARGV = ("/usr/bin/pkexec", "/usr/bin/appio-setup")`. Build exactly `HELPER_ARGV + (verb,)` for six legacy verbs and exactly `HELPER_ARGV + ("set-sample-period", str(period_seconds))` for the period verb.
 - [ ] Extend `decode_body` to require the existing result fields and validate `sample_period` as `None` or an exact integer in 2 through 30, and `sample_period_state` as `None` or one of `applied`, `applied_not_running`, `repair`, `unchanged`, and `service_not_running`. A malformed field invalidates the entire body and retains exit status and bounded stderr.
 
-### Step 5: Run the task verification vector
 
-- [ ] Run `python -m pytest -q tests/p3/test_setup_boundary.py tests/p3/test_setup_client.py tests/p3/test_setup_delegation.py`.
-- [ ] Inspect the shim as a standalone stdlib script and verify its old six vectors and new period vector have no shell interpolation or caller-UID guess.
-
-### Step 6: Commit
-
-- [ ] Run `git add src/appio/setup_boundary.py data/libexec/appio-setup src/appio/setup_client.py tests/p3/test_setup_boundary.py tests/p3/test_setup_client.py`.
-- [ ] Run `git commit -m "feat: extend sample period helper boundary"` and report the commit SHA.
-
-## Task 3: Add safe period files, journals, and non-creating state reads
-
-**Implementer tier:** Capable
-
-**Lane/category**
-
-- Lane `durable-filesystem`.
-- Depends on Task 2 for the fixed target declarations and `SetupDeps` contract. Task 4 consumes the filesystem and journal interfaces.
-
-**Files**
-
-- Modify `src/appio/setup_files.py`.
-- Modify `src/appio/setup_delegation.py`.
-- Modify `tests/p3/test_setup_files.py`.
-- Modify `tests/p3/test_setup_delegation.py`.
-
-**Interfaces**
-
-- Consumes `FixedTarget`, `SetupDeps`, the existing `SafeRootFS` trust seams, and the fixed target declarations from Task 2.
-- Produces `SAMPLE_PERIOD_DROPIN: Path = Path("/etc/systemd/system/appio-iod.service.d/20-sample-period.conf")`.
-- Produces `sample_period_payload(seconds: int) -> bytes` and `parse_sample_period_dropin(data: bytes) -> int | None` with the exact canonical-byte contract.
-- Produces `SafeRootFS.read_bounded(path: str, *, max_bytes: int, create_parents: bool = True) -> bytes` with the legacy creating default and a pinned, non-creating mode.
-- Produces `load_setup_state(fs: SafeRootFS, *, create_parents: bool = True) -> SetupState`, preserving the creating default while forwarding the flag to `read_bounded`.
-- Produces a strict journal record type `PeriodJournalRecord(operation_id: str, target: str, sample_seconds: int, target_sha256: str)` and exact codec and durability functions `encode_period_journal(record: PeriodJournalRecord) -> bytes`, `decode_period_journal(data: bytes) -> PeriodJournalRecord`, `publish_period_pending(fs: SafeRootFS, record: PeriodJournalRecord) -> None`, `publish_period_complete(fs: SafeRootFS, record: PeriodJournalRecord) -> None`, and `remove_period_pending(fs: SafeRootFS) -> None`.
-- Produces fixed constants `SAMPLE_PERIOD_PENDING` and `SAMPLE_PERIOD_COMPLETE` for the two `/var/lib/appio` journal paths. Journal records are root-owned, single-link regular files, mode `0600`, at most 1 KiB, canonical ASCII JSON plus one LF, and use exactly ordered keys `version`, `operation_id`, `target`, `sample_seconds`, and `target_sha256`.
-
-### Step 1: Add canonical payload, traversal, durability, and journal tests
+### Step 5: Add canonical payload, traversal, durability, and journal tests
 
 - [ ] Add `test_sample_period_payload_and_parser_round_trip` for 2, 10, and 30, including exact bytes and a single final LF.
 - [ ] Add `test_sample_period_target_is_in_both_allowlists`, `test_missing_config_target_and_missing_parser_have_distinct_refusals`, `test_foreign_sample_dropin_preserves_bytes`, and `test_empty_sample_dropin_is_replaced`. Cover missing or doubled LF, noncanonical numbers, wrong sections or keys, extra lines, trailing spaces, non-UTF-8 bytes, symlink, hard link, ownership, mode, and size refusals.
@@ -194,72 +179,37 @@ Python 3.14, PyQt6, pytest, pytest-qt, SQLite-backed history, systemd command se
 - [ ] Add `test_period_journal_targets_are_fixed_state_only`, `test_period_journal_pending_and_complete_codec_is_exact`, `test_period_journal_atomic_publish_syncs_parent`, and `test_period_journal_remove_syncs_parent`.
 - [ ] Update setup-state tests to cover `load_setup_state(..., create_parents=False)` and prove missing state parents remain absent. Preserve all existing creating behavior for delegation installation.
 
-### Step 2: Run the red filesystem vector
+### Step 6: Run the red filesystem vector
 
 - [ ] Run `python -m pytest -q tests/p3/test_setup_files.py tests/p3/test_setup_delegation.py`.
 - [ ] Confirm the new tests fail on the absent period parser, missing non-creating flag, missing journal codecs, and missing repeatable directory sync behavior.
 
-### Step 3: Implement canonical period content and target policy
+### Step 7: Implement canonical period content and target policy
 
 - [ ] Implement `sample_period_payload` with exact validation `ValueError("sample period must be an integer from 2 through 30")` for bool, non-integer, and out-of-range values. Emit exactly `[Service]\nEnvironment=APPIO_SAMPLE_SECONDS=<seconds>\n` as UTF-8.
 - [ ] Make `parse_sample_period_dropin` accept only those canonical bytes for 2 through 30. Return `None` for every other byte sequence, including empty data, non-UTF-8 data, missing or multiple final LF, noncanonical period text, altered section, altered key, extra line, or trailing space.
 - [ ] Add the sample target to `FIXED_CONFIG_TARGETS` and `_require_expected_content`. Preserve the distinction between `target:not_fixed_path` and `unexpected_content:not_a_config_target`. Empty target bytes remain replaceable. Every other non-empty noncanonical sequence is foreign and must remain byte-identical.
 
-### Step 4: Implement non-creating safe traversal and directory durability
+### Step 8: Implement non-creating safe traversal and directory durability
 
 - [ ] Add `create_parents` to `SafeRootFS.read_bounded` with default `True`. When false, walk only existing root-owned, non-writable directories through `O_NOFOLLOW` descriptors, never call `mkdir`, and propagate a missing parent or leaf as `FileNotFoundError`. Preserve all trust and bounded-read refusals.
 - [ ] Ensure period directory creation uses the existing pinned traversal, fixed modes, and immediate containing-directory fsync. After the initial valid sample configuration view, support creation of the target and journal parents only at the state-machine’s directory-preparation step.
 - [ ] Add repeatable ancestor and leaf directory durability operations. Every eligible period invocation must fsync `/etc/systemd/system` and `/var/lib`, then the leaf directories `/etc/systemd/system/appio-iod.service.d` and `/var/lib/appio`, even when they already existed. Publication and removal must fsync the affected leaf again. Retries repeat the containing-directory fsyncs instead of assuming a visible child proves durability.
 - [ ] Ensure a failure before rename leaves existing target bytes unchanged and never truncates a fixed target.
 
-### Step 5: Implement strict transaction journal operations
+### Step 9: Implement strict transaction journal operations
 
 - [ ] Validate journal records as version 1, exact lowercase 32-hex operation IDs, the one canonical target path, integer seconds 2 through 30, and lowercase 64-hex SHA-256. Reject extra or missing keys, duplicate JSON keys, non-ASCII or noncanonical JSON, wrong LF shape, oversized bytes, unsafe metadata, and link counts other than one.
 - [ ] Make pending and completed publication use the same safe atomic write and parent-directory durability boundary, with mode `0600` and root ownership. Keep completion evidence separate from the exact `{version, pending_by_uid}` delegation state.
 - [ ] Publish completion before pending removal. A failed completion write or fsync leaves pending evidence and cannot be reported as success. Pending removal or its fsync failure cannot revoke already durable completion, but later invocations must recheck pending absence and classify visible pending recovery correctly.
 
-### Step 6: Preserve the delegation exception-observation contract
+### Step 10: Preserve the delegation exception-observation contract
 
 - [ ] Change `load_setup_state` to accept the keyword-only `create_parents` flag and forward it to `SafeRootFS.read_bounded` while preserving its default.
 - [ ] Ensure the period handler can observe setup state after a failure without creating `/var/lib/appio` or its parents. Keep all non-period helper verbs on their existing creating path.
 
-### Step 7: Run the task verification vector
 
-- [ ] Run `python -m pytest -q tests/p3/test_setup_files.py tests/p3/test_setup_delegation.py tests/p3/test_setup_boundary.py`.
-- [ ] Verify the task diff contains only its four listed files and that all fsync, fixed-path, parser, journal, and byte-preservation assertions pass.
-
-### Step 8: Commit
-
-- [ ] Run `git add src/appio/setup_files.py src/appio/setup_delegation.py tests/p3/test_setup_files.py tests/p3/test_setup_delegation.py`.
-- [ ] Run `git commit -m "feat: add durable sample period state"` and report the commit SHA.
-
-## Task 4: Implement the durable set-period helper state machine
-
-**Implementer tier:** Frontier
-
-**Lane/category**
-
-- Lane `privileged-service`.
-- Depends on Tasks 1, 2, and 3. This task owns the service orchestration and its tests after all consumed contracts are available.
-
-**Files**
-
-- Modify `src/appio/setup_service.py`.
-- Modify `tests/p3/test_setup_service.py`.
-
-**Interfaces**
-
-- Consumes `Invocation.period_seconds`, the seven-verb `VERBS`, `SafeRootFS.read_bounded(..., create_parents=False)`, the sample payload/parser, journal codecs and durability operations, `load_setup_state(..., create_parents=False)`, and the status validator from Tasks 1–3.
-- Produces `SAMPLE_SHOW_ARGV = ("/usr/bin/systemctl", "show", "appio-iod.service", "--property=Environment,EnvironmentFiles,UnsetEnvironment,DropInPaths,UnitFileState,ActiveState", "--no-pager")`.
-- Preserves `SHOW_ARGV = ("/usr/bin/systemctl", "show", "appio-iod.service", "--property=UnitFileState,ActiveState,SubState,Result,ExecMainCode,ExecMainStatus", "--no-pager")` for lifecycle operations.
-- Produces a seven-entry literal `VERB_HANDLERS` and `dispatch(invocation: Invocation, *, deps: SetupDeps) -> dict` with complete period-payload revalidation before the helper lock or any operation.
-- Preserves `main(argv: list[str] | None = None, *, deps: SetupDeps | None = None) -> int`.
-- Produces `_valid_syntax(argv: list[str]) -> str | None`, where `None` means valid syntax and a returned string is the exact exit-2 reason.
-- Produces `_pending(identity: SetupIdentity, fs: SafeRootFS, *, create_parents: bool = True) -> bool | None` and `_observe(result: dict, *, deps: SetupDeps, fs: SafeRootFS, identity: SetupIdentity, strict: bool = False, create_parents: bool = True) -> dict[str, str] | None`, preserving creating observation for legacy verbs and using `create_parents=False` for period-handler exception observation.
-- Produces the complete result document with keys `version`, `verb`, `uid`, `enabled`, `answering`, `pending_activation`, `state`, `export_path`, `export_cutoff`, `error`, `sample_period`, and `sample_period_state` in every encoded result.
-- Produces period outcomes only from `None`, `applied`, `applied_not_running`, `repair`, `unchanged`, and `service_not_running`, while retaining the existing service-state meaning in `state`.
-
-### Step 1: Add exact service and dispatch tests
+### Step 11: Add exact service and dispatch tests
 
 - [ ] Update `tests/p3/test_setup_service.py::test_literal_dispatch_table_has_exactly_seven_verbs`.
 - [ ] Add `test_set_sample_period_inactive_writes_and_never_starts`, `test_set_sample_period_active_uses_try_restart`, and `test_main_preserves_sample_period_out_of_range_reason_and_json`.
@@ -269,25 +219,25 @@ Python 3.14, PyQt6, pytest, pytest-qt, SQLite-backed history, systemd command se
 - [ ] Add `test_inactive_environment_sources_are_unverifiable` for the inactive environment-file and unset-variable branches.
 - [ ] Add `test_malformed_initial_show_does_not_create_missing_preflight_directories`, `test_sample_show_environment_files_multiple_entries_active_and_inactive`, `test_sample_show_omitted_empty_environment_files_is_empty`, `test_sample_show_omitted_empty_unset_environment_is_empty`, `test_active_override_reports_value_and_dropin_paths`, and `test_inactive_environment_override_is_unverifiable_with_value_and_dropin_paths`. Cover the inactive file and unset branches as specified.
 
-### Step 2: Run the red service vector
+### Step 12: Run the red service vector
 
 - [ ] Run `python -m pytest -q tests/p3/test_setup_service.py`.
 - [ ] Confirm failures identify the missing result fields, seventh handler, period query, payload revalidation, state transitions, journal recovery, final lifecycle observation, and exact diagnostics.
 
-### Step 3: Extend result construction and syntax preservation
+### Step 13: Extend result construction and syntax preservation
 
-- [ ] Add `sample_period=None` and `sample_period_state=None` to `_empty` and every result path. For a period invocation that reaches dispatch, retain the requested integer even when the operation later fails. For a boundary range error before identity, emit `uid: null`, `sample_period: null`, and `sample_period_state: null`.
+- [ ] Add `sample_period=None` and `sample_period_state=None` to `_empty` and every result path. Update legacy result fixtures and assertions to expect both null fields while preserving the existing six verbs. Update `VERB_HANDLERS` and `VERBS` together so `setup_service` remains importable at the task commit. For a period invocation that reaches dispatch, retain the requested integer even when the operation later fails. For a boundary range error before identity, emit `uid: null`, `sample_period: null`, and `sample_period_state: null`.
 - [ ] Make dispatch reconstruct the exact two- or three-element argv before calling `parse_invocation`. Reject a forged period `Invocation` without a payload and a forged payload on another verb with `InvocationError(2, "invalid_verb_or_argument_count")`, before the common lock or any operation.
 - [ ] Change syntax validation so `_valid_syntax` preserves the actual exit-2 reason. `main` must print `sample_period_out_of_range` for a canonical out-of-range period rather than replacing it with the generic reason, while preserving the existing shim usage behavior for shape failures.
 - [ ] Keep the compact ASCII-safe result encoder and bounded `result:too_large` fallback. Preserve the beneficiary UID only after identity resolution and never infer it from argv or an arbitrary environment variable.
 
-### Step 4: Keep the three show-property contracts independent
+### Step 14: Keep the three show-property contracts independent
 
 - [ ] Retain the lifecycle `SHOW_ARGV` and its exact six fields for existing enable, disable, status, restart, export, and exception observation.
 - [ ] Add the exact `SAMPLE_SHOW_ARGV` and a bounded line parser for `Environment`, repeated ordered `EnvironmentFiles`, `UnsetEnvironment`, `DropInPaths`, `UnitFileState`, and `ActiveState`. Require exactly one line for `Environment`, `DropInPaths`, `UnitFileState`, and `ActiveState`. Permit omitted `EnvironmentFiles` and `UnsetEnvironment` as empty values, permit repeated `EnvironmentFiles` lines in output order, and reject blank, unknown, duplicate single-valued, missing, or over-limit output with exit 1 and exact reason `sample_period_show_invalid`.
-- [ ] Keep `parse_unit_facts` and the GUI’s `UNIT_SHOW_ARGV` contract in the UI lane. Do not reuse either parser for the period configuration response.
+- [ ] Keep `parse_unit_facts` and the GUI’s `UNIT_SHOW_ARGV` contract in Task 3. Do not reuse either parser for the period configuration response.
 
-### Step 5: Implement D7 steps 1 through 6
+### Step 15: Implement D7 steps 1 through 6
 
 - [ ] Under the common helper lock and bounded runner, read the lifecycle view first and retain `active_state_before`, `result_before`, and `active_before`.
 - [ ] Read the target and both journal files with `create_parents=False`. Treat only missing leaf or parent as absent. Preserve every other trust or I/O error. Reject non-empty noncanonical target bytes as exit 2 with `foreign_drop_in` and exact one-line diagnostic `foreign_drop_in path=/etc/systemd/system/appio-iod.service.d/20-sample-period.conf`.
@@ -296,7 +246,7 @@ Python 3.14, PyQt6, pytest, pytest-qt, SQLite-backed history, systemd command se
 - [ ] A malformed initial configuration view records `sample_period_show_invalid`, skips directory creation, journal publication, target write, reload, restart, and verification, and proceeds to the required final lifecycle observation. The subsequent dispatch exception observer uses the non-creating setup-state read path.
 - [ ] After a valid initial view, create missing parents through safe traversal, run the current-invocation ancestor and leaf directory fsyncs, and fail with `sample_period_state_write_failed` if any required sync fails. If there is no pending record, a matching completed record exists, no manager operation is required, and no journal reconciliation is needed, leave both records untouched for the `unchanged` path. If a matching pending/completed recovery candidate and all initial observations match, fsync the state parent, retain its operation ID, and skip manager operations so final checks can classify it as `repair`. In every other case, publish a matching pending record and fsync `/var/lib/appio` before any target write, reload, or restart. Mark the transaction incomplete whenever matching completion evidence is absent or journal reconciliation is required, so manager operations cannot be skipped.
 
-### Step 6: Implement D7 manager operations and verification
+### Step 16: Implement D7 manager operations and verification
 
 - [ ] Run `daemon-reload` when the target needs writing, the merged configured value differs, or the transaction is incomplete. On a nonzero result, retain `daemon_reload_failed`, skip `try-restart` and the step-9 configuration verification, then continue to the final lifecycle observation without success.
 - [ ] Run `try-restart appio-iod.service` only when `active_before` is true and the requested target, merged value, running value, or incomplete transaction requires it. Never use it for an inactive unit. Retain `service_restart_failed` on a nonzero result and continue through final observation.
@@ -306,32 +256,31 @@ Python 3.14, PyQt6, pytest, pytest-qt, SQLite-backed history, systemd command se
 - [ ] Perform lifecycle observations in the specified order. After operation and configuration verification, read lifecycle. If active, obtain a fresh bounded status reply after that lifecycle read and require `sample_ns == n * NS`. Then read lifecycle once more to establish final `ActiveState` and `Result`. If that final read is active, require a matching status observation obtained after the preceding active lifecycle read. Do not reuse a pre-operation or step-9 probe to satisfy this final check. This fresh post-lifecycle runtime probe is required for every active `applied`, `repair`, and `unchanged` outcome, including the active-final outcome after `try-restart`.
 - [ ] Require valid final `ActiveState` and `Result` for every success. A non-success `Result` while active yields `service_lifecycle_failed` after higher-precedence failures. A prior inactive failed `Result` alone never blocks an inactive apply or repair. Continue required lifecycle reads after command or verification failures whenever the runner can obtain them.
 
-### Step 7: Implement exclusive outcome precedence and journal completion
+### Step 17: Implement exclusive outcome precedence and journal completion
 
 - [ ] Return exit 1 `service_not_running` for an active-before to inactive-final transition. A nonzero `try-restart` with a valid final active lifecycle view returns exit 1 `service_restart_failed`; a failed `daemon-reload` after the first precedence row does not apply returns exit 1 `daemon_reload_failed`. Preserve `sample_period_state=None` for each failure. Apply the remaining exact failure and success precedence from §7, including `service_lifecycle_failed` for an active non-success `Result` when no higher row applies.
 - [ ] Return `applied` only for a target write with an active final state, `applied_not_running` only for a target write with inactive before and after states, `repair` for reload, restart, incomplete-journal replay, or completion-evidence recovery without a target rewrite, and `unchanged` only when no pending record, no operation is required, matching durable completion, fresh matching observations, and current directory checks all hold.
 - [ ] For a successful transaction, publish matching completed evidence atomically and fsync `/var/lib/appio` before returning success. Preserve pending on commit failure with `sample_period_state_commit_failed`. Remove pending only after completion durability, fsync its parent, and treat a pending-unlink fsync failure as non-revoking of already durable completion. On later invocations, repeat directory checks, reconcile visible pending as `repair`, and permit `unchanged` only after durable pending absence is confirmed.
-- [ ] Keep `test_final_lifecycle_activation_race_requires_fresh_sample_probe`, `test_pending_unlink_sync_failure_rechecks_absence_before_unchanged`, `test_missing_completion_evidence_replays_manager_operations`, `test_active_before_inactive_after_has_service_not_running_precedence`, and `test_final_lifecycle_read_failure_cannot_return_success` owned by this task. The GUI test `test_sampling_apply_success_waits_for_matching_nanosecond_probe` belongs to Task 5 and is consumed only as the downstream observation contract.
+- [ ] Keep `test_final_lifecycle_activation_race_requires_fresh_sample_probe`, `test_pending_unlink_sync_failure_rechecks_absence_before_unchanged`, `test_missing_completion_evidence_replays_manager_operations`, `test_active_before_inactive_after_has_service_not_running_precedence`, and `test_final_lifecycle_read_failure_cannot_return_success` owned by this task. The GUI test `test_sampling_apply_success_waits_for_matching_nanosecond_probe` belongs to Task 3 and is consumed only as the downstream observation contract.
 - [ ] Ensure every successful active result has the fresh post-lifecycle status match and every successful inactive result remains truthful about not observing a running period. Ensure no handler path calls `enable`, `start`, or `try-restart` for an inactive unit.
 
-### Step 8: Run the task verification vector
+### Step 18: Run the task verification vector
 
-- [ ] Run `python -m pytest -q tests/p3/test_setup_service.py tests/p3/test_setup_files.py tests/p3/test_setup_boundary.py tests/p3/test_setup_delegation.py`.
+- [ ] Run `python -m pytest -q tests/p3/test_setup_service.py tests/p3/test_setup_files.py tests/p3/test_setup_boundary.py tests/p3/test_setup_delegation.py tests/p3/test_setup_client.py`.
 - [ ] Confirm all exact error strings, exit precedence, journal states, command vectors, result fields, and no-start assertions pass through public `main` and `dispatch` entry points.
 
-### Step 9: Commit
+### Step 19: Commit
 
-- [ ] Run `git add src/appio/setup_service.py tests/p3/test_setup_service.py`.
-- [ ] Run `git commit -m "feat: apply sample period through setup helper"` and report the commit SHA.
-
-## Task 5: Add observed period state to ownership and GUI settings
+- [ ] Run `git add src/appio/setup_boundary.py data/libexec/appio-setup src/appio/setup_client.py tests/p3/test_setup_boundary.py tests/p3/test_setup_client.py src/appio/setup_files.py src/appio/setup_delegation.py tests/p3/test_setup_files.py tests/p3/test_setup_delegation.py src/appio/setup_service.py tests/p3/test_setup_service.py`.
+- [ ] Run `git commit -m "feat: implement durable sample period setup"` and report the commit SHA.
+## Task 3: Add observed period state to ownership and GUI settings
 
 **Implementer tier:** Capable
 
 **Lane/category**
 
 - Lane `gui-ownership`.
-- Depends on Tasks 1, 2, and 4 for the status field, `SetupClient.invoke` payload, and helper result states. It does not change local collector cadence or the single-switch ownership protocol.
+- Depends on Tasks 1 and 2 for the status field, `SetupClient.invoke` payload, and helper result states. It does not change local collector cadence or the single-switch ownership protocol.
 
 **Files**
 
@@ -392,14 +341,14 @@ Python 3.14, PyQt6, pytest, pytest-qt, SQLite-backed history, systemd command se
 - [ ] Run `git add src/appio/collector_owner.py src/appio/ui/collector_window.py tests/p3/test_collector_window.py`.
 - [ ] Run `git commit -m "feat: expose sample period in settings"` and report the commit SHA.
 
-## Task 6: Add isolated host acceptance phases and documentation
+## Task 4: Add isolated host acceptance phases and documentation
 
 **Implementer tier:** Capable
 
 **Lane/category**
 
 - Lane `acceptance-and-documentation`.
-- Depends on Tasks 1 through 5. This task updates only the acceptance harness, its dry-run tests, and the acceptance runbook.
+- Depends on Tasks 1 through 3. This task updates only the acceptance harness, its dry-run tests, and the acceptance runbook.
 
 **Files**
 
