@@ -1,0 +1,25 @@
+digraph execution_graph {
+  rankdir=LR;
+  subgraph cluster_runtime_cadence {
+    label="runtime-cadence";
+    "T-001" [label="Task 1: Resolve configurable cadence and status protocol\nAdvanced"];
+  }
+  subgraph cluster_setup_transaction {
+    label="setup-transaction";
+    "T-002" [label="Task 2: Implement the sample period setup transaction\nFrontier"];
+  }
+  subgraph cluster_gui_ownership {
+    label="gui-ownership";
+    "T-003" [label="Task 3: Add observed period state to ownership and GUI settings\nCapable"];
+  }
+  subgraph cluster_acceptance_documentation {
+    label="acceptance-documentation";
+    "T-004" [label="Task 4: Add isolated host acceptance phases and documentation\nCapable"];
+  }
+  "T-001" -> "T-002";
+  "T-001" -> "T-003";
+  "T-002" -> "T-003";
+  "T-001" -> "T-004";
+  "T-002" -> "T-004";
+  "T-003" -> "T-004";
+}
