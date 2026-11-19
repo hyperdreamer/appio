@@ -431,6 +431,9 @@ def test_mode_is_fixed_even_under_an_untrusted_umask(root: Path):
         os.umask(previous_umask)
     assert stat.S_IMODE(os.stat(rebase(root, SERVICE_DROPIN)).st_mode) == 0o644
     assert stat.S_IMODE(os.stat(rebase(root, STATE_FILE)).st_mode) == 0o600
+    assert stat.S_IMODE((root / "var").stat().st_mode) == 0o755
+    assert stat.S_IMODE((root / "var/lib").stat().st_mode) == 0o755
+    assert stat.S_IMODE(rebase(root, STATE_ROOT).stat().st_mode) == 0o711
 
 
 def test_repeated_write_is_idempotent_and_keeps_the_fixed_mode(root: Path):
@@ -703,19 +706,38 @@ def test_sample_period_target_is_in_both_allowlists():
     assert SAMPLE_TARGET in files.FIXED_CONFIG_TARGETS
 
 
-def test_missing_config_target_and_missing_parser_have_distinct_refusals(root, monkeypatch):
-    path = rebase(root, SAMPLE_TARGET)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(b"administrator data")
-    fs = SafeRootFS(make_deps(root))
-    monkeypatch.setattr(files, "FIXED_CONFIG_TARGETS", files.FIXED_CONFIG_TARGETS - {SAMPLE_TARGET})
+@pytest.mark.parametrize(
+    "target,parser_target",
+    [
+        (SERVICE_DROPIN, "SERVICE_DROPIN"),
+        (USER_MANAGER_DROPIN, "USER_MANAGER_DROPIN"),
+        (SAMPLE_TARGET, "SAMPLE_PERIOD_DROPIN"),
+    ],
+)
+@pytest.mark.parametrize("existing", [None, b"", b"administrator data"])
+def test_missing_config_target_and_missing_parser_have_distinct_refusals(
+    root, monkeypatch, target, parser_target, existing
+):
+    path = rebase(root, target)
+    if existing is not None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(existing)
+    parent_existed = path.parent.exists()
+    events = EventLog()
+    fs = SafeRootFS(make_deps(root, events=events))
+    monkeypatch.setattr(files, "FIXED_CONFIG_TARGETS", files.FIXED_CONFIG_TARGETS - {target})
     with pytest.raises(SafeRootFSError, match="target:not_fixed_path"):
-        fs.atomic_write(SAMPLE_TARGET, b"new")
-    monkeypatch.setattr(files, "FIXED_CONFIG_TARGETS", files.FIXED_CONFIG_TARGETS | {SAMPLE_TARGET})
-    monkeypatch.setattr(files, "SAMPLE_PERIOD_DROPIN", Path("/unused"))
+        fs.atomic_write(target, b"new")
+    monkeypatch.setattr(files, "FIXED_CONFIG_TARGETS", files.FIXED_CONFIG_TARGETS | {target})
+    monkeypatch.setattr(files, parser_target, Path("/unused"))
     with pytest.raises(SafeRootFSError, match="unexpected_content:not_a_config_target"):
-        fs.atomic_write(SAMPLE_TARGET, b"new")
-    assert path.read_bytes() == b"administrator data"
+        fs.atomic_write(target, b"new")
+    assert "mkstemp" not in events.names
+    if existing is None:
+        assert not path.exists()
+        assert path.parent.exists() == parent_existed
+    else:
+        assert path.read_bytes() == existing
 
 
 @pytest.mark.parametrize("foreign", [
@@ -759,6 +781,78 @@ def test_read_bounded_without_creating_missing_parents(root):
     with pytest.raises(FileNotFoundError):
         fs.read_bounded(PENDING_TARGET, max_bytes=1024)
     assert rebase(root, STATE_ROOT).is_dir()
+
+
+@pytest.mark.parametrize("target_state", ["present", "missing_leaf", "missing_parent"])
+def test_noncreating_read_preserves_existing_directory_modes(root, target_state):
+    path = rebase(root, SAMPLE_TARGET)
+    if target_state != "missing_parent":
+        path.parent.mkdir(parents=True, exist_ok=True)
+    if target_state == "present":
+        path.write_bytes(b"[Service]\nEnvironment=APPIO_SAMPLE_SECONDS=10\n")
+        path.chmod(0o644)
+    directories = [
+        root / "etc", root / "etc/systemd", root / "etc/systemd/system", path.parent,
+    ]
+    existing = [directory for directory in directories if directory.exists()]
+    for directory in existing:
+        directory.chmod(0o700)
+
+    fs = SafeRootFS(make_deps(root))
+    if target_state == "present":
+        assert fs.read_bounded(SAMPLE_TARGET, max_bytes=1024, create_parents=False) == (
+            b"[Service]\nEnvironment=APPIO_SAMPLE_SECONDS=10\n"
+        )
+    else:
+        with pytest.raises(FileNotFoundError):
+            fs.read_bounded(SAMPLE_TARGET, max_bytes=1024, create_parents=False)
+
+    assert all(stat.S_IMODE(directory.stat().st_mode) == 0o700 for directory in existing)
+    if target_state == "missing_parent":
+        assert not path.parent.exists()
+
+
+@pytest.mark.parametrize(
+    "target,ancestors",
+    [
+        (SAMPLE_TARGET, ("etc", "etc/systemd", "etc/systemd/system")),
+        (STATE_FILE, ("var", "var/lib")),
+    ],
+)
+def test_atomic_write_preserves_existing_directory_modes(root, target, ancestors):
+    path = rebase(root, target)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    directories = [root / ancestor for ancestor in ancestors] + [path.parent]
+    for directory in directories:
+        directory.chmod(0o700)
+
+    if target == SAMPLE_TARGET:
+        SafeRootFS(make_deps(root)).atomic_write(target, files.sample_period_payload(10))
+    else:
+        SafeRootFS(make_deps(root)).atomic_write(target, b"{}", mode=0o600)
+
+    assert all(stat.S_IMODE(directory.stat().st_mode) == 0o700 for directory in directories)
+
+
+def test_period_preparation_preserves_system_ancestor_modes(root):
+    sample_directory = rebase(root, SAMPLE_TARGET.parent)
+    state_directory = rebase(root, STATE_ROOT)
+    sample_directory.mkdir(parents=True, exist_ok=True)
+    state_directory.mkdir(parents=True, exist_ok=True)
+    ancestors = [
+        root / "etc", root / "etc/systemd", root / "etc/systemd/system",
+        root / "var", root / "var/lib",
+    ]
+    for directory in ancestors:
+        directory.chmod(0o700)
+    sample_directory.chmod(0o700)
+    state_directory.chmod(0o755)
+
+    SafeRootFS(make_deps(root)).prepare_period_directories()
+
+    assert all(stat.S_IMODE(directory.stat().st_mode) == 0o700 for directory in ancestors)
+    assert stat.S_IMODE(sample_directory.stat().st_mode) == 0o755
+    assert stat.S_IMODE(state_directory.stat().st_mode) == 0o711
 
 
 def test_period_ancestor_directory_sync_repeats_for_existing_parent(root, monkeypatch):

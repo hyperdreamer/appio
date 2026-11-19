@@ -165,6 +165,8 @@ class SafeRootFS:
             decode_period_journal(payload)
         if self.deps.effective_uid() != 0:
             raise SafeRootFSError("root_required")
+        if target_fixed in FIXED_CONFIG_TARGETS:
+            _require_expected_content(target_fixed, b"")
 
         destination = self._resolve(target_fixed)
         events = self.deps.event
@@ -254,7 +256,11 @@ class SafeRootFS:
         )
         for directory in directories:
             resolved = self._resolve(directory)
-            descriptor = self._open_parent(resolved, sync_created=True)
+            descriptor = self._open_parent(
+                resolved,
+                sync_created=True,
+                restore_final_mode=directory in (SAMPLE_PERIOD_DROPIN.parent, STATE_ROOT),
+            )
             try:
                 _require_same_directory(descriptor, resolved)
                 os.fsync(descriptor)
@@ -350,7 +356,12 @@ class SafeRootFS:
         return root / fixed.relative_to("/")
 
     def _open_parent(
-        self, parent: Path, *, create_parents: bool = True, sync_created: bool = False
+        self,
+        parent: Path,
+        *,
+        create_parents: bool = True,
+        sync_created: bool = False,
+        restore_final_mode: bool = False,
     ) -> int:
         root = _canonical_absolute(self.deps.root, "root")
         try:
@@ -362,6 +373,7 @@ class SafeRootFS:
 
         descriptor = self._open_anchor(root)
         fixed_current = Path("/")
+        fixed_parent = Path("/") / relative
         try:
             for part in relative.parts:
                 # Directory modes belong to the production path, not the
@@ -371,6 +383,7 @@ class SafeRootFS:
                 descriptor = self._open_or_create_child(
                     descriptor, part, fixed_current,
                     create=create_parents, sync_created=sync_created,
+                    restore_mode=restore_final_mode and fixed_current == fixed_parent,
                 )
             return descriptor
         except BaseException:
@@ -390,7 +403,14 @@ class SafeRootFS:
         return descriptor
 
     def _open_or_create_child(
-        self, parent: int, part: str, full: Path, *, create: bool, sync_created: bool
+        self,
+        parent: int,
+        part: str,
+        full: Path,
+        *,
+        create: bool,
+        sync_created: bool,
+        restore_mode: bool,
     ) -> int:
         flags = _DIR_FLAGS
         created = False
@@ -424,8 +444,9 @@ class SafeRootFS:
                 "untrusted_parent",
                 expected_mode=fixed_mode if raced else None,
             )
-            if not raced:
-                # Normalize only after the directory has passed the trust checks.
+            if created or (restore_mode and not raced):
+                # Normalize only newly created or explicitly prepared directories
+                # after they have passed the trust checks.
                 os.fchmod(child, fixed_mode)
                 self._verify_directory(child, "untrusted_parent", expected_mode=fixed_mode)
             # A failed mkdir fsync may have left an existing directory behind.
@@ -840,19 +861,17 @@ def parse_manager_dropin(data: bytes) -> bool:
 
 
 def _require_expected_content(target: Path, existing: bytes) -> None:
-    if existing == b"":
-        # An empty file loses nothing by being replaced.
-        return
+    # Empty files can be replaced only for targets with a parser branch.
     if target == USER_MANAGER_DROPIN:
-        if not parse_manager_dropin(existing):
+        if existing and not parse_manager_dropin(existing):
             raise SafeRootFSError("unexpected_content:user_manager_dropin")
         return
     if target == SERVICE_DROPIN:
-        if parse_service_dropin(existing) is None:
+        if existing and parse_service_dropin(existing) is None:
             raise SafeRootFSError("unexpected_content:service_dropin")
         return
     if target == SAMPLE_PERIOD_DROPIN:
-        if parse_sample_period_dropin(existing) is None:
+        if existing and parse_sample_period_dropin(existing) is None:
             raise SafeRootFSError("unexpected_content:sample_period_dropin")
         return
     raise SafeRootFSError("unexpected_content:not_a_config_target")

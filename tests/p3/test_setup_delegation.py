@@ -160,6 +160,33 @@ def test_load_setup_state_noncreating_mode_and_default(root: Path):
     assert not rebase(root, STATE_FILE).exists()
 
 
+@pytest.mark.parametrize("options", [{}, {"create_parents": False}])
+@pytest.mark.parametrize("state", ["present", "missing_leaf", "missing_parent"])
+def test_load_setup_state_preserves_existing_directory_modes(root: Path, options, state):
+    path = rebase(root, STATE_FILE)
+    path.parent.parent.mkdir(parents=True, exist_ok=True)
+    if state != "missing_parent":
+        path.parent.mkdir()
+    if state == "present":
+        path.write_bytes(CANONICAL_PENDING)
+        path.chmod(0o600)
+    directories = [root / "var", root / "var/lib"]
+    if path.parent.exists():
+        directories.append(path.parent)
+    for directory in directories:
+        directory.chmod(0o700)
+
+    result = load_setup_state(SafeRootFS(make_deps(root)), **options)
+
+    assert dict(result.pending_by_uid) == ({1000: True} if state == "present" else {})
+    assert all(stat.S_IMODE(directory.stat().st_mode) == 0o700 for directory in directories)
+    if state == "missing_parent":
+        if options.get("create_parents") is False:
+            assert not path.parent.exists()
+        else:
+            assert stat.S_IMODE(path.parent.stat().st_mode) == 0o711
+
+
 def results(delegate: str = "cpu io memory pids", *, getent=0, usermod=0, reload=0):
     return {
         GETENT: CommandResult(getent, "appio:x:990:\n" if getent == 0 else "", "" if getent == 0 else "no group\n"),
