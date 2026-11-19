@@ -112,6 +112,25 @@ def _unit_state(deps):
     return rows
 
 
+def _period_unit_state(deps):
+    unit = _unit_state(deps)
+    active_states = {
+        "active",
+        "inactive",
+        "failed",
+        "activating",
+        "deactivating",
+        "maintenance",
+        "reloading",
+        "refreshing",
+    }
+    if unit["ActiveState"] not in active_states or not re.fullmatch(
+        r"[a-z][a-z0-9-]*", unit["Result"], flags=re.ASCII
+    ):
+        raise ServiceError("inspect-service:invalid_response")
+    return unit
+
+
 def _observe(result, *, deps, fs, identity, strict=False, create_parents=True):
     result["pending_activation"] = _pending(identity, fs, create_parents=create_parents)
     unit = None
@@ -245,16 +264,16 @@ def _parse_sample_show(stdout: object) -> dict[str, object]:
     return rows
 
 
-_PERIOD_ENV = re.compile(r"APPIO_SAMPLE_SECONDS=(?:[2-9]|[12][0-9]|30)\Z", re.ASCII)
+_PERIOD_ENV = re.compile(r"APPIO_SAMPLE_SECONDS=(?:0|[1-9][0-9]*)\Z", re.ASCII)
 
 
-def _configured_period(environment: str) -> int | None:
+def _configured_period(environment: str) -> str | None:
     if not isinstance(environment, str):
         return None
     tokens = [token for token in environment.split() if token.startswith("APPIO_SAMPLE_SECONDS=")]
     if len(tokens) != 1 or _PERIOD_ENV.fullmatch(tokens[0]) is None:
         return None
-    return int(tokens[0].split("=", 1)[1])
+    return tokens[0].split("=", 1)[1]
 
 
 def _sample_seconds(payload: object) -> int | None:
@@ -318,13 +337,13 @@ def _period_result_unit(result: dict[str, object], unit: dict[str, str], *, answ
 
 
 def _period_diagnostic_active(view: dict[str, object], observed: object) -> str:
-    value = observed if isinstance(observed, int) else "unknown"
+    value = observed if isinstance(observed, (int, str)) else "unknown"
     paths = view.get("DropInPaths") or "(none)"
     return f"sample_period_not_in_effect observed={value} DropInPaths={paths}"
 
 
 def _period_diagnostic_inactive(view: dict[str, object], observed: object) -> str:
-    value = observed if isinstance(observed, int) else "unknown"
+    value = observed if isinstance(observed, (int, str)) else "unknown"
     files = view.get("EnvironmentFiles") or []
     file_text = " | ".join(str(item) for item in files) if files else "(none)"
     unset = view.get("UnsetEnvironment") or "(none)"
@@ -335,14 +354,14 @@ def _period_diagnostic_inactive(view: dict[str, object], observed: object) -> st
 
 def _period_active_observation(view: dict[str, object], observed: object, seconds: int) -> object:
     configured = _configured_period(view.get("Environment", ""))
-    return configured if configured != seconds else observed
+    return configured if configured != str(seconds) else observed
 
 
 def _period_final_lifecycle(deps):
     """Read lifecycle twice, with status between the reads when active."""
     observation_failure = None
     try:
-        preceding = _unit_state(deps)
+        preceding = _period_unit_state(deps)
     except BoundaryError as error:
         preceding = None
         observation_failure = ServiceError(error.reason, stderr=getattr(error, "stderr", ""))
@@ -352,7 +371,7 @@ def _period_final_lifecycle(deps):
         status = probe_daemon_status_payload(deps=deps, timeout_seconds=STATUS_TIMEOUT_SECONDS)
 
     try:
-        final = _unit_state(deps)
+        final = _period_unit_state(deps)
     except BoundaryError as error:
         final = None
         if observation_failure is None:
@@ -377,7 +396,7 @@ def _set_sample_period(identity, deps, fs, result):
     canonical = sample_period_payload(seconds)
     digest = hashlib.sha256(canonical).hexdigest()
 
-    before = _unit_state(deps)
+    before = _period_unit_state(deps)
     active_before = before.get("ActiveState") == "active"
     _period_result_unit(result, before)
 
@@ -428,7 +447,7 @@ def _set_sample_period(identity, deps, fs, result):
     if active_before:
         initial_status = probe_daemon_status_payload(deps=deps, timeout_seconds=STATUS_TIMEOUT_SECONDS)
         running = _sample_seconds(initial_status)
-    configured_matches = configured == seconds
+    configured_matches = configured == str(seconds)
     running_matches = active_before and running == seconds
     incomplete_pending = pending is not None
     manager_required = (
@@ -499,7 +518,7 @@ def _set_sample_period(identity, deps, fs, result):
                     deps=deps, timeout_seconds=STATUS_TIMEOUT_SECONDS
                 )
                 observed_after = _sample_seconds(status_after_view)
-                if configured_after != seconds or observed_after != seconds:
+                if configured_after != str(seconds) or observed_after != seconds:
                     verification_failure = _period_failure(
                         "sample_period_overridden",
                         stderr=_period_diagnostic_active(
@@ -508,7 +527,11 @@ def _set_sample_period(identity, deps, fs, result):
                         ),
                         result=result,
                     )
-            elif configured_after != seconds or verification_view.get("EnvironmentFiles") or _sample_unset(verification_view.get("UnsetEnvironment", "")):
+            elif (
+                configured_after != str(seconds)
+                or verification_view.get("EnvironmentFiles")
+                or _sample_unset(verification_view.get("UnsetEnvironment", ""))
+            ):
                 verification_failure = _period_failure(
                     "sample_period_unverifiable",
                     stderr=_period_diagnostic_inactive(verification_view, configured_after),

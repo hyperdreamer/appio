@@ -468,6 +468,52 @@ def test_active_override_reports_value_and_dropin_paths(lifecycle, monkeypatch, 
     assert diagnostic == "sample_period_not_in_effect observed=11 DropInPaths=/etc/systemd/system/appio-iod.service.d/20-sample-period.conf\n"
 
 
+@pytest.mark.parametrize("active", [False, True])
+@pytest.mark.parametrize("configured", [0, 1, 31, "9" * 5000])
+def test_canonical_out_of_range_override_is_reported_in_diagnostic(
+    lifecycle, monkeypatch, capsys, active, configured
+):
+    env = lifecycle
+    env.runner.active = active
+    env.runner.sample_seconds = configured
+    _patch_period_probe(monkeypatch)
+
+    code, result, diagnostic = invoke(env, "set-sample-period", capsys, period=10)
+
+    assert code == 1
+    assert result["error"] == (
+        "sample_period_overridden" if active else "sample_period_unverifiable"
+    )
+    assert f"observed={configured} " in diagnostic
+    assert (
+        "DropInPaths=/etc/systemd/system/appio-iod.service.d/20-sample-period.conf"
+        in diagnostic
+    )
+    assert host(env, SAMPLE_PERIOD_PENDING).exists()
+    assert not host(env, SAMPLE_PERIOD_COMPLETE).exists()
+
+
+@pytest.mark.parametrize("active", [False, True])
+@pytest.mark.parametrize("configured", ["01", "+2", "-1", "٢"])
+def test_noncanonical_override_is_reported_as_unknown(
+    lifecycle, monkeypatch, capsys, active, configured
+):
+    env = lifecycle
+    env.runner.active = active
+    env.runner.sample_seconds = configured
+    _patch_period_probe(monkeypatch)
+
+    code, result, diagnostic = invoke(env, "set-sample-period", capsys, period=10)
+
+    assert code == 1
+    assert result["error"] == (
+        "sample_period_overridden" if active else "sample_period_unverifiable"
+    )
+    assert "observed=unknown " in diagnostic
+    assert host(env, SAMPLE_PERIOD_PENDING).exists()
+    assert not host(env, SAMPLE_PERIOD_COMPLETE).exists()
+
+
 def test_inactive_environment_override_is_unverifiable_with_value_and_dropin_paths(lifecycle, monkeypatch, capsys):
     env = lifecycle
     env.runner.active = False
@@ -1387,6 +1433,52 @@ def test_final_lifecycle_read_failure_cannot_return_success(lifecycle, monkeypat
     assert result["error"] == "inspect-service:exit_17"
     assert result["sample_period_state"] is None
     assert len(lifecycle_reads) >= 3
+
+
+@pytest.mark.parametrize("active", [False, True])
+@pytest.mark.parametrize("lifecycle_read", [1, 2, 3])
+@pytest.mark.parametrize(
+    ("field", "invalid_value"),
+    [
+        ("ActiveState", ""),
+        ("ActiveState", "unexpected"),
+        ("Result", ""),
+        ("Result", "not a result"),
+    ],
+)
+def test_invalid_lifecycle_fields_cannot_complete_period_transaction(
+    lifecycle, monkeypatch, capsys, active, lifecycle_read, field, invalid_value
+):
+    env = lifecycle
+    env.runner.active = active
+    _patch_period_probe(monkeypatch)
+    original_run = env.runner.run
+    lifecycle_reads = 0
+
+    def invalid_lifecycle_field(argv, **kwargs):
+        nonlocal lifecycle_reads
+        result = original_run(argv, **kwargs)
+        if tuple(argv) == service.SHOW_ARGV:
+            lifecycle_reads += 1
+            if lifecycle_reads == lifecycle_read:
+                lines = result.stdout.splitlines()
+                stdout = "\n".join(
+                    f"{field}={invalid_value}" if line.startswith(f"{field}=") else line
+                    for line in lines
+                ) + "\n"
+                return CommandResult(0, stdout, "")
+        return result
+
+    monkeypatch.setattr(env.runner, "run", invalid_lifecycle_field)
+    code, result, _ = invoke(env, "set-sample-period", capsys, period=10)
+    assert code == 1
+    assert result["error"] == "inspect-service:invalid_response"
+    assert result["sample_period_state"] is None
+    assert host(env, SAMPLE_PERIOD_PENDING).exists() is (lifecycle_read != 1)
+    assert not host(env, SAMPLE_PERIOD_COMPLETE).exists()
+    if lifecycle_read == 1:
+        assert DAEMON_RELOAD not in [argv for argv, _ in env.runner.calls]
+        assert TRY_RESTART not in [argv for argv, _ in env.runner.calls]
 
 
 def test_failed_recovery_replay_gets_fresh_id_and_retry_replays(lifecycle, monkeypatch, capsys):
