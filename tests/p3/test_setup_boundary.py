@@ -652,12 +652,17 @@ def test_accept_invocation_production_paths_include_interpreter_and_package():
 # --------------------------------------------------------------------------- #
 
 
-def test_fixed_targets_are_the_two_design_dropins():
+def test_fixed_targets_are_the_three_design_dropins():
     assert {target.key for target in boundary.FIXED_TARGETS} == {
         "delegation-service-dropin",
         "user-manager-dropin",
+        "sample-period-dropin",
     }
-    assert boundary.FIXED_TARGET_PATHS == frozenset({DELEGATION_TARGET, MANAGER_TARGET})
+    assert boundary.FIXED_TARGET_PATHS == frozenset({
+        DELEGATION_TARGET,
+        MANAGER_TARGET,
+        Path("/etc/systemd/system/appio-iod.service.d/20-sample-period.conf"),
+    })
     for path in boundary.FIXED_TARGET_PATHS:
         assert path.is_absolute()
         assert ".." not in path.parts

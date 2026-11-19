@@ -4,7 +4,7 @@ The helper runs as root, so a file operation here is a privilege operation even
 when it looks like ``open``/``write``. Three properties are therefore structural
 rather than advisory:
 
-* **Fixed targets only.** :data:`FIXED_CONFIG_TARGETS` are the two design
+* **Fixed targets only.** :data:`FIXED_CONFIG_TARGETS` are the three design
   drop-ins; :data:`STATE_ROOT` and :data:`LOCK_ROOT` are the helper's own
   private roots. Nothing else is addressable, so argv can never become a path.
 * **Pinned traversal.** Every path is walked component by component from the
@@ -29,6 +29,7 @@ import contextlib
 import dataclasses
 import errno
 import fcntl
+import json
 import os
 import re
 import secrets
@@ -37,10 +38,30 @@ import threading
 from collections.abc import Iterator
 from pathlib import Path
 
-from .setup_boundary import FIXED_TARGETS, MAX_TARGET_BYTES, SetupDeps
+from .setup_boundary import (
+    FIXED_STATE_TARGETS,
+    FIXED_TARGETS,
+    MAX_TARGET_BYTES,
+    SAMPLE_PERIOD_COMPLETE,
+    SAMPLE_PERIOD_PENDING,
+    SetupDeps,
+)
 
 __all__ = [
     "FIXED_CONFIG_TARGETS",
+    "FIXED_STATE_TARGETS",
+    "SAMPLE_PERIOD_DROPIN",
+    "SAMPLE_PERIOD_PENDING",
+    "SAMPLE_PERIOD_COMPLETE",
+    "MAX_PERIOD_JOURNAL_BYTES",
+    "PeriodJournalRecord",
+    "encode_period_journal",
+    "decode_period_journal",
+    "publish_period_pending",
+    "publish_period_complete",
+    "remove_period_pending",
+    "sample_period_payload",
+    "parse_sample_period_dropin",
     "LOCK_FILE",
     "LOCK_ROOT",
     "MAX_COMPONENTS",
@@ -58,13 +79,15 @@ __all__ = [
     "service_dropin_payload",
 ]
 
-# The two design drop-ins are owned by Task 7 (the boundary is the single
-# declaration of the fixed target set); this module must not invent a third
-# spelling of them.
+# The boundary is the single declaration of the fixed configuration targets.
 _TARGETS_BY_KEY = {target.key: target.path for target in FIXED_TARGETS}
 SERVICE_DROPIN: Path = _TARGETS_BY_KEY["delegation-service-dropin"]
 USER_MANAGER_DROPIN: Path = _TARGETS_BY_KEY["user-manager-dropin"]
-FIXED_CONFIG_TARGETS: frozenset[Path] = frozenset((SERVICE_DROPIN, USER_MANAGER_DROPIN))
+SAMPLE_PERIOD_DROPIN: Path = _TARGETS_BY_KEY["sample-period-dropin"]
+FIXED_CONFIG_TARGETS: frozenset[Path] = frozenset(
+    (SERVICE_DROPIN, USER_MANAGER_DROPIN, SAMPLE_PERIOD_DROPIN)
+)
+MAX_PERIOD_JOURNAL_BYTES = 1024
 
 STATE_ROOT = Path("/var/lib/appio")
 STATE_FILE = STATE_ROOT / "setup-state.json"
@@ -136,17 +159,24 @@ class SafeRootFS:
         uid, gid = _require_owner(owner, target_fixed)
         if target_fixed in FIXED_CONFIG_TARGETS and file_mode != _FIXED_CONFIG_MODE:
             raise SafeRootFSError("unsafe_mode:config_target_requires_0644")
+        if target_fixed in FIXED_STATE_TARGETS:
+            if file_mode != 0o600:
+                raise SafeRootFSError("unsafe_mode:period_journal_requires_0600")
+            decode_period_journal(payload)
         if self.deps.effective_uid() != 0:
             raise SafeRootFSError("root_required")
 
         destination = self._resolve(target_fixed)
         events = self.deps.event
-        parent = self._open_parent(destination.parent)
+        parent = self._open_parent(
+            destination.parent,
+            sync_created=(target_fixed in FIXED_STATE_TARGETS or target_fixed == SAMPLE_PERIOD_DROPIN),
+        )
         temporary: str | None = None
         descriptor: int | None = None
         try:
             events("parent-opened")
-            existing = self._read_existing(parent, destination.name)
+            existing = self._read_existing(parent, destination.name, target_fixed)
             events("target-verified")
             if existing is not None and target_fixed in FIXED_CONFIG_TARGETS:
                 _require_expected_content(target_fixed, existing)
@@ -184,21 +214,80 @@ class SafeRootFS:
                     events("unlink-temp")
             os.close(parent)
 
-    def read_bounded(self, path: str, *, max_bytes: int) -> bytes:
-        """Read one fixed file through a pinned descriptor, bounded in size."""
+    def read_bounded(
+        self, path: str | Path, *, max_bytes: int, create_parents: bool = True
+    ) -> bytes:
+        """Read a fixed file through pinned, trusted descriptors."""
 
         target_fixed = _require_fixed_path(path, "target")
         limit = _require_bound(max_bytes)
+        if target_fixed in FIXED_STATE_TARGETS:
+            limit = min(limit, MAX_PERIOD_JOURNAL_BYTES)
         destination = self._resolve(target_fixed)
-        parent = self._open_parent(destination.parent)
+        parent = self._open_parent(
+            destination.parent,
+            create_parents=create_parents,
+            sync_created=create_parents and (
+                target_fixed in FIXED_STATE_TARGETS or target_fixed == SAMPLE_PERIOD_DROPIN
+            ),
+        )
         try:
             descriptor = _open_readonly(parent, destination.name)
             try:
                 _require_regular_single_link(descriptor, "untrusted_target")
-                self._require_trusted_file(descriptor, "untrusted_target")
+                self._require_trusted_file(descriptor, "untrusted_target", target_fixed)
                 return _read_all(descriptor, limit)
             finally:
                 os.close(descriptor)
+        finally:
+            os.close(parent)
+
+    def prepare_period_directories(self) -> None:
+        """Prepare and durably sync the fixed period target and state directories."""
+        if self.deps.effective_uid() != 0:
+            raise SafeRootFSError("root_required")
+        directories = (
+            SAMPLE_PERIOD_DROPIN.parent.parent,
+            STATE_ROOT.parent,
+            SAMPLE_PERIOD_DROPIN.parent,
+            STATE_ROOT,
+        )
+        for directory in directories:
+            resolved = self._resolve(directory)
+            descriptor = self._open_parent(resolved, sync_created=True)
+            try:
+                _require_same_directory(descriptor, resolved)
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+
+    def sync_period_parent(self, path: str | Path) -> None:
+        """Repeat a period file's parent-directory durability boundary."""
+        target = _canonical_absolute(path, "target")
+        if target not in FIXED_STATE_TARGETS and target != SAMPLE_PERIOD_DROPIN:
+            raise SafeRootFSError("target:not_fixed_path")
+        if self.deps.effective_uid() != 0:
+            raise SafeRootFSError("root_required")
+        parent_path = self._resolve(target.parent)
+        parent = self._open_parent(parent_path, create_parents=False)
+        try:
+            _require_same_directory(parent, parent_path)
+            os.fsync(parent)
+        finally:
+            os.close(parent)
+
+    def remove_period_pending(self) -> None:
+        """Remove pending evidence and durably record its absence."""
+        if self.deps.effective_uid() != 0:
+            raise SafeRootFSError("root_required")
+        destination = self._resolve(SAMPLE_PERIOD_PENDING)
+        parent = self._open_parent(destination.parent, create_parents=False)
+        try:
+            existing = self._read_existing(parent, destination.name, SAMPLE_PERIOD_PENDING)
+            _require_same_directory(parent, destination.parent)
+            if existing is not None:
+                os.unlink(destination.name, dir_fd=parent)
+            os.fsync(parent)
         finally:
             os.close(parent)
 
@@ -260,7 +349,9 @@ class SafeRootFS:
         root = _canonical_absolute(self.deps.root, "root")
         return root / fixed.relative_to("/")
 
-    def _open_parent(self, parent: Path) -> int:
+    def _open_parent(
+        self, parent: Path, *, create_parents: bool = True, sync_created: bool = False
+    ) -> int:
         root = _canonical_absolute(self.deps.root, "root")
         try:
             relative = parent.relative_to(root)
@@ -277,7 +368,10 @@ class SafeRootFS:
                 # injected-root spelling: /var/lib/appio is 0711 whether the
                 # seam points at "/" or at a temporary tree.
                 fixed_current = fixed_current / part
-                descriptor = self._open_or_create_child(descriptor, part, fixed_current)
+                descriptor = self._open_or_create_child(
+                    descriptor, part, fixed_current,
+                    create=create_parents, sync_created=sync_created,
+                )
             return descriptor
         except BaseException:
             os.close(descriptor)
@@ -295,25 +389,35 @@ class SafeRootFS:
             raise
         return descriptor
 
-    def _open_or_create_child(self, parent: int, part: str, full: Path) -> int:
+    def _open_or_create_child(
+        self, parent: int, part: str, full: Path, *, create: bool, sync_created: bool
+    ) -> int:
         flags = _DIR_FLAGS
+        created = False
         try:
             child = os.open(part, flags, dir_fd=parent)
         except FileNotFoundError:
+            if not create:
+                raise
             fixed_mode = _fixed_directory_mode(full)
             try:
                 os.mkdir(part, fixed_mode, dir_fd=parent)
+                created = True
             except FileExistsError:
                 pass
             except OSError as exc:
                 raise SafeRootFSError(f"create_parent:{_open_word(exc)}") from exc
+            if created and sync_created:
+                os.fsync(parent)
             try:
                 child = os.open(part, flags, dir_fd=parent)
             except OSError as exc:
                 raise SafeRootFSError(f"untrusted_parent:{_open_word(exc)}") from exc
             try:
-                # mkdir honours the umask; the design's 0711/0700 are exact.
-                os.fchmod(child, fixed_mode)
+                # mkdir honours the umask; set the exact mode only on a
+                # directory this call created, never one won by a race.
+                if created:
+                    os.fchmod(child, fixed_mode)
             except BaseException:
                 os.close(child)
                 raise
@@ -323,6 +427,10 @@ class SafeRootFS:
             ) from exc
         try:
             self._verify_directory(child, "untrusted_parent")
+            # A failed mkdir fsync may have left an existing directory behind.
+            # Re-sync its parent on the next period traversal as well.
+            if sync_created and not created:
+                os.fsync(parent)
         except BaseException:
             os.close(child)
             raise
@@ -369,19 +477,22 @@ class SafeRootFS:
             return descriptor, name
         raise SafeRootFSError("mkstemp:exhausted")
 
-    def _read_existing(self, parent: int, name: str) -> bytes | None:
+    def _read_existing(self, parent: int, name: str, target: Path) -> bytes | None:
         try:
             descriptor = _open_readonly(parent, name)
         except FileNotFoundError:
             return None
         try:
             _require_regular_single_link(descriptor, "untrusted_target")
-            self._require_trusted_file(descriptor, "untrusted_target")
-            return _read_all(descriptor, MAX_TARGET_BYTES)
+            self._require_trusted_file(descriptor, "untrusted_target", target)
+            limit = MAX_PERIOD_JOURNAL_BYTES if target in FIXED_STATE_TARGETS else MAX_TARGET_BYTES
+            return _read_all(descriptor, limit)
         finally:
             os.close(descriptor)
 
-    def _require_trusted_file(self, descriptor: int, prefix: str) -> None:
+    def _require_trusted_file(
+        self, descriptor: int, prefix: str, target: Path | None = None
+    ) -> None:
         info = self.deps.metadata(descriptor)
         uid = getattr(info, "st_uid", None)
         mode = getattr(info, "st_mode", None)
@@ -396,6 +507,10 @@ class SafeRootFS:
             raise SafeRootFSError(f"{prefix}:not_root_owned")
         if stat.S_IMODE(mode) & _WRITABLE_BITS:
             raise SafeRootFSError(f"{prefix}:writable")
+        if target in FIXED_STATE_TARGETS and stat.S_IMODE(mode) != 0o600:
+            raise SafeRootFSError(f"{prefix}:period_journal_mode")
+        if target == SAMPLE_PERIOD_DROPIN and stat.S_IMODE(mode) != 0o644:
+            raise SafeRootFSError(f"{prefix}:sample_dropin_mode")
 
     def _open_lock_file(self, parent: int, name: str) -> int:
         try:
@@ -665,6 +780,22 @@ def manager_dropin_payload() -> bytes:
     return MANAGER_PAYLOAD
 
 
+def sample_period_payload(seconds: int) -> bytes:
+    if isinstance(seconds, bool) or not isinstance(seconds, int):
+        raise ValueError("sample period must be an integer from 2 through 30")
+    value = int(seconds)
+    if not 2 <= value <= 30:
+        raise ValueError("sample period must be an integer from 2 through 30")
+    return f"[Service]\nEnvironment=APPIO_SAMPLE_SECONDS={value}\n".encode("ascii")
+
+
+def parse_sample_period_dropin(data: bytes) -> int | None:
+    if not isinstance(data, bytes):
+        return None
+    match = re.fullmatch(rb"\[Service\]\nEnvironment=APPIO_SAMPLE_SECONDS=([2-9]|[12][0-9]|30)\n", data)
+    return int(match.group(1)) if match else None
+
+
 def parse_service_dropin(data: bytes) -> frozenset[str] | None:
     """Recognise the canonical service drop-in; ``None`` means "not ours".
 
@@ -715,9 +846,76 @@ def _require_expected_content(target: Path, existing: bytes) -> None:
         if parse_service_dropin(existing) is None:
             raise SafeRootFSError("unexpected_content:service_dropin")
         return
+    if target == SAMPLE_PERIOD_DROPIN:
+        if parse_sample_period_dropin(existing) is None:
+            raise SafeRootFSError("unexpected_content:sample_period_dropin")
+        return
     raise SafeRootFSError("unexpected_content:not_a_config_target")
 
 
 def _require_controller_name(name: object) -> None:
     if not isinstance(name, str) or _CONTROLLER.fullmatch(name) is None:
         raise ValueError(f"invalid controller name: {name!r}")
+
+
+@dataclasses.dataclass(frozen=True)
+class PeriodJournalRecord:
+    operation_id: str
+    target: str
+    sample_seconds: int
+    target_sha256: str
+
+
+def encode_period_journal(record: PeriodJournalRecord) -> bytes:
+    if not isinstance(record, PeriodJournalRecord):
+        raise ValueError("invalid period journal record")
+    if not isinstance(record.operation_id, str) or re.fullmatch(r"[0-9a-f]{32}", record.operation_id) is None:
+        raise ValueError("invalid period journal operation_id")
+    if record.target != str(SAMPLE_PERIOD_DROPIN):
+        raise ValueError("invalid period journal target")
+    if type(record.sample_seconds) is not int:
+        raise ValueError("invalid period journal sample_seconds")
+    sample_period_payload(record.sample_seconds)
+    if not isinstance(record.target_sha256, str) or re.fullmatch(r"[0-9a-f]{64}", record.target_sha256) is None:
+        raise ValueError("invalid period journal target_sha256")
+    document = {
+        "version": 1,
+        "operation_id": record.operation_id,
+        "target": record.target,
+        "sample_seconds": record.sample_seconds,
+        "target_sha256": record.target_sha256,
+    }
+    return (json.dumps(document, ensure_ascii=True, separators=(",", ":")) + "\n").encode("ascii")
+
+
+def decode_period_journal(data: bytes) -> PeriodJournalRecord:
+    if not isinstance(data, bytes) or len(data) > MAX_PERIOD_JOURNAL_BYTES:
+        raise ValueError("invalid period journal bytes")
+    try:
+        document = json.loads(data.decode("ascii"))
+    except (UnicodeDecodeError, ValueError, RecursionError) as exc:
+        raise ValueError("invalid period journal JSON") from exc
+    if not isinstance(document, dict) or set(document) != {
+        "version", "operation_id", "target", "sample_seconds", "target_sha256"
+    }:
+        raise ValueError("invalid period journal fields")
+    if type(document["version"]) is not int or document["version"] != 1:
+        raise ValueError("invalid period journal version")
+    record = PeriodJournalRecord(
+        document["operation_id"], document["target"], document["sample_seconds"], document["target_sha256"]
+    )
+    if encode_period_journal(record) != data:
+        raise ValueError("noncanonical period journal")
+    return record
+
+
+def publish_period_pending(fs: SafeRootFS, record: PeriodJournalRecord) -> None:
+    fs.atomic_write(SAMPLE_PERIOD_PENDING, encode_period_journal(record), mode=0o600)
+
+
+def publish_period_complete(fs: SafeRootFS, record: PeriodJournalRecord) -> None:
+    fs.atomic_write(SAMPLE_PERIOD_COMPLETE, encode_period_journal(record), mode=0o600)
+
+
+def remove_period_pending(fs: SafeRootFS) -> None:
+    fs.remove_period_pending()

@@ -117,8 +117,8 @@ class RecordingFS:
             self.timeline.append(("write", path))
         self.inner.atomic_write(path, content, mode=mode, owner=owner)
 
-    def read_bounded(self, path: str, *, max_bytes: int) -> bytes:
-        return self.inner.read_bounded(path, max_bytes=max_bytes)
+    def read_bounded(self, path: str, *, max_bytes: int, create_parents: bool = True) -> bytes:
+        return self.inner.read_bounded(path, max_bytes=max_bytes, create_parents=create_parents)
 
     @contextlib.contextmanager
     def locked(self):
@@ -129,6 +129,16 @@ class RecordingFS:
     # Convenience for assertions.
     def written_paths(self) -> list[str]:
         return [path for path, _content, _mode, _owner in self.writes]
+
+
+def test_load_setup_state_noncreating_mode_and_default(root: Path):
+    fs = RecordingFS(SafeRootFS(make_deps(root)))
+    assert not rebase(root, STATE_ROOT).exists()
+    assert dict(load_setup_state(fs, create_parents=False).pending_by_uid) == {}
+    assert not rebase(root, STATE_ROOT).exists()
+    assert dict(load_setup_state(fs).pending_by_uid) == {}
+    assert rebase(root, STATE_ROOT).is_dir()
+    assert not rebase(root, STATE_FILE).exists()
 
 
 def results(delegate: str = "cpu io memory pids", *, getent=0, usermod=0, reload=0):

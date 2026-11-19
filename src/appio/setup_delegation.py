@@ -120,7 +120,7 @@ class SetupState:
 # --------------------------------------------------------------------------- #
 
 
-def load_setup_state(fs: SafeRootFS) -> SetupState:
+def load_setup_state(fs: SafeRootFS, *, create_parents: bool = True) -> SetupState:
     """Read and validate the shared state; a missing file is legitimately empty.
 
     A present-but-invalid file is *not* treated as empty. It is evidence that
@@ -129,7 +129,9 @@ def load_setup_state(fs: SafeRootFS) -> SetupState:
     """
 
     try:
-        raw = fs.read_bounded(str(STATE_FILE), max_bytes=MAX_STATE_BYTES)
+        raw = fs.read_bounded(
+            str(STATE_FILE), max_bytes=MAX_STATE_BYTES, create_parents=create_parents
+        )
     except FileNotFoundError:
         return SetupState(version=STATE_VERSION, pending_by_uid=MappingProxyType({}))
     except PermissionError as exc:

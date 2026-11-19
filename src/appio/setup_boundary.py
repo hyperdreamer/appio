@@ -222,7 +222,16 @@ FIXED_TARGETS: tuple[FixedTarget, ...] = (
         path=Path("/etc/systemd/user.conf.d/10-appio.conf"),
         description="user-manager DefaultIOAccounting/DefaultTasksMax drop-in",
     ),
+    FixedTarget(
+        key="sample-period-dropin",
+        path=Path("/etc/systemd/system/appio-iod.service.d/20-sample-period.conf"),
+        description="system service sample-period drop-in",
+    ),
 )
+
+SAMPLE_PERIOD_PENDING = Path("/var/lib/appio/sample-period.pending.json")
+SAMPLE_PERIOD_COMPLETE = Path("/var/lib/appio/sample-period.complete.json")
+FIXED_STATE_TARGETS = frozenset((SAMPLE_PERIOD_PENDING, SAMPLE_PERIOD_COMPLETE))
 
 FIXED_TARGET_PATHS: frozenset[Path] = frozenset(target.path for target in FIXED_TARGETS)
 
