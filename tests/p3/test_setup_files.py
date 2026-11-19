@@ -975,6 +975,26 @@ def test_period_retry_syncs_a_previously_failed_created_ancestor(root, monkeypat
     assert rebase(root, STATE_ROOT.parent) in synced
 
 
+@pytest.mark.parametrize(
+    "fixed_path,initial_mode,expected_mode",
+    [
+        (STATE_ROOT, 0o755, 0o711),
+        (SAMPLE_TARGET.parent, 0o700, 0o755),
+    ],
+)
+def test_period_preexisting_directories_restore_fixed_modes(
+    root, fixed_path, initial_mode, expected_mode
+):
+    fs = SafeRootFS(make_deps(root))
+    fs.prepare_period_directories()
+    directory = rebase(root, fixed_path)
+    directory.chmod(initial_mode)
+
+    fs.prepare_period_directories()
+
+    assert stat.S_IMODE(directory.stat().st_mode) == expected_mode
+
+
 @pytest.mark.parametrize("directory", [
     SAMPLE_TARGET.parent.parent, STATE_ROOT.parent, SAMPLE_TARGET.parent, STATE_ROOT,
 ])
@@ -1030,9 +1050,9 @@ def test_period_sync_parent_and_unlink_failure_retry(root, monkeypatch):
         fs.sync_period_parent(STATE_FILE)
 
 
-def test_period_directory_creation_race_preserves_existing_mode(root, monkeypatch):
+def test_period_directory_creation_race_rejects_mismatched_mode(root, monkeypatch):
     directory = rebase(root, SAMPLE_TARGET.parent)
-    directory.mkdir(mode=0o700)
+    directory.mkdir(mode=0o700, parents=True)
     directory.chmod(0o700)
     real_open = os.open
     first = True
@@ -1045,5 +1065,6 @@ def test_period_directory_creation_race_preserves_existing_mode(root, monkeypatc
         return real_open(path, flags, *args, **kwargs)
 
     monkeypatch.setattr(os, "open", raced_open)
-    SafeRootFS(make_deps(root)).prepare_period_directories()
+    with pytest.raises(SafeRootFSError, match="untrusted_parent:mode_mismatch"):
+        SafeRootFS(make_deps(root)).prepare_period_directories()
     assert stat.S_IMODE(directory.stat().st_mode) == 0o700

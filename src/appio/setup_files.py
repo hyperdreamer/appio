@@ -394,17 +394,18 @@ class SafeRootFS:
     ) -> int:
         flags = _DIR_FLAGS
         created = False
+        raced = False
+        fixed_mode = _fixed_directory_mode(full)
         try:
             child = os.open(part, flags, dir_fd=parent)
         except FileNotFoundError:
             if not create:
                 raise
-            fixed_mode = _fixed_directory_mode(full)
             try:
                 os.mkdir(part, fixed_mode, dir_fd=parent)
                 created = True
             except FileExistsError:
-                pass
+                raced = True
             except OSError as exc:
                 raise SafeRootFSError(f"create_parent:{_open_word(exc)}") from exc
             if created and sync_created:
@@ -413,20 +414,18 @@ class SafeRootFS:
                 child = os.open(part, flags, dir_fd=parent)
             except OSError as exc:
                 raise SafeRootFSError(f"untrusted_parent:{_open_word(exc)}") from exc
-            try:
-                # mkdir honours the umask; set the exact mode only on a
-                # directory this call created, never one won by a race.
-                if created:
-                    os.fchmod(child, fixed_mode)
-            except BaseException:
-                os.close(child)
-                raise
         except OSError as exc:
             raise SafeRootFSError(
                 f"untrusted_parent:{_open_word(exc, parent=parent, name=part)}"
             ) from exc
         try:
-            self._verify_directory(child, "untrusted_parent")
+            if raced:
+                self._verify_directory(child, "untrusted_parent", expected_mode=fixed_mode)
+            else:
+                # Restore the fixed mode on paths this call opened normally.
+                # A directory won by the mkdir race must already match it.
+                os.fchmod(child, fixed_mode)
+                self._verify_directory(child, "untrusted_parent")
             # A failed mkdir fsync may have left an existing directory behind.
             # Re-sync its parent on the next period traversal as well.
             if sync_created and not created:
@@ -437,7 +436,9 @@ class SafeRootFS:
         os.close(parent)
         return child
 
-    def _verify_directory(self, descriptor: int, prefix: str) -> None:
+    def _verify_directory(
+        self, descriptor: int, prefix: str, *, expected_mode: int | None = None
+    ) -> None:
         real = os.fstat(descriptor)
         if not stat.S_ISDIR(real.st_mode):
             raise SafeRootFSError(f"{prefix}:not_a_directory")
@@ -455,6 +456,8 @@ class SafeRootFS:
             raise SafeRootFSError(f"{prefix}:not_root_owned")
         if stat.S_IMODE(mode) & _WRITABLE_BITS:
             raise SafeRootFSError(f"{prefix}:writable")
+        if expected_mode is not None and stat.S_IMODE(mode) != expected_mode:
+            raise SafeRootFSError(f"{prefix}:mode_mismatch")
 
     # ------------------------------------------------------------------ #
     # Publication details
