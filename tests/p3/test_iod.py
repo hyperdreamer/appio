@@ -564,7 +564,7 @@ def test_sigterm_equivalent_main_flushes_on_owner_thread_and_restores_handlers(r
                 lambda action, a, *args: sqlite3.SQLITE_DENY if action == sqlite3.SQLITE_TRANSACTION and a == "COMMIT" else sqlite3.SQLITE_OK)
         handlers[iod.signal.SIGTERM](iod.signal.SIGTERM, None)
 
-    monkeypatch.setattr(iod, "Daemon", lambda: r.daemon)
+    monkeypatch.setattr(iod, "Daemon", lambda **kwargs: r.daemon)
     monkeypatch.setattr(iod.os, "geteuid", lambda: 0)
     monkeypatch.setattr(iod.signal, "signal", signal)
     monkeypatch.setattr(r.daemon, "step", signal_after_step)

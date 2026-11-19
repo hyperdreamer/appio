@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 from collections import OrderedDict, deque
+from collections.abc import Callable, Mapping
 from concurrent.futures import Future
 from dataclasses import asdict, dataclass, field
 import errno
@@ -18,6 +19,7 @@ import os
 from pathlib import Path
 import pwd
 import queue
+import re
 import selectors
 import signal
 import socket
@@ -43,6 +45,7 @@ SAMPLE_NS = 10 * NS
 TICK_NS = 2 * NS
 MAX_FLUSH_NS = 30 * NS
 MAINTENANCE_NS = 60 * NS
+PERIOD_TEXT: re.Pattern[str] = re.compile(r"(?:[2-9]|[12][0-9]|30)", re.ASCII)
 
 #: Longest the event loop sleeps with no buffered work. A finished worker job is
 #: not a readable socket, so without the wake below every answer waits out this
@@ -84,6 +87,44 @@ REPLAY_COUNT = 64
 REPLAY_BYTES = 4 * 1024 * 1024
 _COUNTERS = ("rchar", "wchar", "read_bytes", "write_bytes")
 _LOG = logging.getLogger(__name__)
+
+
+def parse_sample_seconds(raw: object) -> int | None:
+    if type(raw) is str and PERIOD_TEXT.fullmatch(raw):
+        return int(raw)
+    return None
+
+
+def configured_sample_ns(environ: Mapping[str, str] | None = None) -> int:
+    environment = os.environ if environ is None else environ
+    if "APPIO_SAMPLE_SECONDS" not in environment:
+        return SAMPLE_NS
+    raw = environment["APPIO_SAMPLE_SECONDS"]
+    if type(raw) is str and raw == "":
+        return SAMPLE_NS
+    seconds = parse_sample_seconds(raw)
+    if seconds is None:
+        try:
+            value = str.__str__(repr(raw))[:64]
+        except BaseException:
+            value = "<unrepresentable>"
+        if not value.isprintable():
+            value = value.encode("unicode_escape").decode("ascii")[:64]
+        _LOG.warning("sample_period_invalid value=%s", value)
+        return SAMPLE_NS
+    return seconds * NS
+
+
+def flush_ns_for(sample_ns: int) -> int:
+    if type(sample_ns) is not int or sample_ns <= 0:
+        raise ValueError("sample_ns must be a positive integer")
+    return max(30 * NS, 3 * sample_ns)
+
+
+def maintenance_ns_for(sample_ns: int) -> int:
+    if type(sample_ns) is not int or sample_ns <= 0:
+        raise ValueError("sample_ns must be a positive integer")
+    return min(60 * NS, max(15 * NS, 3 * sample_ns))
 
 
 @dataclass(frozen=True)
@@ -263,12 +304,16 @@ class _Snapshot:
 class Daemon:
     def __init__(self, paths: DaemonPaths = DaemonPaths(), *, clock=None, peer_reader=read_peer,
                  group_lookup=_groups, filesystem=None, selector=None, query_worker=None,
-                 sample_ns=SAMPLE_NS, flush_ns=MAX_FLUSH_NS, file_source_factory=None):
+                 sample_ns: int = SAMPLE_NS, flush_ns: int = MAX_FLUSH_NS,
+                 maintenance_ns: int = MAINTENANCE_NS, file_source_factory: Callable | None = None):
         if type(sample_ns) is not int or sample_ns <= 0:
             raise ValueError("sample_ns must be a positive integer")
         if type(flush_ns) is not int or flush_ns <= sample_ns:
             raise ValueError("flush_ns must exceed sample_ns")
+        if type(maintenance_ns) is not int or maintenance_ns <= 0:
+            raise ValueError("maintenance_ns must be a positive integer")
         self._sample_ns, self._flush_ns = sample_ns, flush_ns
+        self._maintenance_ns = maintenance_ns
         self.paths = paths
         self.clock = SystemClock() if clock is None else clock
         self.peer_reader, self.group_lookup = peer_reader, group_lookup
@@ -453,7 +498,7 @@ class Daemon:
             now = self.clock()[0]
             self._next_tick = now + TICK_NS
             self._next_sample = self._committed_mono + self._sample_ns
-            self._next_maintenance = now + MAINTENANCE_NS
+            self._next_maintenance = now + self._maintenance_ns
             self._ownership_start = self._committed_mono
             self._running = True
         except BaseException:
@@ -529,11 +574,15 @@ class Daemon:
             return False
 
     def _status(self, client, request_id):
-        return {"protocol": 1, "type": "status", "request_id": request_id,
-                "enabled": True, "answering": self.last_error is None,
-                "pending_activation": self._pending(client.peer.uid),
-                "ownership_start_mono_ns": self._ownership_start,
-                "cursor": None if self.committed_cursor is None else asdict(self.committed_cursor)}
+        status = {"protocol": 1, "type": "status", "request_id": request_id,
+                  "enabled": True, "answering": self.last_error is None,
+                  "pending_activation": self._pending(client.peer.uid),
+                  "ownership_start_mono_ns": self._ownership_start,
+                  "cursor": None if self.committed_cursor is None else asdict(self.committed_cursor)}
+        # Embedded daemons may use periods beyond the protocol's maximum.
+        if self._sample_ns <= 30 * NS:
+            status["sample_ns"] = self._sample_ns
+        return status
 
     def _pending(self, uid):
         # Protocol 1 requires a bool. Unknown fails closed as pending, never as
@@ -794,7 +843,7 @@ class Daemon:
         # A recovery window belongs only to a persistent storage failure. Keep
         # it through quiet ticks and successful pruning that commits no frame.
         if self._storage_error in _STORAGE_ERRORS or self._next_recovery:
-            self._next_recovery = started + MAINTENANCE_NS
+            self._next_recovery = started + self._maintenance_ns
         try:
             if self._recover:
                 self._new_collector()
@@ -838,7 +887,7 @@ class Daemon:
         if now >= self._next_sample and (recovery_due or not (self._quota_paused or self._recover)):
             if self._quota_paused:
                 if self._storage_error in _STORAGE_ERRORS:
-                    self._next_recovery = now + MAINTENANCE_NS
+                    self._next_recovery = now + self._maintenance_ns
                 try:
                     quota = self._pruner.shrink_if_needed()
                     self._quota_paused = quota.sampling_paused
@@ -848,7 +897,7 @@ class Daemon:
                     self._storage_error = "maintenance_failed"
                     self._failure("maintenance_failed")
                     self._recover = True
-                    self._next_recovery = now + MAINTENANCE_NS
+                    self._next_recovery = now + self._maintenance_ns
             if not self._quota_paused:
                 if now - self._committed_mono > self._flush_ns:
                     self.last_error = "collection_overdue"
@@ -872,7 +921,7 @@ class Daemon:
                 self._failure("maintenance_failed")
                 self._quota_paused = True
                 self._recover = True
-            self._next_maintenance = self.clock()[0] + MAINTENANCE_NS
+            self._next_maintenance = self.clock()[0] + self._maintenance_ns
         buffered = any(client.unfed or client.requests or (client.job and client.job.done()) for client in self.clients.values())
         # A past sample boundary in a storage recovery window must not make the
         # selector spin; the retry deadline is the earliest useful wakeup there.
@@ -976,7 +1025,10 @@ def main(argv=None):
     if os.geteuid() != 0:
         _LOG.error("appio-iod requires root")
         return 1
-    daemon = Daemon()
+    sample_ns = configured_sample_ns()
+    flush_ns = flush_ns_for(sample_ns)
+    maintenance_ns = maintenance_ns_for(sample_ns)
+    daemon = Daemon(sample_ns=sample_ns, flush_ns=flush_ns, maintenance_ns=maintenance_ns)
     stopping = False
 
     def stop_signal(signum, frame):
