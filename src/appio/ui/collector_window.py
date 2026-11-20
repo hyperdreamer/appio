@@ -1,11 +1,9 @@
-"""The single P3 shell: one privileged switch, navigation everywhere else.
+"""The P3 shell, with a single switch for machine-wide collection.
 
-Ownership of privilege is deliberate and narrow. Exactly one checkable control --
-``System services (root)`` in Settings -- can change machine-wide collection, and
-it only ever *requests* a change through a consent dialog and
-``/usr/bin/pkexec /usr/bin/appio-setup <verb>``. Every other affordance in this
-window (the status banner, the ``Files`` entry) selects a page, issues one
-read-only query, or focuses that one control; none of them changes any state.
+The ``System services (root)`` switch in Settings controls whether collection is
+started or stopped. The sampling-period row applies a period through a separate
+consent dialog. Both use ``/usr/bin/pkexec /usr/bin/appio-setup <verb>``. The
+status banner and ``Files`` entry navigate without changing collection state.
 
 The switch renders the *probe*, never the last click: clicking restores the
 probed position immediately, and the displayed state is recomputed from
@@ -44,6 +42,7 @@ from PyQt6.QtWidgets import (
     QPushButton,
     QRadioButton,
     QScrollArea,
+    QSpinBox,
     QVBoxLayout,
     QWidget,
 )
@@ -66,7 +65,7 @@ from ..ipc_protocol import FrameDecoder, MAX_OUTBOUND, ProtocolError, encode_fra
 from ..ipc_security import read_peer, require_root_server
 from ..live import LiveCollector, SystemClock
 from ..setup_boundary import CommandResult
-from ..setup_client import SetupClient, SetupReply
+from ..setup_client import SetupClient, SetupReply, first_stderr_line
 from .files_view import STATE_UNAVAILABLE as FILES_STATE_UNAVAILABLE
 from .files_view import FilesView
 
@@ -126,6 +125,7 @@ STATUS_TIMEOUT_SECONDS = 2.0
 PENDING_BUDGET_NS: int = 30 * 10**9
 MAX_HELPER_OUTPUT = 64 * 1024
 CONSENT_COMMAND_PREFIX = "/usr/bin/pkexec /usr/bin/appio-setup"
+NS = 1_000_000_000
 
 _ENABLED_STATES: dict[str, bool] = {
     "enabled": True,
@@ -192,13 +192,15 @@ class _TextDialog(QDialog):
 class ConsentDialog(_TextDialog):
     """One consent dialog, naming the exact commands before any elevation."""
 
-    def __init__(self, parent: QWidget | None, verb: str) -> None:
+    def __init__(self, parent: QWidget | None, verb: str, *,
+                 period_seconds: int | None = None) -> None:
         captions = {
             "enable": "Install delegation and enable",
             "disable": "Disable system services",
             "status": "Run the activation check",
+            "set-sample-period": "Apply sampling period",
         }
-        super().__init__(parent, "Consent", consent_text(verb))
+        super().__init__(parent, "Consent", consent_text(verb, period_seconds=period_seconds))
         self.verb = verb
         self.accept_button = self.add_button(captions[verb], "consent_accept")
         self.cancel_button = self.add_button("Cancel", "consent_cancel")
@@ -277,7 +279,7 @@ class RestartConfirmationDialog(_TextDialog):
         self.cancel_button.clicked.connect(self.reject)
 
 
-def consent_text(verb: str) -> str:
+def consent_text(verb: str, *, period_seconds: int | None = None) -> str:
     """The exact, verb-specific disclosure shown before any elevation."""
 
     if verb == "enable":
@@ -319,7 +321,16 @@ def consent_text(verb: str) -> str:
             "argument:\n"
             f"  {CONSENT_COMMAND_PREFIX} status"
         )
-    raise ValueError("consent is defined only for the fixed verbs enable, disable and status")
+    if verb == "set-sample-period":
+        if type(period_seconds) is not int or not 2 <= period_seconds <= 30:
+            raise ValueError("sample period must be an integer from 2 through 30")
+        return (
+            "Applying this sampling period restarts the active system service. "
+            "An inactive service is not started.\n\n"
+            "This exact command runs through polkit:\n"
+            f"  {CONSENT_COMMAND_PREFIX} set-sample-period {period_seconds}"
+        )
+    raise ValueError("consent is defined only for the fixed verbs enable, disable, status and set-sample-period")
 
 
 def display_state(facts: ServiceFacts, probe_state: str | None = None) -> str:
@@ -406,9 +417,9 @@ def silence_cause(facts: ServiceFacts, client_state: ClientState | None) -> str 
 
 
 class SettingsDialog(QDialog):
-    """``Settings`` owns the single privileged control and its probed status line."""
+    """Settings owns the service switch and sampling-period controls."""
 
-    ROWS: tuple[str, ...] = ("system_services",)
+    ROWS: tuple[str, ...] = ("system_services", "sampling_period")
     STATUS_CAPTION = "System services (root)"
 
     def __init__(self, parent: QWidget | None = None) -> None:
@@ -438,13 +449,48 @@ class SettingsDialog(QDialog):
         row_layout.addWidget(self.status_label, 1)
         row_layout.addWidget(self.recheck)
         layout.addWidget(row)
+
+        self.sample_period_row = QWidget()
+        self.sample_period_row.setObjectName("sample_period_row")
+        period_layout = QVBoxLayout(self.sample_period_row)
+        period_layout.setContentsMargins(0, 0, 0, 0)
+        period_controls = QHBoxLayout()
+        caption = QLabel("Sampling period (system service)")
+        caption.setObjectName("sample_period_caption")
+        self.sample_period_spin = QSpinBox()
+        self.sample_period_spin.setObjectName("sample_period_spin")
+        self.sample_period_spin.setAccessibleName("Sampling period (system service)")
+        self.sample_period_spin.setRange(2, 30)
+        self.sample_period_spin.setSuffix(" s")
+        self.sample_period_spin.setKeyboardTracking(False)
+        self.sample_period_spin.setValue(10)
+        self.sample_period_apply = QPushButton("Apply")
+        self.sample_period_apply.setObjectName("sample_period_apply")
+        period_controls.addWidget(caption)
+        period_controls.addWidget(self.sample_period_spin)
+        period_controls.addWidget(QLabel("(2-30)"))
+        period_controls.addWidget(self.sample_period_apply)
+        period_controls.addStretch(1)
+        period_layout.addLayout(period_controls)
+        self.sample_period_status = QLabel(
+            "Sampling period not known while the collector is not answering."
+        )
+        self.sample_period_status.setObjectName("sample_period_status")
+        self.sample_period_status.setWordWrap(True)
+        self.sample_period_status.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        period_layout.addWidget(self.sample_period_status)
+        hint = QLabel("Shorter periods increase raw history writes and CPU use.")
+        hint.setWordWrap(True)
+        period_layout.addWidget(hint)
+        layout.addWidget(self.sample_period_row)
         layout.addStretch(1)
 
     def focus_row(self, key: str) -> None:
         if key not in self.ROWS:
             raise ValueError("unknown settings row")
         self.focused_row = key
-        self.switch.setFocus(Qt.FocusReason.TabFocusReason)
+        target = self.switch if key == "system_services" else self.sample_period_spin
+        target.setFocus(Qt.FocusReason.TabFocusReason)
 
     def show_switch(self, enabled: bool | None, *, busy: bool, unavailable: bool) -> None:
         """Render the probe. Signal blocking keeps a refresh from re-elevating."""
@@ -541,6 +587,10 @@ class CollectorWindow(QMainWindow):
         self._probe_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="appio-probe")
         self._busy = False
         self._operation: tuple[str, Callable[[SetupReply], None] | None] | None = None
+        self.pending_period_seconds: int | None = None
+        self._period_edited = False
+        self._period_saved = False
+        self._period_error: str | None = None
         self._activation_choice: str | None = None
         self._unsupported_reason: str | None = None
         self._target: Window | None = None
@@ -649,6 +699,9 @@ class CollectorWindow(QMainWindow):
         self.settings = SettingsDialog(self)
         self.settings.recheck.clicked.connect(self._on_recheck_clicked)
         self.settings.switch.clicked.connect(self._on_switch_clicked)
+        self.settings.sample_period_apply.clicked.connect(self._on_sampling_apply)
+        self.settings.sample_period_spin.valueChanged.connect(self._on_sampling_edited)
+        self.settings.sample_period_spin.lineEdit().textEdited.connect(self._on_sampling_edited)
         self.banner_open_settings.clicked.connect(self._open_settings_default)
         self.files_open_settings.clicked.connect(self._open_settings_default)
         self._render_files_message()
@@ -1103,6 +1156,37 @@ class CollectorWindow(QMainWindow):
             busy=self._busy,
             unavailable=self._unsupported_reason is not None,
         )
+        self.settings.sample_period_apply.setEnabled(not self._busy)
+        sample_ns = facts.sample_ns if facts.daemon_verified and facts.answering else None
+        if not self._period_edited and self.pending_period_seconds is None and not self._busy:
+            if sample_ns is not None and sample_ns % NS == 0 and 2 <= sample_ns // NS <= 30:
+                self.settings.sample_period_spin.blockSignals(True)
+                try:
+                    self.settings.sample_period_spin.setValue(sample_ns // NS)
+                finally:
+                    self.settings.sample_period_spin.blockSignals(False)
+        if self._period_error is not None:
+            text = self._period_error
+        elif not facts.answering or not facts.daemon_verified:
+            if self._period_saved and self.pending_period_seconds is not None:
+                text = (f"Saved: sampling every {self.pending_period_seconds} s "
+                        "once the system service starts.")
+            else:
+                text = "Sampling period not known while the collector is not answering."
+        elif sample_ns is None:
+            text = "Sampling period not reported by this collector."
+        else:
+            seconds, fractional_ns = divmod(sample_ns, NS)
+            reported = str(seconds)
+            if fractional_ns:
+                reported += f".{fractional_ns:09d}".rstrip("0")
+            if self.pending_period_seconds is None:
+                text = f"Sampling every {reported} s."
+            elif sample_ns != self.pending_period_seconds * NS:
+                text = f"Requested {self.pending_period_seconds} s, collector reports {reported} s."
+            else:
+                text = f"Waiting for the collector to confirm {self.pending_period_seconds} s."
+        self.settings.sample_period_status.setText(text)
 
     def _show_error(self, message: str) -> None:
         self.error_label.setText(message)
@@ -1206,6 +1290,9 @@ class CollectorWindow(QMainWindow):
             return
         facts = payload.facts
         assert facts is not None
+        observed_sample_ns = facts.sample_ns if facts.daemon_verified and facts.answering else None
+        if observed_sample_ns is None and facts.sample_ns is not None:
+            facts = replace(facts, sample_ns=None)
         client = getattr(self.history, "client", None)
         state = getattr(client, "state", None)
         if state is not None and state.verified and state.answering:
@@ -1229,6 +1316,11 @@ class CollectorWindow(QMainWindow):
             return
         self._facts = facts
         self._facts_applied += 1
+        if (self.pending_period_seconds is not None
+                and observed_sample_ns == self.pending_period_seconds * NS):
+            self.pending_period_seconds = None
+            self._period_saved = False
+            self._period_error = None
         self._render(facts)
         try:
             self._tick_target()
@@ -1261,17 +1353,24 @@ class CollectorWindow(QMainWindow):
             return
         self._open_consent("status")
 
-    def _open_consent(self, verb: str) -> None:
+    def _on_sampling_edited(self, *_args) -> None:
+        self._period_edited = True
+
+    def _on_sampling_apply(self) -> None:
+        if not self._busy:
+            self._open_consent("set-sample-period", period_seconds=self.settings.sample_period_spin.value())
+
+    def _open_consent(self, verb: str, *, period_seconds: int | None = None) -> None:
         if self._busy:
             return
-        self.consent = ConsentDialog(self, verb)
-        self.consent.accepted.connect(lambda: self._begin(verb))
+        self.consent = ConsentDialog(self, verb, period_seconds=period_seconds)
+        self.consent.accepted.connect(lambda: self._begin(verb, period_seconds=period_seconds))
         self.consent.show()
         self.consent.raise_()
         self.consent.activateWindow()
 
-    def _begin(self, verb: str) -> None:
-        if self._busy:
+    def _begin(self, verb: str, *, period_seconds: int | None = None) -> None:
+        if self._closed or self._busy:
             return
         self._clear_error()
         if verb == "enable":
@@ -1280,6 +1379,12 @@ class CollectorWindow(QMainWindow):
             self._start("install-delegation", self._after_install)
         elif verb == "disable":
             self._start("disable", self._after_disable)
+        elif verb == "set-sample-period":
+            self.pending_period_seconds = period_seconds
+            self._period_edited = False
+            self._period_saved = False
+            self._period_error = None
+            self._start(verb, self._after_period, period_seconds=period_seconds)
         else:
             self._start("status", self._after_status)
 
@@ -1292,16 +1397,19 @@ class CollectorWindow(QMainWindow):
             return False
         return True
 
-    def _start(self, verb: str, on_success: Callable[[SetupReply], None] | None) -> None:
+    def _start(self, verb: str, on_success: Callable[[SetupReply], None] | None, *,
+               period_seconds: int | None = None) -> None:
         if self._closed or self._busy:
             return
         self._setup_generation += 1
         self._busy = True
         self._operation = (verb, on_success)
-        if self._facts is not None:
-            self._render(self._facts)
+        self._render(self._facts if self._facts is not None else QUIESCE_FACTS)
         try:
-            future = self.setup.invoke(verb)
+            if verb == "set-sample-period":
+                future = self.setup.invoke(verb, period_seconds=period_seconds)
+            else:
+                future = self.setup.invoke(verb)
         except BaseException as error:
             self._complete_start_failure(error)
             return
@@ -1309,11 +1417,12 @@ class CollectorWindow(QMainWindow):
 
     def _complete_start_failure(self, error: BaseException) -> None:
         self._setup_generation += 1
+        if self._operation is not None and self._operation[0] == "set-sample-period":
+            self._period_error = first_stderr_line(str(error)) or type(error).__name__
         self._operation = None
         self._busy = False
         self._show_error(f"appio: {str(error) or type(error).__name__}")
-        if self._facts is not None:
-            self._render(self._facts)
+        self._render(self._facts if self._facts is not None else QUIESCE_FACTS)
         if not self._closed:
             self._submit_probe(replace_pending=True)
 
@@ -1327,11 +1436,17 @@ class CollectorWindow(QMainWindow):
         try:
             reply = future.result()
         except Exception as error:
+            if _verb == "set-sample-period":
+                self._period_error = first_stderr_line(str(error)) or type(error).__name__
             self._fail(str(error))
         else:
             if self._apply_body(reply.body):
                 self._clear_error()
             if reply.exit_code != 0:
+                if _verb == "set-sample-period":
+                    body = reply.body if isinstance(reply.body, dict) else {}
+                    self._period_error = (first_stderr_line(reply.stderr_first_line)
+                                          or str(body.get("error") or "") or "no detail")
                 self._fail(reply)
             else:
                 self._clear_error()
@@ -1370,6 +1485,14 @@ class CollectorWindow(QMainWindow):
         else:
             self._show_error(f"appio: {failure}")
         self._render(self._facts if self._facts is not None else QUIESCE_FACTS)
+
+    def _after_period(self, reply: SetupReply) -> None:
+        body = reply.body or {}
+        self._period_saved = (
+            body.get("sample_period") == self.pending_period_seconds
+            and body.get("sample_period_state") in ("applied_not_running", "repair")
+            and body.get("answering") is False
+        )
 
     # -- enable, choice and restart ---------------------------------------
 
@@ -1561,9 +1684,12 @@ def production_probe(
         status = None
     if isinstance(status, dict) and status.get("answering") is True:
         pending = status.get("pending_activation")
+        sample_ns = status.get("sample_ns")
+        if type(sample_ns) is not int or not 1 <= sample_ns <= 30 * NS:
+            sample_ns = None
         return ServiceFacts(enabled, active, True, True,
                             pending if type(pending) is bool else None,
-                            sub_state, result, restarts)
+                            sub_state, result, restarts, sample_ns)
     return ServiceFacts(enabled, active, False, False, None, sub_state, result, restarts)
 
 
