@@ -389,6 +389,17 @@ def test_tick_local_returns_committed_advance_without_invalidation(tmp_path):
     failing.close()
 
 
+def test_service_facts_sample_period_validation_and_positional_compatibility():
+    legacy = ServiceFacts(True, "active", True, True, False, "running", "success", 2)
+    assert legacy.sample_ns is None
+    assert ServiceFacts(True, "active", True, True, False, sample_ns=None).sample_ns is None
+    for value in (1, 10_000_000_000, 31_000_000_000):
+        assert ServiceFacts(True, "active", True, True, False, sample_ns=value).sample_ns == value
+    for value in (True, False, 0, -1, 1.5, "10"):
+        with pytest.raises(ValueError, match="^sample_ns must be a positive integer or None$"):
+            ServiceFacts(True, "active", True, True, False, sample_ns=value)
+
+
 def test_parent_symlink_does_not_redirect_the_lease(tmp_path):
     safe = tmp_path / "safe"
     safe.mkdir()

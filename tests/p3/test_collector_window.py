@@ -203,6 +203,7 @@ class FakeSetup:
         self._facts_lock = threading.Lock()
         self.events = events if events is not None else []
         self.calls: list[str] = []
+        self.period_payloads: list[int | None] = []
         self.pending: dict[str, list[Future]] = {}
         self.refresh_calls = 0
 
@@ -224,8 +225,9 @@ class FakeSetup:
         self.events.append(("probe",))
         return facts
 
-    def invoke(self, verb: str) -> Future:
+    def invoke(self, verb: str, *, period_seconds: int | None = None) -> Future:
         self.calls.append(verb)
+        self.period_payloads.append(period_seconds)
         self.events.append(("invoke", verb))
         done: Future = Future()
         self.pending.setdefault(verb, []).append(done)
@@ -4452,3 +4454,393 @@ def test_task4_m089_invalid_file_result_preserves_inner_failure_reason(qtbot, mo
     assert window.files_view.unavailable_text() == (
         "not_retained: file history is not available for this window"
     )
+
+
+NS = 1_000_000_000
+
+
+def period_facts(seconds):
+    return replace(ON, sample_ns=seconds * NS)
+
+
+def begin_period_apply(window, seconds):
+    window.settings.sample_period_spin.setValue(seconds)
+    click(window.settings.sample_period_apply)
+    assert window.consent is not None and window.consent.isVisible()
+    window.consent.accept()
+
+
+def period_reply(seconds, state, *, answering=False):
+    return ok("set-sample-period", {
+        "sample_period": seconds,
+        "sample_period_state": state,
+        "answering": answering,
+    })
+
+
+def test_sampling_row_has_required_object_names(qtbot):
+    window, _, _, _ = build(qtbot)
+    settings = window.settings
+    assert settings.ROWS == ("system_services", "sampling_period")
+    assert settings.sample_period_row.objectName() == "sample_period_row"
+    assert settings.sample_period_spin.objectName() == "sample_period_spin"
+    assert settings.sample_period_apply.objectName() == "sample_period_apply"
+    assert settings.sample_period_status.objectName() == "sample_period_status"
+    assert "Sampling period (system service)" in settings.sample_period_row.findChild(
+        cw.QLabel, "sample_period_caption").text()
+    assert "Shorter periods increase raw history writes and CPU use." in [
+        label.text() for label in settings.findChildren(cw.QLabel)
+    ]
+
+
+def test_sampling_row_focus_and_spin_contract(qtbot):
+    window, _, _, setup = build(qtbot, facts=period_facts(7))
+    refresh_and_settle(qtbot, window)
+    window.open_settings(focus="sampling_period")
+    qtbot.waitUntil(window.settings.sample_period_spin.hasFocus, timeout=2000)
+    spin = window.settings.sample_period_spin
+    assert (spin.minimum(), spin.maximum(), spin.suffix()) == (2, 30, " s")
+    assert spin.keyboardTracking() is False
+    assert spin.value() == 7
+    assert setup.calls == []
+    with pytest.raises(ValueError, match="^unknown settings row$"):
+        window.settings.focus_row("missing")
+
+
+def test_sampling_edit_survives_refresh(qtbot):
+    window, _, _, setup = build(qtbot, facts=period_facts(10))
+    refresh_and_settle(qtbot, window)
+    spin = window.settings.sample_period_spin
+    assert spin.value() == 10
+    spin.setValue(6)
+    setup.facts = period_facts(15)
+    refresh_and_settle(qtbot, window)
+    assert spin.value() == 6
+    assert window.settings.sample_period_status.text() == "Sampling every 15 s."
+
+
+def test_sampling_uncommitted_keyboard_edit_survives_refresh(qtbot):
+    window, _, _, setup = build(qtbot, facts=period_facts(10))
+    refresh_and_settle(qtbot, window)
+    window.open_settings(focus="sampling_period")
+    editor = window.settings.sample_period_spin.lineEdit()
+    editor.selectAll()
+    qtbot.keyClicks(editor, "7")
+    assert window.settings.sample_period_spin.value() == 10
+    setup.facts = period_facts(15)
+    refresh_and_settle(qtbot, window)
+    assert editor.text().strip().startswith("7")
+    assert window.settings.sample_period_status.text() == "Sampling every 15 s."
+
+
+def test_sampling_edit_during_pending_operation_survives_matching_probe(qtbot):
+    window, _, _, setup = build(qtbot, facts=period_facts(10))
+    refresh_and_settle(qtbot, window)
+    begin_period_apply(window, 5)
+    window.settings.sample_period_spin.setValue(16)
+    setup.facts = period_facts(5)
+    complete_and_settle(qtbot, window, setup, "set-sample-period",
+                        period_reply(5, "applied", answering=True))
+    assert window.pending_period_seconds is None
+    assert window.settings.sample_period_spin.value() == 16
+    assert window.settings.sample_period_status.text() == "Sampling every 5 s."
+    setup.facts = period_facts(7)
+    refresh_and_settle(qtbot, window)
+    assert window.settings.sample_period_spin.value() == 16
+    assert window.settings.sample_period_status.text() == "Sampling every 7 s."
+
+
+def test_sampling_status_strings_are_exact(qtbot):
+    window, _, _, setup = build(qtbot, facts=OFF)
+    refresh_and_settle(qtbot, window)
+    assert window.settings.sample_period_status.text() == (
+        "Sampling period not known while the collector is not answering.")
+    assert window.settings.sample_period_spin.value() == 10
+    assert window.settings.sample_period_apply.isEnabled()
+    setup.facts = ON
+    refresh_and_settle(qtbot, window)
+    assert window.settings.sample_period_status.text() == (
+        "Sampling period not reported by this collector.")
+    setup.facts = period_facts(12)
+    refresh_and_settle(qtbot, window)
+    assert window.settings.sample_period_status.text() == "Sampling every 12 s."
+    assert window.settings.sample_period_spin.value() == 12
+    setup.facts = replace(ON, sample_ns=12 * NS + 1)
+    refresh_and_settle(qtbot, window)
+    assert window.settings.sample_period_status.text() == "Sampling every 12.000000001 s."
+    assert window.settings.sample_period_spin.value() == 12
+
+    other, _, _, _ = build(qtbot, facts=replace(ON, sample_ns=12 * NS + 1))
+    refresh_and_settle(qtbot, other)
+    assert other.settings.sample_period_spin.value() == 10
+
+
+def test_sampling_apply_button_is_disabled_while_pending(qtbot):
+    window, _, _, setup = build(qtbot, facts=OFF)
+    refresh_and_settle(qtbot, window)
+    begin_period_apply(window, 6)
+    assert window.busy and not window.settings.sample_period_apply.isEnabled()
+    complete_and_settle(qtbot, window, setup, "set-sample-period",
+                        period_reply(6, "applied_not_running"))
+    assert window.pending_period_seconds == 6
+    assert window.settings.sample_period_apply.isEnabled()
+    click(window.settings.recheck)
+    window.consent.accept()
+    assert window.busy and not window.settings.sample_period_apply.isEnabled()
+    complete_and_settle(qtbot, window, setup, "status", ok("status"))
+    assert window.settings.sample_period_apply.isEnabled()
+
+
+@pytest.mark.parametrize("state", ["applied", "repair"])
+def test_sampling_mismatch_and_superseded_period_are_not_success(qtbot, state):
+    window, _, _, setup = build(qtbot, facts=period_facts(10))
+    refresh_and_settle(qtbot, window)
+    begin_period_apply(window, 5)
+    setup.facts = period_facts(7)
+    complete_and_settle(qtbot, window, setup, "set-sample-period",
+                        period_reply(5, state, answering=True))
+    assert window.pending_period_seconds == 5
+    assert window.settings.sample_period_status.text() == "Requested 5 s, collector reports 7 s."
+    begin_period_apply(window, 9)
+    complete_and_settle(qtbot, window, setup, "set-sample-period",
+                        period_reply(9, "applied", answering=True), index=1)
+    assert window.pending_period_seconds == 9
+    assert window.settings.sample_period_status.text() == "Requested 9 s, collector reports 7 s."
+    setup.facts = period_facts(5)
+    refresh_and_settle(qtbot, window)
+    assert window.pending_period_seconds == 9
+    assert window.settings.sample_period_status.text() == "Requested 9 s, collector reports 5 s."
+
+
+@pytest.mark.parametrize("state", ["applied_not_running", "repair"])
+def test_sampling_saved_status_is_shown_when_inactive(qtbot, state):
+    window, _, _, setup = build(qtbot, facts=OFF)
+    refresh_and_settle(qtbot, window)
+    begin_period_apply(window, 8)
+    complete_and_settle(qtbot, window, setup, "set-sample-period", period_reply(8, state))
+    assert window.pending_period_seconds == 8
+    assert window.settings.sample_period_status.text() == (
+        "Saved: sampling every 8 s once the system service starts.")
+    setup.facts = period_facts(8)
+    refresh_and_settle(qtbot, window)
+    assert window.pending_period_seconds is None
+    assert window.settings.sample_period_status.text() == "Sampling every 8 s."
+
+
+def test_sampling_failed_helper_cannot_establish_saved_state(qtbot):
+    window, _, _, setup = build(qtbot, facts=OFF)
+    refresh_and_settle(qtbot, window)
+    begin_period_apply(window, 8)
+    failed = SetupReply(1, "permission denied", {
+        "sample_period": 8, "sample_period_state": "repair", "answering": False,
+    })
+    complete_and_settle(qtbot, window, setup, "set-sample-period", failed)
+    assert window.pending_period_seconds == 8
+    assert window.settings.sample_period_status.text() == "permission denied"
+    assert "Saved:" not in window.settings.sample_period_status.text()
+    setup.facts = period_facts(8)
+    refresh_and_settle(qtbot, window)
+    assert window.pending_period_seconds is None
+    assert window.settings.sample_period_status.text() == "Sampling every 8 s."
+    assert "permission denied" in window.error_label.text()
+
+
+def test_sampling_apply_preserves_single_switch_activation_invariant(qtbot):
+    window, coordinator, _, setup = build(qtbot, facts=OFF)
+    refresh_and_settle(qtbot, window)
+    before = list(coordinator.reconciles)
+    window.open_settings(focus="sampling_period")
+    begin_period_apply(window, 2)
+    assert setup.calls == ["set-sample-period"]
+    assert setup.period_payloads == [2]
+    assert coordinator.reconciles == before
+    complete_and_settle(qtbot, window, setup, "set-sample-period",
+                        period_reply(2, "applied_not_running"))
+    assert setup.calls == ["set-sample-period"]
+    assert not window.settings.switch.isChecked()
+
+
+def test_sampling_apply_success_waits_for_matching_nanosecond_probe(qtbot):
+    setup = ControlledSetup(period_facts(5))
+    window, _, _, setup = build(qtbot, setup=setup)
+    try:
+        refresh_and_settle(qtbot, window)
+        begin_period_apply(window, 5)
+        assert window.pending_period_seconds == 5
+        setup.started.clear()
+        setup.hold = True
+        setup.complete("set-sample-period", period_reply(5, "applied", answering=True))
+        qtbot.waitUntil(lambda: setup.started.is_set() and not window.busy, timeout=2000)
+        assert window.pending_period_seconds == 5
+        setup.release.set()
+        qtbot.waitUntil(lambda: window.pending_period_seconds is None, timeout=2000)
+        assert window.settings.sample_period_status.text() == "Sampling every 5 s."
+    finally:
+        setup.release.set()
+
+
+def test_sampling_consent_discloses_exact_command(qtbot):
+    window, _, _, setup = build(qtbot, facts=OFF)
+    refresh_and_settle(qtbot, window)
+    window.settings.sample_period_spin.setValue(23)
+    click(window.settings.sample_period_apply)
+    assert window.consent.accept_button.text() == "Apply sampling period"
+    text = window.consent.body_text()
+    assert "  /usr/bin/pkexec /usr/bin/appio-setup set-sample-period 23" in text.splitlines()
+    assert "active" in text and "restart" in text
+    assert "inactive" in text and "not started" in text
+    assert setup.calls == []
+    window.consent.accept()
+    assert setup.calls == ["set-sample-period"]
+    assert setup.period_payloads == [23]
+
+
+def test_sampling_consent_cancellation_dispatches_nothing(qtbot):
+    window, coordinator, _, setup = build(qtbot, facts=OFF)
+    refresh_and_settle(qtbot, window)
+    before = list(coordinator.actions)
+    window.settings.sample_period_spin.setValue(3)
+    click(window.settings.sample_period_apply)
+    window.consent.reject()
+    assert setup.calls == [] and coordinator.actions == before
+    assert window.pending_period_seconds is None
+
+
+def test_sampling_missing_helper_shows_bounded_stderr(qtbot):
+    from appio.setup_client import MAX_STDERR_BYTES, SetupClient
+
+    launched = []
+
+    def launch(argv):
+        launched.append(argv)
+        result = Future()
+        result.set_result(CommandResult(127, "", "helper missing\n" + "x" * (MAX_STDERR_BYTES + 1)))
+        return result
+
+    setup = SetupClient(launch=launch, probe=lambda: OFF, expected_uid=1000)
+    window, _, _, _ = build(qtbot, setup=setup)
+    refresh_and_settle(qtbot, window)
+    begin_period_apply(window, 4)
+    qtbot.waitUntil(lambda: not window.busy, timeout=2000)
+    assert launched == [("/usr/bin/pkexec", "/usr/bin/appio-setup", "set-sample-period", "4")]
+    assert window.settings.sample_period_status.text() == "helper missing"
+    assert "helper missing" in window.error_label.text()
+    assert "Saved:" not in window.settings.sample_period_status.text()
+
+
+@pytest.mark.parametrize("value", [True, 0, -1, 1.5, "5", 30 * NS + 1])
+def test_production_probe_drops_invalid_sample_period(value):
+    status = {"answering": True, "pending_activation": False, "sample_ns": value}
+    facts = cw.production_probe(command=lambda _: CommandResult(1, "", ""),
+                                status_reader=lambda: status)
+    assert facts.sample_ns is None
+
+
+def test_production_probe_reports_only_answering_periods():
+    command = lambda _: CommandResult(0, "UnitFileState=enabled\nActiveState=active\n", "")
+    facts = cw.production_probe(command=command,
+        status_reader=lambda: {"answering": True, "pending_activation": False, "sample_ns": 5 * NS})
+    assert facts.answering and facts.sample_ns == 5 * NS
+    for value in (1, 30 * NS):
+        facts = cw.production_probe(command=command,
+            status_reader=lambda: {"answering": True, "sample_ns": value})
+        assert facts.sample_ns == value
+    for status in ({"answering": True}, {"answering": True, "sample_ns": None}):
+        facts = cw.production_probe(command=command, status_reader=lambda: status)
+        assert facts.sample_ns is None
+    for status in (None, {"answering": False, "sample_ns": 5 * NS}):
+        facts = cw.production_probe(command=command, status_reader=lambda: status)
+        assert not facts.answering and facts.sample_ns is None
+    facts = cw.production_probe(command=command,
+        status_reader=lambda: (_ for _ in ()).throw(OSError("disconnected")))
+    assert not facts.answering and facts.sample_ns is None
+
+
+def test_production_probe_validates_socket_status_before_accepting_period(monkeypatch):
+    import socket
+
+    from appio.ipc_protocol import encode_frame
+
+    class FakeSocket:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def settimeout(self, timeout):
+            pass
+
+        def connect(self, path):
+            assert path == str(cw.SOCKET_PATH)
+
+        def sendall(self, data):
+            assert data
+
+        def recv(self, size):
+            return wire
+
+    monkeypatch.setattr(socket, "socket", lambda *args: FakeSocket())
+    monkeypatch.setattr(cw, "read_peer", lambda client: object())
+    monkeypatch.setattr(cw, "require_root_server", lambda peer: None)
+    command = lambda _: CommandResult(0, "UnitFileState=enabled\nActiveState=active\n", "")
+    status = {
+        "protocol": 1, "type": "status", "request_id": "gui-status",
+        "enabled": True, "answering": True, "pending_activation": False,
+        "ownership_start_mono_ns": None, "cursor": None, "sample_ns": 5 * NS,
+    }
+    for message, expected_answering, expected_period in (
+        (status, True, 5 * NS),
+        ({key: value for key, value in status.items() if key != "sample_ns"}, True, None),
+        ({**status, "answering": False}, False, None),
+        ({**status, "sample_ns": None}, False, None),
+        ({**status, "sample_ns": True}, False, None),
+        ({**status, "sample_ns": 31 * NS}, False, None),
+        (None, False, None),
+    ):
+        wire = b"" if message is None else encode_frame(message)
+        facts = cw.production_probe(command=command)
+        assert (facts.answering, facts.sample_ns) == (expected_answering, expected_period)
+
+
+def test_sampling_stale_ticket_generation_and_restart_cannot_replace_period(qtbot):
+    window, _, _, setup = build(qtbot, facts=period_facts(10))
+    refresh_and_settle(qtbot, window)
+    old_ticket = window._probe_ticket
+    old_generation = window._setup_generation
+    begin_period_apply(window, 5)
+    window._apply_facts(cw.ProbePayload(period_facts(5), None, old_ticket, old_generation))
+    assert window.pending_period_seconds == 5
+    assert window._facts.sample_ns == 10 * NS
+    setup.facts = replace(OFF, active="inactive")
+    complete_and_settle(qtbot, window, setup, "set-sample-period",
+                        period_reply(5, "applied_not_running"))
+    assert window._facts.sample_ns is None
+    assert window.settings.sample_period_status.text() == (
+        "Saved: sampling every 5 s once the system service starts.")
+    window._apply_facts(cw.ProbePayload(period_facts(5), None, old_ticket, old_generation))
+    window._apply_facts(cw.ProbePayload(
+        period_facts(5), None, window._probe_ticket - 1, window._setup_generation))
+    window._apply_facts(cw.ProbePayload(
+        period_facts(5), None, window._probe_ticket, old_generation))
+    assert window.pending_period_seconds == 5
+    assert window._facts.sample_ns is None
+    assert window.settings.sample_period_status.text() == (
+        "Saved: sampling every 5 s once the system service starts.")
+
+
+def test_nonanswering_probe_cannot_verify_period_after_history_promotion(qtbot):
+    window, _, history, setup = build(qtbot, facts=OFF)
+    refresh_and_settle(qtbot, window)
+    begin_period_apply(window, 5)
+    complete_and_settle(qtbot, window, setup, "set-sample-period",
+                        period_reply(5, "applied_not_running"))
+    history.client = SimpleNamespace(state=SimpleNamespace(
+        verified=True, answering=True, pending_activation=False, cursor=None))
+    setup.facts = replace(OFF, sample_ns=5 * NS)
+    refresh_and_settle(qtbot, window)
+    assert window._facts.answering is True
+    assert window._facts.sample_ns is None
+    assert window.pending_period_seconds == 5
+    assert window.settings.sample_period_status.text() == (
+        "Sampling period not reported by this collector.")
