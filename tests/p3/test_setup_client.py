@@ -15,7 +15,7 @@ import pytest
 
 from appio.collector_owner import ServiceFacts
 from appio.setup_boundary import CommandResult, VERBS
-from appio.setup_client import MAX_STDERR_BYTES, MAX_STDOUT_BYTES, SetupClient, SetupReply
+from appio.setup_client import MAX_STDERR_BYTES, MAX_STDOUT_BYTES, SetupClient, SetupReply, decode_body
 
 OFF = ServiceFacts(False, "inactive", False, False, False)
 
@@ -52,6 +52,8 @@ def _body(**overrides: object) -> str:
         "export_path": None,
         "export_cutoff": None,
         "error": None,
+        "sample_period": None,
+        "sample_period_state": None,
     }
     document.update(overrides)
     return json.dumps(document, separators=(",", ":"))
@@ -77,16 +79,48 @@ def test_polkit_dismissal_retains_exact_code_stderr_and_probed_off_state():
     assert client.refresh().enabled is False
 
 
-def test_every_accepted_verb_uses_exactly_the_fixed_three_element_vector():
-    launch = FakeLaunch(result=CommandResult(0, "", ""))
+def test_existing_verbs_keep_legacy_vectors_and_period_verb_carries_payload():
+    launch = FakeLaunch(result=CommandResult(0, _body(), ""))
     client = _client(launch)
-    for verb in sorted(VERBS):
+    for verb in sorted(VERBS - {"set-sample-period"}):
         assert client.invoke(verb).result(timeout=1).exit_code == 0
-    assert launch.calls == [("/usr/bin/pkexec", "/usr/bin/appio-setup", verb)
-                            for verb in sorted(VERBS)]
-    for argv in launch.calls:
-        assert len(argv) == 3
-        assert argv[:2] == ("/usr/bin/pkexec", "/usr/bin/appio-setup")
+    assert client.invoke("set-sample-period", period_seconds=30).result(timeout=1).exit_code == 0
+    assert launch.calls == [
+        ("/usr/bin/pkexec", "/usr/bin/appio-setup", verb)
+        for verb in sorted(VERBS - {"set-sample-period"})
+    ] + [("/usr/bin/pkexec", "/usr/bin/appio-setup", "set-sample-period", "30")]
+
+
+def test_period_payload_pairing_refuses_before_launch():
+    launch = FakeLaunch(result=CommandResult(0, _body(), ""))
+    client = _client(launch)
+    with pytest.raises(ValueError):
+        client.invoke("set-sample-period")
+    with pytest.raises(ValueError):
+        client.invoke("enable", period_seconds=10)
+    assert launch.calls == []
+
+
+def test_decode_body_rejects_null_service_state_for_complete_period_result():
+    body = _body(verb="set-sample-period", sample_period=10,
+                 sample_period_state="applied", state=None)
+    assert decode_body(body, "set-sample-period", 1000) is None
+    assert decode_body(_body(verb="set-sample-period", sample_period=10,
+                             sample_period_state="applied", state="unknown",
+                             export_path=None, error=None), "set-sample-period", 1000) is not None
+
+
+def test_decode_body_validates_period_result_fields():
+    accepted = _body(verb="set-sample-period", sample_period=10, sample_period_state="applied")
+    assert decode_body(accepted, "set-sample-period", 1000) is not None
+    for overrides in (
+        {"sample_period": True},
+        {"sample_period": 1},
+        {"sample_period": 31},
+        {"sample_period_state": "bad"},
+        {"sample_period_state": 1},
+    ):
+        assert decode_body(_body(verb="set-sample-period", **overrides), "set-sample-period", 1000) is None
 
 
 @pytest.mark.parametrize(

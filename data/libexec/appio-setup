@@ -36,16 +36,18 @@ VERBS = frozenset(
         "status",
         "restart-user-manager",
         "export-history",
+        "set-sample-period",
     }
 )
 
 _MAX_UID = 2**32 - 2
 _MAX_PATH_BYTES = 4096
 _CANONICAL_UID = re.compile(r"(?:0|[1-9][0-9]{0,9})", re.ASCII)
+_CANONICAL_PERIOD = re.compile(r"(?:0|[1-9][0-9]{0,7})", re.ASCII)
 _WRITABLE_BITS = 0o022
 _USAGE = (
     "usage: appio-setup <install-delegation|enable|disable|status|"
-    "restart-user-manager|export-history>"
+    "restart-user-manager|export-history|set-sample-period <seconds>>"
 )
 
 
@@ -218,7 +220,12 @@ def _find_package_paths(caller_uid):
 
 
 def main(argv):
-    if len(argv) != 2 or argv[1] not in VERBS:
+    if len(argv) not in (2, 3) or argv[1] not in VERBS:
+        _fail(2, _USAGE)
+    if argv[1] == "set-sample-period":
+        if len(argv) != 3 or not isinstance(argv[2], str) or _CANONICAL_PERIOD.fullmatch(argv[2]) is None:
+            _fail(2, _USAGE)
+    elif len(argv) != 2:
         _fail(2, _USAGE)
     if os.geteuid() != 0:
         _fail(1, "root privileges are required; run this helper through pkexec")

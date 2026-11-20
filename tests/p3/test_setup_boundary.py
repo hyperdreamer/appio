@@ -175,7 +175,7 @@ def rebase(root: Path, target: Path) -> Path:
 # --------------------------------------------------------------------------- #
 
 
-def test_verb_set_is_exactly_the_six_design_verbs():
+def test_verb_set_is_exactly_seven_design_verbs():
     assert VERBS == frozenset(
         {
             "install-delegation",
@@ -184,13 +184,14 @@ def test_verb_set_is_exactly_the_six_design_verbs():
             "status",
             "restart-user-manager",
             "export-history",
+            "set-sample-period",
         }
     )
     with pytest.raises(AttributeError):
         VERBS.add("uninstall-delegation")  # type: ignore[attr-defined]
 
 
-@pytest.mark.parametrize("verb", sorted(VERBS))
+@pytest.mark.parametrize("verb", sorted(VERBS - {"set-sample-period"}))
 def test_every_design_verb_is_accepted(verb: str):
     call = parse_invocation(
         ["/usr/bin/appio-setup", verb],
@@ -199,7 +200,76 @@ def test_every_design_verb_is_accepted(verb: str):
         getpwuid=lambda uid: account() if uid == 1000 else None,
     )
     assert call.verb == verb
+    assert call.period_seconds is None
     assert call.identity.uid == 1000
+
+
+def test_period_argv_forms_are_checked_before_account_lookup():
+    def forbidden_lookup(uid: int) -> object:
+        raise AssertionError("period argv rejection must precede account lookup")
+
+    call = parse_invocation(
+        ["/usr/bin/appio-setup", "set-sample-period", "10"],
+        environ={"PKEXEC_UID": "1000"},
+        euid=0,
+        getpwuid=lambda uid: account() if uid == 1000 else None,
+    )
+    assert call.verb == "set-sample-period"
+    assert call.period_seconds == 10
+
+    for argv in (
+        ["/usr/bin/appio-setup", "set-sample-period"],
+        ["/usr/bin/appio-setup", "set-sample-period", "02"],
+        ["/usr/bin/appio-setup", "set-sample-period", " 5"],
+        ["/usr/bin/appio-setup", "set-sample-period", "+5"],
+        ["/usr/bin/appio-setup", "set-sample-period", "5.0"],
+        ["/usr/bin/appio-setup", "enable", "10"],
+        ["/usr/bin/appio-setup", "set-sample-period", "10", "extra"],
+    ):
+        with pytest.raises(InvocationError) as caught:
+            parse_invocation(argv, environ={}, euid=0, getpwuid=forbidden_lookup)
+        assert caught.value.exit_code == 2
+
+
+@pytest.mark.parametrize("raw", ["0", "1", "31", "12345678"])
+def test_period_payload_range_table(raw):
+    with pytest.raises(InvocationError) as caught:
+        parse_invocation(
+            ["/usr/bin/appio-setup", "set-sample-period", raw],
+            environ={},
+            euid=0,
+            getpwuid=lambda uid: (_ for _ in ()).throw(AssertionError("lookup")),
+        )
+    assert caught.value.reason == "sample_period_out_of_range"
+
+
+def test_period_values_are_preserved_in_the_invocation():
+    call = parse_invocation(
+        ["/usr/bin/appio-setup", "set-sample-period", "30"],
+        environ={"PKEXEC_UID": "1000"},
+        euid=0,
+        getpwuid=lambda uid: account(),
+    )
+    assert call.period_seconds == 30
+
+
+def test_existing_verb_cannot_carry_a_period_payload():
+    with pytest.raises(InvocationError) as caught:
+        parse_invocation(
+            ["/usr/bin/appio-setup", "status", "10"],
+            environ={}, euid=0, getpwuid=lambda uid: pytest.fail("lookup"),
+        )
+    assert caught.value.reason == "invalid_verb_or_argument_count"
+
+
+@pytest.mark.parametrize("verb", sorted(VERBS - {"set-sample-period"}))
+def test_legacy_invocation_has_no_period_payload(verb):
+    call = parse_invocation(
+        ["/usr/bin/appio-setup", verb],
+        environ={"PKEXEC_UID": "1000"}, euid=0,
+        getpwuid=lambda uid: account(),
+    )
+    assert call.period_seconds is None
 
 
 @pytest.mark.parametrize(
