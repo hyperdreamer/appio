@@ -237,10 +237,13 @@ def _host_acceptance():
 
 
 @pytest.mark.parametrize("phase", ["period-runtime", "period-capacity"])
-def test_period_phase_dry_run_is_pure(monkeypatch, capsys, phase):
+def test_period_phase_dry_run_is_pure(monkeypatch, capsys, tmp_path, phase):
     module = _host_acceptance()
     import builtins
+    from types import SimpleNamespace
     original_import = builtins.__import__
+    original_os = module.os
+    evidence_path = tmp_path / ".local" / "state" / "appio" / "p3-acceptance.json"
 
     def checked_import(name, *args, **kwargs):
         assert not name.startswith("appio")
@@ -249,25 +252,42 @@ def test_period_phase_dry_run_is_pure(monkeypatch, capsys, phase):
     def forbidden(*args, **kwargs):
         raise AssertionError("dry run accessed host state")
 
+    class GuardedOS:
+        def __getattr__(self, name):
+            if name in {
+                "open", "stat", "lstat", "access", "listdir", "scandir", "walk",
+                "readlink", "mkdir", "makedirs", "unlink", "remove", "rmdir", "rename",
+                "replace", "chmod", "fchmod", "fsync", "write", "truncate",
+            }:
+                return forbidden
+            return getattr(original_os, name)
+
     with monkeypatch.context() as guarded:
         guarded.setattr(builtins, "__import__", checked_import)
         guarded.setattr(builtins, "open", forbidden)
-        guarded.setattr(Path, "open", forbidden)
-        guarded.setattr(Path, "exists", forbidden)
+        guarded.setattr(module, "os", GuardedOS())
+        for name in (
+            "open", "read_text", "read_bytes", "write_text", "write_bytes", "exists",
+            "is_file", "is_dir", "stat", "lstat", "mkdir", "unlink", "rename", "replace",
+            "glob", "iterdir",
+        ):
+            guarded.setattr(Path, name, forbidden)
+        guarded.setattr(module.pwd, "getpwuid", lambda uid: SimpleNamespace(pw_dir=str(tmp_path)))
         guarded.setattr(module.subprocess, "run", forbidden)
         guarded.setattr(module.subprocess, "Popen", forbidden)
         guarded.setattr(sys, "argv", ["acceptance", "--phase", phase])
         result = module.main()
     assert result == 0
     assert f"Selected phase: {phase}" in capsys.readouterr().out
+    assert not evidence_path.exists()
 
 
-def test_period_runtime_phase_is_available_in_side_effect_free_dry_run(monkeypatch, capsys):
-    test_period_phase_dry_run_is_pure(monkeypatch, capsys, "period-runtime")
+def test_period_runtime_phase_is_available_in_side_effect_free_dry_run(monkeypatch, capsys, tmp_path):
+    test_period_phase_dry_run_is_pure(monkeypatch, capsys, tmp_path, "period-runtime")
 
 
-def test_period_capacity_phase_is_available_in_side_effect_free_dry_run(monkeypatch, capsys):
-    test_period_phase_dry_run_is_pure(monkeypatch, capsys, "period-capacity")
+def test_period_capacity_phase_is_available_in_side_effect_free_dry_run(monkeypatch, capsys, tmp_path):
+    test_period_phase_dry_run_is_pure(monkeypatch, capsys, tmp_path, "period-capacity")
 
 
 def test_helper_period_argument_is_not_observation_callback(monkeypatch):
