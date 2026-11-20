@@ -146,6 +146,7 @@ def test_live_records_validate_every_field_and_phase_combination() -> None:
     remote = RemotePosition("boot-a", 1, 0)
     assert remote == RemotePosition("boot-a", 1, 0)
     assert RemotePosition("boot-a", 2**70, 2**70) == RemotePosition("boot-a", 2**70, 2**70)
+    assert RemotePosition("é" * 128, 1, 0).boot_id == "é" * 128
     _reject("remote.bool-epoch", lambda: RemotePosition("boot-a", True, 0))
     _reject("remote.zero-epoch", lambda: RemotePosition("boot-a", 0, 0))
     _reject("remote.negative-seq", lambda: RemotePosition("boot-a", 1, -1))
@@ -158,6 +159,21 @@ def test_live_records_validate_every_field_and_phase_combination() -> None:
         "totals", KEY, since_boot, replace(a, task_read_bytes=18, task_total_bytes=23)
     )
 
+    # -- revision-8 managed-source and capture record availability --------- #
+    import appio.history_types as history_types
+
+    for name in (
+        "ManagedSourceSpec", "CapturedSourceImage", "CapturedSourceSet", "SnapshotProvenance",
+    ):
+        assert hasattr(history_types, name), f"missing revision-8 record {name}"
+        assert name in history_types.__all__
+    from appio.history_types import (
+        CapturedSourceImage,
+        CapturedSourceSet,
+        ManagedSourceSpec,
+        SnapshotProvenance,
+    )
+
     # -- immutable field inventory ----------------------------------------- #
     inventory = {
         AcceptedIdentity: ("kind", "app_key", "window", "data_digest"),
@@ -165,6 +181,12 @@ def test_live_records_validate_every_field_and_phase_combination() -> None:
         LocalPosition: ("name", "owner", "registration_epoch", "data_version", "total_changes"),
         LocalPositionVector: ("sources",),
         LocalBracket: ("opening", "closing"),
+        ManagedSourceSpec: ("name", "owner", "database_uri", "connect_options"),
+        CapturedSourceImage: ("name", "registration_epoch", "image", "image_digest"),
+        CapturedSourceSet: (
+            "capture_id", "opening", "closing", "images", "snapshot_digest",
+        ),
+        SnapshotProvenance: ("capture_id", "snapshot_digest", "bracket"),
         AnswerProvenance: (
             "kind",
             "app_key",
@@ -174,6 +196,7 @@ def test_live_records_validate_every_field_and_phase_combination() -> None:
             "first_seen_at_ns",
             "answered_source",
             "local_bracket",
+            "snapshot",
         ),
         RetainedRecord: ("value", "provenance"),
         PartState: (
@@ -192,6 +215,7 @@ def test_live_records_validate_every_field_and_phase_combination() -> None:
             "requested_source",
             "answered_source",
             "local_bracket",
+            "snapshot",
             "certified",
         ),
         SeriesMetadata: ("app_id", "app_key", "measured_window", "tier", "coverage"),
@@ -232,6 +256,7 @@ def test_live_records_validate_every_field_and_phase_combination() -> None:
         ("boot_id.empty", ""),
         ("boot_id.nul", "boot\x00a"),
         ("boot_id.long", "x" * 257),
+        ("boot_id.long-utf8", "é" * 129),
         ("boot_id.unencodable", "\ud800"),
         ("boot_id.int", 5),
         ("iod_epoch.zero", 0),
@@ -317,17 +342,170 @@ def test_live_records_validate_every_field_and_phase_combination() -> None:
     _reject("bracket.opening", lambda: LocalBracket(remote, tolerant))  # type: ignore[arg-type]
     _reject("bracket.closing", lambda: LocalBracket(tolerant, [position]))  # type: ignore[arg-type]
 
+    # -- ManagedSourceSpec ------------------------------------------------- #
+    spec = ManagedSourceSpec(
+        "local", "gui", "file:/tmp/local.db?mode=rw", (("timeout", "5"), ("isolation_level", ""))
+    )
+    assert spec.database_uri == "file:/tmp/local.db?mode=rw"
+    assert spec.connect_options == (("timeout", "5"), ("isolation_level", ""))
+    assert replace(spec, owner="iod", connect_options=()).owner == "iod"
+    for label, bad in (
+        ("name", ""),
+        ("name", True),
+        ("name", "\ud800"),
+        ("owner", "root"),
+        ("owner", True),
+        ("owner", "GUI"),
+        ("database_uri", ""),
+        ("database_uri", 5),
+        ("database_uri", "file:a\x00b"),
+        ("database_uri", "file:\ud800"),
+        ("connect_options", []),
+        ("connect_options", {"timeout": "5"}),
+        ("connect_options", lambda: {}),
+        ("connect_options", (["timeout", "5"],)),
+        ("connect_options", (("timeout",),)),
+        ("connect_options", (("timeout", "5", "extra"),)),
+        ("connect_options", ((True, "5"),)),
+        ("connect_options", (("timeout", 5),)),
+        ("connect_options", (("factory", lambda: {}),)),
+        ("connect_options", (("timeout", {}),)),
+        ("connect_options", (("\ud800", "5"),)),
+        ("connect_options", (("timeout", "\ud800"),)),
+    ):
+        _reject(
+            f"managed_source.{label}.{bad!r}",
+            lambda label=label, bad=bad: replace(spec, **{label: bad}),
+        )
+
+    # -- CapturedSourceImage / CapturedSourceSet / SnapshotProvenance ------- #
+    image = CapturedSourceImage(
+        "local", 1, b"abc", "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+    )
+    captured = CapturedSourceSet(1, tolerant, tolerant, (image,), DIGEST)
+    snapshot = SnapshotProvenance(1, DIGEST, bracket)
+    raced_bracket = LocalBracket(tolerant, changed)
+    raced_capture = replace(captured, closing=changed)
+    raced_snapshot = replace(snapshot, bracket=raced_bracket)
+    assert captured.images[0].image == b"abc"
+    assert raced_capture.opening != raced_capture.closing
+    assert raced_snapshot.bracket == raced_bracket
+    assert replace(image, registration_epoch=2**70).registration_epoch == 2**70
+    assert replace(captured, capture_id=2**70).capture_id == 2**70
+    assert replace(snapshot, capture_id=2**70).capture_id == 2**70
+    for label, bad in (
+        ("name", ""),
+        ("name", 5),
+        ("name", "\ud800"),
+        ("registration_epoch", 0),
+        ("registration_epoch", -1),
+        ("registration_epoch", True),
+        ("registration_epoch", 1.0),
+        ("image", "abc"),
+        ("image", bytearray(b"abc")),
+        ("image", memoryview(b"abc")),
+        ("image", (b"abc",)),
+        ("image", True),
+        ("image_digest", "A" * 64),
+        ("image_digest", "a" * 63),
+        ("image_digest", "a" * 65),
+        ("image_digest", "g" * 64),
+        ("image_digest", 5),
+    ):
+        _reject(
+            f"captured_image.{label}.{bad!r}",
+            lambda label=label, bad=bad: replace(image, **{label: bad}),
+        )
+    for record in (captured, snapshot):
+        for capture_id in (0, -1, True, 1.0, "1"):
+            _reject(
+                f"{type(record).__name__}.capture_id.{capture_id!r}",
+                lambda record=record, capture_id=capture_id: replace(record, capture_id=capture_id),
+            )
+        for digest in ("A" * 64, "a" * 63, "a" * 65, "g" * 64, True):
+            _reject(
+                f"{type(record).__name__}.snapshot_digest.{digest!r}",
+                lambda record=record, digest=digest: replace(record, snapshot_digest=digest),
+            )
+
+    second_position = LocalPosition("é", "iod", 2, 1, 0)
+    complete_vector = LocalPositionVector((position, second_position))
+    second_image = replace(image, name="é", registration_epoch=2)
+    complete_capture = replace(
+        captured, opening=complete_vector, closing=complete_vector, images=(image, second_image)
+    )
+    assert tuple(item.name for item in complete_capture.images) == ("local", "é")
+    for label, kwargs in (
+        ("opening.type", {"opening": remote}),
+        ("closing.type", {"closing": (position,)}),
+        ("images.list", {"images": [image, second_image]}),
+        ("images.type", {"images": (image, second_position)}),
+        ("images.empty", {"images": ()}),
+        ("images.duplicate", {"images": (image, image, second_image)}),
+        ("images.unsorted", {"images": (second_image, image)}),
+        ("images.missing", {"images": (image,)}),
+        ("images.extra", {"images": (image, replace(image, name="other"), second_image)}),
+        ("opening.missing", {"opening": tolerant}),
+        ("closing.missing", {"closing": tolerant}),
+        ("opening.incarnation", {
+            "opening": LocalPositionVector((replace(position, registration_epoch=3), second_position)),
+        }),
+        ("closing.incarnation", {
+            "closing": LocalPositionVector((replace(position, registration_epoch=3), second_position)),
+        }),
+        ("images.incarnation", {"images": (replace(image, registration_epoch=3), second_image)}),
+    ):
+        _reject(
+            f"captured_set.{label}",
+            lambda kwargs=kwargs: replace(complete_capture, **kwargs),
+        )
+    _reject("snapshot.bracket-type", lambda: replace(snapshot, bracket=(tolerant, tolerant)))
+    forged_image = copy.copy(image)
+    object.__setattr__(forged_image, "image", bytearray(b"abc"))
+    _reject("captured_set.forged-image", lambda: replace(captured, images=(forged_image,)))
+    forged_capture_vector = copy.copy(tolerant)
+    object.__setattr__(forged_capture_vector, "sources", ())
+    _reject("captured_set.forged-opening", lambda: replace(captured, opening=forged_capture_vector))
+    _reject("captured_set.forged-closing", lambda: replace(captured, closing=forged_capture_vector))
+    forged_bracket = copy.copy(bracket)
+    object.__setattr__(forged_bracket, "closing", forged_capture_vector)
+    _reject("snapshot.forged-bracket", lambda: replace(snapshot, bracket=forged_bracket))
+    for record, name in (
+        (spec, "connect_options"), (image, "image"), (captured, "images"), (snapshot, "bracket"),
+    ):
+        _assert_frozen(record, name)
+
     # -- AnswerProvenance --------------------------------------------------- #
     provenance = AnswerProvenance("totals", KEY, scope, since_boot, identity, 1_000_000_000, None, None)
     assert provenance.accepted_identity == identity
     local_provenance = AnswerProvenance(
-        "totals", KEY, scope, since_boot, identity, 0, tolerant, bracket
+        "totals", KEY, scope, since_boot, identity, 0, tolerant, bracket, snapshot
     )
     assert local_provenance.answered_source == tolerant
+    assert local_provenance.snapshot == snapshot
     raced_provenance = AnswerProvenance(
-        "totals", KEY, scope, since_boot, identity, 0, None, LocalBracket(tolerant, changed)
+        "totals", KEY, scope, since_boot, identity, 0, None, raced_bracket, raced_snapshot
     )
     assert raced_provenance.answered_source is None
+    remote_provenance = replace(provenance, answered_source=remote)
+    assert remote_provenance.snapshot is None
+    assert replace(local_provenance, accepted_identity=None, first_seen_at_ns=None).snapshot == snapshot
+    for label, kwargs in (
+        ("snapshot.missing-local", {"snapshot": None}),
+        ("snapshot.type", {"snapshot": {"capture_id": 1}}),
+        ("snapshot.bracket", {"snapshot": raced_snapshot}),
+        ("snapshot.without-bracket", {"answered_source": None, "local_bracket": None}),
+    ):
+        _reject(
+            f"answer_provenance.{label}",
+            lambda kwargs=kwargs: replace(local_provenance, **kwargs),
+        )
+    _reject("answer_provenance.raced-without-snapshot", lambda: replace(raced_provenance, snapshot=None))
+    _reject("answer_provenance.remote-snapshot", lambda: replace(remote_provenance, snapshot=snapshot))
+    forged_snapshot = copy.copy(snapshot)
+    object.__setattr__(forged_snapshot, "capture_id", True)
+    _reject("answer_provenance.forged-snapshot", lambda: replace(local_provenance, snapshot=forged_snapshot))
+    _assert_frozen(local_provenance, "snapshot")
     assert (
         AnswerProvenance("totals", KEY, scope, since_boot, None, None, None, None).accepted_identity
         is None
@@ -484,12 +662,34 @@ def test_live_records_validate_every_field_and_phase_combination() -> None:
     _reject("part.record-type", lambda: PartState("totals", KEY, scope, "ok", 1, since_boot, a, None))
 
     # -- FrameProvenance ---------------------------------------------------- #
-    assert FrameProvenance(3, since_boot, remote, remote, None, True).certified is True
-    assert FrameProvenance(3, since_boot, tolerant, tolerant, bracket, True).certified is True
-    fallback = FrameProvenance(3, since_boot, remote, tolerant, bracket, False)
+    assert FrameProvenance(3, since_boot, remote, remote, None, None, True).certified is True
+    local_frame = FrameProvenance(3, since_boot, tolerant, tolerant, bracket, snapshot, True)
+    assert local_frame.certified is True
+    fallback = FrameProvenance(3, since_boot, remote, tolerant, bracket, snapshot, False)
     assert fallback.answered_source == tolerant
-    uncertified = FrameProvenance(3, since_boot, tolerant, None, LocalBracket(tolerant, changed), False)
+    uncertified = FrameProvenance(3, since_boot, tolerant, None, raced_bracket, raced_snapshot, False)
     assert uncertified.certified is False
+    # Failed local work may have bracket evidence without a captured image.
+    assert replace(uncertified, snapshot=None).certified is False
+    _assert_frozen(local_frame, "snapshot")
+    for label, kwargs in (
+        ("snapshot.missing-certified", {"snapshot": None}),
+        ("snapshot.type", {"snapshot": (1, DIGEST, bracket)}),
+        ("snapshot.forged", {"snapshot": forged_snapshot}),
+        ("snapshot.bracket", {"snapshot": raced_snapshot}),
+        ("bracket.equal-without-source", {"answered_source": None, "certified": False}),
+        ("bracket.unequal-with-source", {"local_bracket": raced_bracket, "snapshot": raced_snapshot, "certified": False}),
+    ):
+        _reject(
+            f"frame_provenance.{label}",
+            lambda kwargs=kwargs: replace(local_frame, **kwargs),
+        )
+    remote_frame = FrameProvenance(3, since_boot, remote, remote, None, None, False)
+    _reject("frame_provenance.remote-snapshot", lambda: replace(remote_frame, snapshot=snapshot))
+    _reject(
+        "frame_provenance.unanswered-snapshot-without-bracket",
+        lambda: replace(remote_frame, answered_source=None, snapshot=snapshot),
+    )
     for label, kwargs in (
         ("generation.negative", {"generation": -1}),
         ("generation.bool", {"generation": True}),
@@ -518,6 +718,7 @@ def test_live_records_validate_every_field_and_phase_combination() -> None:
             "requested_source": remote,
             "answered_source": remote,
             "local_bracket": None,
+            "snapshot": None,
             "certified": True,
         }
         _reject(
@@ -1086,7 +1287,7 @@ def test_live_records_validate_every_field_and_phase_combination() -> None:
         "import appio.history_types\n"
         "banned = ('appio.iodclient', 'appio.history_router', 'appio.query',\n"
         "          'appio.iod_history', 'appio.store', 'appio.ipc_models',\n"
-        "          'appio.identity', 'PyQt6')\n"
+        "          'appio.identity', 'sqlite3', 'PyQt6')\n"
         "loaded = [name for name in banned if name in sys.modules]\n"
         "assert not loaded, loaded\n"
     )
