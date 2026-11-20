@@ -1,5 +1,9 @@
 """P3 acceptance: fixture counters travel through the real daemon and Qt shell."""
 import os
+import importlib.util
+import json
+import sys
+from pathlib import Path
 
 import pytest
 from PyQt6.QtWidgets import QLabel
@@ -222,3 +226,180 @@ def test_all_mutation_opens_are_confined_and_unknown_commands_fail(tmp_path):
         with pytest.raises(AssertionError, match="outside temporary root"):
             h.deps.runner.run(("/usr/bin/touch", "/etc/appio-unexpected"))
         assert h.actual_uid == os.getuid() != 0
+
+
+def _host_acceptance():
+    path = Path(__file__).resolve().parents[2] / "tools/acceptance/appio-p3-root.py"
+    spec = importlib.util.spec_from_file_location("p3_host_acceptance", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.mark.parametrize("phase", ["period-runtime", "period-capacity"])
+def test_period_phase_dry_run_is_pure(monkeypatch, capsys, phase):
+    module = _host_acceptance()
+    import builtins
+    original_import = builtins.__import__
+
+    def checked_import(name, *args, **kwargs):
+        assert not name.startswith("appio")
+        return original_import(name, *args, **kwargs)
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("dry run accessed host state")
+
+    with monkeypatch.context() as guarded:
+        guarded.setattr(builtins, "__import__", checked_import)
+        guarded.setattr(builtins, "open", forbidden)
+        guarded.setattr(Path, "open", forbidden)
+        guarded.setattr(Path, "exists", forbidden)
+        guarded.setattr(module.subprocess, "run", forbidden)
+        guarded.setattr(module.subprocess, "Popen", forbidden)
+        guarded.setattr(sys, "argv", ["acceptance", "--phase", phase])
+        result = module.main()
+    assert result == 0
+    assert f"Selected phase: {phase}" in capsys.readouterr().out
+
+
+def test_period_runtime_phase_is_available_in_side_effect_free_dry_run(monkeypatch, capsys):
+    test_period_phase_dry_run_is_pure(monkeypatch, capsys, "period-runtime")
+
+
+def test_period_capacity_phase_is_available_in_side_effect_free_dry_run(monkeypatch, capsys):
+    test_period_phase_dry_run_is_pure(monkeypatch, capsys, "period-capacity")
+
+
+def test_helper_period_argument_is_not_observation_callback(monkeypatch):
+    module = _host_acceptance()
+    calls = []
+    def command(argv):
+        calls.append(argv)
+        return json.dumps({"version": 1, "verb": argv[2], "uid": os.getuid()})
+    monkeypatch.setattr(module, "command", command)
+    def unexpected_popen(*args, **kwargs):
+        raise AssertionError("invalid helper arguments reached subprocess")
+    monkeypatch.setattr(module.subprocess, "Popen", unexpected_popen)
+    for verb in ("install-delegation", "enable", "disable", "status", "restart-user-manager", "export-history"):
+        module.helper(verb)
+        assert calls[-1] == module.HELPER + (verb,)
+        with pytest.raises((RuntimeError, TypeError)):
+            module.helper(verb, "2")
+    module.helper("set-sample-period", "2")
+    assert calls[-1] == module.HELPER + ("set-sample-period", "2")
+    for args in ((), ("1",), ("31",), ("02",), ("2", "3"), (2,)):
+        with pytest.raises((RuntimeError, TypeError)):
+            module.helper("set-sample-period", *args)
+
+    class Child:
+        returncode = 0
+        def __enter__(self): return self
+        def __exit__(self, *args): pass
+        def poll(self):
+            self.polls = getattr(self, "polls", 0) + 1
+            return None if self.polls == 1 else 0
+        def communicate(self):
+            return json.dumps({"version": 1, "verb": "status", "uid": os.getuid()}), ""
+    def popen(argv, **kwargs):
+        calls.append(argv)
+        return Child()
+    observed = []
+    monkeypatch.setattr(module.subprocess, "Popen", popen)
+    module.helper("status", observe=lambda: observed.append(True))
+    assert calls[-1] == module.HELPER + ("status",)
+    assert observed == [True]
+
+
+def test_capacity_fixture_materializes_and_prunes_real_core_units(tmp_path):
+    module = _host_acceptance()
+    from appio.quota import QuotaPruner
+    database = tmp_path / "capacity.sqlite"
+    with module.capacity_fixture(database, app_count=3, initial_count=12) as db:
+        pruner = QuotaPruner(db, [database], batch_size=4)
+        result = pruner.expire("capacity", 2 * 86_400 * NS)
+        assert len(result.deleted) == 4
+        assert not result.skipped
+        assert db.execute("SELECT count(*) FROM sample_coverage").fetchone()[0] == 8
+        module.capacity_generate(db, 3, 12, 2 * NS)
+        assert db.execute("SELECT count(*) FROM sample_coverage").fetchone()[0] == 11
+
+
+def test_capacity_fixture_full_reserve_supports_saturated_production_prune(tmp_path):
+    module = _host_acceptance()
+    from appio.quota import QuotaPruner
+    database = tmp_path / "capacity.sqlite"
+    with module.capacity_fixture(database) as db:
+        assert db.execute("SELECT count(*) FROM app").fetchone()[0] == 226
+        assert db.execute("SELECT count(*) FROM sample_coverage").fetchone()[0] == 57_968
+        result = QuotaPruner(db, [database]).expire("capacity", 2 * 86_400 * NS + 15 * NS)
+        assert len(result.deleted) == 2048
+        assert not result.skipped
+        assert all(unit.kind == "core" for unit in result.deleted)
+        assert db.execute("SELECT count(*) FROM sample_coverage").fetchone()[0] == 57_968 - 2048
+
+
+def test_restart_gap_accepts_new_gap_and_rejects_old():
+    module = _host_acceptance()
+    before = {"tables": {"gap": [(9, "boot", "iod", 1, 1, 1, 2, "collector_gap")]}}
+    apply = {"status": {"cursor": {"boot_id": "boot", "iod_epoch": 2}}, "restart_boundary_ns": 10}
+    after = {"tables": {"gap": before["tables"]["gap"] + [(10, "boot", "iod", 2, 0, 3, 4, "collector_gap")], "sample": [], "collector_epoch": []}}
+    assert module.test_active_period_apply_records_restart_gap(before, after, apply)["new_gaps"]
+    after["tables"]["gap"] = before["tables"]["gap"]
+    with pytest.raises(RuntimeError):
+        module.test_active_period_apply_records_restart_gap(before, after, apply)
+
+    after["tables"]["collector_epoch"] = [("iod", "boot", 2, 1, 15)]
+    after["tables"]["sample"] = [("boot", "iod", 2, 1, 1, 0, 15, 15, 5, 10)]
+    assert module.test_active_period_apply_records_restart_gap(before, after, apply)["new_epoch_start_ns"] == 15
+    after["tables"]["sample"][0] = ("boot", "iod", 2, 1, 1, 0, 15, 15, 5, 9)
+    with pytest.raises(RuntimeError):
+        module.test_active_period_apply_records_restart_gap(before, after, apply)
+
+
+def test_ten_minute_measurement_checks_identity_endpoints_and_cadence(monkeypatch):
+    from types import SimpleNamespace
+    module = _host_acceptance()
+    clock = [100 * NS]
+    monkeypatch.setattr(module, "time", SimpleNamespace(monotonic_ns=lambda: clock[0], sleep=lambda seconds: clock.__setitem__(0, clock[0] + int(seconds * NS))))
+    cutoff = {"boot_id": "boot", "iod_epoch": 3}
+    frames = [("boot", "iod", 3, seq, 1, 0, clock[0] + seq * 30 * NS, clock[0] + seq * 30 * NS) for seq in range(1, 21)]
+    export = {"helper": {"export_cutoff": cutoff}, "tables": {"sample": frames}}
+    monkeypatch.setattr(module, "period_export", lambda: export)
+    monkeypatch.setattr(module, "period_status", lambda seconds: {"sample_ns": seconds * NS, "cursor": cutoff})
+    monkeypatch.setattr(module, "unit", lambda: {"InvocationID": "instance"})
+    result = module.test_thirty_second_ten_minute_run_has_no_overdue_paths()
+    assert len(result["endpoints"]) == 20
+    assert result["end_ns"] - result["start_ns"] == 600 * NS
+    clock[0] = 100 * NS
+    broken = list(frames[10])
+    broken[7] += 10 * NS
+    frames[10] = tuple(broken)
+    with pytest.raises(RuntimeError, match="overdue or irregular"):
+        module.test_thirty_second_ten_minute_run_has_no_overdue_paths()
+
+
+def test_runtime_always_restores_after_failed_apply(monkeypatch):
+    module = _host_acceptance()
+    monkeypatch.setattr(module, "period_export", lambda: {"helper": {}, "tables": {}})
+    def failed_apply(seconds):
+        raise RuntimeError("apply failed")
+    monkeypatch.setattr(module, "test_apply_two_and_thirty_seconds_restarts_only_active_service", failed_apply)
+    calls = []
+    monkeypatch.setattr(module, "helper", lambda *args: calls.append(args) or {"sample_period": 10})
+    monkeypatch.setattr(module, "period_status", lambda seconds: {"sample_ns": seconds * NS})
+    evidence = {"host_checks": {"verify": "passed"}}
+    with pytest.raises(RuntimeError, match="apply failed"):
+        module.period_runtime(evidence)
+    assert calls == [("set-sample-period", "10")]
+    assert evidence["period_runtime"]["cleanup"]["restored"] is True
+
+
+def test_runtime_restoration_failure_is_recorded(monkeypatch):
+    module = _host_acceptance()
+    monkeypatch.setattr(module, "period_export", lambda: {"helper": {}, "tables": {}})
+    monkeypatch.setattr(module, "test_apply_two_and_thirty_seconds_restarts_only_active_service", lambda seconds: (_ for _ in ()).throw(RuntimeError("apply failed")))
+    monkeypatch.setattr(module, "helper", lambda *args: (_ for _ in ()).throw(RuntimeError("restore failed")))
+    evidence = {"host_checks": {"verify": "passed"}}
+    with pytest.raises(RuntimeError, match="restore failed"):
+        module.period_runtime(evidence)
+    assert evidence["period_runtime"]["cleanup"] == {"restored": False, "error": "restore failed"}

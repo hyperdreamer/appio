@@ -6,9 +6,10 @@ injected credentials. It never runs this procedure, polkit, a real manager,
 BPF or a host sampler. P5 packaging/installers remain deferred; the manual
 staging below exists only to exercise reviewed P3 runtime artifacts.
 
-**Current host evidence: UNRUN.** Only the rootless tests and the script's
-non-mutating dry run have been exercised in the acceptance lane. A simulated
-16 MiB probe is not evidence that this machine accounts block I/O.
+**Current host evidence: UNRUN.** The `period-runtime` and `period-capacity`
+phases are both UNRUN for this run. Rootless tests and dry runs do not establish
+host measurement results. A simulated 16 MiB probe does not establish that this
+machine accounts block I/O.
 
 ## Prerequisites and installation
 
@@ -106,13 +107,61 @@ and binds it to `/usr/bin/appio-setup`.
 
 This prints fixed proposed operations and exits without importing appio,
 reading host state, creating evidence files or running a command. All host
-checks remain UNRUN. `--run` authorizes one named phase; the helper still
-receives exactly one of its six verbs. Script options are never helper options.
+checks remain UNRUN. `--run` authorizes one named phase. The helper accepts
+seven verbs, with one canonical decimal seconds argument in the range 2–30 for
+`set-sample-period`. The other six verbs accept no argument. Script options are
+never helper options.
 Do not run this script with sudo. `pkexec` must derive the beneficiary from the
 real non-root login. Real-phase results, helper JSON and separate manual
 observations go to the NSS home at
 `~/.local/state/appio/p3-acceptance.json` (0600). A failed or unobserved check is
 recorded as incomplete; it never becomes a pass by inference.
+
+## Sample period acceptance phases
+
+Both dry runs print a plan without importing appio, reading host state, running a
+subprocess, or writing evidence.
+
+```sh
+python tools/acceptance/appio-p3-root.py --phase period-runtime
+python tools/acceptance/appio-p3-root.py --phase period-capacity
+```
+
+For a future host acceptance, use the executable forms below. Both phases are
+UNRUN in this run.
+
+```sh
+tools/acceptance/appio-p3-root.py --run --phase period-runtime
+tools/acceptance/appio-p3-root.py --run --phase period-capacity
+```
+
+`period-runtime` requires the reviewed installation, a disposable systemd login,
+a successful `enable` and `verify`, an active answering service, and polkit
+access. It takes approximately thirteen minutes. For 2 and 30 seconds it records
+helper results, active state, changed service InvocationID, reported `sample_ns`,
+and successive committed sample intervals within the greater of 500 ms and 10%
+of the requested period. Before and after each apply it inspects user-owned
+`export-history` copies. A new collector gap or documented truncated partial
+interval must represent each restart. It reapplies 30 seconds and checks the
+unchanged result, drop-in inode and modification time, and InvocationID. A
+minimum 600-second monotonic window checks unchanged boot, epoch and invocation,
+at least 18 endpoints, boundary coverage, cadence, and intervals strictly below
+the 90-second flush window. It never inspects the installed database or system
+journal. Cleanup always applies 10 seconds and verifies the reported value. A
+failed restoration is recorded and fails the phase. Evidence is written to the
+existing mode-0600 acceptance file. No session-termination flag is needed.
+
+`period-capacity` uses a disposable SQLite database outside `/var/lib/appio` and
+calls the production retention pruner. It needs the matching appio runtime and
+at least 30 minutes of monotonic measurement time. The fixture contains 226 app
+IDs and 57,968 aged, materialized core units. The reserve is
+`2048 + ceil(1800/15) * (2048 - 226 * floor(15/2)) = 57,968`. The phase adds
+one eligible unit per app every 2 seconds and prunes each 15 seconds. It records
+all batch results, minimum pre-prune count, app and backlog counts, generated and
+retired totals, and elapsed time. Every batch must retire 2,048 units with no
+skips, retirement must exceed 113 units per second, and the final backlog must
+not exceed the initial backlog. The fixture is deleted on exit. This phase does
+not invoke the helper or systemctl and does not open the installed database.
 
 ## Host sequence
 
@@ -160,7 +209,9 @@ recorded as incomplete; it never becomes a pass by inference.
    continuation cursor. Reopen the GUI and inspect that interval. Record an
    explicit replay/gap and unavailable values when evidence is absent. Do not
    substitute zero for a missed interval or claim wall time as observed I/O.
-6. **Disable, final WAL export, fallback.** Close the GUI and run
+6. **Sample period runtime.** After `verify` and before `disable`, run the
+   `period-runtime` phase described below on the disposable login.
+7. **Disable, final WAL export, fallback.** Close the GUI and run
    `/usr/bin/python -I tools/acceptance/appio-p3-root.py --run --phase disable`.
    Disable is its own fixed helper/polkit operation. Require disabled/inactive
    proof, preserved drop-ins/groups, a caller-owned regular 0600 export, an
@@ -172,7 +223,7 @@ recorded as incomplete; it never becomes a pass by inference.
    then compares every exported row with the daemon database. Reopen the GUI:
    only after inactive proof and acquiring the lease may local collection
    resume. Record actual transition gaps/partial coverage.
-7. **Optional session-ending branch.** Only on the expendable login, after
+8. **Optional session-ending branch.** Only on the expendable login, after
    enable, explicitly select both flags:
    `/usr/bin/python -I tools/acceptance/appio-p3-root.py --run --phase restart-user-manager --allow-session-termination`.
    **This terminates the user manager and ends the session, including the
