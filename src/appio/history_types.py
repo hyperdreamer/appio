@@ -325,7 +325,7 @@ class ManagedSourceSpec:
             if not isinstance(option, tuple) or len(option) != 2:
                 raise ValueError("each connect option must be an immutable text pair")
             _text(option[0], "managed_source_spec.connect_options[].key")
-            _text(option[1], "managed_source_spec.connect_options[].value", allow_empty=True)
+            _text(option[1], "managed_source_spec.connect_options[].value")
 
 
 @dataclass(frozen=True)
@@ -398,6 +398,8 @@ class CapturedSourceImage:
         if not isinstance(self.image, bytes):
             raise ValueError("captured_source_image.image must be immutable bytes")
         _digest_text(self.image_digest)
+        if self.image_digest != hashlib.sha256(self.image).hexdigest():
+            raise ValueError("captured_source_image.image_digest must match image bytes")
 
 
 @dataclass(frozen=True)
@@ -615,7 +617,7 @@ class PartState:
             raise ValueError("the retained record window must match the requested window")
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, init=False)
 class FrameProvenance:
     """Prepared window, requested/answered source and exact certification."""
 
@@ -626,6 +628,39 @@ class FrameProvenance:
     local_bracket: LocalBracket | None
     snapshot: SnapshotProvenance | None
     certified: bool
+
+    def __init__(
+        self,
+        generation: int,
+        window: Window,
+        requested_source: SourcePosition,
+        answered_source: SourcePosition | None,
+        local_bracket: LocalBracket | None,
+        *args: object,
+        snapshot: SnapshotProvenance | None = None,
+        certified: bool | None = None,
+    ) -> None:
+        if len(args) > 2:
+            raise TypeError("FrameProvenance accepts at most seven positional arguments")
+        if len(args) == 2:
+            if snapshot is not None or certified is not None:
+                raise TypeError("snapshot or certified supplied twice")
+            snapshot, certified = args
+        elif args:
+            if isinstance(args[0], bool) and certified is None:
+                certified = args[0]
+            else:
+                if snapshot is not None:
+                    raise TypeError("snapshot supplied twice")
+                snapshot = args[0]
+        object.__setattr__(self, "generation", generation)
+        object.__setattr__(self, "window", window)
+        object.__setattr__(self, "requested_source", requested_source)
+        object.__setattr__(self, "answered_source", answered_source)
+        object.__setattr__(self, "local_bracket", local_bracket)
+        object.__setattr__(self, "snapshot", snapshot)
+        object.__setattr__(self, "certified", certified)
+        self.__post_init__()
 
     def __post_init__(self) -> None:
         _integer(self.generation, "frame_provenance.generation")
@@ -660,8 +695,6 @@ class FrameProvenance:
             _record(snapshot, SnapshotProvenance, "frame_provenance.snapshot")
             if bracket is None or snapshot.bracket != bracket:
                 raise ValueError("frame snapshot evidence must match its local bracket")
-        if certified and bracket is not None and snapshot is None:
-            raise ValueError("a certified local frame requires snapshot evidence")
         if certified and (answered is None or answered != requested):
             raise ValueError(
                 "certification requires an answered source equal to the requested source"

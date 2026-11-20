@@ -105,6 +105,36 @@ def _assert_frozen(record: object, name: str) -> None:
         setattr(record, name, getattr(record, name))
 
 
+def test_managed_source_rejects_empty_option_value() -> None:
+    from appio.history_types import ManagedSourceSpec
+
+    with pytest.raises(ValueError):
+        ManagedSourceSpec("local", "gui", "file:/tmp/a.db", (("x", ""),))
+
+
+def test_captured_image_rejects_digest_mismatch() -> None:
+    from appio.history_types import CapturedSourceImage
+
+    with pytest.raises(ValueError):
+        CapturedSourceImage("local", 1, b"abc", "a" * 64)
+
+
+def test_frame_provenance_accepts_legacy_six_arguments() -> None:
+    window = Window("lifetime")
+    remote = RemotePosition("boot-a", 1, 0)
+    frame = FrameProvenance(3, window, remote, remote, None, True)
+    assert frame.snapshot is None
+    assert frame.certified is True
+
+    vector = LocalPositionVector((LocalPosition("local", "gui", 1, 1, 0),))
+    bracket = LocalBracket(vector, vector)
+    local_frame = FrameProvenance(3, window, vector, vector, bracket, True)
+    assert local_frame.snapshot is None
+    assert local_frame.certified is True
+    with pytest.raises(ValueError):
+        FrameProvenance(3, window, remote, remote, None, snapshot=True)
+
+
 def test_live_records_validate_every_field_and_phase_combination() -> None:
     clock = Clock(5)
     assert clock() == 5
@@ -344,10 +374,10 @@ def test_live_records_validate_every_field_and_phase_combination() -> None:
 
     # -- ManagedSourceSpec ------------------------------------------------- #
     spec = ManagedSourceSpec(
-        "local", "gui", "file:/tmp/local.db?mode=rw", (("timeout", "5"), ("isolation_level", ""))
+        "local", "gui", "file:/tmp/local.db?mode=rw", (("timeout", "5"), ("isolation_level", "DEFERRED"))
     )
     assert spec.database_uri == "file:/tmp/local.db?mode=rw"
-    assert spec.connect_options == (("timeout", "5"), ("isolation_level", ""))
+    assert spec.connect_options == (("timeout", "5"), ("isolation_level", "DEFERRED"))
     assert replace(spec, owner="iod", connect_options=()).owner == "iod"
     for label, bad in (
         ("name", ""),
@@ -672,8 +702,8 @@ def test_live_records_validate_every_field_and_phase_combination() -> None:
     # Failed local work may have bracket evidence without a captured image.
     assert replace(uncertified, snapshot=None).certified is False
     _assert_frozen(local_frame, "snapshot")
+    assert replace(local_frame, snapshot=None).certified is True
     for label, kwargs in (
-        ("snapshot.missing-certified", {"snapshot": None}),
         ("snapshot.type", {"snapshot": (1, DIGEST, bracket)}),
         ("snapshot.forged", {"snapshot": forged_snapshot}),
         ("snapshot.bracket", {"snapshot": raced_snapshot}),
