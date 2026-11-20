@@ -2,11 +2,13 @@
 """Opt-in P3 host acceptance. The default path only prints a plan.
 
 Run from an expendable non-root login after following docs/acceptance/appio-p3-root.md.
-The helper always receives exactly one verb; all flags here are script flags.
+The helper receives a fixed verb and, for set-sample-period, one seconds argument.
+All flags here are script flags.
 """
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import grp
 import json
 import os
@@ -17,13 +19,14 @@ import sqlite3
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 
 HELPER = ("/usr/bin/pkexec", "/usr/bin/appio-setup")
 SERVICE = "appio-iod.service"
 DROPINS = (Path("/etc/systemd/system/user@.service.d/10-appio-io.conf"),
            Path("/etc/systemd/user.conf.d/10-appio.conf"))
-PHASES = ("enable", "verify", "disable", "restart-user-manager")
+PHASES = ("enable", "verify", "period-runtime", "period-capacity", "disable", "restart-user-manager")
 
 
 def require(ok, message):
@@ -34,7 +37,8 @@ def require(ok, message):
 def plan(phase):
     print("DRY RUN: no commands, imports of appio, file writes, elevation or session changes.")
     print("Prerequisite: install the reviewed runtime; service initially disabled (see runbook).")
-    print("Sequence: enable -> manual reboot/fresh session -> verify -> disable.")
+    print("Sequence: enable -> manual reboot/fresh session -> verify -> period-runtime -> disable.")
+    print("period-runtime measures both periods and restores 10 s; period-capacity uses a disposable SQLite fixture.")
     for verb in ("install-delegation", "enable", "status", "export-history", "disable"):
         print("  " + shlex.join(HELPER + (verb,)))
     print("Activation choices: restart user manager now (ENDS THE SESSION), or activate after reboot.")
@@ -53,15 +57,20 @@ def command(argv):
     return done.stdout.strip()
 
 
-def helper(verb, observe=None):
-    require(verb in ("install-delegation", "enable", "status", "export-history", "disable", "restart-user-manager"), "unknown helper verb")
-    print("Authorizing: " + shlex.join(HELPER + (verb,)), flush=True)
+def helper(verb, *command_args, observe=None):
+    require(verb in ("install-delegation", "enable", "status", "export-history", "disable", "restart-user-manager", "set-sample-period"), "unknown helper verb")
+    if verb == "set-sample-period":
+        require(len(command_args) == 1 and isinstance(command_args[0], str) and command_args[0] in tuple(str(n) for n in range(2, 31)), "invalid sample period")
+    else:
+        require(not command_args, "unexpected helper arguments")
+    argv = HELPER + (verb,) + command_args
+    print("Authorizing: " + shlex.join(argv), flush=True)
     if observe is None:
-        output = command(HELPER + (verb,))
+        output = command(argv)
     else:
         # Bound every wait; observe the short-lived probe while the fixed helper
         # runs. Missing evidence fails instead of treating controller presence as proof.
-        with subprocess.Popen(HELPER + (verb,), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as child:
+        with subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as child:
             deadline = time.monotonic() + 90
             while child.poll() is None:
                 observe()
@@ -79,7 +88,7 @@ def helper(verb, observe=None):
 
 
 def unit(name=SERVICE):
-    output = command(("/usr/bin/systemctl", "show", name, "--property=UnitFileState,ActiveState,MainPID"))
+    output = command(("/usr/bin/systemctl", "show", name, "--property=UnitFileState,ActiveState,MainPID,InvocationID"))
     return dict(line.split("=", 1) for line in output.splitlines())
 
 
@@ -205,7 +214,7 @@ def verify(evidence):
                     observed[dev] = max(observed.get(dev, 0), int(values.get("wbytes", "0")))
             except FileNotFoundError:
                 pass
-    evidence["status"] = helper("status", observe)
+    evidence["status"] = helper("status", observe=observe)
     expected = 16 * 1024 * 1024
     evidence["probe"] = {"target": str(target), "expected_bytes": expected, "observed_wbytes": observed, "devices": sorted(devices), "units": sorted(map(str, units))}
     require(len(devices) == 1 and units, "probe observation missed; rerun verify, do not claim host accounting")
@@ -235,6 +244,216 @@ def verify(evidence):
         history.append(exchange("query", query=query)[-1])
     evidence["closed_gui_history"] = {"first": first, "replay_or_gap": replay, "history": history}
     evidence["reopened"] = confirm("Reopen GUI and query that closed interval: historical data remains available; gaps are visible and unavailable is not zero. Close GUI before disable.")
+
+
+NS = 1_000_000_000
+PERIOD_DROPIN = Path("/etc/systemd/system/appio-iod.service.d/20-sample-period.conf")
+
+
+def period_export():
+    result = helper("export-history")
+    path, data = exported(result)
+    return {"helper": result, "tables": dict(data), "path": str(path)}
+
+
+def period_status(seconds):
+    status = exchange()[-1]
+    require(status.get("answering") is True and status.get("sample_ns") == seconds * NS,
+            f"daemon does not report {seconds} seconds")
+    return status
+
+
+def frame_endpoints(export, boot, epoch, start=0, end=None):
+    endpoints = {}
+    for row in export["tables"]["sample"]:
+        row_boot, source, row_epoch, seq, _, _, _, observed = row[:8]
+        if row_boot == boot and source == "iod" and row_epoch == epoch and observed >= start and (end is None or observed <= end):
+            key = (row_epoch, seq)
+            if key in endpoints:
+                require(endpoints[key] == observed, "inconsistent frame endpoints")
+            endpoints[key] = observed
+    return [endpoints[key] for key in sorted(endpoints)]
+
+
+def test_two_second_and_thirty_second_runs_match_status_and_intervals(export, status, seconds):
+    cursor = status["cursor"]
+    points = frame_endpoints(export, cursor["boot_id"], cursor["iod_epoch"])
+    require(len(points) >= 3, f"insufficient {seconds}-second committed frames")
+    period = seconds * NS
+    tolerance = max(500_000_000, period // 10)
+    deltas = [b - a for a, b in zip(points[-3:], points[-2:])]
+    require(all(abs(delta - period) <= tolerance for delta in deltas), "sample cadence outside tolerance")
+    return {"sample_ns": status["sample_ns"], "endpoints": points[-3:], "deltas": deltas}
+
+
+def test_apply_two_and_thirty_seconds_restarts_only_active_service(seconds):
+    before = unit()
+    require(before["ActiveState"] == "active" and before["InvocationID"], "service must be active before period change")
+    boundary = time.monotonic_ns()
+    result = helper("set-sample-period", str(seconds))
+    after = unit()
+    status = period_status(seconds)
+    deadline = time.monotonic() + seconds * 2 + 10
+    while status.get("cursor") is None and time.monotonic() < deadline:
+        time.sleep(1)
+        status = period_status(seconds)
+    require(status.get("cursor") is not None, "collector did not publish a cursor")
+    require(result.get("sample_period") == seconds and after["ActiveState"] == "active" and after["InvocationID"] and after["InvocationID"] != before["InvocationID"], "active apply failed to restart service")
+    return {"before": before, "after": after, "result": result, "status": status, "restart_boundary_ns": boundary}
+
+
+def test_active_period_apply_records_restart_gap(before, after, apply):
+    boot = apply["status"]["cursor"]["boot_id"]
+    previous_max = max((row[0] for row in before["tables"]["gap"]), default=0)
+    gaps = [row for row in after["tables"]["gap"] if row[0] > previous_max and row[1] == boot and row[2] == "iod" and row[7] == "collector_gap"]
+    if gaps:
+        return {"baseline_max_gap_id": previous_max, "new_gaps": gaps}
+    epoch = apply["status"]["cursor"]["iod_epoch"]
+    epochs = [row for row in after["tables"]["collector_epoch"] if row[0] == "iod" and row[1] == boot and row[2] == epoch]
+    if epochs:
+        epoch_start = epochs[0][4]
+        partial = [row for row in after["tables"]["sample"] if row[0] == boot and row[1] == "iod" and row[2] == epoch and row[8] is not None and row[9] is not None and row[8] < apply["restart_boundary_ns"] and row[7] == epoch_start and row[9] == epoch_start - row[8]]
+        if partial:
+            return {"baseline_max_gap_id": previous_max, "new_epoch_start_ns": epoch_start, "partial_interval": partial[0]}
+    raise RuntimeError("no new collector_gap or truncated partial interval in exported history after active apply")
+
+
+def test_identical_period_reapply_is_unchanged():
+    before = PERIOD_DROPIN.stat()
+    invocation = unit()["InvocationID"]
+    result = helper("set-sample-period", "30")
+    after = PERIOD_DROPIN.stat()
+    require(result.get("sample_period_state") == "unchanged" and
+            (before.st_ino, before.st_mtime_ns) == (after.st_ino, after.st_mtime_ns) and
+            unit()["InvocationID"] == invocation, "identical period reapply changed service or drop-in")
+    return {"result": result, "inode": before.st_ino, "mtime_ns": before.st_mtime_ns, "invocation_id": invocation}
+
+
+def test_thirty_second_ten_minute_run_has_no_overdue_paths():
+    from appio.iod import flush_ns_for
+    baseline = period_export()
+    before = period_status(30)
+    invocation = unit()["InvocationID"]
+    start = time.monotonic_ns()
+    while time.monotonic_ns() - start < 600 * NS:
+        time.sleep(min(5, (600 * NS - (time.monotonic_ns() - start)) / NS))
+    end = time.monotonic_ns()
+    final = period_export()
+    after = period_status(30)
+    old = baseline["helper"]["export_cutoff"]
+    new = final["helper"]["export_cutoff"]
+    require((old["boot_id"], old["iod_epoch"]) == (new["boot_id"], new["iod_epoch"]) == (before["cursor"]["boot_id"], before["cursor"]["iod_epoch"]) == (after["cursor"]["boot_id"], after["cursor"]["iod_epoch"]) and unit()["InvocationID"] == invocation, "collector identity changed during measurement")
+    points = frame_endpoints(final, old["boot_id"], old["iod_epoch"], start, end)
+    tolerance = max(500_000_000, 30 * NS // 10)
+    require(len(points) >= 18 and points[0] - start <= 30 * NS + tolerance and end - points[-1] <= 30 * NS + tolerance, "measurement endpoint coverage insufficient")
+    deltas = [b - a for a, b in zip(points, points[1:])]
+    flush = flush_ns_for(30 * NS)
+    require(flush == 90 * NS and all(abs(delta - 30 * NS) <= tolerance and delta < flush for delta in deltas), "overdue or irregular sample interval")
+    return {"baseline": baseline["helper"], "final": final["helper"], "start_ns": start, "end_ns": end, "invocation_id": invocation, "endpoints": points, "deltas": deltas, "flush_ns": flush}
+
+
+def period_runtime(evidence):
+    require(evidence.get("host_checks", {}).get("verify", "").startswith("passed"), "run verify before period-runtime")
+    record = evidence["period_runtime"] = {"applies": []}
+    try:
+        for seconds in (2, 30):
+            before = period_export()
+            apply = test_apply_two_and_thirty_seconds_restarts_only_active_service(seconds)
+            item = {"before_export": before["helper"], "apply": apply}
+            record["applies"].append(item)
+            time.sleep(seconds * 3 + 1)
+            after = period_export()
+            item["after_export"] = after["helper"]
+            item["restart_gap"] = test_active_period_apply_records_restart_gap(before, after, apply)
+            item["cadence"] = test_two_second_and_thirty_second_runs_match_status_and_intervals(after, period_status(seconds), seconds)
+        record["identical"] = test_identical_period_reapply_is_unchanged()
+        record["ten_minute"] = test_thirty_second_ten_minute_run_has_no_overdue_paths()
+    finally:
+        try:
+            result = helper("set-sample-period", "10")
+            status = period_status(10)
+            record["cleanup"] = {"result": result, "status": status, "restored": True}
+        except Exception as error:
+            record["cleanup"] = {"restored": False, "error": str(error)}
+            raise
+
+
+@contextmanager
+def capacity_fixture(path, app_count=226, initial_count=57_968):
+    from appio.durable import canonical_json
+    from appio.schema import SCHEMA_SQL
+    from appio.store import _empty_coverage
+
+    coverage = canonical_json(_empty_coverage())
+    db = sqlite3.connect(path)
+    try:
+        db.executescript(SCHEMA_SQL)
+        db.execute("INSERT INTO boot(boot_id,boot_order,started_mono_ns,started_wall,source) VALUES('capacity',1,0,0,'iod')")
+        db.execute("INSERT INTO clock_map VALUES('capacity',0,0)")
+        db.executemany("INSERT INTO app VALUES(?,?,?,NULL,0,0,'system')", ((app, f'app-{app}', f'app-{app}') for app in range(1, app_count + 1)))
+        db.executemany("INSERT INTO app_boot_total VALUES('capacity',?,0,0,0,0,NULL,NULL,NULL,?)", ((app, coverage) for app in range(1, app_count + 1)))
+        db.executemany("INSERT INTO app_lifetime_total VALUES(?,0,0,0,0,?,'capacity',0)", ((app, coverage) for app in range(1, app_count + 1)))
+        db.executemany("INSERT INTO rollup_app VALUES('capacity',?,0,?,0,0,0,0,NULL,NULL,NULL,?)", ((app, secs, coverage) for app in range(1, app_count + 1) for secs in (60, 3600)))
+        db.executemany("INSERT INTO sample_coverage VALUES('capacity','iod',1,?,?,0,?)", ((seq // app_count, seq % app_count + 1, coverage) for seq in range(initial_count)))
+        db.commit()
+        yield db
+    finally:
+        db.close()
+
+
+def capacity_generate(db, app_count, seq, mono_ns):
+    from appio.durable import canonical_json
+    from appio.store import _empty_coverage
+
+    coverage = canonical_json(_empty_coverage())
+    db.executemany("INSERT OR IGNORE INTO rollup_app VALUES('capacity',?,?,?,0,0,0,0,NULL,NULL,NULL,?)", ((app, mono_ns // (secs * NS) * (secs * NS), secs, coverage) for app in range(1, app_count + 1) for secs in (60, 3600)))
+    db.executemany("INSERT INTO sample_coverage VALUES('capacity','iod',1,?,?,?,?)", ((seq, app, mono_ns, coverage) for app in range(1, app_count + 1)))
+    db.commit()
+
+
+def period_capacity(evidence):
+    from appio.iod import maintenance_ns_for
+    from appio.quota import DEFAULT_BATCH_SIZE, QuotaPruner
+
+    require(maintenance_ns_for(2 * NS) == 15 * NS and DEFAULT_BATCH_SIZE == 2048, "unexpected pruning cadence or batch")
+    record = evidence["period_capacity"] = {"app_count": 226, "initial_backlog": 57_968, "generated": 0, "retired": 0, "batches": []}
+    temp_root = Path(tempfile.gettempdir()).resolve()
+    require(not temp_root.is_relative_to(Path("/var/lib/appio")), "capacity fixture must be outside the installed state directory")
+    with tempfile.TemporaryDirectory(prefix="appio-period-capacity-", dir=temp_root) as directory:
+        path = Path(directory) / "capacity.sqlite"
+        with capacity_fixture(path) as db:
+            count = db.execute("SELECT count(*) FROM sample_coverage").fetchone()[0]
+            require(count == record["initial_backlog"], "initial fixture backlog mismatch")
+            pruner = QuotaPruner(db, [path])
+            start = time.monotonic_ns()
+            next_sample = 2 * NS
+            next_prune = 15 * NS
+            sequence = 100_000
+            while next_prune <= 1800 * NS:
+                elapsed = time.monotonic_ns() - start
+                if elapsed < min(next_sample, next_prune):
+                    time.sleep((min(next_sample, next_prune) - elapsed) / NS)
+                    continue
+                if next_sample <= next_prune:
+                    require(elapsed - next_sample < 2 * NS, "capacity generation missed a sample deadline")
+                    capacity_generate(db, 226, sequence, next_sample)
+                    sequence += 1
+                    record["generated"] += 226
+                    next_sample += 2 * NS
+                else:
+                    before = db.execute("SELECT count(*) FROM sample_coverage").fetchone()[0]
+                    require(before >= 2048, "insufficient eligible backlog")
+                    result = pruner.expire("capacity", 2 * 86_400 * NS + next_prune)
+                    after = db.execute("SELECT count(*) FROM sample_coverage").fetchone()[0]
+                    batch = {"deadline_ns": next_prune, "pre_prune": before, "retired": len(result.deleted), "skipped": len(result.skipped), "complete": result.complete, "sampling_paused": result.sampling_paused, "physical_bytes": result.physical_bytes, "reason": result.reason, "post_prune": after}
+                    record["batches"].append(batch)
+                    require(len(result.deleted) == 2048 and not result.skipped and before - after == 2048 and all(unit.kind == "core" for unit in result.deleted), "pruning batch was not saturated")
+                    record["retired"] += len(result.deleted)
+                    next_prune += 15 * NS
+            record["elapsed_ns"] = time.monotonic_ns() - start
+            record["final_backlog"] = db.execute("SELECT count(*) FROM sample_coverage").fetchone()[0]
+            record["minimum_pre_prune"] = min(batch["pre_prune"] for batch in record["batches"])
+            require(record["elapsed_ns"] >= 1800 * NS and record["retired"] * NS > 113 * record["elapsed_ns"] and record["final_backlog"] <= record["initial_backlog"], "capacity measurement failed")
 
 
 def disable(evidence):
@@ -292,7 +511,7 @@ def main():
         helper("restart-user-manager")
     else:
         try:
-            {"enable": enable, "verify": verify, "disable": disable}[args.phase](evidence)
+            {"enable": enable, "verify": verify, "period-runtime": period_runtime, "period-capacity": period_capacity, "disable": disable}[args.phase](evidence)
             evidence["host_checks"][args.phase] = "passed (manual observations separately recorded)"
         except Exception as error:
             evidence["host_checks"][args.phase] = f"incomplete: {error}"
