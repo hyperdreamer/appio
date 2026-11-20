@@ -237,7 +237,7 @@ def _host_acceptance():
 
 
 @pytest.mark.parametrize("phase", ["period-runtime", "period-capacity"])
-def test_period_phase_dry_run_is_pure(monkeypatch, capsys, tmp_path, phase):
+def test_period_phase_dry_run_is_pure(monkeypatch, capsys, tmp_path, phase, mutated_plan=None):
     module = _host_acceptance()
     import builtins
     from types import SimpleNamespace
@@ -245,27 +245,50 @@ def test_period_phase_dry_run_is_pure(monkeypatch, capsys, tmp_path, phase):
     original_os = module.os
     evidence_path = tmp_path / ".local" / "state" / "appio" / "p3-acceptance.json"
 
-    def checked_import(name, *args, **kwargs):
-        assert not name.startswith("appio")
-        return original_import(name, *args, **kwargs)
-
     def forbidden(*args, **kwargs):
         raise AssertionError("dry run accessed host state")
 
-    class GuardedOS:
+    class GuardedPath:
         def __getattr__(self, name):
             if name in {
-                "open", "stat", "lstat", "access", "listdir", "scandir", "walk",
+                "exists", "lexists", "isfile", "isdir", "islink", "stat", "lstat",
+                "samefile", "realpath", "getsize", "getmtime", "getatime", "getctime",
+                "ismount", "getxattr", "listxattr",
+            }:
+                return forbidden
+            return getattr(original_os.path, name)
+
+    guarded_path = GuardedPath()
+
+    class GuardedOS:
+        def __getattr__(self, name):
+            if name == "path":
+                return guarded_path
+            if name in {
+                "open", "close", "fdopen", "read", "write", "fstat", "ftruncate",
+                "stat", "lstat", "access", "listdir", "scandir", "walk",
                 "readlink", "mkdir", "makedirs", "unlink", "remove", "rmdir", "rename",
-                "replace", "chmod", "fchmod", "fsync", "write", "truncate",
+                "replace", "chmod", "fchmod", "fsync", "truncate",
             }:
                 return forbidden
             return getattr(original_os, name)
 
+    guarded_os = GuardedOS()
+
+    def checked_import(name, globals=None, locals=None, fromlist=(), level=0):
+        assert not name.startswith("appio")
+        if level == 0 and name == "os":
+            return guarded_os
+        if level == 0 and name == "os.path":
+            return guarded_path if fromlist else guarded_os
+        return original_import(name, globals, locals, fromlist, level)
+
     with monkeypatch.context() as guarded:
         guarded.setattr(builtins, "__import__", checked_import)
         guarded.setattr(builtins, "open", forbidden)
-        guarded.setattr(module, "os", GuardedOS())
+        guarded.setattr(module, "os", guarded_os)
+        if mutated_plan is not None:
+            guarded.setattr(module, "plan", mutated_plan)
         for name in (
             "open", "read_text", "read_bytes", "write_text", "write_bytes", "exists",
             "is_file", "is_dir", "stat", "lstat", "mkdir", "unlink", "rename", "replace",
@@ -286,8 +309,35 @@ def test_period_runtime_phase_is_available_in_side_effect_free_dry_run(monkeypat
     test_period_phase_dry_run_is_pure(monkeypatch, capsys, tmp_path, "period-runtime")
 
 
-def test_period_capacity_phase_is_available_in_side_effect_free_dry_run(monkeypatch, capsys, tmp_path):
-    test_period_phase_dry_run_is_pure(monkeypatch, capsys, tmp_path, "period-capacity")
+def test_dry_run_purity_guard_rejects_local_os_open(monkeypatch, capsys, tmp_path):
+    marker = tmp_path / "local-os-marker"
+
+    def mutated_plan(phase):
+        import os
+        fd = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        os.close(fd)
+        print(f"Selected phase: {phase}. Host checks: UNRUN.")
+
+    with pytest.raises(AssertionError, match="dry run accessed host state"):
+        test_period_phase_dry_run_is_pure(
+            monkeypatch, capsys, tmp_path, "period-runtime", mutated_plan
+        )
+    assert not os.path.exists(marker)
+
+
+def test_dry_run_purity_guard_rejects_local_os_path_exists(monkeypatch, capsys, tmp_path):
+    marker = tmp_path / "local-os-path-marker"
+    marker.write_text("present")
+
+    def mutated_plan(phase):
+        import os.path
+        os.path.exists(marker)
+        print(f"Selected phase: {phase}. Host checks: UNRUN.")
+
+    with pytest.raises(AssertionError, match="dry run accessed host state"):
+        test_period_phase_dry_run_is_pure(
+            monkeypatch, capsys, tmp_path, "period-capacity", mutated_plan
+        )
 
 
 def test_helper_period_argument_is_not_observation_callback(monkeypatch):
