@@ -1,16 +1,20 @@
 # appio live Overview lane and retained totals: technical specification
 
-Date: 2026-11-15. Status: implementation contract for the approved design, revision 7.
+Date: 2026-11-15. Status: implementation contract for the approved design, revision 8.
 
 ## 1. Authority, provenance, and boundaries
 
-Behavioural authority: `docs/superpowers/specs/2026-11-15-live-overview-totals-design.md`, §§1–13. The task's approval establishes that file as authority despite its historical `draft for review` header. Drafting baseline: `413f35aa53997ca543b01a878b96aac17490efc5`; design Git blob: `77e62e363d340c292911d4e905e87b94ffa2b43a`; design SHA-256: `8d6941b545ba15c9338f94df63d9d5c6b0b861e7cc7f14f8e85e2a675a6d70d9`.
+Behavioural authority remains `docs/superpowers/specs/2026-11-15-live-overview-totals-design.md`, §§1–13, with the epoch 6 source-authority correction approved by the user and fenced by `receipts/epoch-6-spec-repair-fence.json`. The correction supersedes the design's pathname-reopen/stat certificate in its local-source clauses and supplies the managed worker-owned source contract in §4. It does not change the chart, retention, settlement, scheduler, Files, status, recovery, capacity, or producer contracts unless this document explicitly says so.
 
-This document amends exactly the eighteen locations enumerated by design §9. Section 11 maps each amendment to its replacement contract here. All other contracts in the monitor, Files, charts, silent-daemon recovery, and dead-scope-controls specifications remain in force. In particular, recovery-spec §4.4 transition ownership and §4.5 preparation-error ownership are unchanged. A **specification decision** below chooses a mechanism necessary to implement an approved decision; it does not authorise another feature.
+The epoch 6 source route is deliberately narrow. A live local source is admitted through a managed source registry. The registry owns the source connection and keeps it on one source-actor thread. The same connection observes its position and supplies the SQLite backup that becomes an immutable captured snapshot for local workers. Detail and Files workers never receive that connection or reopen the registered pathname. A source replacement retires the old source incarnation before a new registration is admitted. The primary GUI registration also owns the separate, narrowly scoped gap writer specified in §4.5. Its writes do not confer source authority, and their presence is checked on the registered observer before a preparation can rely on them.
 
-Requirements are prospective. Source references describe the drafting baseline; test tables describe required implementation evidence, not executed results. No application suite is to be run as part of drafting this specification.
+The design's eighteen amendment locations remain the amendment inventory for its chart and Overview work. The source-authority changes below replace the local-source mechanism described by the affected rows and reconcile every clause that depended on pathname identity or a worker-opened source. All other contracts in the monitor, Files, charts, silent-daemon recovery, and dead-scope-controls specifications remain in force. In particular, recovery-spec §4.4 transition ownership and §4.5 preparation-error ownership are unchanged. A **specification decision** below chooses a mechanism necessary to implement an approved decision; it does not authorise another feature.
+
+The drafting baseline is commit `413f35aa53997ca543b01a878b96aac17490efc5`. The approved design Git blob is `77e62e363d340c292911d4e905e87b94ffa2b43a`, with SHA-256 `8d6941b545ba15c9338f94df63d9d5c6b0b861e7cc7f14f8e85e2a675a6d70d9`.
 
 ### 1.1 Checked implementation facts
+
+The following facts were checked against the current integration sources and are part of the implementation boundary. A fact records an existing seam. It is not permission to infer a stronger SQLite guarantee than the public API provides.
 
 | Existing evidence | Consequence |
 | --- | --- |
@@ -19,9 +23,15 @@ Requirements are prospective. Source references describe the drafting baseline; 
 | `_read_local` constructs totals and series for every ranked row; `ready` waits for the entire remote queue. | Prepare ranking and ownership only; construct selected detail lazily and exclude it from frame readiness. |
 | `IodClient._expire` removes a pending request and fails its Future without cancelling the daemon job. | Track transport completion separately from Future completion and retain correlation after expiry. |
 | `IodClient._generation_token` contains boot and epoch but not sequence; decoded totals/series omit their external subject metadata. | Use the full cursor in the cache key and preserve external subjects without changing wire records. |
-| `QueryService.connection` is long-lived; private worker connections are opened for backup. | Observe source positions on the registered connection, outside transactions, rather than on a new worker connection. |
-| `SeriesChart` reaggregates all samples into time-pixel bins; `_apply_timeline` uses full setters. | Add bucket-anchored append state and per-run polylines, preserving exact sums, independent scales, and hole exclusion. |
-| `CollectorWindow` owns `_pending`, `_displayed`, the recovery submission gate, and the transport pump; `AppIoWindow` uses a structural query protocol. | Keep those owners, add source certification, and expose detail/provenance through a structural optional interface. |
+| `collector_owner.py::_accept_export` currently opens an exported pathname, validates it, retains the connection in `_exports`, and passes `QueryService(connection)` to `HistoryRouter.add_source`. | Export admission changes in this specification. The export is copied into a managed source registration or retained as a frozen history artifact. Its arbitrary connection is never registered as a live source. The affected call site is listed in §13. |
+| A Python `sqlite3.Connection` is thread-affine by default and the stdlib exposes no supported general-purpose API that proves an arbitrary connection's current pathname, original immutable URI option, or physical inode identity. | No caller-supplied connection, `stat()` equality, reopen check, equal image, or cross-connection counter comparison can certify a live source. §4 names the supported admission boundary and all fail-closed cases. |
+| `PRAGMA data_version` is meaningful for a connection's observation of commits by other connections, while `Connection.total_changes` is meaningful for writes through that connection. | The managed source actor reads both values from the same long-lived source connection before and after its own backup. These values are compared only within the same registration epoch. They are not physical-file identity proofs. |
+| SQLite backup produces a consistent destination image from the source connection, but a closing observation can race a commit and a later commit can occur after that observation. | A capture is certified only for the managed source incarnation and equal opening/closing position vector. A raced bracket is usable as an immutable image for a worker but cannot certify the frame. A later observation triggers the existing replacement path. |
+| DELETE-journal and WAL databases can have independent writers and can report `SQLITE_BUSY` or `SQLITE_LOCKED` during capture. | The source actor handles journal-specific lock outcomes as source-capture errors or bounded retries. It never turns a partial backup or a failed lock attempt into a certified frame. |
+| `HistoryRouter.record_transport_gap` appends every notice, ignores missing/negative bounds or an unknown boot, deduplicates `gui_absent` by boot and bounds, writes the GUI epoch (or 1) with seq 0, and invalidates for an existing or newly inserted row. The client also emits unbounded loss notices. | Preserve this callback and gap ownership rule with the managed writer and observer-visible completion in §4.5. The database work and subsequent invalidation are asynchronous so client pumping never waits on SQLite. |
+| Existing worker validation already requires exact request, external subject, Window, coverage, and digest binding. | Captured snapshots feed those validators. Snapshot provenance is an additional source binding and never replaces `_settle` validation. |
+
+The current application may continue to create writer connections for the GUI collector and daemon. Those writer connections are not Overview source connections. The managed source actor observes their commits through its own connection and copies the source with that same connection.
 
 ### 1.2 Implementation boundary and module inventory
 
@@ -29,16 +39,18 @@ Only the following production modules acquire interfaces or changed behaviour. E
 
 | Module | Authorised responsibility |
 | --- | --- |
-| `src/appio/history_types.py` (new) | Immutable, Qt-free position, scope, acceptance, retained-record, series metadata, slot-state, and frame-provenance records and pure scope/digest helpers (§2). |
-| `src/appio/history_validation.py` (new) | Shared pure request/selector validation before client caching and router acceptance; no publication or I/O (§5.4). |
-| `src/appio/history_router.py` | Scope-owned detail lifecycle, lazy local reads, positions, one query scheduler and settlement writer (§§3–6). |
+| `src/appio/history_types.py` | Immutable, Qt-free position, capture, snapshot-provenance, scope, acceptance, retained-record, series metadata, slot-state, and frame-provenance records and pure helpers (§2). |
+| `src/appio/history_validation.py` | Shared pure request/selector validation before client caching and router acceptance; no publication or I/O (§5.4). |
+| `src/appio/history_source.py` (new) | Managed source registration, source-actor read-only connection ownership, the paired GUI gap-writer connection and its serialized transactions, position observation, SQLite backup into temporary destinations, immutable capture construction, replacement retirement, and source-actor shutdown (§4). |
+| `src/appio/history_router.py` | Scope-owned detail lifecycle, managed source admission, asynchronous transport-gap submission and invalidation, lazy local reads, positions, one query scheduler and settlement writer (§§3–6). |
 | `src/appio/iodclient.py` | Internal query-to-transport observation, expired correlation, connection retirement, cursor-complete caching, decoded subject metadata (§5). |
+| `src/appio/collector_owner.py` | Normal owner transitions, helper-export import through the managed source registry, and explicit retirement before replacement. |
 | `src/appio/ui/render_model.py` | Per-dependency provenance, measured-window admission, independent availability and lane composition (§7). |
-| `src/appio/ui/main_window.py` | Optional retained capability, UI-local fallback adapter, detail-only updates, append callers, measurement observations (§§6–9). |
+| `src/appio/ui/main_window.py` | Optional retained capability, UI-local fallback adapter, detail-only updates, append callers, and measurement observations (§§6–9). |
 | `src/appio/ui/charts.py` | Append methods/state, canonical intervals, curves and closed fills (§8). |
-| `src/appio/ui/collector_window.py` | Source-driven preparation, certification, continued polling, one status composer and separate age label (§§6, 9). |
+| `src/appio/ui/collector_window.py` | Managed primary-source startup and shutdown, source-driven preparation, certification, continued polling, one status composer and separate age label (§§4–6, 9). |
 
-**Specification decision:** the neutral `history_types.py` module imports only the standard library and `appio.contracts`. It owns no I/O, registry, concrete query service, client, router, Qt object, Future, or mutable global cache. `history_validation.py` imports only the standard library, `appio.contracts`, `appio.ipc_models.QueryRequest`, and the neutral helpers; it never imports client/router/Qt or inspects owner state. The pure renderer may additionally import the neutral records/helpers; this is solely the provenance representation required by design §9, not permission to import a router or producer. No field or signature is added to `appio.contracts`, `appio.query.QueryService`, `QueryRequest`, the store, or any wire/durable record.
+The implementation must update every caller that passes a live `QueryService(connection)` to `HistoryRouter.add_source`, including the helper export path in `CollectorCoordinator._accept_export`. Tests that construct an arbitrary `sqlite3.Connection` for local history must choose an explicit managed-source fixture or assert the specified fail-closed admission error. The existing writer, handover, and export validation code remains in force after the source is copied into the managed registration.
 
 No dependency, schema migration, sampling change, device-attribution relaxation, new scope control, privileged action, service repair, or host transition is part of this change. Direct-detail refusal still clears both presentation surfaces as specified by the dead-scope-controls specification; a shell preparation refusal still preserves its last frame.
 
@@ -88,9 +100,19 @@ Tuple length, tag, subject and embedded bounds must agree with the supplied vali
 
 **Specification decision — local digest encoding.** Hash the UTF-8 encoding of canonical JSON `["appio-local-answer-v1", kind, app_key, encoded_window, encoded_value]` with SHA-256. JSON uses `sort_keys=True`, `separators=(",", ":")`, `ensure_ascii=False`, `allow_nan=False`. Encode a contract dataclass as a field-name object recursively; encode tuples as arrays and include `None` explicitly. Encode the exact Window with its five fields. Omit `app_id` from AppTotal/Series/DiskShare and their nested records; retain AppTotal's `app_key` and require it to equal the external subject. No path, connection identity, acceptance time, or registration epoch enters this payload digest. Retain array order as returned/validated; do not sort samples into acceptability. Hash every remaining contract field, including coverage, optional peaks, suspension, device and residual records. Validate the value type for `kind` and its subject/window association first. Nonfinite values that cannot be encoded are invalid results. This is payload hashing on the worker/result path, not table hashing for local positions (§4).
 
-### 2.2 Source positions and local copy bracket
+### 2.2 Source authority, positions, and immutable captured snapshots
+
+A local source position belongs to a **managed source registration**, never to a
+pathname or an arbitrary caller-supplied `sqlite3.Connection`.
 
 ```python
+@dataclass(frozen=True)
+class ManagedSourceSpec:
+    name: str
+    owner: Literal["gui", "iod"]
+    database_uri: str
+    connect_options: tuple[tuple[str, str], ...]
+
 @dataclass(frozen=True)
 class RemotePosition:
     boot_id: str
@@ -114,22 +136,87 @@ class LocalBracket:
     opening: LocalPositionVector
     closing: LocalPositionVector
 
+@dataclass(frozen=True)
+class CapturedSourceImage:
+    name: str
+    registration_epoch: int
+    image: bytes
+    image_digest: str
+
+@dataclass(frozen=True)
+class CapturedSourceSet:
+    capture_id: int
+    opening: LocalPositionVector
+    closing: LocalPositionVector
+    images: tuple[CapturedSourceImage, ...]
+    snapshot_digest: str
+
+@dataclass(frozen=True)
+class SnapshotProvenance:
+    capture_id: int
+    snapshot_digest: str
+    bracket: LocalBracket
+
 SourcePosition = RemotePosition | LocalPositionVector
 ```
+
+`ManagedSourceSpec` is an admission description, not a connection handle. Its
+URI and serialized options are retained for an explicit new registration. A
+live spec must describe a file-backed source that the source actor can open with
+its normal read-only/query-only options. `connect_options` uses immutable
+scalar text values so a mutable factory object cannot change the registration
+behind the actor's authority token. The registry assigns a strictly increasing
+`registration_epoch` when it opens the source. It never reuses an epoch in the
+lifetime of the router process.
 
 | Record/field | Validation and meaning |
 | --- | --- |
 | `RemotePosition.boot_id` | Nonempty boot identity, obeying the existing StreamCursor boot-text validation. |
-| `RemotePosition.iod_epoch`, `seq` | Epoch is at least 1; sequence is at least 0, with the same integer validation as StreamCursor. Conversion copies the full `ClientState.cursor` triple. |
-| `LocalPosition.name` | Exact registered source name, including `local` for the initial source. |
-| `owner` | Exactly `gui` or `iod`, the registered owner; not a display-state token. |
-| `registration_epoch` | At least 1, allocated by this router's strictly increasing registration counter; never reused within its lifetime. |
-| `data_version` | At least 1, scalar result of `PRAGMA main.data_version` on this registered service's connection. |
-| `total_changes` | At least 0, that same connection's `total_changes` property. |
-| `LocalPositionVector.sources` | Only LocalPosition records, unique names, strictly sorted by `name.encode("utf-8")`. Include every registered source, not only `local` or the currently contributing store. The open router always has its primary source. |
-| `LocalBracket` | Two independently observed vectors; equality is not required for construction. An unequal bracket is valid evidence of a race, never a successful position certificate. |
+| `RemotePosition.iod_epoch`, `seq` | Epoch is at least 1 and sequence is at least 0, with the same integer validation as StreamCursor. Conversion copies the full `ClientState.cursor` triple. |
+| `ManagedSourceSpec.name`, `owner` | Nonempty unique source name and exactly `gui` or `iod`. The name identifies a registration slot. It does not identify a physical file. |
+| `ManagedSourceSpec.database_uri` | A valid source URI accepted by the managed factory. It is never reopened by a worker as an identity check. A path string has no certificate value. |
+| `LocalPosition.name`, `owner` | Exact name and owner of the active managed registration. |
+| `registration_epoch` | At least 1 and unique for every registration incarnation, including replacement under the same name. |
+| `data_version` | At least 1, scalar result of `PRAGMA main.data_version` read on this registration's own source connection after the actor has confirmed that the connection is outside a transaction. It detects commits by other connections as observed by this connection. |
+| `total_changes` | At least 0, the `total_changes` property of that same read-only source connection. The separate gap writer's counter is never substituted. Its commits are observed through the source connection's `data_version`. |
+| `LocalPositionVector.sources` | Only LocalPosition records, unique names, strictly sorted by `name.encode("utf-8")`. Include every active managed source, not only `local` or the currently contributing store. The open router always has its primary source. |
+| `LocalBracket` | Opening and closing vectors observed by the source actor outside an active transaction. Equality is not required. An unequal bracket is race evidence and never a successful frame certificate. |
+| `CapturedSourceImage` | Immutable bytes copied from the source actor's backup destination, paired with its source name, registration epoch, and SHA-256 digest. The bytes contain a private SQLite image. No connection or source pathname is carried. |
+| `CapturedSourceSet` | One source-actor capture across all active registrations. `images` is unique and name-ordered, each image digest is verified, and `snapshot_digest` is the digest of the canonical ordered image set plus its source epochs. The set is immutable worker input. |
 
-Source positions are tagged by their record types. Local and remote positions never compare equal. No cursor sequence change is a connection-authority change. Conversely, a local registration change or remote connection/boot/epoch change is an authority change even if a payload or raw counter repeats.
+A managed source actor obtains the opening and closing vectors from the same
+long-lived connection incarnations that perform the backups. It does not compare
+these values with another connection's counters. It does not use `stat()`,
+`st_dev`, `st_ino`, a URI string, a reopened pathname, a table hash, or equal
+backup bytes as proof that a pathname still names the same physical database.
+
+The stdlib `sqlite3` API cannot establish the original pathname or immutable URI
+option of an arbitrary supplied connection, cannot prove that a connection is
+currently bound to the file visible at a pathname, and cannot close the ABA gap
+between two pathname observations. It also does not expose a portable
+connection-level physical-file identity certificate. Those facts are explicit
+admission limits. They do not prevent ordinary live measurements through the
+managed source actor, because the actor owns the connection whose counters and
+backup are being compared.
+
+A `CapturedSourceSet` is accepted as a frame source only when its opening and
+closing vectors are equal and every `(name, owner, registration_epoch)` in that
+vector is still the active registration when the owner thread settles the
+capture. The equal bracket certifies the managed source connection incarnations
+and the consistent backup image at that observed position. It does not certify a
+pathname. If the vectors differ, the image remains valid immutable worker input
+with `answered_source is None`, but the frame is uncertified and exactly one
+coalesced replacement is due. A commit after the closing read is detected by the
+next source observation. An authority retirement after capture makes the capture
+obsolete even when its vectors are equal.
+
+Workers receive only the bytes and immutable provenance. A worker writes each
+image to its own private temporary SQLite file, verifies the digest, opens that
+file on its own thread, runs the existing materialisation and numerical
+reducers, and closes and removes the private copy. No `sqlite3.Connection`,
+source actor, source pathname, temporary destination pathname, or mutable
+registry object crosses into a worker result. The source actor retains the
+capture lease until every dependent worker completion has been drained.
 
 ### 2.3 Per-dependency provenance, retained record, and settled state
 
@@ -144,6 +231,7 @@ class AnswerProvenance:
     first_seen_at_ns: int | None
     answered_source: SourcePosition | None
     local_bracket: LocalBracket | None
+    snapshot: SnapshotProvenance | None
 
 @dataclass(frozen=True)
 class RetainedRecord:
@@ -168,6 +256,7 @@ class FrameProvenance:
     requested_source: SourcePosition
     answered_source: SourcePosition | None
     local_bracket: LocalBracket | None
+    snapshot: SnapshotProvenance | None
     certified: bool
 
 @dataclass(frozen=True)
@@ -187,7 +276,8 @@ Exact field obligations:
 | `measured_window` | The actual requested Window accepted at settlement. It is never changed to the newest preparation or applied window. |
 | `accepted_identity`, `first_seen_at_ns` | Both present or both `None`. When present, kind/subject/window exactly match the provenance and the stamp is nonnegative. Production router acceptances always provide both. The UI fallback may lack both. |
 | `answered_source` | The issue-time remote cursor retained by the correlated query, or an equal local bracket's vector. `None` means no position is proved. A source is provenance, not an observation-time claim. |
-| `local_bracket` | `None` for remote answers. For local answers retain both observations; when equal, `answered_source` equals that vector; when unequal, `answered_source is None`. |
+| `local_bracket` | `None` for remote answers. For local answers it is the source actor's opening/closing bracket carried by `snapshot`; when equal, `answered_source` equals that vector; when unequal, `answered_source is None`. A worker or caller cannot manufacture this bracket from a pathname check. |
+| `snapshot` | `None` for remote answers. For local answers, a validated `SnapshotProvenance` whose capture ID and digest match the immutable captured source set used by the worker and whose bracket equals `local_bracket`. |
 | `RetainedRecord.value` | DiskShare iff provenance kind is totals, Series iff series; positive presentation subject ID and `value.window == provenance.measured_window`. Ranking cannot be stored as a detail record. Revalidate nested contracts before publication. |
 | `PartState.kind`, `app_key`, `scope` | Exact slot key. If a requested window exists, its retention scope equals this key. |
 | `request_id` | Router-wide positive, never-reused request token number; distinct from a daemon wire request ID. |
@@ -195,8 +285,9 @@ Exact field obligations:
 | `record` | Present only for state ok; its kind/key/scope/window match the slot and token. Pending does not embed an older record; the separate retained accessor supplies it. |
 | `reason` | Nonempty rendered reason only for failed; `None` for the other states. Preserve error text as specified in §3.4. |
 | `FrameProvenance.generation`, `window` | Nonnegative frame generation and exact prepared window. |
-| `requested_source` | Captured at the accepted `_submit_prepare` call, before enqueuing remote ranking or submitting the local copy. |
-| `certified` | Exact bool; true iff ranking succeeded, answered_source is present, and equals requested_source. An unequal local bracket cannot certify. Remote failure/local fallback cannot certify a remote requested position. |
+| `requested_source` | For remote mode, captured at the accepted `_submit_prepare` call before enqueuing ranking. For local mode, the post-gap-fence capture's opening vector, installed before worker/token admission and frame completion (§4.5). |
+| `snapshot` | A local frame carries the `SnapshotProvenance` returned by the managed source actor. It is immutable evidence of the capture's registration incarnations and bracket, not a live source handle. |
+| `certified` | Exact bool; true iff ranking succeeded, the local snapshot bracket is equal, its registration incarnations are still current at settlement, and `answered_source` equals `requested_source` (or the remote answered cursor equals the remote requested cursor). An unequal local bracket cannot certify. Remote failure/local fallback cannot certify a remote requested position. |
 | `SeriesMetadata` | Positive presentation app_id, validated external app_key, exact measured Window, legal contract Tier and revalidated Coverage; `tier == coverage.tier`. It describes the successful effective Series from which the model projects points, including an available-empty or lifetime Series. It is not inferred from a coverage label or from share's possibly different tier. |
 
 The PartState combinations are exhaustive:
@@ -220,14 +311,18 @@ On the first successful settlement of an AcceptedIdentity in a live `(kind, app_
 
 ### 3.1 Exact public surface
 
-Existing constructor positional arguments retain their meanings. Add only an optional clock for deterministic acceptance stamps:
+Existing constructor positional arguments are replaced at this boundary because an arbitrary `QueryService` connection cannot be certified. The source registry is explicit:
 
 ```python
 class HistoryRouter:
-    def __init__(self, local: QueryService, client: IodClient,
+    def __init__(self, sources: ManagedSourceRegistry, client: IodClient,
                  registry: AppRegistry, *,
                  clock_ns: Callable[[], int] = time.monotonic_ns) -> None: ...
     def prepare(self, window: Window) -> None: ...
+    def record_transport_gap(self, notice: GapNotice) -> None: ...
+    def retry_transport_gaps(self) -> None: ...
+    @property
+    def gap_persistence_error(self) -> Exception | None: ...
     def ready(self, window: Window) -> bool: ...
     def ranking(self, window: Window, metric: str) -> list[AppTotal]: ...
     def series(self, app_id: int, window: Window) -> Series: ...
@@ -241,6 +336,9 @@ class HistoryRouter:
     def ranking_provenance(self, app_key: str, window: Window) -> AnswerProvenance | None: ...
     def frame_provenance(self, window: Window) -> FrameProvenance | None: ...
     def preparation_source(self, window: Window) -> SourcePosition | None: ...
+    def add_managed_source(self, spec: ManagedSourceSpec) -> None: ...
+    def retire_managed_source(self, name: str, reason: str) -> None: ...
+    def replace_managed_source(self, name: str, spec: ManagedSourceSpec) -> None: ...
     def local_position(self, source_name: str) -> LocalPosition: ...
     def source_position(self) -> SourcePosition: ...
     def drain(self) -> bool: ...
@@ -250,7 +348,20 @@ class HistoryRouter:
     def local_read_in_flight(self) -> bool: ...
 ```
 
-Existing `add_source`, invalidation, Files query and source-status methods, diagnostics, and close semantics remain, with the necessary scheduler/registration changes specified below. The new methods are structural capabilities, not a requirement to import this class in the view.
+`ManagedSourceRegistry` is the source-actor object described in §4. The
+constructor retains the existing remote client and app registry roles. The old
+`local: QueryService` constructor argument is removed because accepting it would
+make the unsupported arbitrary-connection route look valid. `add_source` remains
+as a compatibility entry point only for callers that already use the router
+surface: a `ManagedSourceSpec` is forwarded to `add_managed_source`, while a
+`QueryService` or raw `sqlite3.Connection` fails synchronously with
+`SourceAdmissionError("history source is not managed")`. It never inspects or
+certifies that connection.
+
+Existing invalidation, Files query and source-status methods, diagnostics, and
+close semantics remain, with the necessary scheduler/registration changes
+specified below. The new methods are structural capabilities, not a requirement
+to import this class in the view.
 
 | Symbol | Contract |
 | --- | --- |
@@ -260,10 +371,11 @@ Existing `add_source`, invalidation, Files query and source-status methods, diag
 | `retained` | Pure read of the newest eligible accepted record for the live selected key. Check endpoint eligibility against the caller's **applied** endpoint. Return None for a retired slot, a current failed state, or no record. Pending may return an older accepted record. For range/since-boot require a nonnegative integer endpoint and measured end <= applied endpoint; for lifetime/launch require None. Reject wrong argument types or key/tag combinations. An ineligible future-end record returns None and is never restamped. |
 | `ranking_provenance` | Return provenance only for a successful row of the matching current completed frame generation and external key; never fetch or use a previous generation to fill an unfinished one. The view captures this alongside its applied ranking rows and keeps it only for that applied frame. |
 | `frame_provenance` | Return the current generation's completed certificate for its exact prepared Window, or None until that generation has completed. An older completed frame with the same Window cannot substitute. Preparation metadata alone is not a certificate. |
-| `preparation_source` | Pure read of the source captured by the currently accepted preparation for this exact Window, or None if there is no matching accepted preparation. Available before readiness; never certify, query or reread current counters/cursor here. |
-| `local_position` / `source_position` | Observe according to §4, on the owner thread, without mutating a store. Closed router or invalid source is an error, never a fabricated unchanged token. |
+| `record_transport_gap` | Owner-thread callback retaining the existing `None` return and immediate `transport_issues` append. Qualifying notices enter the registry writer without waiting. Its terminal completion, failure, invalidation, and preparation fence are specified in §4.5. |
+| `preparation_source` | Pure read of the source captured by the currently accepted preparation for this exact Window, or None if there is no matching accepted preparation or its fenced local capture has not completed. Available before readiness once that capture completes; never certify, query or reread current counters/cursor here. |
+| `local_position` / `source_position` | Return the most recent completed observation from the managed source actor on the owner thread. A fresh capture uses a source-actor request and returns its own opening/closing positions. These methods never read a `QueryService` connection or mutate a store. A closed router, retired registration, or unavailable observation is an error, never a fabricated unchanged token. |
 | `drain` | Collect completed local/remote jobs, settle each once, reap terminal transport slots, dispatch eligible queued work, and report whether visible frame/slot/file state changed. No wait, target calculation, prepare, Qt event processing, or widget mutation. |
-| `pending_work` | True iff a frame read/query, live queued or outstanding detail, Files job/page/coverage, uncollected completion, or occupied transport slot (including expired/retired publication) still needs draining. It includes queued/running local detail and Files workers. False only when all such work is absent. |
+| `pending_work` | True iff a gap write or its undrained completion, a fenced capture, a frame read/query, live queued or outstanding detail, Files job/page/coverage, uncollected completion, or occupied transport slot (including expired/retired publication) still needs draining. It includes queued/running local detail and Files workers. False only when all such work is absent. |
 | `local_read_in_flight` | Unchanged: `_local_future is not None and not _local_future.done()`. This is the frame-read Future, including queued work. Never substitute Future.running() or a detail-record state. |
 
 `series`/`disk_share` keep exact-window semantics. They return only a successfully accepted answer for the caller's exact Window and subject, with its original Window. If that exact answer is pending/missing, request it when admitted and raise HistoryPending; a retained answer for an older endpoint is not an exact answer. A current exact request's failure raises its stored original exception (with existing reason/message), rather than returning old data or looping silently. A successful original local synchronous internal query path may still be used inside the worker; it does not bypass settlement when publishing to the UI router.
@@ -297,11 +409,23 @@ Retire by removing unsent tokens and deferred successors, marking already-issued
 
 **Specification decision — bounded independent local lanes (D03).** Use a dedicated `ThreadPoolExecutor(max_workers=1, thread_name_prefix="appio-frame")` only for frame ranking/ownership copies, with `_local_future` still the single frame Future governed by the frozen admission gate. Use a different `ThreadPoolExecutor(max_workers=1, thread_name_prefix="appio-detail-files")` for lazy detail and existing local Files jobs. No shared executor, worker permit, or detail-held router lock may serialize a frame behind detail/Files. Store-local SQLite lock waits keep their existing bounded worker policy; there is no global lock held during backup/query.
 
-A detail worker copies the registered file-backed sources, plans/materialises using the existing ownership rules, resolves the external key independently in each private snapshot, and computes only the requested kind for that subject and exact Window. Do not use a store-local ID from another source or a registry ID as a database key. Preserve existing merge, tier, peak, residual and coverage reducers. Reuse helper decomposition without keeping worker SQLite connections on the Qt thread or sharing them across threads. Each frame/detail copy has its own §4 observation bracket; a later detail copy may measure a later commit and cannot certify the frame.
+A detail worker uses an immutable `CapturedSourceSet` admitted by the source
+actor. The worker writes each image to its own private file, resolves the
+external key independently in that copy, and computes only the requested kind
+for the exact Window. It does not create a connection to the registered
+pathname. Do not use a store-local ID from another source or a registry ID as a
+database key. Preserve existing merge, tier, peak, residual and coverage
+reducers. Reuse helper decomposition without keeping worker SQLite connections
+on the Qt thread or sharing them across threads. Its `LocalPartOutcome` or
+`LocalFilesOutcome` carries `SnapshotProvenance` and the exact capture ID and
+digest. A detail capture may be newer than the applied frame and never certifies
+that frame. A frame worker and a detail worker may share an already captured
+immutable source set only when the token records the same capture ID and source
+registration vector.
 
 Capacity is charged from worker submission until its completion is drained, including queued, completed-but-uncollected, and publication-retired jobs. The frame lane holds at most one charged Future, including a retired running frame; drain/reap a completed old frame before replacing `_local_future`, and the unchanged `not done()` gate prevents submission behind a running one. On the background lane at most two detail Futures total (one per live selected kind when capacity permits) and at most eight Files worker Futures may be charged, for a hard maximum of ten. Retired running jobs count against these same totals, not an extra allowance per selection/lifetime. Cancel/remove retired unsent jobs where possible, but release their capacity only when their terminal completion is drained. An admitted current detail with no capacity stays logically pending without a submitted Future; keep at most one current request and one latest desired-window successor per selected kind. Drain schedules it when capacity frees. Files retains its maximum of eight outward jobs and rejects excess with its existing queue-full outcome. Repeated subject/scope changes cannot grow the worker queue without bound. Router close retires owners and shuts down both executors with the existing nonblocking `wait=False, cancel_futures=True` semantics; running completions retain resource accounting until reaped, publish nothing and cannot arm a closed UI.
 
-Callbacks enqueue immutable token-bound outcomes in an owner-drained `queue.SimpleQueue`; they never publish, inspect registered connections, or mutate router maps/widgets. Owner-thread drain performs closing reads and settlement. A real worker-barrier fixture must hold a detail **inside computation**, submit a later frame, and observe that frame's ranking/ownership complete and apply before releasing the detail; a delivery-only barrier is an additional ordering control, not evidence for independent execution capacity. No local job blocks the Qt thread waiting for a worker or database lock.
+Callbacks enqueue immutable token-bound outcomes in an owner-drained `queue.SimpleQueue`; they never publish, inspect registered connections, or mutate router maps/widgets. The source actor performs both observations and backup on its own thread. Owner-thread drain only receives the completed immutable capture and performs settlement. A real worker-barrier fixture must hold a detail **inside computation**, submit a later frame, and observe that frame's ranking/ownership complete and apply before releasing the detail; a delivery-only barrier is an additional ordering control, not evidence for independent execution capacity. No local job blocks the Qt thread waiting for a worker or database lock.
 
 ### 3.4 One settlement function
 
@@ -334,6 +458,7 @@ class LocalFrameOutcome:
     not_retained: bool
     chronology_unproved: bool
     file_available: bool
+    snapshot: SnapshotProvenance
 
 @dataclass(frozen=True)
 class LocalPartOutcome:
@@ -342,6 +467,7 @@ class LocalPartOutcome:
     app_key: str
     value: DiskShare | Series
     data_digest: str
+    snapshot: SnapshotProvenance
 
 @dataclass(frozen=True)
 class LocalFilesOutcome:
@@ -351,6 +477,7 @@ class LocalFilesOutcome:
     table: FileTable
     coverage: FileCoverage
     served_gap_count: int | None
+    snapshot: SnapshotProvenance
 
 LocalOutcome = LocalFrameOutcome | LocalPartOutcome | LocalFilesOutcome
 
@@ -363,9 +490,9 @@ class RemoteSettlement:
 @dataclass(frozen=True)
 class LocalSettlement:
     worker_id: int
+    capture: CapturedSourceSet | None = None
     outcome: LocalOutcome | None = None
     error: Exception | None = None
-    local_bracket: LocalBracket | None = None
 
 SettlementInput = RemoteSettlement | LocalSettlement
 
@@ -373,11 +500,11 @@ def _settle(self, token: RequestToken, outcome: SettlementInput | None = None,
             *, retiring: bool = False) -> bool: ...
 ```
 
-These are private immutable router records with exactly the listed fields. The existing `HistorySegment` remains in this module; no worker record moves it or a Future into history_types. RequestToken.request is an immutable normalized QueryRequest with exact kind, external subject, Window, metric, sort, direction, search, limit, coverage kind and continuation. Remote normalization is the client's §5.2 normalization; local normalization applies the same selector defaults/prechecks without calling the client. A local request is bound to a worker, not a fictitious client Future. `scope` is present for a detail; frame/files use None and their exact request scopes. token_id and owner_id are positive and never reused; frame owner_id is its generation, detail owner_id its lifetime_id, Files owner_id its delivery generation. slot_id is positive only for remote work and None for local work. Authority obeys §3.2; requested_source is captured at owner admission. A frame can own one local and one remote token with the same owner_id. The callback's RemoteSettlement.response/error is captured from that exact Future's terminal result/exception; it cannot substitute a separately supplied mapping/error. Require a done Future, and compare any queued wrapper with that bound outcome before acceptance. query_transport supplies its original answered_source; no wrapper chooses a newer cursor.
+These are private immutable router records with exactly the listed fields. The existing `HistorySegment` remains in this module; no worker record moves it or a Future into history_types. RequestToken.request is an immutable normalized QueryRequest with exact kind, external subject, Window, metric, sort, direction, search, limit, coverage kind and continuation. Remote normalization is the client's §5.2 normalization; local normalization applies the same selector defaults/prechecks without calling the client. A local request is bound to a worker, not a fictitious client Future. `scope` is present for a detail; frame/files use None and their exact request scopes. token_id and owner_id are positive and never reused; frame owner_id is its generation, detail owner_id its lifetime_id, Files owner_id its delivery generation. slot_id is positive only for remote work and None for local work. Authority obeys §3.2; requested_source is captured at owner admission. For a local frame, admission of the worker token follows the fenced capture and uses its opening vector as requested_source (§4.5). Other local tokens use their admission observation, while the outcome's snapshot records the exact immutable capture used by the worker. A frame can own one local and one remote token with the same owner_id. The callback's RemoteSettlement.response/error is captured from that exact Future's terminal result/exception; it cannot substitute a separately supplied mapping/error. Require a done Future, and compare any queued wrapper with that bound outcome before acceptance. query_transport supplies its original answered_source; no wrapper chooses a newer cursor.
 
-Before submitting local work, register an immutable worker binding `(worker_id=token.token_id, token_id, request, authority, captured registrations/paths, opening_vector)` on the owner thread. Only frame/detail bindings need an opening vector; Files retains its existing private-snapshot/served-interval proofs. The submitted worker and its completion must carry that exact worker_id/request. The binding and Future are tracked until drained even after retirement. No worker may consult the current selected key/window to construct its completion. A successful frame/detail completion receives the closing read and LocalBracket on the owner thread before `_settle`; acceptance requires that bracket to be present, its opening equal to the immutable worker binding's opening_vector and its closing equal to that owner-thread read. A closing-read error becomes LocalSettlement.error through the existing read-error seam. Files local_bracket is None. Callback code only wraps/queues returned immutable values/errors. Deep-freeze worker collections before enqueueing; no connection, QueryService, worker router, mutable dict/list or materialised database escapes the worker.
+Before submitting local work, ask the managed source registry for one immutable `CapturedSourceSet` on the source actor. The request records the capture ID, snapshot digest, complete name-ordered `(name, owner, registration_epoch)` vector and opening vector. The source actor retains a capture lease until every dependent worker completion is drained. The submitted worker and its completion carry the exact worker_id, request, capture ID/digest and `SnapshotProvenance`. A worker never consults the current selected key/window or registry to construct its completion. The binding and Future are tracked until drained after retirement. Files uses the same captured source set and includes its provenance in `LocalFilesOutcome`; there is no separate pathname-based Files copy. The source actor may release the lease only after the router has reaped the terminal completion and no dependent owner can settle from that capture. No worker may receive a source connection, `QueryService`, source pathname, temporary destination pathname, mutable registry or materialised database. Deep-freeze worker collections before enqueueing.
 
-LocalFrameOutcome contains **all** copied routing evidence formerly returned by `_read_local`, without eager parts or database handles. Its request is ranking for the exact copied Window. Validate tuple element/nested contracts, unique ranking external identities, exact bool flags, HistorySegment intervals, nonempty boot identifiers, nonempty half-open gap/overlap intervals, and boundaries `(boot, at_ns, from_owner, to_owner)` with nonnegative at_ns and gui/iod owner labels supported by the adjacent proven segments. Preserve planner boot chronology and within-boot segment/boundary order; known-gap evidence can overlap across sources and gains no new global nonoverlap/sort rule. `known_gaps` carries the worker's known-gap evidence rather than an invented remote envelope. Preserve the existing planner's ordering/reducers; do not sort malformed outcomes into validity. LocalPartOutcome requires totals -> DiskShare or series -> Series, exact external app_key/request binding after private-store key resolution, exact value.window, and `data_digest == local_answer_digest(kind, app_key, window, value)`. Its store/worker numeric ID is remapped only after external validation. LocalFilesOutcome is the immutable content of the existing FileViewResult plus request/key/worker binding; its table/coverage retain exact requested windows, served_interval, coverage, tiers, unknown-owner evidence and served_gap_count (nonnegative int excluding bool, or None only where the existing local contract allows it). The worker must run the existing fatal-vs-skippable candidate/provenance proofs in its private snapshot before emitting success; those are pure acceptance predicates without outward publication. `_settle` revalidates the returned table/coverage/served evidence and owns outward acceptance. It is not a remote FileTable envelope.
+LocalFrameOutcome contains **all** copied routing evidence formerly returned by `_read_local`, without eager parts or database handles. Its request is ranking for the exact copied Window. Its `snapshot` must match the worker binding's capture ID/digest and is accepted only when the source registration vector is still active at settlement. Validate tuple element/nested contracts, unique ranking external identities, exact bool flags, HistorySegment intervals, nonempty boot identifiers, nonempty half-open gap/overlap intervals, and boundaries `(boot, at_ns, from_owner, to_owner)` with nonnegative at_ns and gui/iod owner labels supported by the adjacent proven segments. Preserve planner boot chronology and within-boot segment/boundary order; known-gap evidence can overlap across sources and gains no new global nonoverlap/sort rule. `known_gaps` carries the worker's known-gap evidence rather than an invented remote envelope. Preserve the existing planner's ordering/reducers; do not sort malformed outcomes into validity. LocalPartOutcome requires totals -> DiskShare or series -> Series, exact external app_key/request binding after private-store key resolution, exact value.window, `data_digest == local_answer_digest(kind, app_key, window, value)`, and a snapshot matching the binding. Its store/worker numeric ID is remapped only after external validation. LocalFilesOutcome is the immutable content of the existing FileViewResult plus request/key/worker binding and matching snapshot provenance; its table/coverage retain exact requested windows, served_interval, coverage, tiers, unknown-owner evidence and served_gap_count (nonnegative int excluding bool, or None only where the existing local contract allows it). The worker must run the existing fatal-vs-skippable candidate/provenance proofs in its private snapshot before emitting success; those are pure acceptance predicates without outward publication. `_settle` revalidates the returned table/coverage/served evidence and owns outward acceptance. It is not a remote FileTable envelope.
 
 The writer runs on the router/client owner thread. Reconcile authority through §3.2 **before** ordinary outcome guards so an obsolete-authority current frame has already retired. The `retiring=True` administrative arm requires outcome=None and explicitly retires that owner: a matching outward Files Future receives the existing `WindowUnavailableError("file_source_unavailable", "File history generation retired.")`; detail retirement clears only that lifetime's records; frame retirement discards its staged evidence and takes the unavailable seam. These actions never release transport/worker capacity early or clear another lifetime's records/diagnostic. All owner-data writes, including administrative frame/Files retirement, go through this boundary; the shell alone handles its own recovery fields. For ordinary outcomes:
 
@@ -392,47 +519,134 @@ Existing `_settle_file` is only the outward-Future completion helper called by t
 
 Failure reason text is `str(error)` unchanged when nonempty, otherwise the exception class name. Current selector/association violations created by this boundary use `RequestRejected("invalid_result", "invalid_result")`, so the exact slot reason is `invalid_result`. The exact-only adapter has no client import: its internal invalid-provenance/selector failure is `ValueError("invalid_result")`, which yields the same reason through its failed slot. A decoder's existing RemoteError retains its actual machine reason and human detail; it is not rewritten to a coverage reason. WindowUnavailableError keeps its exact refusal text. Catch Exception, not BaseException. Navigation retirement is not a new current failure.
 
-## 4. Local position function and snapshot discipline
+## 4. Managed source authority and immutable snapshot discipline
 
-### 4.1 Position algorithm; no table hashing
+### 4.1 Source-actor ownership and admission
 
-For each registered source, on its existing `QueryService.connection`, require `connection.in_transaction is False`, execute and fully consume:
+`ManagedSourceRegistry` is the only local-source authority used by `HistoryRouter`. Its public logical surface is:
 
 ```python
-data_version = connection.execute("PRAGMA main.data_version").fetchone()[0]
-total_changes = connection.total_changes
-position = LocalPosition(name, owner, registration_epoch,
-                         data_version, total_changes)
+class ManagedSourceRegistry:
+    def register(self, spec: ManagedSourceSpec) -> RegistrationFuture: ...
+    def replace(self, name: str, spec: ManagedSourceSpec) -> RegistrationFuture: ...
+    def retire(self, name: str, reason: str) -> None: ...
+    def record_transport_gap(self, notice: GapNotice) -> Future[GapWriteResult]: ...
+    def observe(self) -> LocalPositionVector: ...
+    def capture(self) -> CaptureFuture: ...
+    def close(self) -> None: ...
 ```
 
-The **table/column hash inventory is empty**. No table or column is hashed for local_position in approved revision 7. In particular, do not hash sampler-checkpoint rows, receipt rows, all table contents, `max(rowid)`, latest sample time, file size, schema version, or a new observer connection's counters. Several tables are WITHOUT ROWID; latest-row scans miss deletion and in-place updates. The exact local position is the five-field tuple above. Payload hashing for accepted local identities (§2.1) is a separate operation.
+The public methods serialize requests onto one source-actor thread. The actor owns exactly one read-only observing `sqlite3.Connection` for every active registration incarnation, and the separate narrowly scoped writer for the primary GUI registration in §4.5. It creates, uses, and closes those connections on the actor thread, so the normal sqlite3 thread-affinity check remains enabled. Each observing connection is opened once during registration, schema-validated, placed in the required read-only/query-only mode, confirmed outside a transaction, and observed before the registration becomes visible. A registration is visible only after those steps and, for the primary GUI registration, the writer admission in §4.5 succeed.
 
-Order the complete vector by the UTF-8 bytes of registered source names, collecting the owner and registration epoch alongside the two counters. A change confined to an imported/non-primary store changes the vector. Adding/removing a source changes its entries; replacement/reopen changes its epoch even when the two raw counters repeat. Never compare raw SQLite counters across registrations.
+`ManagedSourceSpec` is an admission description containing a nonempty source name, an allowed owner, a database URI or pathname, and immutable scalar connection options. It is not a connection handle and it is never used later as an identity check. A positive `registration_epoch` is allocated from a process-wide monotonic counter for every successful incarnation. An epoch is never reused, including after retirement, failed replacement, or process-local name reuse. The authority tuple is `(name, owner, registration_epoch, connection_incarnation)`, where `connection_incarnation` identifies the actor-owned connection object for the lifetime of that registration.
 
-Own-connection writes advance total_changes; another connection's commits advance data_version. This detects the existing sampler, gap/overlap, handover/receipt, epoch, rollup and quota paths without changing any writer. Counters are conservative change tokens, not a count of relevant measurements; e.g. a rolled-back write may cause extra work. Equality, not numeric subtraction or ordering across connections, is the comparison. Each source observation costs O(1); sorting a changed registration list costs O(S log S), caching its order is permitted, and reading a vector costs O(S) for S sources.
+Admission accepts only a managed specification or the result of a managed source factory that transfers ownership to the source actor. A raw `sqlite3.Connection`, `QueryService`, cursor, connection-like object, or opaque callback is rejected before inspection with `SourceAdmissionError("history source is not managed")`. An existing arbitrary connection may be used by a caller's own exact-only service or by an owner-thread snapshot adapter under §6.2, but it cannot enter this local frame/Files authority path. If a caller cannot prove the required ownership transfer and source binding, admission fails closed with `SourceAdmissionError("source binding is unprovable")`.
 
-### 4.2 Registration epoch mutation points
+The registry never reopens a registered URI or pathname to establish identity during observation, backup, worker admission, settlement, or cleanup. A pathname, URI, equal image, table hash, `st_dev`, `st_ino`, `data_version`, or `total_changes` value alone is not an authority certificate. The implementation performs no `stat()`-based source certificate and no second-connection counter comparison. The only source authority is the still-active managed connection incarnation and its registration epoch.
 
-`HistoryRouter` owns `_next_registration_epoch: int`, initially 1, and a registration record per `_sources` entry. Allocate and then increment the counter:
+Retirement marks the registration inactive before removing it from the current source vector. It also retires dependent frame, detail, and Files owners through the router's existing authority transition. The actor closes the connection on its own thread after dependent capture and worker cleanup can no longer use it. A replacement is serialized as retire-then-register. No capture can contain both the old and new incarnation under one name. An external replacement of the registered pathname therefore requires an explicit `replace` operation. The registry never silently rebinds, follows an ABA path change, or treats equal bytes from a new connection as continuity. An unprovable relationship is refused.
 
-1. When constructing the initial `local` registration.
-2. On every successful `add_source` installation, including replacement of the same collector_id/service/owner. Keep add_source's existing invalidation.
-3. When a registered QueryService object or its connection object is replaced/reopened, even under the same name, owner and path.
-4. When a registration is rebound to another physical database, including a path replacement with a different filesystem `(st_dev, st_ino)` while the source name and owner remain equal.
-5. On re-adding a removed source; removing an entry changes the vector immediately and never frees its epoch for reuse.
+### 4.2 Same-connection position observation
 
-**Specification decision:** registration bookkeeping remembers service/connection object identity and the canonical main database path plus `(st_dev, st_ino)` obtained at registration. Before source observation/copy admission, compare those identities (one stat per registered file); on change perform a registration replacement before observing counters and copying. If the registered connection still addresses an old unlinked file while the path now denotes another file, refuse the copy as an operational source error until the registration has been rebound to a connection for that file. Never observe the old connection and copy a different file. Do not claim that stat alone proves a new connection is correctly bound. Owners explicitly using add_source/reopen refresh this bookkeeping at that point. There is no new store identity column, writer callback or persistent epoch.
+For each active registration, the source actor first requires `connection.in_transaction is False`. It then executes and fully consumes the following operations on that registration's own connection:
 
-A failed installation/identity check cannot publish a vector for the proposed source. Do not reset an epoch on commit, backup, query, frame generation, worker creation, owner-fact display changes, or an unchanged observation.
+```python
+data_version = connection.execute(
+    "PRAGMA main.data_version"
+).fetchone()[0]
+total_changes = connection.total_changes
+position = LocalPosition(
+    name, owner, registration_epoch, data_version, total_changes
+)
+```
 
-### 4.3 Two observations and certification
+The table/column hash inventory is empty. `local_position` does not hash sampler checkpoints, receipts, table contents, `max(rowid)`, latest sample time, file size, schema version, or counters from another observer connection. Several store tables are `WITHOUT ROWID`, and latest-row scans miss deletion and in-place updates. Payload hashing for an accepted local identity remains a separate operation.
 
-1. On the owner thread, immediately before submitting a frame copy, verify every registered observer has no active transaction, capture the ordered registration/path list and opening vector, and retain both with the frame token. An in-transaction source is an operational prepare failure with the existing `history source has an uncommitted transaction` text; do not commit or roll back a caller's transaction.
-2. The worker opens its own read-only file connections and uses SQLite backup into private databases, as today. Each backup is internally consistent; ownership planning/materialisation and ranking operate on these private copies. Registered live connections never cross to the worker.
-3. When the copy/ranking result is consumed, on the owner thread, recheck registration identities, require no active observer transaction, and capture the closing vector **before publication**. No BEGIN, pinned read transaction, or shared read context may enclose either observer pass. Fully finish each PRAGMA cursor. Do not borrow QueryService._snapshot for an observer pass.
-4. Preserve LocalBracket(opening, closing). If equal, the local ranking's answered_source is that vector. If unequal because of ordinary data-version/total-change movement under the same registrations, answered_source is None; the live frame may display its own honestly qualified data but cannot advance displayed_source. A registration-set/identity change also makes the bracket unequal **and** takes §3.2's stronger authority-retirement transition before publication; that retired frame cannot apply and its single replacement follows the frozen floor/gate. Retain its bracket only as retirement evidence. Operational observation failure propagates through the existing preparation/readiness error seam rather than certifying a sentinel token.
+The complete `LocalPositionVector` is ordered by the UTF-8 bytes of registered source names and includes `(name, owner, registration_epoch, data_version, total_changes)` for every active source. Adding or removing a source changes the vector. Replacing or reopening a source changes its epoch even when its two raw counters repeat. Raw SQLite counters from different connections or registrations are never subtracted, ordered, or otherwise compared with one another.
 
-The closing observer read is the conservative boundary, not the backup's cutoff. A commit during backup and a commit after backup but before the closing read both yield an uncertified frame and one coalesced replacement. A commit after the closing read leaves that frame certified and is detected by the next current-vector comparison. Do not put a second transaction around the opening and closing reads that would conceal the intervening commit. Lazy detail copies use the same bracket for provenance; they do not certify the frame, even with an equal bracket. A registered-source observation error for a current local detail settles that dependency as failed with the exact error reason; only frame preparation/readiness observation errors use the frame-wide error seam. No local result or bracket exception bypasses `_settle`.
+The managed observing connection remains query-only. A commit made through an independent connection, including the §4.5 gap writer, advances `data_version` as observed by that connection. The observation therefore covers the existing sampler, gap/overlap, handover/receipt, epoch, rollup, and quota writer paths. The counters are conservative change tokens, so a rollback can cause extra work. Equality is the only comparison. An observation costs O(1) per active source and O(S) for a vector of S sources after the registered-name order is cached.
+
+The implementation must include independent-writer fixtures for both DELETE-journal and WAL-journal modes. They must exercise commits and rollback through the separate managed gap writer and external GUI/daemon-style writers, checkpoint activity, and an observation with an active transaction. The read-only observer must reject attempted writes. A source with an active transaction is an operational source error. The actor never commits or rolls back a caller-owned transaction to make observation possible.
+
+### 4.3 Serialized capture, backup, and settlement provenance
+
+A `capture()` request is serialized with registration, retirement, replacement, observation, and close on the source actor. The actor performs the following steps for the complete active registration set.
+
+1. Confirm that every managed connection is open and outside a transaction, then take the opening `LocalPositionVector` from those same connections.
+2. For each source in UTF-8 name order, create a private temporary SQLite destination and invoke SQLite backup from that source's actor-owned connection. The source URI or pathname is not reopened. Read the destination completely into immutable bytes, compute its canonical image digest, validate its schema and required source metadata, close it, and remove the temporary destination before returning the image record. No destination pathname is retained in the capture.
+3. Take the closing `LocalPositionVector` from the same actor-owned connections after every backup and destination read has completed. The actor fully consumes every observer cursor and does not wrap either vector in a transaction that would hide an intervening commit.
+4. Build a `CapturedSourceSet` containing the ordered immutable images, opening and closing vectors, a fresh positive `capture_id`, and a canonical `snapshot_digest` over the ordered image bytes and registration epochs. The capture keeps a lease on every source registration until all dependent worker completions are reaped.
+5. Return the immutable capture to the router. The owner thread receives only the completed value or an error and does not read the registered connections during settlement.
+
+The backup operation has SQLite's normal consistent-image semantics. The opening and closing vectors prove movement of the managed connection incarnations across the capture interval. They do not prove a pathname, inode, or cross-connection identity relationship. A commit during backup, or after backup and before the closing vector, produces a valid immutable image with an unequal local bracket. That image may be used by detail and Files workers, but its frame cannot be certified and exactly one coalesced replacement is due. A commit after the closing vector is detected by the next current-vector observation. An equal bracket means `answered_source` equals the opening vector. An unequal bracket means `answered_source is None`.
+
+Busy and locked outcomes use a finite retry budget and a monotonic deadline. The retry policy covers DELETE and WAL modes, including an independent writer and checkpoint activity. Retry never opens a second source connection, changes a registration epoch, or replaces a source. When the deadline expires, the capture fails with the exact operational error. A partial image set is never admitted to a worker. The finite deadline and busy budget are implementation constants exposed to deterministic tests.
+
+Workers receive only immutable image bytes and validated capture metadata. Each worker writes its own private temporary SQLite file, verifies the expected digest, opens that private file on its worker thread, runs the existing materialisation, ownership, numerical, and fatal-vs-skippable candidate/provenance reducers, and closes and removes the file in `finally`. A worker never opens the registered URI or pathname and never receives a source connection, `QueryService`, source actor, registry, temporary destination pathname, mutable store, or another worker's connection. Worker outputs carry `SnapshotProvenance` with the exact `capture_id`, digest, and bracket used by that worker.
+
+A local frame, detail, and Files token records the capture ID, snapshot digest, complete name-ordered registration vector, and opening vector at admission. The local frame and Files work use the same captured source set when they belong to one preparation. A detail worker may use a capture requested for its own exact detail token when no frame capture exists, but it still carries its own complete provenance and never certifies a frame. A shared capture is admitted only when every consuming token records the same capture ID, digest, and registration vector. The source actor retains the capture lease until the router has reaped every dependent terminal completion and no dependent owner can settle from that capture.
+
+`_settle` is the sole publication boundary. Before publishing a local result it validates the tracked worker binding, capture ID, digest, exact request, snapshot provenance, complete registration vector, active registration epochs, token authority, nested result, and selector-specific contract. A completion from a retired or replaced authority releases its own worker and capture resources after terminal observation, but it cannot publish. A stale completion cannot clear another owner's pending marker, record, diagnostic, or capacity charge. Detail, Files, and frame retirement preserve their existing owner-specific failure and unavailable seams. An observation error for a current local detail fails that dependency with its exact reason. A capture or observation error during frame preparation uses the existing frame-wide preparation/readiness seam. No local result or bracket exception bypasses `_settle`.
+
+### 4.4 Replacement, recovery, and shutdown
+
+A source replacement retires the old authority before admitting the new specification. The source vector changes immediately at retirement, and all affected owners enter the existing §3.2 authority transition. Old captures may finish only for cleanup. Their outcomes are discarded after the active-registration and token checks. The frozen floor and gate coalesce this into exactly one replacement preparation. The old detail lifetime is cleared according to §3.4, and the new source does not inherit its identity, first-seen stamp, answered source, or retained record.
+
+The new registration becomes visible only after its own connection has passed schema validation, read-only/query-only setup, outside-transaction confirmation, and an initial same-connection observation. If replacement fails, the name remains retired and the prior authority is not reactivated. The existing operational error remains visible, and the established source retry path may attempt a new registration. Retry never reuses the old epoch, adopts an old capture, resumes an old connection, or proves continuity from equal bytes or equal counter values.
+
+`close()` marks the registry closed, retires every registration, rejects new registration, gap and capture requests, and queues actor-owned connection closure on the source actor. The shutdown-drain rule for previously admitted gap writes is §4.5. The router preserves `wait=False, cancel_futures=True` for worker shutdown. No GUI or owner thread waits for a source actor, worker, Future, or SQLite lock. Late completions are reaped and cannot publish into a closed router. Capture leases remain accounted for until their dependent terminal completions are drained.
+
+The standard Python `sqlite3` API exposes no supported general-purpose operation that recovers the original immutable URI option of an arbitrary supplied connection or proves that it remains bound to the current pathname after replacement and ABA. Path text, equal counters, equal backup bytes, opening/closing `stat()` results, and a second observer connection cannot close that gap. The managed source route is therefore the complete certificate boundary for local frame authority. Arbitrary pre-existing, immutable, stale, or otherwise unprovable external connections are fail-closed at this boundary while ordinary live measurements use the managed registration route.
+
+### 4.5 Managed transport-gap writer and preparation fence
+
+**Decision D12 — one registry-owned writer for the primary GUI registration.** `GapNotice` is the existing frozen record in `appio.iodclient`. The following result lives in `history_source.py` and is immutable:
+
+```python
+@dataclass(frozen=True)
+class GapWriteResult:
+    registration_epoch: int
+    disposition: Literal["inserted", "duplicate", "unknown_boot"]
+    boot_id: str
+    from_mono_ns: int
+    to_mono_ns: int
+
+class ManagedSourceRegistry:
+    def __init__(self, *, wake: Callable[[], None]) -> None: ...
+    def record_transport_gap(self, notice: GapNotice) -> Future[GapWriteResult]: ...
+
+class HistoryRouter:
+    def record_transport_gap(self, notice: GapNotice) -> None: ...
+    def retry_transport_gaps(self) -> None: ...
+    @property
+    def gap_persistence_error(self) -> Exception | None: ...
+```
+
+`GapWriteResult` validates a positive non-boolean registration epoch, nonempty boot and nonnegative, strictly increasing integer bounds. The registry method returns immediately with a Future bound to the immutable notice and the active primary registration epoch. The Future resolves only after the transaction and the observer check below, or raises the original exception. It does not accept a connection, store, arbitrary writer callback, pathname override or source name. `wake` is a notification only, invoked when a gap is admitted and when actor work completes. It must enqueue an owner-thread wake, never call `drain` or touch widgets from the actor. The production composition uses a dedicated `_wake_object()` signal for the source registry, separate from the client's existing refresh wake. Its queued QObject slot handles startup completion until the window exists; thereafter it only calls `window._arm_poll()`, whose poll context drains without running ordinary refresh or retry. Connect it with an explicit queued Qt connection to an owner-thread QObject slot. Thus completion cannot create a retry loop through `window.refresh`. A test may explicitly drain completed Futures. No Future callback publishes router state.
+
+**Admission and lifetime.** The primary slot is exactly `name="local", owner="gui"`. The registry derives both SQLite URIs from the same immutable admission description, with `uri=True` and `cache=shared` on both. On the actor thread it opens the `mode=rw` writer first and then the `mode=ro`, `PRAGMA query_only=ON` observer with `cached_statements=0`. Reject immutable URIs or conflicting `mode`, `cache`, or mutable options for the primary pair. The writer cannot create a missing database. The GUI collector and other unrelated connections keep SQLite's ordinary private cache. Both actor connections are schema-validated and checked outside transactions before the registration becomes visible. Set foreign keys ON, `synchronous=FULL`, and a zero SQLite busy timeout on the writer; set `read_uncommitted=OFF` on the observer. Keep the observer's `query_only=ON` throughout its lifetime and install a SQLite authorizer on that connection before it becomes visible. The authorizer admits only the SELECT/READ/FUNCTION/RECURSIVE actions and read-only PRAGMAs needed for schema validation, observation and backup. It rejects INSERT, UPDATE, DELETE, schema changes, ATTACH/DETACH, mutating PRAGMAs and attempts to disable query_only. The sole scoped exception is `read_uncommitted` inside the private pairing challenge described below. Its actor-owned guard allows the temporary ON/OFF transitions only during that challenge and requires OFF before any observation, backup, worker input or publication. Disabling the observer's Python statement cache ensures a previously prepared guarded PRAGMA cannot execute again after the guard closes without another authorizer decision. Verify both controls before admission. SQLite shared cache can reuse the writer's writable pager for a `mode=ro` connection, so the URI alone is not the read-only enforcement. The authorizer and query_only together maintain the observer's read-only contract; neither is disabled for a gap write. Do not change journal mode. The writer's sole permitted persistent mutation is the gap transaction below. Imported GUI/iod sources are observer-only. No caller supplies either connection and neither connection leaves the actor. The primary factory rejects an environment where shared cache is omitted or the following binding challenge fails.
+
+At admission, before the initial position observation, the actor verifies the pair using SQLite shared-cache visibility of an uncommitted challenge, without asserting physical identity. With the writer in `BEGIN IMMEDIATE`, generate a fresh 256-bit random boot ID and a positive SQLite-integer boot order not already present on the writer; retry a collision with a new value and fail after 10 collisions. Insert a temporary valid `boot` row with that identity, zero start times and source `gui`. No other process can see this uncommitted row through its ordinary private-cache connection. Under the guarded authorizer exception, turn the observer's `read_uncommitted` ON and SELECT that exact random boot ID and boot order. The exact row must be visible; a missing row or any error is `SourceAdmissionError("gap writer binding is unprovable")`. Roll back the writer transaction, confirm both connections see no challenge row, and restore `read_uncommitted=OFF` in a finally path. On any challenge or restoration failure, roll back the transaction, retire an observer whose mode cannot be restored, and expose no registration. The challenge is serialized with every capture and observation on the actor. Both connections remain open and are never silently replaced for the entire registration epoch, so the pair stays bound for later transactions. A new registration repeats the challenge. Do not repeat this probe during ordinary gap writes: shared-cache SQLite can advance the observer's conservative `data_version` even for a rolled-back challenge. Neither the temporary row nor its uncommitted visibility enters a source position, worker snapshot or persisted store. The unpredictable exact nonce prevents a lock held by a third shared-cache connection on an unrelated database from masquerading as this writer. This checks the managed connections' live shared-cache relationship, not pathname, inode, counters, equal bytes, or a physical-file identity certificate. The registered observer connection and epoch remain the only frame-source authority. The post-commit observer-visible result check is an additional logical evidence check. A source path replacement remains an explicit retire-then-register operation under §4.4.
+
+`run_interactive` first creates/migrates the existing GUI store using `AppIoStore(database_path)` as today, but never passes its connection or `QueryService(store)` to the router or registry. Construct the registry with the dedicated source wake, submit the primary managed spec, and start Qt's event loop without waiting for registration. On the queued owner-thread completion, close the bootstrap store on its creating thread, construct the client and router only after successful registration, install `on_gap` to call `router.record_transport_gap(notice)`, then construct the coordinator/window and start normal refresh. No client pump or frame preparation starts before the primary registration is active. On startup failure, save the original exception on the owner thread, close any bootstrap and partially created actor resources, and request `application.exit(1)`. After `application.exec()` returns, re-raise that saved exception through the existing startup error path. The bootstrap connection is not a managed source or a gap writer. This asynchronous startup also applies to the production coordinator and harness composition. Keep the existing local collector factory and its independent writer.
+
+**Callback and transaction.** On the owner thread, the router immediately appends every notice to `transport_issues`, including an unidentified or unbounded disconnect notice. If boot is empty, either bound is None, or the start is negative, return None without writing or invalidating, matching the existing path. Otherwise enqueue the notice on the primary registry writer and return None. The registry serializes all submissions, registration, observation, capture, retirement and close on the actor. Do not block `IodClient.pump`, a Qt slot, or the router owner on the Future.
+
+For a qualifying notice the actor requires the writer and observer of the bound epoch to be active and outside transactions. Execute `BEGIN IMMEDIATE` on the writer, then, in that same transaction, check `boot` for `boot_id`; if absent, roll back the read-only transaction without inserting and apply the unknown-boot check below. Otherwise check `gap` for exactly `(boot_id, source='gui', from_mono_ns, to_mono_ns, reason='gui_absent')`. If present, roll back the read-only transaction with disposition `duplicate`. If absent, read `collector_epoch.epoch WHERE source='gui'`, default to 1 when absent, and insert exactly one `gap` row with that epoch, `seq=0`, the notice bounds and reason `gui_absent`; commit with disposition `inserted`. Rolling back the two no-write arms matters: SQLite shared-cache may advance the observer's `data_version` for an empty committed writer transaction. These values and the deduplication predicate match `history_router.py::record_transport_gap` and `AppIoStore._insert_gap`. Use a direct INSERT inside this actor-owned transaction, since `AppIoStore.record_gap` starts its own transaction. Do not nest it, alter the schema, create root gaps, or change other store writers. Validate the existing `GapNotice` and SQLite integer bounds before the transaction. Fully consume each cursor.
+
+After COMMIT for an insertion or ROLLBACK for a no-write arm, with the observer still outside any transaction, read its boot and matching gap using that same predicate. `inserted` or `duplicate` succeeds only if the registered observer sees the matching row. `unknown_boot` succeeds only if the observer also lacks the boot. A contradiction raises `SourceAdmissionError("gap writer result is not visible to managed source")`, retains the notice as failed, and prevents dependent frame certification. An observer-visible duplicate is success even if an independent writer inserted it. This check proves the evidence exists on the source connection, not that the two connections name the same physical file. A mismatched pair may already have committed a row in the writer database, so the failure must not be reported as a rolled-back write. An explicit primary replacement is required to establish new incarnations. Never silently reopen or rebind either connection to repair a mismatch.
+
+`BEGIN IMMEDIATE` serializes the check and insert against other SQLite writers, including GUI collector and daemon-style external writers. A competing writer that uses the same check under its own immediate transaction cannot create a duplicate. An unrelated writer that deliberately inserts identical rows without that check remains outside this guarantee. In DELETE mode an external reader can delay COMMIT, and the actor must finish observer reads before attempting a write. In WAL mode independent writers serialize while observer reads and checkpoints retain their normal SQLite behaviour. There is no checkpoint, journal-mode switch, global lock or cross-connection counter comparison added by this operation. A completed COMMIT with `synchronous=FULL` is the durability boundary, subject to SQLite and filesystem guarantees. The observer check is performed after that boundary and before a dependent capture.
+
+**Failure and retry.** For `SQLITE_BUSY` or `SQLITE_LOCKED` at begin, statements or commit, roll back the actor's transaction if still active and retry the entire transaction with a monotonic one-second overall deadline, at most 10 attempts and at most 10 ms between attempts. Zero busy timeout prevents an individual SQLite lock wait from exceeding this budget. Tests inject the clock and retry scheduler rather than sleep. Retry never holds a router/UI lock and never uses another connection. On exhausted retries, failed rollback, an I/O/full/read-only/schema error, a contradictory observer check, or any other exception, complete the Future exceptionally. Preserve an uncertain post-COMMIT outcome and check/deduplicate before any later insert. Never turn an error into `unknown_boot` or a successful empty frame.
+
+The owner drains each completion once. For `inserted` and `duplicate`, invalidate the prior frame and Files deliveries using the existing invalidation seam, even for a duplicate, then notify. `unknown_boot` causes no invalidation. A failure stores its exact exception in `gap_persistence_error`, retains the notice and its epoch for retry, and uses the existing frame preparation/readiness error seam for dependent preparations. The error is visible until that failed notice resolves, including when its registration retires; retired failures are diagnostic only and do not fence a newly registered epoch. Multiple notices retain FIFO order and separate outcomes; identical pending notices may share one transaction but each callback remains in `transport_issues`. `retry_transport_gaps()` is a nonblocking owner-thread request to retry each still-failed notice at most once per ordinary refresh, on the same active epoch and with the same finite transaction budget. The ordinary target refresh calls it once before preparation; poll-only drain and completion notification do not auto-retry. A successful retry clears only its own error and applies the same invalidation rule. If several failures remain, `gap_persistence_error` exposes the oldest unresolved error. Retired-epoch failures are never redirected to a new source, and their terminal error is retained as a diagnostic rather than silently reported as persisted.
+
+**Preparation ordering.** A prepare records a fence through all qualifying gap submissions accepted before its owner-thread call, including unresolved failures from the active epoch. After the unchanged Window precheck it allocates its generation and records the request, but it does not start remote ranking, local capture, or worker submission until that fence has terminal successful/unknown-boot outcomes and their owner-thread invalidations have run. A pending fenced preparation is the sole pending frame owner and counts as `pending_work`; it has no local requested source or certificate yet. The shell's existing pending-frame gate prevents a second preparation from replacing that owner while the fence is unresolved. `local_read_in_flight` continues to describe only an actual frame Future, as §3.1 specifies. A failed fenced gap completes that preparation through its existing operational error seam without capture, ranking publication, or a fabricated unchanged source. Ordinary refresh may invoke the retry above and subsequently submit a new preparation through the existing gate. Do not invalidate the newly fenced generation for a gap that preceded it: apply the gap's invalidation to the prior owner before activating the fenced generation. A gap accepted after preparation is not in that preparation's fence and follows the ordinary later invalidation/replacement path.
+
+For a local preparation, the source actor's capture opening vector, taken after the fence, becomes its immutable `requested_source` and the shell's `_pending_source`. Until then `preparation_source(window)` returns None. `drain` installs that vector before the frame can become ready or apply; the shell copies it into `_pending_source` during the same owner-thread drain/apply pass. For remote mode retain the issue-time remote cursor at accepted prepare and enqueue its ranking only after the fence. A failed capture uses the existing preparation error path. No earlier cached vector substitutes for the opening vector. A held gap cannot block Qt, and the existing queued wake arms polling so a completion is drained even if no frame was previously pending.
+
+**Retirement and shutdown.** `retire` and `replace` immediately revoke admission for the writer together with the observing registration. Actor work already inside a transaction may finish only against its old incarnation; queued work that has not begun fails with a retired-source error. Its completion cannot invalidate or publish under a new epoch. A replacement receives a new observer and writer, and failed admission leaves both retired. On close, stop new callbacks/admissions and retire publication immediately. The actor enters a shutdown-drain state in which previously admitted gap operations may finish or fail within their deadlines against their original connections, even though the registration is no longer active for new work or publication. It then closes writer and observer on the actor thread. `CollectorWindow.shutdown` stops timers and closes coordinator/client before router/registry, keeping the registry open through client teardown. Router close requests registry close without waiting, while the actor owns the connections until its queue has finished. Late completions release resources and cannot wake or mutate a closed UI. This does not change the router executors' `wait=False, cancel_futures=True` rule.
 
 ## 5. One remote scheduler, transport ownership, and accepted shapes
 
@@ -522,7 +736,7 @@ Decoded response dictionaries keep existing `kind`, `result`, `snapshot`, `next_
 
 Remote current answers require a response mapping with `kind == request.kind`, a valid snapshot where the existing route requires one, legal continuation shape and an immutable client association equal to the token's normalized request. The shared pure validator enforces the table's shape, nested-content and exact request-field predicates; the expressly identified ranking-ownership and Files-owner predicates stay contextual even when an individual check needs only the request/response. `_settle` reruns it, then applies the table's owner-context predicates (ranking local ownership; Files ranking snapshot, cursor authority and page history). Revalidate nested contracts, not merely the broad from_wire union. Remote external keys use the existing AppKey validator; ID remapping occurs only after external validation.
 
-Local inputs normalize **without** a remote envelope or snapshot: LocalFrameOutcome.ranking is the ranking selector's row sequence, with its exact worker request/Window, unique AppKeys and routing evidence checked together; empty local ranking is valid, while the nonempty/no-mixed-store restrictions below apply only to remote ownership. LocalPartOutcome.value/app_key supply totals/series result/key, with the exact requested Window, nested/sequence rules below and local digest supplying accepted identity. LocalFilesOutcome.table and coverage supply the combined Files result and its local served-gap evidence; enforce exact request/key/sort/direction/search, matching table/coverage/tiers/unknown-owner/served interval and existing ownership-candidate proofs, then construct FileViewResult. Remote snapshot/continuation/ranking-cursor requirements do not apply to local Files; a local continuation is forbidden. Local frame/detail answered_source comes only from its closing bracket, never from a client observation. All extra frame evidence and Files evidence publish atomically with their validated owner result in `_settle`. Malformed local binding, variant or content fails that owner before any of its evidence publishes.
+Local inputs normalize **without** a remote envelope or snapshot: LocalFrameOutcome.ranking is the ranking selector's row sequence, with its exact worker request/Window, unique AppKeys and routing evidence checked together. The outcome nevertheless carries the `SnapshotProvenance` of the immutable source set used to produce it. Empty local ranking is valid, while the nonempty/no-mixed-store restrictions below apply only to remote ownership. LocalPartOutcome.value/app_key supply totals/series result/key, with the exact requested Window, nested/sequence rules below and local digest supplying accepted identity. LocalFilesOutcome.table and coverage supply the combined Files result and its local served-gap evidence, with the same source snapshot provenance. Enforce exact request/key/sort/direction/search, matching table/coverage/tiers/unknown-owner/served interval and existing ownership-candidate proofs, then construct FileViewResult. Remote snapshot/continuation/ranking-cursor requirements do not apply to local Files; a local continuation is forbidden. Local frame/detail source provenance comes only from the source actor's captured snapshot and its validated bracket, never from a client observation. All extra frame evidence and Files evidence publish atomically with their validated owner result in `_settle`. Malformed local binding, variant, snapshot or content fails that owner before any of its evidence publishes.
 
 | Selector | Exact accepted result and association |
 | --- | --- |
@@ -556,7 +770,7 @@ self._displayed_source: SourcePosition | None = None
 self._displayed_certified: bool = False
 ```
 
-At an accepted `_submit_prepare(wanted, origin, *, now)` call, `history.prepare(wanted)` captures the requested source after its unchanged Window/A22 precheck and before submitting either the local copy or remote ranking. This capture is part of that one gate call; the shell reads the exact stored value through `history.preparation_source(wanted)` after prepare succeeds and records it as `_pending_source`. Do not independently recapture the cursor/vector in the shell and router or require an unspecified setter. A refused preparation reaches its original precheck before any source observation; a rejected gate/failure never advances displayed_source. source_position selects remote only for a verified answering connection with a valid cursor; otherwise it observes the local vector. For local mode this capture is the opening observer vector in §4.3, not a third observation. The live boot for a lifetime request lives in remote/frame provenance, not in Window.
+At an accepted `_submit_prepare(wanted, origin, *, now)` call, `history.prepare(wanted)` performs its unchanged Window/A22 precheck and establishes the §4.5 gap fence. For remote mode it captures the requested cursor in that call before submitting ranking. For local mode it requests the managed capture after the fence and installs that capture's opening vector as the requested source when the actor completes. The shell reads the exact stored value through `history.preparation_source(wanted)` after prepare succeeds and, if it is initially None for local mode, again after each owner-thread drain before readiness/application. It installs that value once as `_pending_source`. Do not independently recapture the cursor/vector in the shell and router or require an unspecified setter. A refused preparation reaches its original precheck before any source observation; a rejected gate/failure never advances displayed_source. source_position selects remote only for a verified answering connection with a valid cursor; otherwise it observes the local vector. For local mode the requested source is the opening observer vector in §4.3, not a third observation. The live boot for a lifetime request lives in remote/frame provenance, not in Window.
 
 When `_apply_frame` obtains FrameProvenance for its ready Window, require its generation to equal the router preparation being applied and install `_displayed` through its existing single path. If certified and requested_source equals that frame's captured pending source, set `_displayed_source` to requested_source and `_displayed_certified=True`. Otherwise set `_displayed_certified=False` and leave the last proved displayed_source unchanged; that old token cannot certify the newly applied frame. Scope reset/no-target construction clears displayed_source and its flag. Clear pending_source on the same acceptance/retirement/application transitions that own `_pending`; no callback promotes it separately. Detail answers never write either field.
 
@@ -1022,16 +1236,16 @@ Rows A01–A18 correspond one-for-one, in order, to design §9. They are effecti
 | A06 charts-spec §6.3 step shape | §8.6 per-run midpoint polylines plus closed fills and monotone inset | Per-side exact scale, maxima, holes, finite coordinates, exact arithmetic |
 | A07 charts-spec §7 / recovery-spec §§4.3, 8 status | §9 one ordered status tree and separate age widget; add updating/live/loading-measurements/measurements-unavailable templates | Frozen refusal, operational error, busy, retry, initial loading/waiting/empty strings; recovery §4.4 unchanged |
 | A08 charts-design §§5.5–5.6 / charts-spec §4.2 trigger | §6.1 suppresses certified endpoint-only triggers, adds source/uncertified triggers | Submission gate, retirement, coalescing, floors, explicit owner, probe rules |
-| A09 charts-spec §1 router boundary / eager local detail | §§2–4 explicit slot/retained/provenance/clock interface, typed local outcomes and independent bounded frame/background execution | Existing query/refusal guarantees and no concrete QueryService change |
+| A09 charts-spec §1 router boundary / eager local detail | §§2–4 explicit slot/retained/provenance/clock interface, typed local outcomes, managed gap-writer callback and independent bounded frame/background execution | Existing query/refusal guarantees, persisted GUI gap semantics and no concrete QueryService change |
 | A10 new retained accessor | §3.1 exact retained signature, eligibility and publication-before-notification | Exact-window getters and HistoryPending |
 | A11 charts-spec §2.1 / §3.3 model and UI protocol | §§2, 6.2, 7.1 per-part provenance, SeriesMetadata, explicit requested Window/external key, legacy-direct defaults and optional retained/identity/reset capabilities | Old positional model meanings, no concrete router in view, exact-only services valid |
-| A12 new local source position | §4 O(1) `(name,owner,registration_epoch,data_version,total_changes)` and ordered full vector/bracket | No schema or writer change; no table/rowid hashing |
+| A12 new local source position | §4 O(1) `(name,owner,registration_epoch,data_version,total_changes)` and ordered full vector/bracket; D12 adds the separate managed gap writer and observer-visible completion | No schema or existing collector/daemon writer change; no table/rowid hashing |
 | A13 charts-design §§5.5–5.6 / charts-spec §§3.5, 4.2, 4.5 poll/apply | §6.3 context-specific no-frame drain/notify, ordinary deferred gate, poll drain/apply only while work exists | Pump transport-only, one frame-apply path, unchanged recovery §4.5 error owner |
 | A14 client boot/epoch cache key | §§5.3–5.4 canonical query plus full cursor/original answered_source, shared validation before insertion and bound-result rejection eviction | Existing cache cap, eviction, read-through behaviour and failure exclusion |
 | A15 client Future expiry/transport ownership | §§5.1–5.2 terminal/lost/retired release, tombstones, deadline and guarded retirement seam | Five-second Future settlement and unchanged wire |
 | A16 Series/DiskShare decode metadata | §5.3 preserves external app_key and binds correlated immutable QueryRequest | Existing decoded/wire field contracts |
 | A17 Files direct dispatch | §§5.1, 5.4 scheduler for pages/continuations/coverage and one acceptance writer | Files requested/served identity, paging, snapshot, counters, ownership, rendering |
-| A18 new local registration identity | §4.2 epoch changes on installation, replacement, reopening and physical rebinding | Existing add_source generation invalidation |
+| A18 new local registration identity | §§4.2, 4.5 epoch changes on installation, replacement, reopening and explicit rebinding; the primary writer retires with its observer | Existing add_source generation invalidation and no physical identity claim |
 
 No amendment authorises changing recovery-field set/clear sites, DEVICE completeness policy, lifetime Window validity, Files accounting, QueryService/store schema, daemon query selectors, root ownership, sampling cadence, consent, launch/range controls, wire format or daemon cache identity implementation. The cursor-complete client cache is not a rewrite of the daemon's database snapshot digest.
 
@@ -1043,7 +1257,7 @@ All entries are required later implementation tests, not results. Use synthetic 
 
 - `LiveOverviewHarness`: production HistoryRouter, IodClient where transport is under test, AppIoWindow and CollectorWindow with timers stopped/explicitly driven; synthetic registry subjects A/B; independent ranking peak None by default; real retained accessor, queued notification and UI rendering. Hold frame/series/totals/Files outcomes separately. Include both a delivery-only local barrier and a **real detail worker computation barrier** on the background executor; while the latter is held, submit/complete/apply a later frame on its independent executor before releasing the detail. Count worker submissions, charged capacity including retired jobs, frame retirements/replacements/applications and publication/clear/notification order.
 - `QueryTransportHarness`: real client framing/normalization/cache/timeout path, virtual clock, correlated result/error injection and a fake peer whose one historical job remains occupied after caller expiry. It may continue streaming snapshots/status while that job is held. Count actual query envelopes, connection generations, terminal events and socket retirement.
-- `LocalPositionStores`: two file-backed synthetic stores, persistent registered QueryService connections, independent external-writer connections, and explicit registration replacements. No copy-observer connection is substituted for a registered observer. Expose backup-complete and closing-read barriers plus committed deletion/update fixtures.
+- `LocalPositionStores`: two file-backed synthetic stores, persistent actor-owned read-only observing connections, the paired managed GUI gap writer, independent external-writer connections, and explicit registration replacements. No copy-observer connection is substituted for a registered observer. Expose backup-complete and closing-read barriers plus committed deletion/update fixtures.
 - `AppendProbe`: production charts with exact plot W=8 and the fixed 31/32-bucket fixtures/counted events/ceilings of §8.7, raw validation/comparison and aggregation counters kept separate, observable cache geometry and update/repaint calls. Instrument actual raw aggregation and bound element copies, including alternate/rebuild paths; no public debug interface or hidden extra scans.
 - `ExactOnlyQuery`: structural frozen query service with independent exact results/HistoryPending/errors and no retained methods. Identity-bearing variant implements exactly `exact_answer_identity` (§6.2); identity-less variant omits it. Drive actual adapter/UI authority epochs, including reset with an unchanged lifetime Window. Both use the real UI adapter.
 - `status_cases`: §12.7's explicit typed input/expected-row/text/visibility table plus shell lifecycle traces. Drive the production choice function and real labels, count decision calls and query/prepare events per specified action, and assert age separately; never substitute a true-predicate count.
@@ -1094,9 +1308,9 @@ All entries are required later implementation tests, not results. Use synthetic 
 | Exact test name | Required observation |
 | --- | --- |
 | `test_local_vector_observes_each_registered_connection_without_hashing` | Exact PRAGMA/property values and name order over two sources; constant per-source observation; no table scan/hash/rowid/new observer connection. |
-| `test_local_vector_changes_for_every_existing_commit_path` | Separate committed older-row deletion, rollup deletion, in-place collector_epoch update, receipt/handover update and non-primary-only write, using both own-connection and external commits. Row maxima remaining unchanged cannot defeat the token. |
+| `test_local_vector_changes_for_every_existing_commit_path` | Separate committed older-row deletion, rollup deletion, in-place collector_epoch update, receipt/handover update and non-primary-only write, using the managed gap writer and external commits. Row maxima remaining unchanged cannot defeat the token. |
 | `test_local_registration_add_remove_replace_and_reopen_never_repeat_token` | Addition/removal, same-name/owner replacement, same-counter new connection and physical rebinding each change vector; failed rebinding cannot certify old observer/new copied file. |
-| `test_local_observations_require_committed_registered_connections` | Both opening and closing observers reject active transactions; no caller commit/rollback or pinned transaction hides a commit; missing/invalid observer/physical binding yields operational error. |
+| `test_local_observations_require_committed_registered_connections` | Both opening and closing observers reject active transactions; no caller commit/rollback or pinned transaction hides a commit; a missing or invalid observer or unprovable source admission yields an operational error. |
 | `test_commit_during_backup_is_uncertified_with_one_replacement` | Commit behind backup barrier before completion; unequal bracket, own data may apply, displayed_source not promoted, exactly one later replacement. |
 | `test_commit_after_backup_before_closing_read_is_uncertified` | Distinct schedule with backup already finished; closing boundary still observes change and coalesces exactly one replacement. |
 | `test_commit_after_closing_read_is_caught_by_next_comparison` | Frame certifies its equal bracket; later commit does not retroactively alter it, next tick prepares once. |
@@ -1231,12 +1445,12 @@ The remote liveness fixture is normative. At virtual t=0.0 s admit ranking, answ
 1. Preserve existing frozen tests for exact A22 launch/range reasons and precedence, direct refusal cleanup, file-only subject/union selection, unavailable versus zero, None versus zero peak, signed residuals, DEVICE completeness, Files served/requested windows and served_gap_count None. Only tests asserting the expressly amended step/bin/exact-part/pending-error/endpoint-trigger mechanisms may change those expectations; keep their substantive honesty assertions.
 2. Keep the recovery-spec tests for same history key, queued local read gates, 30-second stall/floor arithmetic, explicit deferred/retry ownership, probe-generation arbitration, sole `_refresh_after_apply` writers, operational prepare failures and Files transient retirement. Add source/detail assertions without rewriting those controls to weaker fakes.
 3. After implementation run the focused new/extended inventory, then `python -m pytest` under the repository offscreen environment. Run `python -m pytest --collect-only -q` to verify exact named test inventory and parameter cases; an omitted row is not satisfied by a broad green suite. Report `preserve_exact` arms as preservation controls, with separate discriminator outcomes; baseline-green availability is never a fabricated initial red. Do not run these implementation gates during specification drafting.
-4. Extend the existing development-only typecheck gate to `python -m mypy --follow-imports=skip --ignore-missing-imports src/appio/history_types.py src/appio/history_validation.py src/appio/history_router.py src/appio/iodclient.py src/appio/ui/render_model.py src/appio/ui/charts.py src/appio/ui/theme.py src/appio/ui/main_window.py src/appio/ui/files_view.py src/appio/ui/collector_window.py`. Keep runtime dependencies unchanged; record the actual checker version in later evidence.
+4. Extend the existing development-only typecheck gate to `python -m mypy --follow-imports=skip --ignore-missing-imports src/appio/history_types.py src/appio/history_source.py src/appio/history_validation.py src/appio/history_router.py src/appio/iodclient.py src/appio/ui/render_model.py src/appio/ui/charts.py src/appio/ui/theme.py src/appio/ui/main_window.py src/appio/ui/files_view.py src/appio/ui/collector_window.py`. Keep runtime dependencies unchanged; record the actual checker version in later evidence.
 5. With passing targeted controls, falsify the mechanisms in a disposable copy: bypass external/request/selector validation (including before cache insertion); **remove only the unscoped process-mapping Coverage-value predicate while leaving AppKey, request, kind and every other check enabled** (the value-only arm must fail, the valid mapping control must pass, and the restored rerun must pass; the exercised boundary is the shared validator invoked by both the client pre-cache step and router settlement, so neither can mask the mutation); tie detail lifetime to generation; clear records in prepare; preserve a record on failure or restore it on pending; drop frame authority retirement; share the frame executor with detail; bypass a local outcome's binding; release transport on Future.done; omit seq from cache or restamp answered_source; observe only primary/latest rows, hold observer transaction or omit registration epoch; trigger on endpoint alone; let poll enter the deferred gate; omit typed model metadata or use share tier for chart identity; fail to reset the exact adapter on authority notification; reaggregate history on append; copy member-index vectors; merge runs by envelope; retain lowered peak/scale; truncate age; reverse status priorities or concatenate age into frozen texts. Every claimed kill names the exact discriminator parameter/assertion, with a passing control and restored rerun; import/collection failure is not a kill. Baseline-green preservation arms may not be credited for new retention/settlement/provenance mechanisms.
 6. Inspect offscreen grabs for a mirrored streaming curve, separate readable age, exact visible status/reason text and persistent Overview/Files navigation. Geometry and byte/state tests remain the nonvisual evidence; a screenshot alone cannot prove no bridge, scheduler serialization or source certification.
 7. Before integration, compare changed symbol/record inventories against §11's eighteen amendments and report any missing evidence as not run. No daemon/service manipulation, host transition, live privileged acceptance or unrelated earlier gate is introduced by this specification.
 
-Implementation sequencing: establish neutral records and shared selector validation first, then the client pre-cache/association/transport seams and typed local worker outcomes/independent capacity. Implement authority retirement and the single writer before wiring router/view notifications. Add model metadata and adapter identity/reset before timeline append callers, and typed refusal state before switching all status writers to the composer. Only then run the liveness, malformed-retry, direct-model, deferred-context and status/cost discriminator inventory. Do not demonstrate AC-4 with a delivery-only fixture while the executors still share capacity.
+Implementation sequencing: establish neutral records and shared selector validation first. Implement the primary managed registration and paired gap-writer seam, startup, transaction, callback, wake, retry and shutdown/fence tests while the old constructor still exists. Migrate the real callback and every constructor/test listed in §12.10, then narrow the router constructor only after that route is working. Next implement the client pre-cache/association/transport seams and typed local worker outcomes/independent capacity. Implement authority retirement and the single settlement writer before wiring router/view notifications. Add model metadata and adapter identity/reset before timeline append callers, and typed refusal state before switching all status writers to the composer. Only then run the liveness, malformed-retry, direct-model, deferred-context and status/cost discriminator inventory. Do not demonstrate AC-4 with a delivery-only fixture while the executors still share capacity.
 
 The following are mandatory exact mutation-to-discriminator mappings for review findings 10–11 (additional mutations above remain required where applicable):
 
@@ -1251,6 +1465,29 @@ The following are mandatory exact mutation-to-discriminator mappings for review 
 | Wrong status precedence / count all raw predicates instead of selecting the expected row | §12.7 values+work ->6a, pending+failed ->6d, direct refusal+PrepareRetry ->1, dual failed ->share_bad. `test_live_status_tree_selects_exactly_one_reachable_row` asserts actual row/text/visibility with zero query/prepare/recovery writes; changing a branch counter cannot satisfy it. |
 
 All of this is prospective implementation evidence. The review's baseline observations are preservation evidence only; no full application suite, new inventory test or future API test is claimed to have run during this revision.
+
+### 12.10 Transport-gap writer migration and regression gates
+
+The callback producer sites are `iodclient.py::_apply_gap` (bounded daemon gaps, line 1512) and `_record_transport_gap` (unbounded disconnect, lines 1729–1753). Production composition is `ui/collector_window.py::run_interactive` (lines 2033–2045), and the existing router implementation is `history_router.py::record_transport_gap` (lines 1999–2015). The ownership consumer is `history_router.py::_plan` (line 2135). Migrate these as a complete path, including the client holder and wake wiring, without changing the gap wire format or `_plan`'s rule that complete iod evidence is not overridden by a GUI absence. Existing `AppIoStore.record_gap` and `_insert_gap` are at `store.py:417` and `store.py:301` respectively. The schema's `gap` and `gui_absent` constraints are at `schema.py:328–336`.
+
+Reconcile the existing callback tests and harnesses: `tests/p3/test_history_router.py::test_transport_loss_is_local_and_does_not_override_a_complete_export` (calls at 515–516) must wait by actor barrier and owner drain before inspecting the row, while retaining both GUI deduplication and complete-export assertions. `tests/p3/test_collector_window.py` installs real callbacks at 2497 and 3660, with a test double at 2801. `tests/p3/acceptance_harness.py` installs one at 421 and constructs/reconstructs routers at 432 and 614. `tests/p3/test_collector_owner.py:63` is a double. Migrate these and `tests/live_overview_support.py:645` to managed fixtures, preserve their externally observed outcomes, and retain the callback-compatible `None` return. Do not substitute a mock writer for the real callback path below.
+
+Constructor migration also covers the worker helper calls in `history_router.py:1674,2298,2359`, the production constructor at `collector_window.py:2045`, and `collector_owner.py:276`'s existing export registration. The affected direct test constructors are `tests/p3/test_collector_window.py:1746,2339,2506,3659,5338,5408,5518`, `tests/p3/test_history_router.py:113`, `tests/p3/test_live_overview_client.py:1138,1456,1550`, `tests/p3/test_live_overview_router.py:1234,1433,1558,1782,2381,3291,3520,3610`, `tests/p4/test_file_history_isolation.py:52,83,102,122,148,177`, `tests/p4/test_file_served_interval.py:59`, `tests/p4/test_files_tab_clipping.py:28,38,59`, `tests/p4/test_files_tab_process_scope.py:15,33`, and `tests/p4/test_files_tab_real_store.py:108`, and `tests/p4/test_file_history_router.py:96,247,304,543,562,576,624,658,727`. Managed test fixtures create their own actor-owned connections and close them through the registry, while unrelated legacy callers assert the fail-closed error. The line numbers identify the drafting baseline and are not future line-number requirements.
+
+Required exact tests are prospective implementation tests. Use real file-backed stores, actual actor and SQLite connections, production router and client where named, a stopped/explicitly driven Qt loop, and barriers rather than wall-clock sleeps. Each journal-mode arm runs with both DELETE and WAL.
+
+| Exact test name and target | Required observations |
+| --- | --- |
+| `test_transport_gap_callback_persists_before_frame_capture` — `tests/p3/test_collector_window.py` | Drive a valid encoded bounded gap through the real `IodClient.pump` and the same `run_interactive` callback composition. Hold the actor before its transaction, assert pump returns and every notice is immediately in `transport_issues`, start prepare and prove zero capture/ranking/worker submissions while held. Release, drain, then assert one committed GUI row, observer-visible completion, invalidation before the new frame's capture, the capture contains that row, and applied ownership matches `_plan`. With complete iod coverage assert it is not overridden. A real unbounded disconnect is retained as a notice and creates no row or invalidation. |
+| `test_transport_gap_atomic_dedup_with_concurrent_writers` — `tests/p3/test_history_router.py` | In each journal mode, two real SQLite connections contend on a barrier around `BEGIN IMMEDIATE`, including a cooperating external writer attempting the same gap and an independent collector-style write. Release the lock explicitly, drain, and assert exactly one matching GUI gap, both commits preserved, original epoch/seq/bounds, no root gap, and observer data_version advances. Include the reverse winner order, active reader and WAL checkpoint. Verify bounded busy retry and GUI-thread responsiveness. |
+| `test_transport_gap_unknown_boot_bounds_and_epoch_fallback` — `tests/p3/test_history_router.py` | Empty identity, None bounds, negative start and unknown boot produce notices but no row/invalidation. Existing boot with no GUI epoch inserts epoch 1 and seq 0. The unknown-boot and duplicate no-write arms use ROLLBACK and leave the source vector unchanged in the absence of independent commits. Existing GUI epoch is used, and a duplicate with a different notice reason/iod cursor still deduplicates by exactly boot and bounds and invalidates once per completed callback. |
+| `test_transport_gap_writer_failure_retry_and_commit_ambiguity` — `tests/p3/test_history_router.py` | Independently inject BUSY at begin and commit, LOCKED, I/O error and a failure after actual COMMIT. Assert rollback where possible, bounded attempts, exact retained error, no certified dependent frame, no duplicate after retry, and only the successfully retried notice clears its error. A permanent failure cannot self-retry through poll/notification. A later ordinary refresh retries once. |
+| `test_transport_gap_observer_visibility_rejects_divergent_pair` — `tests/p3/test_live_overview_router.py` | In a disposable fixture deliberately arrange the registry-owned observer and writer to address different valid stores before admission, without using path/stat identity claims. Assert the uncommitted nonce challenge fails before any gap is inserted and its temporary boot row is rolled back. Also hold a third shared-cache writer lock on the observer database to prove a lock alone cannot pass the challenge. Separately inject a post-COMMIT observer failure and assert the exact visibility error, no success or frame certification, and the already committed writer row is acknowledged. A correct pair sees the nonce only during admission, rolls it back before its initial source observation, and completes with committed-read mode restored. A subsequent explicit replacement creates fresh epochs and never adopts an old completion. |
+| `test_transport_gap_writer_registration_retirement_and_close` — `tests/p3/test_live_overview_router.py` | Check observer query_only is ON and the authorizer rejects writes, including an isolated mutation removing query_only while the authorizer remains active; disabling query_only itself must be denied. Prepare and execute the guarded `read_uncommitted=ON` during admission, then attempt the identical SQL after the guard closes and require denial, proving statement caching cannot bypass the authorizer. Check writer is separately actor-created and thread-affine, arbitrary connection admission fails, only the primary GUI slot has a writer, and failed pair admission exposes no registration. Hold a write across retire/replace and close, prove old completions cannot invalidate the new registration or publish, queued retired work has an error, and both connections close on the actor. Shutdown-drain admitted writes without waiting in the UI and preserve worker capacity accounting. |
+| `test_transport_gap_startup_and_callback_shutdown_order` — `tests/p3/test_collector_window.py` | Exercise production startup with delayed/failed primary registration and the real wake object. Pump/prepare cannot start before successful admission, bootstrap closes on its owner thread, errors are surfaced, and no UI thread waits. Shut down with an admitted write and assert coordinator/client close precede registry close, actor finishes/fails and closes, and late completion cannot touch the closed window. |
+| `test_transport_gap_fence_error_and_later_gap_ordering` — `tests/p3/test_live_overview_router.py` | A prior gap's pending write fences local capture and remote ranking, its invalidation applies to the old frame before the new generation activates, and local requested_source is the actual post-fence opening vector. A write failure takes the preparation error path, a later ordinary retry recovers, and a gap arriving after a preparation follows ordinary invalidation without being mistaken for its fence. Poll remains armed and no callback synchronously waits. |
+
+Mandatory isolated production mutations and their named killers, each with a passing control and restored rerun, are: remove the atomic duplicate check or move it before `BEGIN IMMEDIATE` -> `test_transport_gap_atomic_dedup_with_concurrent_writers`; remove either the observer authorizer or query_only control -> `test_transport_gap_writer_registration_retirement_and_close`; commit a no-write duplicate or unknown-boot transaction -> `test_transport_gap_unknown_boot_bounds_and_epoch_fallback`; omit the shared-cache binding challenge or observer visibility check -> `test_transport_gap_observer_visibility_rejects_divergent_pair`; bypass the preparation fence or invalidate the newer fenced generation -> `test_transport_gap_callback_persists_before_frame_capture` and `test_transport_gap_fence_error_and_later_gap_ordering`; ignore a failed commit or turn it into unknown boot -> `test_transport_gap_writer_failure_retry_and_commit_ambiguity`; deliver an old completion to a replacement epoch or close the actor connection on the owner thread -> `test_transport_gap_writer_registration_retirement_and_close`; remove the real callback wiring -> `test_transport_gap_callback_persists_before_frame_capture`. Assert the named row, barrier ordering, error or thread identity, not merely test collection or a generic exception. Run these mutations in disposable copies only.
 
 ## 13. Specification decisions and exclusions
 
@@ -1271,5 +1508,6 @@ The following decision register records the review corrections. Each entry selec
 | D09 / 9 | An optional exact-provenance method and UI-owned authority notifications/reset define adapter stamps and unchanged-lifetime retirement (§6.2). |
 | D10 / 10 | Mark baseline-green dependency arms as preservation controls; require separate retained-window/failure/provenance discriminators and exact mutation-to-assertion mappings (§§12.5, 12.9). |
 | D11 / 11 | Fixed chart fixtures count aggregation, bounds, intervals and vertices separately; a typed status result is checked against explicit expected rows/text/visibility (§§8.7, 9.2, 12.6–12.7). |
+| D12 / epoch 6 B1 | The primary managed GUI registration owns a separate actor-thread gap writer, with atomic deduplication, observer-visible completion, asynchronous preparation fence and paired retirement (§§4.5, 6.1, 12.10). |
 
-The collector's ten-second cadence, DEVICE whole-window attribution rule, retention/tiering, store schema/writers, concrete QueryService, ownership/receipts, daemon protocol, Files rendering/paging/accounting, scope-control availability, helper/consent behaviour, session and display-manager lifetime remain outside this work. No reboot, shutdown, power, sleep, service restart, process-tree signal, or host repair is needed to draft or implement these contracts.
+The collector's ten-second cadence, DEVICE whole-window attribution rule, retention/tiering, store schema and existing collector/daemon writers, concrete QueryService, ownership/receipts, daemon protocol, Files rendering/paging/accounting, scope-control availability, helper/consent behaviour, session and display-manager lifetime remain outside this work. No reboot, shutdown, power, sleep, service restart, process-tree signal, or host repair is needed to draft or implement these contracts.
