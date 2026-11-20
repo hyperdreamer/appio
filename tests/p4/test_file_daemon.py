@@ -238,6 +238,9 @@ def test_main_logs_daemon_failure_with_traceback(monkeypatch, caplog):
         last_error = None
         selector = SimpleNamespace(close=lambda: None)
 
+        def __init__(self, *, sample_ns, flush_ns, maintenance_ns):
+            del sample_ns, flush_ns, maintenance_ns
+
         def start(self):
             raise RuntimeError("synthetic daemon failure")
 

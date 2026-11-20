@@ -309,6 +309,10 @@ def test_period_runtime_phase_is_available_in_side_effect_free_dry_run(monkeypat
     test_period_phase_dry_run_is_pure(monkeypatch, capsys, tmp_path, "period-runtime")
 
 
+def test_period_capacity_phase_is_available_in_side_effect_free_dry_run(monkeypatch, capsys, tmp_path):
+    test_period_phase_dry_run_is_pure(monkeypatch, capsys, tmp_path, "period-capacity")
+
+
 def test_dry_run_purity_guard_rejects_local_os_open(monkeypatch, capsys, tmp_path):
     marker = tmp_path / "local-os-marker"
 

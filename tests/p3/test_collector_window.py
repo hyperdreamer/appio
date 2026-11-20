@@ -4669,11 +4669,24 @@ def test_sampling_apply_success_waits_for_matching_nanosecond_probe(qtbot):
         assert window.pending_period_seconds == 5
         setup.started.clear()
         setup.hold = True
+        setup.facts = replace(period_facts(5), sample_ns=5 * NS + 1)
         setup.complete("set-sample-period", period_reply(5, "applied", answering=True))
         qtbot.waitUntil(lambda: setup.started.is_set() and not window.busy, timeout=2000)
         assert window.pending_period_seconds == 5
+
+        # A nanosecond-level mismatch must remain pending even though the
+        # reported value rounds to the requested whole-second setting.
+        after = window.facts_applied
         setup.release.set()
-        qtbot.waitUntil(lambda: window.pending_period_seconds is None, timeout=2000)
+        qtbot.waitUntil(lambda: window.facts_applied > after, timeout=2000)
+        assert window.pending_period_seconds == 5
+        assert window.settings.sample_period_status.text() == (
+            "Requested 5 s, collector reports 5.000000001 s.")
+
+        setup.hold = False
+        setup.facts = period_facts(5)
+        refresh_and_settle(qtbot, window)
+        assert window.pending_period_seconds is None
         assert window.settings.sample_period_status.text() == "Sampling every 5 s."
     finally:
         setup.release.set()
