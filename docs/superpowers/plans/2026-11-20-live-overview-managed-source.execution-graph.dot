@@ -1,0 +1,21 @@
+digraph execution_manifest {
+  rankdir=LR;
+  node [shape=box, style=rounded];
+  "T-001" [label="T-001 [foundation] Extend immutable managed-source and snapshot provenance records"];
+  "T-002" [label="T-002 [source] Build the managed source registry and actor-owned observations"];
+  "T-003" [label="T-003 [source] Serialize captures and convert local workers to immutable snapshots"];
+  "T-004" [label="T-004 [source] Add the registry-owned GUI gap writer and preparation fence"];
+  "T-005" [label="T-005 [integration] Cut over the router surface and every production/test caller"];
+  "T-006" [label="T-006 [regression] Complete settlement, source-retirement and startup regression coverage"];
+  "T-007" [label="T-007 [verification] Prove the gap writer and managed-source boundaries with isolated mutations"];
+  "T-008" [label="T-008 [acceptance] Final integration review and evidence package"];
+  "T-001" -> "T-002";
+  "T-002" -> "T-003";
+  "T-002" -> "T-004";
+  "T-003" -> "T-004";
+  "T-003" -> "T-005";
+  "T-004" -> "T-005";
+  "T-005" -> "T-006";
+  "T-006" -> "T-007";
+  "T-007" -> "T-008";
+}

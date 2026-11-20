@@ -1,0 +1,279 @@
+# appio live Overview managed-source execution manifest — derived from the committed plan.
+# 6 lanes; every task maps exactly once to a source-plan task.
+schema_version: 1
+epoch: 6
+source_plan:
+  path: "docs/superpowers/plans/2026-11-20-live-overview-managed-source.md"
+  sha256: "ac4285a68ab88c7511ed48107876b58f741c81903a679e47587406a331d0df98"
+  commit: "86fccfec840621425d89cda28f1e11b3dd5541b5"
+  tasks: 8
+source_documents:
+  - path: "docs/superpowers/specs/2026-11-15-live-overview-totals-spec.md"
+    sha256: "03f1d2adbc3f8a67b94429a4d61ef61008c8761c37ce78624ba4f12c6874b0c3"
+  - path: "docs/superpowers/specs/2026-11-15-live-overview-totals-design.md"
+    sha256: "8d6941b545ba15c9338f94df63d9d5c6b0b861e7cc7f14f8e85e2a675a6d70d9"
+derivation:
+  lane_from: "the plan per-task Lane line"
+  depends_on_from: "the plan per-task Depends on line plus every same-lane predecessor edge"
+  ownership_from: "the plan per-task Files allowlist, repository-relative POSIX paths"
+  validation_from: "the test modules each task owns, run as argv with no shell metacharacters"
+  exclusive_resources_policy: "none; every task is source-of-truth sequential work over shared modules, so lanes are serialized by explicit cross-lane dependency edges"
+  interface_policy: "signature digest is sha256 over the whitespace-normalized signature"
+  signature_normalization: "Collapse ASCII whitespace runs to one space; trim; SHA-256 over UTF-8 signature bytes without trailing newline."
+lanes:
+  - id: foundation
+    task_ids: [T-001]
+  - id: source
+    task_ids: [T-002, T-003, T-004]
+  - id: integration
+    task_ids: [T-005]
+  - id: regression
+    task_ids: [T-006]
+  - id: verification
+    task_ids: [T-007]
+  - id: acceptance
+    task_ids: [T-008]
+interfaces:
+  - id: appio.records.v1
+    producer: T-001
+    signature: "RetentionScope | AcceptedIdentity | ManagedSourceSpec | RemotePosition | LocalPosition | LocalPositionVector | LocalBracket | CapturedSourceImage | CapturedSourceSet | SnapshotProvenance | SourcePosition | AnswerProvenance | RetainedRecord | PartState | FrameProvenance | SeriesMetadata"
+    signature_sha256: "85be62a790bd1673c98f16ad1d1faedc029d81f4bb9d39a7848b3f34d951da63"
+  - id: appio.managed_source.v1
+    producer: T-002
+    signature: "ManagedSourceRegistry.register(spec: ManagedSourceSpec) -> RegistrationFuture; replace(name: str, spec: ManagedSourceSpec) -> RegistrationFuture; retire(name: str, reason: str) -> None; observe() -> LocalPositionVector; capture() -> CaptureFuture; close() -> None"
+    signature_sha256: "6a4ff09359dc1ab0f27f201bb43eb858215e69f4ff8e4c6cd98516b9bdb23306"
+  - id: appio.snapshot_provenance.v1
+    producer: T-003
+    signature: "local_capture(sources: ManagedSourceRegistry, workers: WorkerPool) -> CapturedSourceSet; worker_outcome(images: CapturedSourceSet, request: QueryRequest) -> LocalOutcome"
+    signature_sha256: "88a431295b85e9476c75e119de7bfef552a018b940c6274a511fc18a42ff802a"
+  - id: appio.gap_writer.v1
+    producer: T-004
+    signature: "append_transport_gap(notice: TransportGapNotice) -> Future[None]; gap_persistence_error() -> str | None; prepare_fence() -> None"
+    signature_sha256: "0db9b196efdc21cc45332734b9a517dac4422593f190781e7912ee0e4d06a513"
+  - id: appio.router_surface.v1
+    producer: T-005
+    signature: "HistoryRouter(sources: ManagedSourceRegistry, client: IodClient, registry: AppRegistry, *, clock_ns: Callable[[], int] = time.monotonic_ns); add_managed_source(spec: ManagedSourceSpec) -> None; retire_managed_source(name: str, reason: str) -> None; replace_managed_source(name: str, spec: ManagedSourceSpec) -> None; local_position(source_name: str) -> LocalPosition; source_position() -> SourcePosition"
+    signature_sha256: "847eb46ae6d23b8f9206246acb3a1fa12a155f7b415f06e1af3a6cd36dd83ce0"
+tasks:
+  - id: T-001
+    plan_task: 1
+    title: "Extend immutable managed-source and snapshot provenance records"
+    implementer_tier: "advanced"
+    lane: foundation
+    sequence: 1
+    depends_on: []
+    owns:
+      - "src/appio/history_types.py"
+      - "tests/live_overview_support.py"
+      - "tests/p3/test_live_overview_router.py"
+    resources: []
+    produces: ["appio.records.v1"]
+    consumes: []
+    validation:
+      - argv: ["python", "-m", "pytest", "-q", "tests/live_overview_support.py"]
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+          QT_QPA_PLATFORM: "offscreen"
+          PYTEST_QT_API: "pyqt6"
+      - argv: ["python", "-m", "pytest", "-q", "tests/p3/test_live_overview_router.py"]
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+          QT_QPA_PLATFORM: "offscreen"
+          PYTEST_QT_API: "pyqt6"
+  - id: T-002
+    plan_task: 2
+    title: "Build the managed source registry and actor-owned observations"
+    implementer_tier: "capable"
+    lane: source
+    sequence: 1
+    depends_on: ["T-001"]
+    owns:
+      - "src/appio/history_source.py"
+      - "tests/live_overview_support.py"
+      - "tests/p3/test_live_overview_router.py"
+    resources: []
+    produces: ["appio.managed_source.v1"]
+    consumes: ["appio.records.v1"]
+    validation:
+      - argv: ["python", "-m", "pytest", "-q", "tests/p3/test_live_overview_router.py"]
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+          QT_QPA_PLATFORM: "offscreen"
+          PYTEST_QT_API: "pyqt6"
+  - id: T-003
+    plan_task: 3
+    title: "Serialize captures and convert local workers to immutable snapshots"
+    implementer_tier: "capable"
+    lane: source
+    sequence: 2
+    depends_on: ["T-002"]
+    owns:
+      - "src/appio/history_source.py"
+      - "src/appio/history_router.py"
+      - "tests/live_overview_support.py"
+      - "tests/p3/test_live_overview_router.py"
+      - "tests/p4/test_file_history_router.py"
+    resources: []
+    produces: ["appio.snapshot_provenance.v1"]
+    consumes: ["appio.records.v1", "appio.managed_source.v1"]
+    validation:
+      - argv: ["python", "-m", "pytest", "-q", "tests/p3/test_live_overview_router.py"]
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+          QT_QPA_PLATFORM: "offscreen"
+          PYTEST_QT_API: "pyqt6"
+      - argv: ["python", "-m", "pytest", "-q", "tests/p4/test_file_history_router.py"]
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+          QT_QPA_PLATFORM: "offscreen"
+          PYTEST_QT_API: "pyqt6"
+  - id: T-004
+    plan_task: 4
+    title: "Add the registry-owned GUI gap writer and preparation fence"
+    implementer_tier: "capable"
+    lane: source
+    sequence: 3
+    depends_on: ["T-002", "T-003"]
+    owns:
+      - "src/appio/history_source.py"
+      - "src/appio/history_router.py"
+      - "tests/live_overview_support.py"
+      - "tests/p3/test_live_overview_router.py"
+      - "tests/p3/test_collector_window.py"
+    resources: []
+    produces: ["appio.gap_writer.v1"]
+    consumes: ["appio.managed_source.v1"]
+    validation:
+      - argv: ["python", "-m", "pytest", "-q", "tests/p3/test_live_overview_router.py"]
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+          QT_QPA_PLATFORM: "offscreen"
+          PYTEST_QT_API: "pyqt6"
+      - argv: ["python", "-m", "pytest", "-q", "tests/p3/test_collector_window.py"]
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+          QT_QPA_PLATFORM: "offscreen"
+          PYTEST_QT_API: "pyqt6"
+  - id: T-005
+    plan_task: 5
+    title: "Cut over the router surface and every production/test caller"
+    implementer_tier: "advanced"
+    lane: integration
+    sequence: 1
+    depends_on: ["T-003", "T-004"]
+    owns:
+      - "src/appio/history_router.py"
+      - "src/appio/collector_owner.py"
+      - "src/appio/ui/collector_window.py"
+      - "tests/live_overview_support.py"
+      - "tests/p3/acceptance_harness.py"
+    resources: []
+    produces: ["appio.router_surface.v1"]
+    consumes: ["appio.records.v1", "appio.snapshot_provenance.v1", "appio.gap_writer.v1"]
+    validation:
+      - argv: ["python", "-m", "pytest", "-q", "tests/p3/test_live_overview_router.py"]
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+          QT_QPA_PLATFORM: "offscreen"
+          PYTEST_QT_API: "pyqt6"
+      - argv: ["python", "-m", "pytest", "-q", "tests/p3/test_collector_window.py"]
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+          QT_QPA_PLATFORM: "offscreen"
+          PYTEST_QT_API: "pyqt6"
+      - argv: ["python", "-m", "pytest", "-q", "tests/p3/test_collector_owner.py"]
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+          QT_QPA_PLATFORM: "offscreen"
+          PYTEST_QT_API: "pyqt6"
+  - id: T-006
+    plan_task: 6
+    title: "Complete settlement, source-retirement and startup regression coverage"
+    implementer_tier: "capable"
+    lane: regression
+    sequence: 1
+    depends_on: ["T-005"]
+    owns:
+      - "tests/p3/test_live_overview_router.py"
+      - "tests/p3/test_live_overview_client.py"
+      - "tests/p3/test_collector_window.py"
+      - "tests/p3/test_collector_owner.py"
+      - "tests/p3/acceptance_harness.py"
+    resources: []
+    produces: []
+    consumes: ["appio.router_surface.v1"]
+    validation:
+      - argv: ["python", "-m", "pytest", "-q", "tests/p3/test_live_overview_router.py"]
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+          QT_QPA_PLATFORM: "offscreen"
+          PYTEST_QT_API: "pyqt6"
+      - argv: ["python", "-m", "pytest", "-q", "tests/p3/test_live_overview_client.py"]
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+          QT_QPA_PLATFORM: "offscreen"
+          PYTEST_QT_API: "pyqt6"
+      - argv: ["python", "-m", "pytest", "-q", "tests/p3/test_collector_window.py"]
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+          QT_QPA_PLATFORM: "offscreen"
+          PYTEST_QT_API: "pyqt6"
+      - argv: ["python", "-m", "pytest", "-q", "tests/p3/test_collector_owner.py"]
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+          QT_QPA_PLATFORM: "offscreen"
+          PYTEST_QT_API: "pyqt6"
+  - id: T-007
+    plan_task: 7
+    title: "Prove the gap writer and managed-source boundaries with isolated mutations"
+    implementer_tier: "advanced"
+    lane: verification
+    sequence: 1
+    depends_on: ["T-006"]
+    owns:
+      - "tests/p3/test_live_overview_router.py"
+      - "tests/p3/test_collector_window.py"
+      - "tests/p3/test_collector_owner.py"
+      - "tests/p3/test_history_router.py"
+      - "tests/live_overview_support.py"
+    resources: []
+    produces: []
+    consumes: ["appio.router_surface.v1"]
+    validation:
+      - argv: ["python", "-m", "pytest", "-q", "tests/p3/test_live_overview_router.py"]
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+          QT_QPA_PLATFORM: "offscreen"
+          PYTEST_QT_API: "pyqt6"
+      - argv: ["python", "-m", "pytest", "-q", "tests/p3/test_collector_window.py"]
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+          QT_QPA_PLATFORM: "offscreen"
+          PYTEST_QT_API: "pyqt6"
+      - argv: ["python", "-m", "pytest", "-q", "tests/p3/test_history_router.py"]
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+          QT_QPA_PLATFORM: "offscreen"
+          PYTEST_QT_API: "pyqt6"
+  - id: T-008
+    plan_task: 8
+    title: "Final integration review and evidence package"
+    implementer_tier: "frontier"
+    lane: acceptance
+    sequence: 1
+    depends_on: ["T-007"]
+    owns: []
+    resources: []
+    produces: []
+    consumes: ["appio.router_surface.v1"]
+    validation:
+      - argv: ["python", "-m", "pytest", "-q", "tests/p3/test_live_overview_router.py"]
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+          QT_QPA_PLATFORM: "offscreen"
+          PYTEST_QT_API: "pyqt6"
+      - argv: ["python", "-m", "pytest", "-q", "tests/p3/test_collector_window.py"]
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+          QT_QPA_PLATFORM: "offscreen"
+          PYTEST_QT_API: "pyqt6"
