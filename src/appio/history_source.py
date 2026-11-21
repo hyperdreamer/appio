@@ -74,8 +74,10 @@ _WRITE_ACTION_NAMES = (
     "SQLITE_CREATE_TEMP_VIEW",
     "SQLITE_CREATE_TRIGGER",
     "SQLITE_CREATE_VIEW",
+    "SQLITE_CREATE_VTABLE",
     "SQLITE_DROP_INDEX",
     "SQLITE_DROP_TABLE",
+    "SQLITE_DROP_VTABLE",
     "SQLITE_DROP_TEMP_INDEX",
     "SQLITE_DROP_TEMP_TABLE",
     "SQLITE_DROP_TEMP_TRIGGER",
@@ -160,6 +162,7 @@ def _connection_options(spec: ManagedSourceSpec) -> dict[str, object]:
             if cached_statements < 0 or str(cached_statements) != value:
                 raise SourceAdmissionError(
                     "managed source cached_statements is invalid")
+            options[key] = cached_statements
         elif key == "isolation_level":
             if value not in ("DEFERRED", "IMMEDIATE", "EXCLUSIVE"):
                 raise SourceAdmissionError(
@@ -243,6 +246,20 @@ def _backup_image(connection: sqlite3.Connection) -> bytes:
         destination.close()
 
 
+class _CaptureLease:
+    """Keep one actor available until an admitted capture has finished."""
+
+    def __init__(self, actor: _SourceActor) -> None:
+        self.actor = actor
+        self._released = False
+
+    def release(self) -> None:
+        if self._released:
+            return
+        self._released = True
+        self.actor._release_lease(self)
+
+
 class _SourceActor:
     """Serialize all access to one observer connection on its owner thread."""
 
@@ -251,7 +268,12 @@ class _SourceActor:
         self.spec = spec
         self.registration_epoch = registration_epoch
         self._wake = wake
-        self._commands: queue.Queue[tuple[object, Future | None]] = queue.Queue()
+        self._commands: queue.Queue[
+            tuple[object, Future | None, _CaptureLease | None]
+        ] = queue.Queue()
+        self._deferred: list[tuple[object, Future]] = []
+        self._leases: set[_CaptureLease] = set()
+        self._stop_queued = False
         self.ready: Future = Future()
         self.closed: Future = Future()
         self._status_lock = threading.Lock()
@@ -271,25 +293,63 @@ class _SourceActor:
     def start(self) -> None:
         self._thread.start()
 
-    def submit(self, operation: str) -> Future:
+    def submit(self, operation: str, lease: _CaptureLease | None = None) -> Future:
         future: Future = Future()
         with self._status_lock:
-            if self._status != "active":
+            if lease is None:
+                if self._status != "active":
+                    future.set_exception(SourceAdmissionError(
+                        f"managed source {self.spec.name!r} is not active"))
+                    return future
+                if self._leases:
+                    self._deferred.append((operation, future))
+                else:
+                    self._commands.put((operation, future, None))
+            elif (lease.actor is not self or lease not in self._leases
+                  or self._status not in ("active", "retiring")):
                 future.set_exception(SourceAdmissionError(
                     f"managed source {self.spec.name!r} is not active"))
-                return future
-            self._commands.put((operation, future))
+            else:
+                self._commands.put((operation, future, lease))
         return future
+
+    def acquire_lease(self) -> _CaptureLease:
+        with self._status_lock:
+            if self._status != "active":
+                raise SourceAdmissionError(
+                    f"managed source {self.spec.name!r} is not active")
+            lease = _CaptureLease(self)
+            self._leases.add(lease)
+            return lease
 
     def close(self) -> Future:
         with self._status_lock:
             if self._status not in ("retiring", "closed", "failed"):
                 self._status = "retiring"
-                self._commands.put((_STOP, None))
+            if self._status == "retiring" and not self._leases:
+                self._queue_stop_locked()
             elif self._status == "failed" and not self.closed.done():
                 # The opening path always completes ``closed`` after cleanup.
                 pass
         return self.closed
+
+    def _queue_stop_locked(self) -> None:
+        if not self._stop_queued:
+            self._stop_queued = True
+            self._commands.put((_STOP, None, None))
+
+    def _release_lease(self, lease: _CaptureLease) -> None:
+        with self._status_lock:
+            if lease not in self._leases:
+                return
+            self._leases.remove(lease)
+            if self._leases:
+                return
+            for command in self._deferred:
+                self._commands.put((*command, None))
+            self._deferred.clear()
+            if self._status == "retiring":
+                self._queue_stop_locked()
 
     def _set_status(self, status: str) -> None:
         with self._status_lock:
@@ -311,11 +371,15 @@ class _SourceActor:
         self._notify()
         try:
             while True:
-                operation, future = self._commands.get()
+                operation, future, lease = self._commands.get()
                 if operation is _STOP:
                     break
                 assert future is not None
-                if self.status != "active":
+                with self._status_lock:
+                    admitted = (self._status == "active" or (
+                        lease is not None and lease in self._leases
+                        and self._status == "retiring"))
+                if not admitted:
                     future.set_exception(SourceAdmissionError(
                         f"managed source {self.spec.name!r} is retired"))
                     self._notify()
@@ -461,12 +525,25 @@ class ManagedSourceRegistry:
                     "managed source registry has no active sources"))
             capture_id = self._next_capture_id
             self._next_capture_id += 1
+            leases: list[_CaptureLease] = []
+            try:
+                for registration in registrations:
+                    leases.append(registration.actor.acquire_lease())
+            except BaseException as error:
+                for lease in leases:
+                    lease.release()
+                return _failed_future(_safe_error(
+                    registrations[0].spec, error, "capture admission"))
         try:
             future = self._capture_executor.submit(
-                self._capture, capture_id, registrations)
+                self._capture, capture_id, registrations, tuple(leases))
         except RuntimeError:
+            for lease in leases:
+                lease.release()
             return _failed_future(SourceAdmissionError(
                 "managed source registry is closed"))
+        future.add_done_callback(
+            lambda _completed: self._release_capture_leases(leases))
         future.add_done_callback(lambda _completed: self._notify())
         return future
 
@@ -496,6 +573,11 @@ class ManagedSourceRegistry:
             for actor in actors.values():
                 actor.close()
         self._capture_executor.shutdown(wait=False, cancel_futures=True)
+
+    @staticmethod
+    def _release_capture_leases(leases: tuple[_CaptureLease, ...]) -> None:
+        for lease in leases:
+            lease.release()
 
     def _start_after_retirement(self, spec: ManagedSourceSpec, future: Future,
                                 retired: Future) -> None:
@@ -633,10 +715,19 @@ class ManagedSourceRegistry:
         names = sorted(registrations, key=lambda name: name.encode("utf-8"))
         return tuple(registrations[name] for name in names)
 
-    def _collect(self, registrations: tuple[_Registration, ...],
-                 operation: str) -> tuple[LocalPosition, ...]:
-        futures = [registration.actor.submit(operation)
-                   for registration in registrations]
+    def _collect(
+            self,
+            registrations: tuple[_Registration, ...],
+            operation: str,
+            leases: tuple[_CaptureLease, ...] | None = None,
+    ) -> tuple[LocalPosition, ...]:
+        if leases is None:
+            futures = [registration.actor.submit(operation)
+                       for registration in registrations]
+        else:
+            futures = [registration.actor.submit(operation, lease)
+                       for registration, lease in zip(
+                           registrations, leases, strict=True)]
         positions = []
         for future in futures:
             try:
@@ -657,15 +748,15 @@ class ManagedSourceRegistry:
                 raise SourceAdmissionError("managed source registrations changed")
 
     def _capture(self, capture_id: int,
-                 registrations: tuple[_Registration, ...]) -> CapturedSourceSet:
+                 registrations: tuple[_Registration, ...],
+                 leases: tuple[_CaptureLease, ...]) -> CapturedSourceSet:
         with self._capture_lock:
-            opening_positions = self._collect(registrations, "observe")
+            opening_positions = self._collect(registrations, "observe", leases)
             opening = LocalPositionVector(opening_positions)
 
-            image_futures = [registration.actor.submit("capture")
-                             for registration in registrations]
             images = []
-            for registration, future in zip(registrations, image_futures, strict=True):
+            for registration, lease in zip(registrations, leases, strict=True):
+                future = registration.actor.submit("capture", lease)
                 try:
                     image = future.result()
                 except BaseException as error:
@@ -679,9 +770,8 @@ class ManagedSourceRegistry:
                     hashlib.sha256(image).hexdigest(),
                 ))
 
-            closing_positions = self._collect(registrations, "observe")
+            closing_positions = self._collect(registrations, "observe", leases)
             closing = LocalPositionVector(closing_positions)
-            self._verify_current(registrations)
             digest = hashlib.sha256()
             digest.update(b"appio-captured-source-set-v1\0")
             for image in images:

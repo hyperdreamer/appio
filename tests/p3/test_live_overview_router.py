@@ -1898,6 +1898,88 @@ def _register_fixture_sources(registry, stores, *names):
     return receipts
 
 
+def test_capture_retirement_waits_for_admitted_capture(tmp_path, monkeypatch):
+    """An admitted capture completes before retirement closes its actor."""
+
+    import appio.history_source as history_source
+    from live_overview_support import LocalPositionStores
+    from appio.history_source import SourceAdmissionError
+    from appio.history_types import CapturedSourceSet
+
+    stores = LocalPositionStores(tmp_path)
+    registry = stores.new_managed_registry()
+    entered = threading.Event()
+    release = threading.Event()
+    original_backup = history_source._backup_image
+
+    def blocked_backup(connection):
+        entered.set()
+        if not release.wait(5):
+            raise TimeoutError("test did not release source backup")
+        return original_backup(connection)
+
+    monkeypatch.setattr(history_source, "_backup_image", blocked_backup)
+    try:
+        _register_fixture_sources(registry, stores, "local")
+        capture = registry.capture()
+        assert entered.wait(5)
+
+        registry.retire("local", "capture lease test")
+        release.set()
+
+        captured = capture.result(timeout=10)
+        assert isinstance(captured, CapturedSourceSet)
+        assert captured.images[0].name == "local"
+        with pytest.raises(SourceAdmissionError):
+            registry.observe()
+    finally:
+        release.set()
+        registry.close()
+        stores.close()
+
+
+def test_managed_source_forwards_cached_statements_option(tmp_path, monkeypatch):
+    """Admission passes the validated statement-cache size to sqlite3.connect."""
+
+    import appio.history_source as history_source
+    from live_overview_support import LocalPositionStores
+
+    stores = LocalPositionStores(tmp_path)
+    registry = stores.new_managed_registry()
+    original_connect = history_source.sqlite3.connect
+    captured_options = []
+
+    def connect(database, *args, **options):
+        if isinstance(database, str) and database.startswith("file:"):
+            captured_options.append(dict(options))
+        return original_connect(database, *args, **options)
+
+    monkeypatch.setattr(history_source.sqlite3, "connect", connect)
+    spec = stores.managed_spec("local", owner="iod")
+    spec = replace(spec, connect_options=(("cached_statements", "0"),))
+    try:
+        registry.register(spec).result(timeout=10)
+        assert captured_options == [{
+            "uri": True,
+            "isolation_level": None,
+            "check_same_thread": True,
+            "cached_statements": 0,
+        }]
+    finally:
+        registry.close()
+        stores.close()
+
+
+def test_read_only_authorizer_denies_virtual_table_schema_actions():
+    """The authorizer independently rejects virtual-table schema mutations."""
+
+    from appio.history_source import _read_only_authorizer
+
+    for action in (sqlite3.SQLITE_CREATE_VTABLE, sqlite3.SQLITE_DROP_VTABLE):
+        assert _read_only_authorizer(action, "table", None, "main", None) == (
+            sqlite3.SQLITE_DENY)
+
+
 def test_local_vector_observes_each_registered_connection_without_hashing(
         tmp_path, monkeypatch):
     """Observe every persistent actor connection with one constant SQL read."""
