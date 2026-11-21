@@ -10,11 +10,11 @@
 
 **Tech Stack:** Python >=3.14, SQLite, standard-library `dataclasses`, `Future`, threads, executors and queues, the existing AppIO store and query reducers, PyQt6, pytest and pytest-qt, and the documented development-only mypy command.
 
-**Authority:** `docs/superpowers/specs/2026-11-15-live-overview-totals-spec.md`, revision 7, SHA-256 `03f1d2adbc3f8a67b94429a4d61ef61008c8761c37ce78624ba4f12c6874b0c3`. The approved design remains unchanged at SHA-256 `8d6941b545ba15c9338f94df63d9d5c6b0b861e7cc7f14f8e85e2a675a6d70d9`. The completed earlier live-overview plan, including its repair tasks, is an input and is not re-planned here.
+**Authority:** `docs/superpowers/specs/2026-11-15-live-overview-totals-spec.md`, revision 8, SHA-256 `03f1d2adbc3f8a67b94429a4d61ef61008c8761c37ce78624ba4f12c6874b0c3`. The approved design remains unchanged at SHA-256 `8d6941b545ba15c9338f94df63d9d5c6b0b861e7cc7f14f8e85e2a675a6d70d9`. The completed earlier live-overview plan, including its repair tasks, is an input and is not re-planned here.
 
 ## Global Constraints
 
-- Implement exactly the managed-source contract in specification revision 7. Preserve the completed retained-value, recovery, chart, status, transport, Files, store, producer, sampling, wire-format and schema contracts unless revision 7 explicitly changes their source ownership or provenance.
+- Implement exactly the managed-source contract in specification revision 8. Preserve the completed retained-value, recovery, chart, status, transport, Files, store, producer, sampling, wire-format and schema contracts unless revision 8 explicitly changes their source ownership or provenance.
 - A managed source is the authority for its own connection incarnation. A source actor opens, uses, observes, backs up and closes its connection on its own thread. No `sqlite3.Connection`, `QueryService`, source actor, source pathname, temporary destination pathname, mutable registry or materialised database crosses into a worker result.
 - Do not use pathname text, `stat()`, device/inode values, equal backup bytes, table hashes, row maxima, counters from another connection, or a second observer as a physical-source certificate. The Python `sqlite3` API cannot prove that an arbitrary supplied connection remains bound to a pathname.
 - The primary GUI registration must use the approved writer/observer shared-cache admission challenge, query-only and authorizer enforcement, committed observer visibility checks, and the finite retry/error semantics in §4.5. Fail closed when the runtime cannot provide the required pairing evidence. Do not alter journal mode or the store schema.
