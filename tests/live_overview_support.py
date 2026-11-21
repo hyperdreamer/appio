@@ -348,11 +348,12 @@ class _Barrier:
 class LocalPositionStores:
     """Two actual file-backed sources and independent, committed writers.
 
-    Registered observers are the persistent QueryService connections. Worker
-    barriers never replace an observer or manufacture a source position.
+    Managed observers are persistent source-actor connections and writers are
+    independent committed SQLite connections. Worker barriers never replace an
+    observer or manufacture a source position.
     """
 
-    def __init__(self, directory=None) -> None:
+    def __init__(self, directory=None, *, journal_modes=None) -> None:
         import os
         import sqlite3
         import tempfile
@@ -364,8 +365,12 @@ class LocalPositionStores:
         self.root = Path(self._temporary.name)
         self.paths = {name: self.root / f"{name}.db" for name in ("local", "export")}
         self.stores = {name: AppIoStore(path) for name, path in self.paths.items()}
-        for store in self.stores.values():
-            store.connection.execute("PRAGMA journal_mode=WAL")
+        modes = journal_modes or {"local": "WAL", "export": "WAL"}
+        for name, store in self.stores.items():
+            mode = modes.get(name, "WAL")
+            if mode not in ("DELETE", "WAL"):
+                raise ValueError(f"unsupported fixture journal mode {mode!r}")
+            store.connection.execute(f"PRAGMA journal_mode={mode}")
             store.start_boot("boot-a", 1, 0, 1000.0, "gui")
             store.connection.commit()
         self._seed_local()
@@ -375,6 +380,7 @@ class LocalPositionStores:
             for name, path in self.paths.items()
         }
         self.router = None
+        self.managed_registry = None
         self._extra_connections: list[object] = []
         self._barriers: list[_Barrier] = []
         self._closed = False
@@ -407,6 +413,25 @@ class LocalPositionStores:
                              (1000 + second) * 10**9, records, ())
             frame, state = baseline_seed(tick) if seq == 0 else aggregate_tick(state, tick)
             store.record_tick(frame, state)
+
+    def managed_spec(self, name: str, *, owner: str = "iod"):
+        """Describe one fixture file without sharing its SQLite connection."""
+        from appio.history_types import ManagedSourceSpec
+
+        if name not in self.paths:
+            raise KeyError(name)
+        return ManagedSourceSpec(
+            name, owner, self.paths[name].as_uri() + "?mode=ro", ())
+
+    def new_managed_registry(self, *, wake=None):
+        """Create one registry whose actors own persistent fixture observers."""
+        from appio.history_source import ManagedSourceRegistry
+
+        if self.managed_registry is not None:
+            raise RuntimeError("a managed registry is already attached")
+        self.managed_registry = ManagedSourceRegistry(
+            wake=(lambda: None) if wake is None else wake)
+        return self.managed_registry
 
     def attach(self, router) -> None:
         if self.router is not None:
@@ -536,6 +561,8 @@ class LocalPositionStores:
         self._closed = True
         for barrier in self._barriers:
             barrier.release()
+        if self.managed_registry is not None:
+            self.managed_registry.close()
         for connection in (*self.writers.values(), *self._extra_connections):
             connection.close()
         for store in self.stores.values():
