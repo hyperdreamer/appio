@@ -11,16 +11,13 @@ from appio.query import QueryService
 from tests.p3.test_handover import APP, BOOT, NS, group, initialized, outgoing, record, tick
 from tests.p4.test_file_history_router import Client, WINDOW, retained
 from live_overview_support import (
-    inject_managed_router_sources, wait_for_capture_admission, wait_for_local_frame,
+    add_managed_source, managed_router, wait_for_capture_admission, wait_for_local_frame,
 )
 
 
 @pytest.fixture(autouse=True)
-def managed_sources(monkeypatch):
-    registries = inject_managed_router_sources(monkeypatch)
+def managed_sources():
     yield
-    for sources in registries:
-        sources.close()
 
 
 def _measured_store(path):
@@ -61,7 +58,8 @@ def test_R01_boot_lookup_failure_preserves_process_T_D_history(tmp_path, monkeyp
     # Removing the per-source availability guard must fail this preparation,
     # not merely change a mock call count or a source-text assertion.
     store = _measured_store(tmp_path / "process.db")
-    router = HistoryRouter(QueryService(store), Client(), AppRegistry())
+    router = managed_router(store, Client())
+
     window = Window("range", BOOT, 100 * NS, 120 * NS)
     _deny_file_watermark(monkeypatch)
     try:
@@ -99,8 +97,9 @@ def test_boot_lookup_failure_does_not_hide_another_sources_file_receipt(
     store = _measured_store(tmp_path / "process.db")
     bad, good = QueryService(store), QueryService(retained.db)
     local, other = (bad, good) if bad_first else (good, bad)
-    router = HistoryRouter(local, Client(), AppRegistry())
-    router.add_source(other, collector_id="other", owner="iod")
+    router = managed_router(local, Client())
+    add_managed_source(router, other, name="other", owner="iod")
+
     window = Window("range", BOOT, 100 * NS, 120 * NS)
     _deny_file_watermark(monkeypatch, only_process_source=True)
     try:
@@ -118,7 +117,8 @@ def test_boot_lookup_failure_does_not_hide_another_sources_file_receipt(
 def test_R02_connection_closed_before_prepare_marks_files_unavailable(retained, previous_success):
     # Managed actor closure must be refused before worker submission.
     # Repreparing also pins that a previous available status cannot survive.
-    router = HistoryRouter(QueryService(retained.db), Client(), AppRegistry())
+    router = managed_router(retained.db, Client())
+
     try:
         if previous_success:
             router.prepare(WINDOW)
@@ -139,7 +139,8 @@ def test_R02_connection_closed_before_prepare_marks_files_unavailable(retained, 
 @pytest.mark.parametrize("failure_stage", ["precheck", "submit"])
 def test_prepare_failure_clears_previous_availability_and_preserves_exception(
         retained, monkeypatch, failure_stage):
-    router = HistoryRouter(QueryService(retained.db), Client(), AppRegistry())
+    router = managed_router(retained.db, Client())
+
     error = RuntimeError("preparation rejected")
 
     def rejected(*args, **kwargs):
@@ -151,7 +152,7 @@ def test_prepare_failure_clears_previous_availability_and_preserves_exception(
         assert router.ready(WINDOW)
         assert router.file_source_status().available
         if failure_stage == "precheck":
-            monkeypatch.setattr(router.local, "_precheck", rejected)
+            monkeypatch.setattr(router, "_precheck", rejected)
             with pytest.raises(RuntimeError) as caught:
                 router.prepare(WINDOW)
         else:
@@ -169,7 +170,8 @@ def test_prepare_failure_clears_previous_availability_and_preserves_exception(
 
 
 def test_prepare_advertises_file_availability_only_after_submission(retained, monkeypatch):
-    router = HistoryRouter(QueryService(retained.db), Client(), AppRegistry())
+    router = managed_router(retained.db, Client())
+
     submit = router._executor.submit
 
     def checked_submit(*args, **kwargs):
@@ -198,7 +200,8 @@ def test_R02_failed_preparation_marks_files_unavailable(tmp_path, close_register
     # This failure precedes the file lookup, so guarding that query alone
     # cannot make the test green. Never depend on a fabricated failed Future.
     store = _measured_store(tmp_path / "broken.db")
-    router = HistoryRouter(QueryService(store), Client(), AppRegistry())
+    router = managed_router(store, Client())
+
     window = Window("range", BOOT, 100 * NS, 120 * NS)
     store.connection.execute("DROP TABLE collector_interval")
     store.connection.commit()

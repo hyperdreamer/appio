@@ -437,7 +437,7 @@ class LocalPositionStores:
         if self.router is not None:
             raise RuntimeError("stores are already attached")
         self.router = router
-        router.add_source(self.services["export"], collector_id="export", owner="gui")
+        router.add_source(self.managed_spec("export", owner="iod")).result(timeout=10)
 
     def commit(self, name: str, sql: str, parameters: tuple = ()) -> int:
         """Perform a real external update or deletion and commit it."""
@@ -448,21 +448,16 @@ class LocalPositionStores:
 
     def replace(self, name: str = "export", path=None, *, owner: str = "gui"):
         """Install a new persistent observer through the production registry."""
-        import sqlite3
-        from appio.query import QueryService
+        from pathlib import Path
 
         if self.router is None or name == "local":
             raise ValueError("replacement requires an attached imported source")
-        connection = sqlite3.connect(path or self.paths[name])
-        service = QueryService(connection)
-        try:
-            self.router.add_source(service, collector_id=name, owner=owner)
-        except BaseException:
-            connection.close()
-            raise
-        self._extra_connections.append(connection)
-        self.services[name] = service
-        return service
+        source_path = Path(path or self.paths[name])
+        if path is not None:
+            self.paths[name] = source_path
+        spec = self.managed_spec(name, owner=owner)
+        self.router.replace_managed_source(name, spec)
+        return spec
 
     @contextmanager
     def backup_complete(self, *, kind: str = "ranking"):
@@ -576,6 +571,29 @@ class LocalPositionStores:
         self.close()
 
 
+def managed_spec(service_or_store, name: str, owner: str):
+    from pathlib import Path
+    from appio.history_types import ManagedSourceSpec
+
+    connection = getattr(service_or_store, "connection", service_or_store)
+    path = connection.execute("PRAGMA database_list").fetchone()[2]
+    mode = "?mode=rw&cache=shared" if name == "local" and owner == "gui" else "?mode=ro"
+    return ManagedSourceSpec(name, owner, Path(path).as_uri() + mode, ())
+
+
+def add_managed_source(router, service_or_store, *, name: str, owner: str):
+    future = router.add_managed_source(managed_spec(service_or_store, name, owner))
+    return future.result(timeout=10)
+
+
+def managed_router(store, client, registry=None, **options):
+    from appio.query import QueryService
+    from appio.iodclient import AppRegistry
+
+    return make_managed_router(
+        QueryService(store), client, registry or AppRegistry(), **options)
+
+
 def make_managed_router(local, client, registry, *, source_options=None, **options):
     """Use actor-owned primary and imported sources during constructor cutover."""
 
@@ -596,54 +614,15 @@ def make_managed_router(local, client, registry, *, source_options=None, **optio
             sources.register(spec).result(timeout=10)
 
     register("local", local, "gui")
-    router = HistoryRouter(local, client, registry, _capture_provider=sources, **options)
-    add_source = router.add_source
+    router = HistoryRouter(sources, client, registry, **options)
     close = router.close
-
-    def add_managed_source(service, *, collector_id, owner):
-        register(collector_id, service, owner)
-        add_source(service, collector_id=collector_id, owner=owner)
 
     def close_managed_router():
         close()
         sources.close()
 
-    router.add_source = add_managed_source
     router.close = close_managed_router
     return router
-
-
-def inject_managed_router_sources(monkeypatch):
-    """Give legacy Files fixtures real source actors through the private seam."""
-
-    from pathlib import Path
-    from appio.history_router import HistoryRouter
-    from appio.history_source import ManagedSourceRegistry
-    from appio.history_types import ManagedSourceSpec
-
-    initialize = HistoryRouter.__init__
-    add_source = HistoryRouter.add_source
-    registries = []
-
-    def register(sources, name, service, owner):
-        path = service.connection.execute("PRAGMA database_list").fetchone()[2]
-        mode = "?mode=rw&cache=shared" if name == "local" else "?mode=ro"
-        sources.register(ManagedSourceSpec(
-            name, owner, Path(path).as_uri() + mode, ())).result(timeout=10)
-
-    def managed_init(router, local, client, registry, **options):
-        sources = ManagedSourceRegistry(wake=lambda: None)
-        registries.append(sources)
-        register(sources, "local", local, "gui")
-        initialize(router, local, client, registry, _capture_provider=sources, **options)
-
-    def managed_add(router, service, *, collector_id, owner):
-        register(router._capture_provider, collector_id, service, owner)
-        add_source(router, service, collector_id=collector_id, owner=owner)
-
-    monkeypatch.setattr(HistoryRouter, "__init__", managed_init)
-    monkeypatch.setattr(HistoryRouter, "add_source", managed_add)
-    return registries
 
 
 def wait_for_capture_admission(router, *, timeout=15.0):

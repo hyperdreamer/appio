@@ -2016,8 +2016,9 @@ def run_interactive(args) -> int:
 
     from PyQt6.QtWidgets import QApplication
 
+    from ..history_source import ManagedSourceRegistry
+    from ..history_types import ManagedSourceSpec
     from ..iodclient import AppRegistry, IodClient
-    from ..query import QueryService
     from ..store import AppIoStore
 
     application = QApplication.instance() or QApplication([sys.argv[0]])
@@ -2030,10 +2031,16 @@ def run_interactive(args) -> int:
 
     database_path = Path(args.db)
     store = AppIoStore(database_path)
-    local_service = QueryService(store)
     registry = AppRegistry()
     wake = _wake_object()
+    sources = ManagedSourceRegistry(wake=wake.woke.emit)
+    primary_spec = ManagedSourceSpec(
+        "local", "gui", database_path.absolute().as_uri() + "?mode=rw&cache=shared", ())
+    registration = sources.register(primary_spec)
     router_holder: dict[str, HistoryRouter] = {}
+    coordinator_holder: dict[str, CollectorCoordinator] = {}
+    window_holder: dict[str, CollectorWindow] = {}
+    startup_error: list[BaseException] = []
 
     def on_gap(notice) -> None:
         router = router_holder.get("router")
@@ -2042,47 +2049,71 @@ def run_interactive(args) -> int:
 
     client = IodClient(SOCKET_PATH, on_gap=on_gap, on_change=wake.woke.emit,
                        clock_ns=age_clock_ns)
-    router = HistoryRouter(local_service, client, registry, clock_ns=age_clock_ns)
-    router_holder["router"] = router
 
-    def local_factory() -> LiveCollector:
-        # The coordinator's lazy factory owns the decision to collect locally.
-        # An accepted export is a pending incoming handover, not a reason to
-        # discard the persisted cutoff and start a fresh baseline.
-        offer = coordinator.resume_handover
-        return LiveCollector(
-            proc_root=args.proc_root,
-            cgroup_root=args.cgroup_root,
-            database_path=database_path,
-            source="gui",
-            baseline_only=offer is None,
-            resume_handover=offer,
+    def start_after_registration() -> None:
+        if window_holder or not registration.done():
+            return
+        try:
+            registration.result()
+        except BaseException as error:
+            startup_error.append(error)
+            application.quit()
+            return
+
+        router = HistoryRouter(sources, client, registry, clock_ns=age_clock_ns)
+        router_holder["router"] = router
+
+        def local_factory() -> LiveCollector:
+            # The coordinator's lazy factory owns the decision to collect locally.
+            # An accepted export is a pending incoming handover, not a reason to
+            # discard the persisted cutoff and start a fresh baseline.
+            offer = coordinator_holder["coordinator"].resume_handover
+            return LiveCollector(
+                proc_root=args.proc_root,
+                cgroup_root=args.cgroup_root,
+                database_path=database_path,
+                source="gui",
+                baseline_only=offer is None,
+                resume_handover=offer,
+            )
+
+        coordinator = CollectorCoordinator(
+            local_factory=local_factory,
+            client=client,
+            history=router,
+            lease=GuiLease(_gui_lease_path()),
+            clock=SystemClock(),
         )
+        coordinator_holder["coordinator"] = coordinator
+        window = CollectorWindow(
+            coordinator,
+            router,
+            SetupClient(launch=_launch_helper, probe=production_probe),
+            age_clock_ns=age_clock_ns,
+            pump=client.pump,
+            refresh_interval_ms=max(1, int(round(args.interval * 1000))),
+        )
+        window_holder["window"] = window
+        # Scheduled through the event loop, never called from inside pump(): the
+        # client emits while it is still decoding frames, so a direct slot would
+        # re-enter pump(). A zero-delay timer is that hand-off -- every settled reply
+        # is one event-loop turn, not one poll interval.
+        wake.woke.connect(lambda: QTimer.singleShot(0, window.refresh))
+        window.show()
+        window.refresh()
 
-    coordinator = CollectorCoordinator(
-        local_factory=local_factory,
-        client=client,
-        history=router,
-        lease=GuiLease(_gui_lease_path()),
-        clock=SystemClock(),
-    )
-    window = CollectorWindow(
-        coordinator,
-        router,
-        SetupClient(launch=_launch_helper, probe=production_probe),
-        age_clock_ns=age_clock_ns,
-        pump=client.pump,
-        refresh_interval_ms=max(1, int(round(args.interval * 1000))),
-    )
-    # Scheduled through the event loop, never called from inside pump(): the
-    # client emits while it is still decoding frames, so a direct slot would
-    # re-enter pump(). A zero-delay timer is that hand-off -- every settled reply
-    # is one event-loop turn, not one poll interval.
-    wake.woke.connect(lambda: QTimer.singleShot(0, window.refresh))
-    window.show()
-    window.refresh()
+    wake.woke.connect(start_after_registration)
+    registration.add_done_callback(lambda _completed: wake.woke.emit())
     try:
-        return application.exec()
+        exit_code = application.exec()
     finally:
-        window.shutdown()
+        if window_holder:
+            window_holder["window"].shutdown()
+            sources.close()
+        else:
+            client.close()
+            sources.close()
         store.connection.close()
+    if startup_error:
+        raise startup_error[0]
+    return exit_code

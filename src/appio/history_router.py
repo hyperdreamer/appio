@@ -35,7 +35,7 @@ from typing import Literal
 from .contracts import (
     AppTotal, Direction, DiskShare, FileCoverage, FileSort, FileTable, HistoryPending, Series, Window,
     FILE_HOUR_NS, LAUNCH_WINDOW_MESSAGE, WindowUnavailableError, SQLITE_INT_MAX,
-    validate_enum, validate_search, validate_sqlite_integer, validate_window,
+    MAX_RANGE_NS, validate_enum, validate_search, validate_sqlite_integer, validate_window,
 )
 from .history_types import (
     AcceptedIdentity,
@@ -45,6 +45,7 @@ from .history_types import (
     LocalBracket,
     LocalPosition,
     LocalPositionVector,
+    ManagedSourceSpec,
     PartState,
     RemotePosition,
     RetainedRecord,
@@ -89,6 +90,7 @@ from .ipc_models import QueryRequest
 from .ownership import ownership_exclusions, subtract_intervals
 from .query import QueryService, _model_coverage, _reduce_coverage
 from .store import AppIoStore, _empty_coverage
+from .tier import select_tier
 
 _COUNTERS = ("rchar", "wchar", "read_bytes", "write_bytes")
 
@@ -626,62 +628,17 @@ LocalOutcome = LocalFrameOutcome | LocalPartOutcome | LocalFilesOutcome
 
 
 @dataclass(frozen=True)
-class _SourceRegistration:
-    """One live local source and the identity the owner registered it under.
-
-    The registration is not a wire or durable record. It keeps the live service
-    and connection objects on the owner side only, together with the canonical
-    main path and filesystem ``(st_dev, st_ino)`` observed at install, so later
-    observations can prove they still address the registered file (§4.2).
-    """
-
-    name: str
-    owner: str
-    registration_epoch: int
-    service: QueryService
-    connection: sqlite3.Connection
-    path: str
-    physical: tuple[int, int] | None
-
-    def __post_init__(self) -> None:
-        _private_name(self.name, "registration.name")
-        _private_enum(self.owner, _POSITION_OWNERS, "registration.owner")
-        _private_int(self.registration_epoch, "registration.registration_epoch", minimum=1)
-        if not isinstance(self.service, QueryService) or not isinstance(
-                self.connection, sqlite3.Connection):
-            raise ValueError("a registration binds one query service and its connection")
-        if self.service.connection is not self.connection:
-            raise ValueError("a registration binds the service's own connection")
-        if not isinstance(self.path, str):
-            raise ValueError("registration.path must be text")
-        if self.physical is not None:
-            if (not isinstance(self.physical, tuple) or len(self.physical) != 2
-                    or any(isinstance(value, bool) or not isinstance(value, int)
-                           for value in self.physical)):
-                raise ValueError("registration.physical must be a (st_dev, st_ino) pair")
-
-
-@dataclass(frozen=True)
 class _SourceStamp:
-    """The immutable part of one registration that a worker binding carries."""
+    """The immutable identity of one managed registration."""
 
     name: str
     owner: str
     registration_epoch: int
-    path: str
-    physical: tuple[int, int] | None
 
     def __post_init__(self) -> None:
         _private_name(self.name, "registration_stamp.name")
         _private_enum(self.owner, _POSITION_OWNERS, "registration_stamp.owner")
         _private_int(self.registration_epoch, "registration_stamp.registration_epoch", minimum=1)
-        if not isinstance(self.path, str):
-            raise ValueError("registration_stamp.path must be text")
-        if self.physical is not None:
-            if (not isinstance(self.physical, tuple) or len(self.physical) != 2
-                    or any(isinstance(value, bool) or not isinstance(value, int)
-                           for value in self.physical)):
-                raise ValueError("registration_stamp.physical must be a (st_dev, st_ino) pair")
 
 
 @dataclass(frozen=True)
@@ -946,41 +903,19 @@ class _Preparation:
 
 
 class HistoryRouter:
-    def __init__(self, local: QueryService, client: IodClient, registry: AppRegistry, *,
-                 clock_ns: Callable[[], int] = time.monotonic_ns,
-                 _capture_provider: ManagedSourceRegistry | None = None):
+    def __init__(self, sources: ManagedSourceRegistry, client: IodClient,
+                 registry: AppRegistry, *,
+                 clock_ns: Callable[[], int] = time.monotonic_ns):
+        if not isinstance(sources, ManagedSourceRegistry):
+            raise SourceAdmissionError("history source is not managed")
         if not callable(clock_ns):
             raise ValueError("clock_ns must be callable")
-        self.local, self.client, self.registry = local, client, registry
+        self.sources, self.client, self.registry = sources, client, registry
         self._clock_ns = clock_ns
-        self._capture_provider = _capture_provider
+        self._capture_provider = sources
         self._capture_jobs: dict[int, tuple[RequestToken, Future]] = {}
         self._worker_captures: dict[int, int] = {}
         self._frame_jobs: dict[int, Future] = {}
-        self._sources = {"local": (local, "gui")}
-        # Registration bookkeeping (§4.2): a strictly increasing epoch that is
-        # never reused, plus the live service/connection identity, canonical
-        # main path and filesystem inode pair observed at install. A commit,
-        # query or frame generation never advances an epoch.
-        self._next_registration_epoch = 1
-        self._registrations: dict[str, _SourceRegistration] = {}
-        #: The first physical file each connection object was registered for.
-        #: Replacing the file at that pathname leaves the connection reading the
-        #: unlinked original, so a stat of the pathname describes another
-        #: database; one connection is never re-stamped with a replacement's
-        #: identity (§4.2). Retired entries stay so a removed source cannot be
-        #: re-added under the stale connection either.
-        self._connection_bindings: dict[int, tuple[sqlite3.Connection,
-                                                    tuple[int, int] | None]] = {}
-        #: Every database path this router has bound a connection to, retired
-        #: registrations included. A first registration for an unseen path
-        #: establishes that binding; any later connection offered for a known
-        #: path or an existing source name must be proven to read that file.
-        self._path_bindings: set[str] = set()
-        # Capture identity only when a source is registered, never in a Files
-        # request on the UI thread. Worker connections stay read-only.
-        self._source_paths: dict[str, str] = {}
-        self._install_registration("local", local, "gui")
         self.segments: tuple[HistorySegment, ...] = ()
         self.boundaries: tuple[tuple[str, int, str, str], ...] = ()
         self.view_state = "unavailable"
@@ -1070,65 +1005,6 @@ class HistoryRouter:
             token_id += 1
         self._next_token_id = token_id + 1
         return token_id
-
-    @staticmethod
-    def _physical_identity(path: str) -> tuple[int, int] | None:
-        """The registered file's ``(st_dev, st_ino)``, or None when there is none."""
-
-        if not path:
-            return None
-        try:
-            info = os.stat(path)
-        except OSError:
-            return None
-        return (info.st_dev, info.st_ino)
-
-    def _rebinding(self, name: str, path: str) -> bool:
-        """Whether an unseen connection would replace an existing file binding.
-
-        A source name keeps its registration across replacement, and one
-        database path keeps the file the router already bound even after that
-        source was removed. Either case means the incoming connection is
-        claiming an identity the router has already certified, so it must be
-        proven (§4.2).
-        """
-
-        return name in self._registrations or (bool(path) and path in self._path_bindings)
-
-    @staticmethod
-    def _image_matches_file(path: str, image: bytes) -> bool:
-        """Whether ``image`` is exactly the current byte content of ``path``."""
-
-        view = memoryview(image)
-        offset = 0
-        with open(path, "rb") as handle:
-            while True:
-                chunk = handle.read(1 << 20)
-                if not chunk:
-                    return offset == len(view)
-                if offset + len(chunk) > len(view) or view[offset:offset + len(chunk)] != chunk:
-                    return False
-                offset += len(chunk)
-
-    @staticmethod
-    def _image_matches_database(path: str, image: bytes) -> bool:
-        """Whether a read-only connection to ``path`` serializes to ``image``.
-
-        A journal-mode-independent equality: the main file of a WAL source does
-        not carry its uncheckpointed frames, so a byte comparison cannot speak
-        for that source.
-        """
-
-        try:
-            probe = sqlite3.connect(Path(path).as_uri() + "?mode=ro", uri=True, timeout=0.0)
-        except sqlite3.Error:
-            return False
-        try:
-            return probe.serialize(name="main") == image
-        except (AttributeError, NotImplementedError, sqlite3.Error):
-            return False
-        finally:
-            probe.close()
 
     def _prove_file_binding(self, name: str, connection: sqlite3.Connection,
                             path: str) -> None:
@@ -1286,16 +1162,25 @@ class HistoryRouter:
                              registration.registration_epoch, data_version,
                              connection.total_changes)
 
-    def local_position(self, source_name: str) -> LocalPosition:
-        """Observe one registered source's exact committed change token."""
+    @staticmethod
+    def _precheck(window: Window) -> None:
+        validate_window(window)
+        if window.kind == "launch" or (
+                window.kind == "range"
+                and window.end_mono_ns - window.start_mono_ns > MAX_RANGE_NS):
+            select_tier(window, None)
 
-        return self._observe_registration(self._current_registration(source_name))
+    def local_position(self, source_name: str) -> LocalPosition:
+        """Return the last completed actor observation for one source."""
+
+        positions = self.sources.observe().sources
+        for position in positions:
+            if position.name == source_name:
+                return position
+        raise KeyError(source_name)
 
     def _local_vector(self) -> LocalPositionVector:
-        if self._capture_provider is not None:
-            return self._capture_provider.observe()
-        names = sorted(self._sources, key=lambda name: name.encode("utf-8"))
-        return LocalPositionVector(tuple(self.local_position(name) for name in names))
+        return self.sources.observe()
 
     def source_position(self) -> SourcePosition:
         """The current source authority: a remote cursor or the local vector."""
@@ -1307,25 +1192,19 @@ class HistoryRouter:
                 return RemotePosition(cursor.boot_id, cursor.iod_epoch, cursor.seq)
         return self._local_vector()
 
-    def remove_source(self, collector_id: str) -> None:
-        """Retire one imported source; its registration epoch is never reused."""
+    def retire_managed_source(self, name: str, reason: str) -> None:
+        self.sources.retire(name, reason)
+        self.invalidate()
 
-        if collector_id == "local":
-            raise ValueError("the primary local source cannot be removed")
-        if collector_id not in self._sources:
-            raise KeyError(collector_id)
-        del self._sources[collector_id]
-        self._registrations.pop(collector_id, None)
-        self._source_paths.pop(collector_id, None)
-        # The retired connection's physical binding stays remembered: re-adding
-        # the same connection after a path replacement still addresses the old
-        # file and must be refused, not re-stamped (§4.2).
+    def replace_managed_source(self, name: str, spec: ManagedSourceSpec) -> None:
+        if not isinstance(spec, ManagedSourceSpec):
+            raise SourceAdmissionError("history source is not managed")
+        future = self.sources.replace(name, spec)
+        future.add_done_callback(lambda _completed: self._notify())
         self.invalidate()
 
     def _managed_sources(self) -> ManagedSourceRegistry:
-        if not isinstance(self._capture_provider, ManagedSourceRegistry):
-            raise SourceAdmissionError("history source is not managed")
-        return self._capture_provider
+        return self.sources
 
     def _capture_local_binding(self, *, worker_id: int, token_id: int | None = None,
                                request: QueryRequest,
@@ -1335,7 +1214,7 @@ class HistoryRouter:
         sources = self._managed_sources()
         opening = sources.observe() if capture is None else capture.opening
         stamps = tuple(_SourceStamp(position.name, position.owner,
-                                    position.registration_epoch, "", None)
+                                    position.registration_epoch)
                        for position in opening.sources)
         paths = tuple((position.name, "", position.owner) for position in opening.sources)
         snapshot = None if capture is None else _capture_provenance(capture)
@@ -1460,21 +1339,16 @@ class HistoryRouter:
                 self._release_worker_capture(worker_id)
 
     def _closing_vector(self, binding: _LocalCopyBinding) -> LocalPositionVector:
-        """Re-check identities and observe the closing vector before publication."""
+        """Return the registry's owner-side closing observation."""
 
-        names = sorted(self._sources, key=lambda name: name.encode("utf-8"))
-        if tuple(names) != tuple(stamp.name for stamp in binding.registrations):
+        closing = self.sources.observe()
+        identities = tuple((position.name, position.owner, position.registration_epoch)
+                           for position in closing.sources)
+        expected = tuple((stamp.name, stamp.owner, stamp.registration_epoch)
+                         for stamp in binding.registrations)
+        if identities != expected:
             raise ValueError("history source registrations changed during the copy")
-        positions = []
-        for stamp in binding.registrations:
-            registration = self._current_registration(stamp.name)
-            current = _SourceStamp(registration.name, registration.owner,
-                                   registration.registration_epoch,
-                                   registration.path, registration.physical)
-            if current != stamp:
-                raise ValueError("history source registrations changed during the copy")
-            positions.append(self._observe_registration(registration))
-        return LocalPositionVector(tuple(positions))
+        return closing
 
     def _close_local_settlement(self, settlement: LocalSettlement, *,
                                 binding: _LocalCopyBinding | None = None
@@ -1906,7 +1780,7 @@ class HistoryRouter:
         """
 
         # A22 must win even over a bad app/sort, just as on the RPC surface.
-        self.local._precheck(window)
+        self._precheck(window)
         validate_enum(sort, _FILE_SORT_NAMES, "sort")
         validate_enum(direction, ("asc", "desc"), "direction")
         validate_search(search)
@@ -1938,18 +1812,6 @@ class HistoryRouter:
                 self._file_owners.pop(owner.owner_id, None)
             self._settle_file(future, generation, error=error)
         return future
-
-    def _local_files_paths(self) -> tuple[tuple[str, str, str], ...]:
-        """Registered file-backed sources for one private-snapshot Files read."""
-
-        paths = []
-        for name, (service, owner) in self._sources.items():
-            path = self._source_paths[name]
-            if not path or service.connection.in_transaction:
-                raise WindowUnavailableError(
-                    "file_source_unavailable", "File history needs a committed store.")
-            paths.append((name, path, owner))
-        return tuple(paths)
 
     def _admit_remote_files(self, owner: _FilesOwner) -> None:
         """Capture the ranking snapshot/cursor and enqueue the first page."""
@@ -2180,16 +2042,17 @@ class HistoryRouter:
         self._remote_snapshot = None
         self._ready = False
 
-    def add_source(self, service: QueryService, *, collector_id: str, owner: str) -> None:
-        if not collector_id or collector_id == "local":
-            raise ValueError("an imported collector requires its own identity")
-        validate_enum(owner, ("gui", "iod"), "owner")
-        # Install (and consume) the registration epoch before the source joins
-        # the live map: a failed install leaves the previous registration and
-        # source untouched, so no proposed vector can be published.
-        self._install_registration(collector_id, service, owner)
-        self._sources[collector_id] = (service, owner)
-        self.invalidate()
+    def add_managed_source(self, spec: ManagedSourceSpec) -> Future:
+        if not isinstance(spec, ManagedSourceSpec):
+            raise SourceAdmissionError("history source is not managed")
+        future = self.sources.register(spec)
+        future.add_done_callback(lambda _completed: self._notify())
+        return future
+
+    def add_source(self, spec: ManagedSourceSpec) -> Future:
+        """Compatibility entry point for immutable managed source specs only."""
+
+        return self.add_managed_source(spec)
 
     def _primary_registration_epoch(self) -> int | None:
         for name, owner, epoch in self._managed_sources().registration_vector():
@@ -2304,8 +2167,6 @@ class HistoryRouter:
                 lambda completed, sources=sources, capture_id=capture_id:
                     sources.release_capture(capture_id))
             self._worker_captures.pop(worker_id)
-        if sources is not None:
-            sources.close()
 
     def _plan(self, window):
         evidence, cuts, gaps = [], defaultdict(dict), set()
@@ -2857,7 +2718,7 @@ class HistoryRouter:
         key = self.registry.key_for(app_id)
         if not isinstance(window, Window):
             raise ValueError("request_detail requires an exact Window")
-        self.local._precheck(window)
+        self._precheck(window)
         validate_window(window)
         lifetime = self._detail
         if lifetime is None or lifetime.app_key != key:
@@ -3008,7 +2869,7 @@ class HistoryRouter:
     def prepare(self, window: Window) -> None:
         # A22 precedes any source observation, exactly as before.
         self._file_status = FileAvailability(False, False, "file_source_unavailable")
-        self.local._precheck(window)
+        self._precheck(window)
         if self._closed:
             raise RuntimeError("history router is closed")
         self._managed_sources()

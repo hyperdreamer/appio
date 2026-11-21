@@ -1135,8 +1135,11 @@ def _scheduler_router(tmp_path, *, name="scheduler.db"):
     # One peer snapshot proves the file capability set and a cursor; a status
     # reply alone carries no capabilities.
     transport.stream(4)
-    router = HistoryRouter(QueryService(store), transport.client, AppRegistry(),
-                           clock_ns=transport.clock)
+    from live_overview_support import make_managed_router
+
+    router = make_managed_router(
+        QueryService(store), transport.client, AppRegistry(), clock_ns=transport.clock)
+
     return router, transport, store
 
 
@@ -1453,8 +1456,11 @@ def test_frame_failure_or_local_fallback_certifies_no_remote_position(tmp_path):
     local = _process_store(tmp_path / "mixed.db", ((mixed_key, 17, 20),))
     transport = QueryTransportHarness(cursor=RemotePosition(BOOT, 7, 3))
     transport.stream(4)
-    router = HistoryRouter(QueryService(local), transport.client, AppRegistry(),
-                           clock_ns=transport.clock)
+    from live_overview_support import make_managed_router
+
+    router = make_managed_router(
+        QueryService(local), transport.client, AppRegistry(), clock_ns=transport.clock)
+
     try:
         release = threading.Event()
         entered = threading.Event()
@@ -1547,9 +1553,12 @@ def test_frame_failure_or_local_fallback_certifies_no_remote_position(tmp_path):
         empty_store.connection.commit()
         empty_transport = QueryTransportHarness(cursor=RemotePosition(BOOT, 7, 3))
         empty_transport.stream(4)
-        empty_router = HistoryRouter(
+        from live_overview_support import make_managed_router
+
+        empty_router = make_managed_router(
             QueryService(empty_store), empty_transport.client, AppRegistry(),
             clock_ns=empty_transport.clock)
+
         try:
             empty_router.prepare(other)
             empty_transport.pump()

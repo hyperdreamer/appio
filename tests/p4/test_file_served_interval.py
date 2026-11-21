@@ -17,15 +17,12 @@ from appio.query import QueryService
 from appio.ui.files_view import FilesView
 from test_files import APP, ZERO, observation
 from tests.p4.test_file_history_router import Client, drive
-from live_overview_support import inject_managed_router_sources, wait_for_local_frame
+from live_overview_support import add_managed_source, make_managed_router, wait_for_local_frame
 
 
 @pytest.fixture(autouse=True)
-def managed_sources(monkeypatch):
-    registries = inject_managed_router_sources(monkeypatch)
+def managed_sources():
     yield
-    for sources in registries:
-        sources.close()
 
 
 BOOT = "boot-A"
@@ -65,10 +62,11 @@ def histories(tmp_path):
         return db
 
     def route(db, window=REQUESTED, other=None):
-        router = HistoryRouter(QueryService(db), Client(), AppRegistry())
+        router = make_managed_router(QueryService(db), Client(), AppRegistry())
         routers.append(router)
         if other is not None:
-            router.add_source(QueryService(other), collector_id="other", owner="iod")
+            add_managed_source(router, other, name="other", owner="iod")
+
         router.prepare(window)
         wait_for_local_frame(router)
         assert router.ready(window)

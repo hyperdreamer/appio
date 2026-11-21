@@ -1743,7 +1743,10 @@ def test_collector_window_wires_stall_caption_to_real_files_view(qtbot, tmp_path
     runtime.consume(*frames.tick(0))
     runtime.consume(*frames.tick(H))
 
-    history = HistoryRouter(QueryService(frames.db), IdleClient(), AppRegistry())
+    from live_overview_support import make_managed_router
+
+    history = make_managed_router(QueryService(frames.db), IdleClient(), AppRegistry())
+
     now = [H - 1]
     window = CollectorWindow(
         ControlledCoordinator(), history, ControlledSetup(OFF),
@@ -2336,7 +2339,10 @@ def test_real_history_router_gates_rendering_until_ready(qtbot, tmp_path):
     store = AppIoStore(tmp_path / "history.db")
     store.start_boot(BOOT, 1, 0, 1000.0, "gui")
     store.connection.commit()
-    history = HistoryRouter(QueryService(store), IdleClient(), AppRegistry())
+    from live_overview_support import make_managed_router
+
+    history = make_managed_router(QueryService(store), IdleClient(), AppRegistry())
+
     coordinator = FakeCoordinator()
     setup = FakeSetup(OFF)
     window = CollectorWindow(coordinator, history, setup,
@@ -2503,7 +2509,10 @@ def test_window_keeps_in_flight_history_for_the_same_scope(qtbot, tmp_path, monk
         return client.state.verified and client.state.answering
 
     qtbot.waitUntil(prime_client, timeout=1500)
-    history = HistoryRouter(QueryService(local), client, AppRegistry())
+    from live_overview_support import make_managed_router
+
+    history = make_managed_router(QueryService(local), client, AppRegistry())
+
     read_local = history._read_local
 
     def slow_local_snapshot(*args):
@@ -5412,9 +5421,8 @@ def test_native_composition_binds_one_age_clock_domain(qtbot, tmp_path):
     store = AppIoStore(tmp_path / "native-composition.db")
     store.start_boot(BOOT, 1, 0, 1000.0, "gui")
     store.connection.commit()
-    router = HistoryRouter(
-        QueryService(store), transport.client, AppRegistry(), clock_ns=age
-    )
+    router = make_managed_router(QueryService(store), transport.client, AppRegistry(), clock_ns=age)
+
     coordinator = ControlledCoordinator()
     coordinator.history = router
     window = CollectorWindow(
@@ -5482,12 +5490,13 @@ def test_native_composition_binds_one_age_clock_domain(qtbot, tmp_path):
             boot_id=BOOT, cursor=RemotePosition(BOOT, 7, 3), clock=age
         )
         deadline_transport.stream(4)
-        deadline_router = HistoryRouter(
+        deadline_router = make_managed_router(
             QueryService(deadline_store),
             deadline_transport.client,
             AppRegistry(),
             clock_ns=age,
         )
+
         deadline_window = Window("since_boot", BOOT, end_mono_ns=pending.end_mono_ns)
         deadline_router.prepare(deadline_window)
         deadline_transport.pump()
@@ -5592,7 +5601,10 @@ def test_real_local_detail_completion_is_not_consumed_by_readiness_without_notif
         def query(self, request):
             raise AssertionError(f"local history issued a remote query: {request.kind}")
 
-    history = HistoryRouter(QueryService(store), IdleClient(), AppRegistry())
+    from live_overview_support import make_managed_router
+
+    history = make_managed_router(QueryService(store), IdleClient(), AppRegistry())
+
     window = CollectorWindow(
         ControlledCoordinator(), history, ControlledSetup(OFF),
         clock_ns=lambda: 140 * ns,

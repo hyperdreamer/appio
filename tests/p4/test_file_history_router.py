@@ -43,16 +43,13 @@ from appio.ui.files_view import FilesView
 from tests.p3.test_iodclient import Harness, snapshot_frame
 from tests.p4.test_file_runtime import APP, ZERO, Frames, event
 from live_overview_support import (
-    inject_managed_router_sources, wait_for_capture_admission, wait_for_local_frame,
+    add_managed_source, managed_router, wait_for_capture_admission, wait_for_local_frame,
 )
 
 
 @pytest.fixture(autouse=True)
-def managed_sources(monkeypatch):
-    registries = inject_managed_router_sources(monkeypatch)
+def managed_sources():
     yield
-    for sources in registries:
-        sources.close()
 
 SORTS = ("bytes_total", "bytes_r", "bytes_w", "reads", "writes", "basename", "dev", "last_seen")
 WINDOW = Window("since_boot", "boot-A", end_mono_ns=H)
@@ -103,8 +100,15 @@ def inject_requested_gap_evidence(db, app_id=1, gaps=1):
     assert not db.in_transaction
 
 
+def managed_router(store, client, registry=None, **options):
+    from live_overview_support import make_managed_router
+
+    return make_managed_router(
+        QueryService(store), client, registry or AppRegistry(), **options)
+
+
 def local_router(retained):
-    router = HistoryRouter(QueryService(retained.db), Client(), AppRegistry())
+    router = managed_router(retained.db, Client())
     router.prepare(WINDOW)
     wait_for_local_frame(router)
     assert router.ready(WINDOW)
@@ -330,8 +334,9 @@ def test_mixed_or_excluded_ownership_never_merges_database_local_paths(retained,
     other = Frames(tmp_path / "other.db")
     other.tick(0)
     other.tick(H)
-    router = HistoryRouter(QueryService(retained.db), Client(), AppRegistry())
-    router.add_source(QueryService(other.db), collector_id="other", owner="gui")
+    router = managed_router(retained.db, Client())
+    add_managed_source(router, other.db, name="other", owner="gui")
+
     # Distinct epochs constitute unproved concurrent ownership even for matching AppKey.
     other.db.execute("UPDATE collector_interval SET source='gui',epoch=7")
     other.db.commit()
@@ -387,7 +392,8 @@ class Remote:
         self.h.client.pump()
         self.rpc = HistoryRpc(retained.db)
         self.store = AppIoStore(tmp_path / "local-empty.db")
-        self.router = HistoryRouter(QueryService(self.store), self.h.client, AppRegistry())
+        self.router = managed_router(self.store, self.h.client)
+
         self.requests = []
         self.replies = []
         self.router.prepare(window)
@@ -627,7 +633,8 @@ def test_remote_query_errors_are_typed_without_rewriting_data_reason(tmp_path):
 
     for index, (error, kind, reason) in enumerate(cases):
         store, _ = source(tmp_path / f"remote-{index}.db")
-        router = HistoryRouter(QueryService(store), FailedQueryClient(error), AppRegistry())
+        router = managed_router(store, FailedQueryClient(error))
+
         scope = process_window(100, 110)
         try:
             router.prepare(scope)
@@ -646,7 +653,8 @@ def test_remote_query_errors_are_typed_without_rewriting_data_reason(tmp_path):
     pruned, _ = source(tmp_path / "pruned.db")
     pruned.connection.execute("DELETE FROM collector_interval")
     pruned.connection.commit()
-    router = HistoryRouter(QueryService(pruned), Client(), AppRegistry())
+    router = managed_router(pruned, Client())
+
     scope = Window("lifetime")
     try:
         router.prepare(scope)
@@ -660,7 +668,8 @@ def test_remote_query_errors_are_typed_without_rewriting_data_reason(tmp_path):
 
 
 def test_retirement_and_cancellation_do_not_set_history_failure_flags(retained):
-    router = HistoryRouter(QueryService(retained.db), Client(), AppRegistry())
+    router = managed_router(retained.db, Client())
+
     try:
         with pytest.raises(WindowUnavailableError):
             router.prepare(Window("launch", "boot-A", launch_id=1))
@@ -708,7 +717,8 @@ def test_retirement_and_cancellation_do_not_set_history_failure_flags(retained):
                 self.bound[future], 0, None, "terminal", None, None, None)
 
     unavailable_client = UnavailableQueryClient()
-    router = HistoryRouter(QueryService(retained.db), unavailable_client, AppRegistry())
+    router = managed_router(retained.db, unavailable_client)
+
     try:
         router.prepare(WINDOW)
         wait_for_local_frame(router)
@@ -742,7 +752,8 @@ def test_retirement_and_cancellation_do_not_set_history_failure_flags(retained):
                 self.bound[future], 0, None, "terminal", None, None, None)
 
     cancelled_client = CancelledQueryClient()
-    router = HistoryRouter(QueryService(retained.db), cancelled_client, AppRegistry())
+    router = managed_router(retained.db, cancelled_client)
+
     try:
         router.prepare(WINDOW)
         wait_for_local_frame(router)
@@ -811,7 +822,8 @@ def test_queued_local_read_blocks_every_replacement_submission(retained, qtbot, 
 
     from appio.ui.collector_window import CollectorWindow
 
-    history = HistoryRouter(QueryService(retained.db), Client(), AppRegistry())
+    history = managed_router(retained.db, Client())
+
     current = Window("since_boot", "boot-A", end_mono_ns=H)
     explicit = Window("range", "boot-A", 0, H)
     blocker_started = threading.Event()
