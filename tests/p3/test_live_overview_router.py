@@ -4703,41 +4703,53 @@ def test_remote_detail_liveness_across_ten_second_commit(tmp_path, qtbot):
 
 
 @pytest.mark.parametrize("kind", ["totals", "series"])
-@pytest.mark.parametrize("schedule", ["settled", "forward_frame_held", "replacement_local_completed"])
+@pytest.mark.parametrize("schedule", [
+    "settled", "forward_frame_held", "replacement_local_completed",
+    "subject_change_local_held", "subject_change_local_completed",
+])
 def test_remote_detail_after_mixed_store_refusal_uses_local_ownership(tmp_path, kind, schedule, monkeypatch):
     from test_history_router import BOOT as fixture_boot, source
     from live_overview_support import add_managed_source, make_managed_router
 
     local, _ = source(tmp_path / "overlap-local.db", start=100, end=122)
+    local.connection.execute(
+        "INSERT INTO app VALUES(18,'exe:/usr/bin/second','second',NULL,0,0,'user')")
+    local.connection.execute(
+        "INSERT INTO app_boot_total SELECT boot_id,18,0,0,0,0,NULL,NULL,NULL,coverage_json "
+        "FROM app_boot_total WHERE app_id=17")
+    local.connection.commit()
     imported, _ = source(tmp_path / "overlap-export.db", "iod", start=100, end=120)
+    second, _ = source(tmp_path / "second-export.db", "iod", app_id=18,
+                       key="/usr/bin/second", start=100, end=120)
     client = _BoundClient(boot=fixture_boot)
     router = make_managed_router(QueryService(local), client, AppRegistry(), clock_ns=client.clock)
     add_managed_source(router, imported, name="export", owner="iod")
+    add_managed_source(router, second, name="second", owner="iod")
     window = Window("since_boot", fixture_boot, end_mono_ns=130 * NS)
     release_frame = threading.Event()
+    subject_change = schedule.startswith("subject_change_")
     try:
         router.prepare(window)
         wait_local(router)
-        remote_rows = QueryService(imported).ranking(window, "total_bytes")
+        remote_rows = (QueryService(imported).ranking(window, "total_bytes")
+                       + QueryService(second).ranking(window, "total_bytes"))
         client.settle(client.only("ranking"), {
             "kind": "ranking", "result": remote_rows, "snapshot": DIGEST,
             "next_cursor": None,
         })
         assert router.ready(window)
-        row, = router.ranking(window, "total_bytes")
-        assert row.total_bytes == 0
-        assert row.coverage.overlap_uncertain_intervals == 1
+        rows = {row.app_key: row for row in router.ranking(window, "total_bytes")}
+        assert set(rows) == {"exe:/usr/bin/shared", "exe:/usr/bin/second"}
+        for row in rows.values():
+            assert row.total_bytes == 0
+            assert row.coverage.overlap_uncertain_intervals == 1
+        row = rows["exe:/usr/bin/shared"]
         assert router._remote is None
         assert "mixed-store" in router.daemon_answer_error.reason
         router.select_detail(row.app_key, window)
-        scope = retention_scope(row.app_key, window)
-        router.request_detail(kind, row.app_id, window)
-        remote_id = remote_rows[0].app_id
-        service = QueryService(imported)
-        remote_value = (service.disk_share(remote_id, window) if kind == "totals"
-                        else service.series(remote_id, window))
-        future = client.only(kind)
-        if schedule == "forward_frame_held":
+        if not subject_change:
+            router.request_detail(kind, row.app_id, window)
+        if schedule in ("forward_frame_held", "subject_change_local_held"):
             entered = threading.Event()
             read = router._read_local
 
@@ -4747,10 +4759,12 @@ def test_remote_detail_after_mixed_store_refusal_uses_local_ownership(tmp_path, 
                 return read(*args, **kwargs)
 
             monkeypatch.setattr(router, "_read_local", held_frame)
-            router.prepare(replace(window, end_mono_ns=140 * NS))
+            desired = (Window("range", fixture_boot, 130 * NS, 140 * NS) if subject_change
+                       else replace(window, end_mono_ns=140 * NS))
+            router.prepare(desired)
             _drain_until(router, entered.is_set)
             assert not router._has_local_history and router._overlap_ranges == []
-        elif schedule == "replacement_local_completed":
+        elif schedule in ("replacement_local_completed", "subject_change_local_completed"):
             desired = Window("range", fixture_boot, 130 * NS, 140 * NS)
             router.prepare(desired)
             wait_local(router)
@@ -4758,6 +4772,28 @@ def test_remote_detail_after_mixed_store_refusal_uses_local_ownership(tmp_path, 
             assert router._applied_window == window
             assert router._local_settlement.outcome.request.window == desired
             assert not router._has_local_history and router._overlap_ranges == []
+        if subject_change:
+            row = rows["exe:/usr/bin/second"]
+            # Public provenance still describes only the current generation.
+            assert router.ranking_provenance(row.app_key, window) is None
+            router.select_detail(row.app_key, window)
+            router.request_detail(kind, row.app_id, window)
+            assert router._applied_window == window
+            # Release the wire slot while the replacement stays unapplied.
+            client.settle(client.only("ranking"), {
+                "kind": "ranking", "result": [], "snapshot": DIGEST,
+                "next_cursor": None,
+            })
+            router.drain()
+        scope = retention_scope(row.app_key, window)
+        service = QueryService(second if subject_change else imported)
+        remote_id = next(item.app_id for item in remote_rows if item.app_key == row.app_key)
+        remote_value = (service.disk_share(remote_id, window) if kind == "totals"
+                        else service.series(remote_id, window))
+        remote_amount = (remote_value.task_total_bytes if kind == "totals" else
+                         sum(point.read_bytes + point.write_bytes for point in remote_value.points))
+        assert remote_amount == 40
+        future = client.only(kind)
         client.settle(future, {
             "kind": kind, "result": remote_value, "app_key": row.app_key,
             "snapshot": DIGEST, "next_cursor": None,
@@ -4781,6 +4817,7 @@ def test_remote_detail_after_mixed_store_refusal_uses_local_ownership(tmp_path, 
         router.close()
         local.connection.close()
         imported.connection.close()
+        second.connection.close()
 
 
 @pytest.mark.parametrize("kind", ["totals", "series"])

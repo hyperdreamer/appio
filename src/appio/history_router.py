@@ -967,6 +967,9 @@ class HistoryRouter:
         self._detail: _DetailLifetime | None = None
         self._next_lifetime_id = 1
         self._applied_window: Window | None = None
+        #: Immutable row proofs from the last observed applied ranking. A newly
+        #: selected subject needs its ownership decision during preparation too.
+        self._applied_ranking_provenance: dict[str, AnswerProvenance] = {}
         #: One wire occupant and its priority-stable queue (§5.1).
         self._queue: list[_QueueEntry] = []
         self._occupant: tuple[RequestToken, Future] | None = None
@@ -2261,6 +2264,7 @@ class HistoryRouter:
 
     def close(self):
         self.invalidate()
+        self._applied_ranking_provenance = {}
         self._close_views()
         self._queue = []
         self._closed = True
@@ -2692,6 +2696,7 @@ class HistoryRouter:
         """One authority transition: clear detail and retire its admitted frame."""
 
         self._authority = current
+        self._applied_ranking_provenance = {}
         changed = self._retire_detail_lifetime()
         frame = self._frame
         if frame is not None and not frame.retired:
@@ -2783,7 +2788,9 @@ class HistoryRouter:
         family = self._window_family(key, window)
         endpoint = applied_endpoint(window)
         lifetime = self._detail
-        ranking_provenance = self.ranking_provenance(key, window)
+        ranking_provenance = self._applied_ranking_provenance.get(key)
+        if ranking_provenance is None or ranking_provenance.measured_window != window:
+            ranking_provenance = self.ranking_provenance(key, window)
         if (lifetime is not None and lifetime.app_key == key
                 and lifetime.family == family):
             if ranking_provenance is not None:
@@ -4076,6 +4083,8 @@ class HistoryRouter:
             rows = [replace(row, coverage=replace(row.coverage, complete=False,
                                                    unavailable_reason="not_retained"))
                     for row in rows]
+        assert self._frame is not None
+        self._applied_ranking_provenance = dict(self._frame.ranking_provenance)
         return sorted(rows, key=lambda row: (-getattr(row, "total_bytes" if metric == "total_bytes" else metric),
                                              row.app_key.encode("utf-8")))
 
