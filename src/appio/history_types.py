@@ -35,10 +35,13 @@ __all__ = [
     "AcceptedIdentity",
     "AnswerKind",
     "AnswerProvenance",
+    "CapturedSourceImage",
+    "CapturedSourceSet",
     "FrameProvenance",
     "LocalBracket",
     "LocalPosition",
     "LocalPositionVector",
+    "ManagedSourceSpec",
     "PartKind",
     "PartPhase",
     "PartState",
@@ -46,6 +49,7 @@ __all__ = [
     "RetentionScope",
     "RetainedRecord",
     "SeriesMetadata",
+    "SnapshotProvenance",
     "SourcePosition",
     "applied_endpoint",
     "local_answer_digest",
@@ -86,9 +90,12 @@ _LOCAL_DIGEST_TAG = "appio-local-answer-v1"
 # ---------------------------------------------------------------------------
 
 
-def _text(value: object, field: str, *, max_bytes: int | None = None) -> str:
-    if not isinstance(value, str) or value == "":
-        raise ValueError(f"{field} must be a non-empty string")
+def _text(
+    value: object, field: str, *, max_bytes: int | None = None, allow_empty: bool = False
+) -> str:
+    if not isinstance(value, str) or (value == "" and not allow_empty):
+        requirement = "a string" if allow_empty else "a non-empty string"
+        raise ValueError(f"{field} must be {requirement}")
     try:
         encoded = value.encode("utf-8")
     except UnicodeEncodeError as error:
@@ -158,7 +165,7 @@ def _revalidate_tree(value: object) -> None:
         if not math.isfinite(value):
             raise ValueError("history values must be finite numbers")
         return
-    if value is None or isinstance(value, (bool, int, str)):
+    if value is None or isinstance(value, (bool, int, str, bytes)):
         return
     if isinstance(value, (list, dict, set, frozenset)):
         raise ValueError("history records carry tuples, not mutable collections")
@@ -298,6 +305,30 @@ class RemotePosition:
 
 
 @dataclass(frozen=True)
+class ManagedSourceSpec:
+    """Immutable connection configuration for one managed history source."""
+
+    name: str
+    owner: Literal["gui", "iod"]
+    database_uri: str
+    connect_options: tuple[tuple[str, str], ...]
+
+    def __post_init__(self) -> None:
+        _text(self.name, "managed_source_spec.name")
+        _enum(self.owner, _OWNERS, "managed_source_spec.owner")
+        uri = _text(self.database_uri, "managed_source_spec.database_uri")
+        if "\x00" in uri:
+            raise ValueError("managed_source_spec.database_uri must not contain NUL")
+        if not isinstance(self.connect_options, tuple):
+            raise ValueError("managed_source_spec.connect_options must be a tuple")
+        for option in self.connect_options:
+            if not isinstance(option, tuple) or len(option) != 2:
+                raise ValueError("each connect option must be an immutable text pair")
+            _text(option[0], "managed_source_spec.connect_options[].key")
+            _text(option[1], "managed_source_spec.connect_options[].value")
+
+
+@dataclass(frozen=True)
 class LocalPosition:
     """One registered source's O(1) change token, never a table hash."""
 
@@ -351,6 +382,77 @@ class LocalBracket:
 
 
 @dataclass(frozen=True)
+class CapturedSourceImage:
+    """Serialized bytes and digest for one registered source incarnation."""
+
+    name: str
+    registration_epoch: int
+    image: bytes
+    image_digest: str
+
+    def __post_init__(self) -> None:
+        _text(self.name, "captured_source_image.name")
+        _integer(
+            self.registration_epoch, "captured_source_image.registration_epoch", minimum=1
+        )
+        if not isinstance(self.image, bytes):
+            raise ValueError("captured_source_image.image must be immutable bytes")
+        _digest_text(self.image_digest)
+        if self.image_digest != hashlib.sha256(self.image).hexdigest():
+            raise ValueError("captured_source_image.image_digest must match image bytes")
+
+
+@dataclass(frozen=True)
+class CapturedSourceSet:
+    """One complete, ordered image set with its opening and closing vectors."""
+
+    capture_id: int
+    opening: LocalPositionVector
+    closing: LocalPositionVector
+    images: tuple[CapturedSourceImage, ...]
+    snapshot_digest: str
+
+    def __post_init__(self) -> None:
+        _integer(self.capture_id, "captured_source_set.capture_id", minimum=1)
+        _record(self.opening, LocalPositionVector, "captured_source_set.opening")
+        _record(self.closing, LocalPositionVector, "captured_source_set.closing")
+        _digest_text(self.snapshot_digest)
+        if not isinstance(self.images, tuple):
+            raise ValueError("captured_source_set.images must be a tuple")
+        encoded: list[bytes] = []
+        for image in self.images:
+            _record(image, CapturedSourceImage, "captured_source_set.images[]")
+            encoded.append(image.name.encode("utf-8"))
+        if len(set(encoded)) != len(encoded):
+            raise ValueError("captured_source_set.images names must be unique")
+        if encoded != sorted(encoded):
+            raise ValueError("captured_source_set.images must be sorted by name UTF-8 bytes")
+        members = tuple((image.name, image.registration_epoch) for image in self.images)
+        for vector in (self.opening, self.closing):
+            sources = tuple(
+                (source.name, source.registration_epoch) for source in vector.sources
+            )
+            if members != sources:
+                raise ValueError(
+                    "captured images must match every source incarnation in both vectors"
+                )
+
+
+@dataclass(frozen=True)
+class SnapshotProvenance:
+    """The capture identity and local bracket supporting an observed answer."""
+
+    capture_id: int
+    snapshot_digest: str
+    bracket: LocalBracket
+
+    def __post_init__(self) -> None:
+        _integer(self.capture_id, "snapshot_provenance.capture_id", minimum=1)
+        _digest_text(self.snapshot_digest)
+        _record(self.bracket, LocalBracket, "snapshot_provenance.bracket")
+
+
+@dataclass(frozen=True)
 class AnswerProvenance:
     """The measured Window, identity, stamp and proved source of one answer."""
 
@@ -362,6 +464,7 @@ class AnswerProvenance:
     first_seen_at_ns: int | None
     answered_source: "SourcePosition | None"
     local_bracket: LocalBracket | None
+    snapshot: SnapshotProvenance | None = None
 
     def __post_init__(self) -> None:
         _enum(self.kind, _ANSWER_KINDS, "answer_provenance.kind")
@@ -409,6 +512,13 @@ class AnswerProvenance:
             raise ValueError("a local answered source requires its local bracket")
         if isinstance(answered, RemotePosition) and bracket is not None:
             raise ValueError("a remote answered source cannot carry a local bracket")
+        snapshot = self.snapshot
+        if snapshot is not None:
+            _record(snapshot, SnapshotProvenance, "answer_provenance.snapshot")
+            if bracket is None or snapshot.bracket != bracket:
+                raise ValueError("answer snapshot evidence must match its local bracket")
+        if identity is not None and bracket is not None and snapshot is None:
+            raise ValueError("a local accepted identity requires snapshot evidence")
 
 
 @dataclass(frozen=True)
@@ -507,7 +617,7 @@ class PartState:
             raise ValueError("the retained record window must match the requested window")
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, init=False)
 class FrameProvenance:
     """Prepared window, requested/answered source and exact certification."""
 
@@ -516,7 +626,41 @@ class FrameProvenance:
     requested_source: "SourcePosition"
     answered_source: "SourcePosition | None"
     local_bracket: LocalBracket | None
+    snapshot: SnapshotProvenance | None
     certified: bool
+
+    def __init__(
+        self,
+        generation: int,
+        window: Window,
+        requested_source: SourcePosition,
+        answered_source: SourcePosition | None,
+        local_bracket: LocalBracket | None,
+        *args: object,
+        snapshot: SnapshotProvenance | None = None,
+        certified: bool | None = None,
+    ) -> None:
+        if len(args) > 2:
+            raise TypeError("FrameProvenance accepts at most seven positional arguments")
+        if len(args) == 2:
+            if snapshot is not None or certified is not None:
+                raise TypeError("snapshot or certified supplied twice")
+            snapshot, certified = args
+        elif args:
+            if isinstance(args[0], bool) and certified is None:
+                certified = args[0]
+            else:
+                if snapshot is not None:
+                    raise TypeError("snapshot supplied twice")
+                snapshot = args[0]
+        object.__setattr__(self, "generation", generation)
+        object.__setattr__(self, "window", window)
+        object.__setattr__(self, "requested_source", requested_source)
+        object.__setattr__(self, "answered_source", answered_source)
+        object.__setattr__(self, "local_bracket", local_bracket)
+        object.__setattr__(self, "snapshot", snapshot)
+        object.__setattr__(self, "certified", certified)
+        self.__post_init__()
 
     def __post_init__(self) -> None:
         _integer(self.generation, "frame_provenance.generation")
@@ -546,10 +690,17 @@ class FrameProvenance:
                     raise ValueError("an equal local bracket is the answered source")
             elif answered is not None:
                 raise ValueError("an unequal local bracket proves no answered source")
+        snapshot = self.snapshot
+        if snapshot is not None:
+            _record(snapshot, SnapshotProvenance, "frame_provenance.snapshot")
+            if bracket is None or snapshot.bracket != bracket:
+                raise ValueError("frame snapshot evidence must match its local bracket")
         if certified and (answered is None or answered != requested):
             raise ValueError(
                 "certification requires an answered source equal to the requested source"
             )
+        # Ranking success and source-incarnation checks are supplied by the
+        # producer. This neutral record validates their provenance evidence.
 
 
 @dataclass(frozen=True)
