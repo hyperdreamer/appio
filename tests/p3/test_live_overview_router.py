@@ -3682,6 +3682,73 @@ def test_settlement_superseded_or_duplicate_has_no_publication_effect(tmp_path):
         store.connection.close()
 
 
+def test_held_local_detail_accepts_once_after_forward_frames(tmp_path):
+    """A held local detail keeps its lifetime while forward frames settle."""
+
+    from live_overview_support import LocalPositionStores, _DeliveryQueue, make_managed_router
+
+    with LocalPositionStores(tmp_path) as stores:
+        router = make_managed_router(
+            stores.services["local"], _LocalCountingClient(), AppRegistry())
+        stores.attach(router)
+        delivery = _DeliveryQueue(router._completed)
+        router._completed = delivery
+        with delivery.lock:
+            delivery.held.add("totals")
+        window_a = Window("since_boot", BOOT, end_mono_ns=140 * NS)
+        window_b = Window("since_boot", BOOT, end_mono_ns=180 * NS)
+        window_c = Window("since_boot", BOOT, end_mono_ns=220 * NS)
+        scope = retention_scope(KEY, window_a)
+        settlements = []
+        settle_impl = router._settle
+
+        def settle_spy(token, outcome=None, *, retiring=False):
+            changed = settle_impl(token, outcome, retiring=retiring)
+            if token.owner == "detail":
+                settlements.append((token.token_id, retiring, changed))
+            return changed
+
+        router._settle = settle_spy
+        try:
+            router.prepare(window_a)
+            assert isinstance(wait_local(router), LocalFrameOutcome)
+            assert router.ready(window_a) is True
+            presentation = router.registry.id_for(KEY)
+            router.select_detail(KEY, window_a)
+
+            state = router.request_detail("totals", presentation, window_a)
+            token_id = state.request_id
+            _drain_until(router, delivery.entered.is_set)
+            assert state.state == "pending"
+            assert router._detail.live["totals"].token_id == token_id
+
+            for forward in (window_b, window_c):
+                router.prepare(forward)
+                assert isinstance(wait_local(router), LocalFrameOutcome)
+                assert router.ready(forward) is True
+                assert router._detail.live["totals"].token_id == token_id
+                assert router.part_state("totals", KEY, scope).state == "pending"
+
+            delivery.release("totals")
+            _drain_until(
+                router,
+                lambda: router.part_state("totals", KEY, scope).state != "pending",
+            )
+            state = router.part_state("totals", KEY, scope)
+            record = router.retained("totals", KEY, scope, window_c.end_mono_ns)
+            assert state.state == "ok"
+            assert state.request_id == token_id
+            assert record is not None
+            assert record.value.window == window_a
+            assert [entry for entry in settlements if entry[0] == token_id] == [
+                (token_id, False, True)
+            ]
+        finally:
+            delivery.release("totals")
+            del router._settle
+            router.close()
+
+
 def test_scope_owned_detail_survives_forward_frame_generations(tmp_path):
     """Detail belongs to its selected scope, not to one preparing frame.
 
@@ -4241,6 +4308,64 @@ def test_authority_change_clears_details_without_conflating_cursor_advance(tmp_p
         assert router.drain() is True
         assert router.retained("totals", KEY, scope, window.end_mono_ns) is None
     finally:
+        router.close()
+        store.connection.close()
+
+
+def test_authority_change_retires_pending_frame_once_and_replacement_applies(tmp_path):
+    """A connection-authority change retires one frame owner before replacement."""
+
+    client = _BoundClient()
+    router, store = _empty_router(tmp_path, client, name="frame-authority.db")
+    window = Window("since_boot", BOOT, end_mono_ns=140 * NS)
+    try:
+        _remote_frame(router, client, window)
+        router.prepare(window)
+        assert wait_local(router) is not None
+        stale_frame = router._frame
+        stale_future = client.only("ranking")
+        retirements = []
+        retire_impl = router._retire_frame_owner
+
+        def retire_spy(token):
+            retirements.append(token.token_id)
+            return retire_impl(token)
+
+        router._retire_frame_owner = retire_spy
+        before_generation = router._generation
+        client._generation += 1
+        assert router.drain() is True
+        assert retirements == [stale_frame.local_token.token_id]
+        assert stale_frame.retired is True
+        assert router._generation == before_generation + 1
+        assert router.frame_provenance(window) is None
+
+        client.settle(stale_future, {
+            "kind": "ranking",
+            "result": [total(17, KEY)],
+            "snapshot": DIGEST,
+            "next_cursor": None,
+        })
+        assert router.drain() is False
+        assert retirements == [stale_frame.local_token.token_id]
+        assert router.frame_provenance(window) is None
+
+        router.prepare(window)
+        assert wait_local(router) is not None
+        replacement = client.only("ranking")
+        client.settle(replacement, {
+            "kind": "ranking",
+            "result": [total(17, KEY)],
+            "snapshot": DIGEST,
+            "next_cursor": None,
+        })
+        assert router.ready(window) is True
+        assert router._frame is not stale_frame
+        assert router.frame_provenance(window) is not None
+        assert retirements == [stale_frame.local_token.token_id]
+    finally:
+        if "retire_spy" in locals():
+            del router._retire_frame_owner
         router.close()
         store.connection.close()
 
