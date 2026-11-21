@@ -1195,6 +1195,181 @@ def _page(window, *, rows=1, app_id=7, overflow_window=None):
                      "desc", None, overflow, coverage())
 
 
+@pytest.fixture
+def held_remote_detail(tmp_path):
+    from appio.history_types import retention_scope
+
+    router, transport, store = _scheduler_router(tmp_path)
+    window = Window("since_boot", BOOT, end_mono_ns=140 * NS)
+    presentation = _ready_remote_frame(router, transport, window)
+    router.select_detail(KEY, window)
+    router.request_detail("totals", presentation, window)
+    router.request_detail("series", presentation, window)
+    transport.pump()
+    future = router._occupant[1]
+    try:
+        yield router, transport, window, future, retention_scope(KEY, window)
+    finally:
+        router.close()
+        transport.client.close()
+        for server in transport.servers:
+            server.close()
+        store.connection.close()
+
+
+def test_query_timeout_keeps_transport_slot_until_terminal_or_retirement(held_remote_detail):
+    from appio.iodclient import REQUEST_LIFETIME_NS
+
+    router, transport, window, future, scope = held_remote_detail
+    sends = len(transport.query_frames)
+    transport.advance_ns(REQUEST_LIFETIME_NS)
+    transport.stream(5)
+    router.drain()
+    assert _reason(future) == "query_timeout"
+    assert router.part_state("totals", KEY, scope).state == "failed"
+    assert router.retained("totals", KEY, scope, window.end_mono_ns) is None
+    assert router._occupant[1] is future, "expired Future released the wire occupant"
+    assert len(transport.query_frames) == sends
+    transport.error(future, "unavailable", "late terminal")
+    router.drain()
+    transport.pump()
+    assert len(transport.query_frames) == sends + 1
+    assert router._occupant[0].request.kind == "series"
+
+
+def test_expired_query_retires_at_request_specific_silence_deadline(held_remote_detail):
+    from appio.iodclient import NO_ANSWER_NS, REQUEST_LIFETIME_NS
+
+    router, transport, _, future, _ = held_remote_detail
+    issued = transport.client.query_transport(future).issued_at_ns
+    generation = transport.client.generation
+    transport.clock.ns = issued + REQUEST_LIFETIME_NS
+    transport.stream(5)
+    router.drain()
+    deadline = issued + REQUEST_LIFETIME_NS + NO_ANSWER_NS
+    transport.clock.ns = deadline - 1
+    transport.stream(6)
+    router.drain()
+    assert router._occupant[1] is future
+    assert transport.client.query_transport(future).phase == "expired"
+    transport.clock.ns = deadline
+    router.drain()
+    assert transport.client.query_transport(future).phase == "lost"
+    assert transport.client._sock is None
+    assert transport.client.generation == generation
+    assert not transport.client.retire_query_connection(future)
+
+
+def test_cancelled_or_publication_retired_future_keeps_wire_occupant(held_remote_detail):
+    router, transport, window, future, _ = held_remote_detail
+    sends = len(transport.query_frames)
+    router.select_detail(None, None)
+    assert future.cancel()
+    router.drain()
+    transport.stream(5)
+    router.drain()
+    assert router._occupant[1] is future
+    assert transport.client.query_transport(future).phase == "active"
+    assert len(transport.query_frames) == sends
+    transport.reply(future, share(1, window), snapshot=SNAPSHOT)
+    router.drain()
+    assert router._occupant is None
+    assert transport.client.cached_responses == 1  # Only the prior ranking.
+
+
+@pytest.mark.parametrize("terminal", ["result", "error"])
+def test_late_expired_terminal_releases_without_second_publication_or_cache(
+        held_remote_detail, terminal):
+    from appio.iodclient import REQUEST_LIFETIME_NS
+
+    router, transport, window, future, scope = held_remote_detail
+    transport.advance_ns(REQUEST_LIFETIME_NS)
+    transport.stream(5)
+    router.drain()
+    failed = router.part_state("totals", KEY, scope)
+    assert failed.state == "failed"
+    cached = transport.client.cached_responses
+    if terminal == "result":
+        transport.reply(future, share(1, window), snapshot=SNAPSHOT)
+    else:
+        transport.error(future, "unavailable", "late failure")
+    router.drain()
+    assert transport.client.query_transport(future).phase == "terminal"
+    assert router.part_state("totals", KEY, scope) == failed
+    assert router.retained("totals", KEY, scope, window.end_mono_ns) is None
+    assert transport.client.cached_responses == cached
+    assert _reason(future) == "query_timeout"
+    router.drain()
+    assert router.part_state("totals", KEY, scope) == failed
+
+
+@pytest.mark.parametrize("fault", [
+    "wrong_kind", "wrong_key", "wrong_window", "file_coverage", "scalar_coverage",
+    "unknown_owner", "process_mapping_key", "process_mapping_value",
+    "process_mapping_valid", "duplicate_ranking", "association",
+])
+def test_malformed_result_is_not_cached_and_same_cursor_retry_sends(tmp_path, monkeypatch, fault):
+    from appio import iodclient as client_module
+
+    router, transport, store = _scheduler_router(tmp_path, name=f"malformed-{fault}.db")
+    window = Window("since_boot", BOOT, end_mono_ns=140 * NS)
+    try:
+        presentation = _ready_remote_frame(router, transport, window)
+        transport.client._drop_cache()
+        process = fault in ("file_coverage", "scalar_coverage", "unknown_owner",
+                            "process_mapping_key", "process_mapping_value", "process_mapping_valid")
+        kind = "coverage" if process else "ranking" if fault == "duplicate_ranking" else "totals"
+        request = QueryRequest(kind, window, None if kind in ("coverage", "ranking") else KEY)
+        good = {KEY: coverage()} if process else [total(7, KEY)] if kind == "ranking" else share(1, window)
+        bad = {
+            "wrong_kind": series(1, window),
+            "wrong_window": share(1, replace(window, end_mono_ns=150 * NS)),
+            "file_coverage": _file_coverage(window, app_id=transport.client._apps.id_for(KEY)),
+            "scalar_coverage": coverage(),
+            "unknown_owner": _unknown_owner(window),
+            "process_mapping_key": {"unit:/alpha.service": coverage()},
+            "process_mapping_value": {KEY: "not a Coverage"},
+            "process_mapping_valid": {KEY: coverage()},
+            "duplicate_ranking": [total(7, KEY), total(8, KEY)],
+        }.get(fault, good)
+        if fault == "wrong_key":
+            bad = share(transport.client._apps.id_for(OTHER_KEY), window)
+        before = len(transport.query_frames)
+        future = transport.query(request)
+        issued = transport.client.query_transport(future)
+        if fault == "association":
+            transport.client._transports[future].request = QueryRequest("totals", window, OTHER_KEY)
+        # Exercise the shared acceptance boundary with a malformed decoded value.
+        # Framing, request correlation, and all unrelated envelope fields remain real.
+        with monkeypatch.context() as patch:
+            patch.setattr(client_module, "from_wire", lambda *args, **kwargs: bad)
+            transport.reply_for(issued.request_id, request, good, snapshot=SNAPSHOT)
+        assert len(transport.query_frames) == before + 1
+        if fault == "process_mapping_valid":
+            assert future.result()["result"] == good
+            assert transport.client.cached_responses == 1
+        else:
+            assert _reason(future) == "invalid_result", fault
+            assert transport.client.cached_responses == 0, fault
+            assert router._detail is None
+            retry = transport.query(request)
+            assert len(transport.query_frames) == before + 2, fault
+            transport.reply(retry, good, snapshot=SNAPSHOT)
+            assert retry.result()["result"] is not None
+            assert transport.client.cached_responses == 1
+        hit = transport.query(request)
+        assert hit.done() and hit.exception() is None
+        expected_sends = 1 if fault == "process_mapping_valid" else 2
+        assert len(transport.query_frames) == before + expected_sends
+        assert transport.client.cached_responses == 1
+    finally:
+        router.close()
+        transport.client.close()
+        for server in transport.servers:
+            server.close()
+        store.connection.close()
+
+
 def test_all_history_queries_share_one_priority_stable_scheduler(tmp_path):
     """Every historical selector shares one occupant, priority and stable order.
 

@@ -3412,6 +3412,31 @@ class HistoryRouter:
             if answered is None or answered != token.requested_source:
                 return self._reject_token(
                     token, settlement, RequestRejected("invalid_result", "invalid_result"))
+            local_settlement = self._local_settlement
+            applied_local = None if local_settlement is None else local_settlement.outcome
+            applied_ownership = (
+                isinstance(applied_local, LocalFrameOutcome)
+                and applied_local.request.window == token.request.window
+                and (applied_local.has_local_history or bool(applied_local.overlaps)))
+            if self._remote is None and (
+                    self._has_local_history or self._overlap_ranges or applied_ownership):
+                # Ranking kept the ownership-filtered local frame. Recompute
+                # this exact detail through the same managed-source reducers.
+                self.client.reject_query_result(future)
+                self._settled_tokens.add(token.token_id)
+                local_token = replace(
+                    token, token_id=self._allocate_token_id(), origin="local",
+                    slot_id=None, requested_source=self._local_vector())
+                lifetime = self._detail
+                if lifetime.live.get(kind) == token:
+                    lifetime.live[kind] = local_token
+                else:
+                    lifetime.successors[kind] = local_token
+                slot = lifetime.slots[(kind, token.scope)]
+                if slot.token == token:
+                    slot.token = local_token
+                self._start_local_detail(local_token)
+                return True
             digest = actual.get("snapshot")
             presentation = self.registry.id_for(token.request.app_key)
             return self._publish_detail(

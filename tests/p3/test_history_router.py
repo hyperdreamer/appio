@@ -603,12 +603,13 @@ def test_settled_pruned_lifetime_summary_is_not_replaced_with_zero(tmp_path):
 def test_transport_gap_unknown_boot_bounds_and_epoch_fallback(tmp_path, monkeypatch, journal_mode):
     """No-write outcomes preserve positions and successful callbacks invalidate."""
     from appio.iodclient import GapNotice
-    from live_overview_support import drain_transport_gaps, make_managed_router
+    from live_overview_support import GapSqlHarness, drain_transport_gaps, make_managed_router
 
     local, _ = source(tmp_path / "gaps.db")
     local.connection.execute(f"PRAGMA journal_mode={journal_mode}")
     local.connection.execute("DELETE FROM collector_epoch WHERE source='gui'")
     local.connection.commit()
+    sql = GapSqlHarness(monkeypatch)
     history = make_managed_router(QueryService(local), Client(), AppRegistry())
     sources = history._capture_provider
     notifications = []
@@ -624,7 +625,11 @@ def test_transport_gap_unknown_boot_bounds_and_epoch_fallback(tmp_path, monkeypa
         for item in ignored:
             assert history.record_transport_gap(item) is None
         history.record_transport_gap(replace(notice, boot_id="missing"))
+        unknown = history._gap_writes[-1].future.result(timeout=10)
+        assert unknown.disposition == "unknown_boot"
         drain_transport_gaps(history)
+        writer = next(probe for probe in sql.connections if probe.role == "writer")
+        assert writer.sql[-1] == "ROLLBACK", "unknown boot must roll back its no-write transaction"
         assert history._generation == generation
         assert sources.observe_async().result(timeout=10) == initial
         assert history.gap_persistence_error is None
@@ -639,6 +644,9 @@ def test_transport_gap_unknown_boot_bounds_and_epoch_fallback(tmp_path, monkeypa
         assert inserted != initial
         duplicate = replace(notice, iod_epoch=10, seq=99, reason="cursor_not_retained")
         history.record_transport_gap(duplicate)
+        duplicate_result = history._gap_writes[-1].future.result(timeout=10)
+        assert duplicate_result.disposition == "duplicate"
+        assert writer.sql[-1] == "ROLLBACK", "duplicate must roll back its no-write transaction"
         for item in history._gap_writes:
             item.future.exception(timeout=10)
         history.retry_transport_gaps()
@@ -660,7 +668,7 @@ def test_transport_gap_unknown_boot_bounds_and_epoch_fallback(tmp_path, monkeypa
 
 
 @pytest.mark.parametrize("journal_mode", ["DELETE", "WAL"])
-@pytest.mark.parametrize("winner", ["external", "actor", "reader"])
+@pytest.mark.parametrize("winner", ["external", "actor", "reader", "race"])
 def test_transport_gap_atomic_dedup_with_concurrent_writers(
         tmp_path, monkeypatch, journal_mode, winner):
     """The duplicate check shares the insert's immediate transaction."""
@@ -695,7 +703,18 @@ def test_transport_gap_atomic_dedup_with_concurrent_writers(
     sql.before_execute = observe_duplicate_check
     try:
         before = history._capture_provider.observe_async().result(timeout=10)
-        if winner in ("external", "reader"):
+        if winner == "race":
+            with sql.hold("BEGIN IMMEDIATE") as beginning:
+                history.record_transport_gap(notice)
+                beginning.wait()
+                external.execute("BEGIN IMMEDIATE")
+                external.execute("INSERT INTO gap(boot_id,source,epoch,seq,from_mono_ns,to_mono_ns,reason) "
+                    "VALUES(?,'gui',1,0,?,?,'gui_absent')", (BOOT, 110 * NS, 120 * NS))
+                external.execute("UPDATE app SET name='collector committed' WHERE app_id=17")
+                external.execute("COMMIT")
+                beginning.release()
+                drain_transport_gaps(history)
+        elif winner in ("external", "reader"):
             external.execute("BEGIN IMMEDIATE" if winner == "external" else "BEGIN")
             external.execute("SELECT * FROM boot").fetchall()
             history.record_transport_gap(notice)

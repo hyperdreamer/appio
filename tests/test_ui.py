@@ -3972,6 +3972,157 @@ class BrokenRetainedQuery(ExactOnlyQuery):
         return self._broken("ranking_provenance", app_key, window)
 
 
+def _dependency_view(qtbot, *, window=WINDOW_A, share_value=None, series_value=None):
+    clock = ExactOnlyClock(1_000_000_000)
+    service = IdentityExactOnlyQuery()
+    service.rows = [app_total(1, SUBJECT_KEY, "Alpha", 22, peak_bps=None)]
+    service.set_share(window, share_value or measured_share(window))
+    service.set_series(window, series_value or measured_series(window))
+    for kind, digest in (("totals", "b"), ("series", "c")):
+        service.identities[(kind, SUBJECT_KEY, window)] = AcceptedIdentity(
+            kind, SUBJECT_KEY, window, digest * 64)
+    view = AppIoWindow(service, clock_ns=clock)
+    qtbot.addWidget(view)
+    view.set_window(window)
+    return clock, service, view
+
+
+@pytest.mark.parametrize("arm", ["preserve_exact", "retained_A_pending_B"])
+def test_share_outputs_survive_series_failure_or_pending(qtbot, arm):
+    clock, service, view = _dependency_view(qtbot)
+    try:
+        original = view._overview_model.share_provenance
+        requested = WINDOW_A
+        if arm == "retained_A_pending_B":
+            requested = WINDOW_B
+            clock.advance_ns(2_000_000_000)
+            service.set_pending("totals", 1, requested)
+        for outcome in (RuntimeError("series_bad"), HistoryPending("still loading")):
+            service.set_error("series", 1, requested, outcome)
+            view.set_window(requested)
+            model = view._overview_model
+            assert [item.text for item in model.kpis[:3]] == [
+                format_bytes(22), format_bytes(17), format_bytes(5)]
+            assert model.kpis[4].text == format_bytes(14)
+            assert model.share.window == WINDOW_A
+            assert model.share_provenance == original
+            assert view._donut.shares() is not None
+            assert view._share_bars.fractions()
+            assert not model.device_lanes
+            if arm == "retained_A_pending_B":
+                assert f"; share measured: since_boot {BOOT_A} through 20000000000 ns" in model.detail_line
+                assert oldest_answer_age(view.measurement_status().displayed_answers, clock()) == "oldest answer 2 s ago"
+    finally:
+        view.close()
+
+
+@pytest.mark.parametrize("arm", ["preserve_exact", "series_coverage_reason"])
+def test_series_device_incomplete_only_withholds_device_lanes(qtbot, arm):
+    clock, service, view = _dependency_view(qtbot)
+    try:
+        requested = WINDOW_A if arm == "preserve_exact" else WINDOW_B
+        if requested == WINDOW_B:
+            clock.advance_ns(2_000_000_000)
+            service.set_pending("totals", 1, requested)
+        incomplete = replace(measured_series(requested), coverage=coverage(
+            complete=False, device_state="incomplete", unavailable_reason=None))
+        service.set_series(requested, incomplete)
+        view.set_window(requested)
+        model = view._overview_model
+        assert model.kpis[4].text == format_bytes(14)
+        assert view._share_bars.fractions()
+        assert model.reconciliation is not None
+        assert model.task_points == incomplete.points
+        assert model.device_lanes == () and model.more_devices == 0
+        assert model.series_metadata.coverage.device_state == "incomplete"
+        assert model.series_metadata.tier == "raw"
+        assert model.detail_line.endswith("; device lanes: incomplete")
+    finally:
+        view.close()
+
+
+@pytest.mark.parametrize("arm", ["preserve_exact", "failure_pending"])
+def test_share_failure_keeps_independent_task_lane(qtbot, arm):
+    clock, service, view = _dependency_view(qtbot)
+    try:
+        accepted = view._overview_model.series_provenance
+        requested = WINDOW_A if arm == "preserve_exact" else WINDOW_B
+        if requested == WINDOW_B:
+            clock.advance_ns(2_000_000_000)
+            service.set_pending("series", 1, requested)
+        service.set_error("totals", 1, requested, RuntimeError("share_bad"))
+        view.set_window(requested)
+        for retry in (False, True):
+            if retry:
+                service.set_pending("totals", 1, requested)
+                view.refresh()
+            model = view._overview_model
+            assert all(item.text == "unavailable" for item in model.kpis)
+            assert model.share is None and model.share_provenance is None
+            assert model.task_points == measured_series(WINDOW_A).points
+            assert model.series_provenance == accepted
+            assert view._detail_service.retained("totals", SUBJECT_KEY,
+                retention_scope(SUBJECT_KEY, requested), requested.end_mono_ns) is None
+            if arm == "failure_pending":
+                assert f"; series measured: since_boot {BOOT_A} through 20000000000 ns" in model.detail_line
+    finally:
+        view.close()
+
+
+@pytest.mark.parametrize("arm", ["preserve_exact", "retained_A_pending_B"])
+def test_undefined_residual_does_not_remove_device_total_or_bars(qtbot, arm):
+    value = replace(measured_share(WINDOW_A), residual_read=None,
+                    residual_write=None, residual_total=None)
+    clock, service, view = _dependency_view(qtbot, share_value=value)
+    try:
+        accepted = view._overview_model.share_provenance
+        if arm == "retained_A_pending_B":
+            clock.advance_ns(2_000_000_000)
+            service.set_pending("totals", 1, WINDOW_B)
+            service.set_pending("series", 1, WINDOW_B)
+            view.set_window(WINDOW_B)
+        model = view._overview_model
+        assert model.kpis[4].text == format_bytes(14)
+        assert view._share_bars.fractions()
+        assert model.reconciliation is None
+        assert model.share_provenance == accepted
+        assert model.share.window == WINDOW_A
+        if arm == "retained_A_pending_B":
+            assert f"; share measured: since_boot {BOOT_A} through 20000000000 ns" in model.detail_line
+            assert oldest_answer_age(view.measurement_status().displayed_answers, clock()) == "oldest answer 2 s ago"
+    finally:
+        view.close()
+
+
+@pytest.mark.parametrize("arm", ["preserve_exact", "failure_pending"])
+def test_lifetime_detail_keeps_totals_without_chronology(qtbot, arm):
+    lifetime = Window("lifetime")
+    clock, service, view = _dependency_view(qtbot, window=lifetime)
+    try:
+        model = view._overview_model
+        assert [item.text for item in model.kpis[:3]] == [format_bytes(22), format_bytes(17), format_bytes(5)]
+        assert model.kpis[4].text == format_bytes(14)
+        assert model.task_points == () and model.device_lanes == ()
+        assert view._share_bars.fractions()
+        assert all(BOOT_A in name for name, _fraction in view._share_bars.fractions())
+        if arm == "failure_pending":
+            clock.advance_ns(2_000_000_000)
+            service.set_error("totals", 1, lifetime, RuntimeError("share_bad"))
+            view.refresh()
+            service.set_pending("totals", 1, lifetime)
+            view.refresh()
+            assert view._overview_model.share is None
+            assert all(item.text == "unavailable" for item in view._overview_model.kpis)
+            assert view._detail_service.retained("totals", SUBJECT_KEY,
+                retention_scope(SUBJECT_KEY, lifetime), None) is None
+            assert oldest_answer_age(view.measurement_status().displayed_answers, clock()) is None
+            service.set_share(lifetime, measured_share(lifetime))
+            view.refresh()
+            assert view._overview_model.kpis[0].text == format_bytes(22)
+    finally:
+        view.close()
+
+
 def test_pending_refresh_keeps_retained_dependency_values(qtbot) -> None:
     clock = ExactOnlyClock(1_000_000_000)
     service = IdentityExactOnlyQuery()

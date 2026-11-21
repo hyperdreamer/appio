@@ -106,6 +106,54 @@ def _assert_frozen(record: object, name: str) -> None:
         setattr(record, name, getattr(record, name))
 
 
+def test_revision_8_inventory_has_one_definition_at_prescribed_file():
+    import ast
+    from collections import defaultdict
+    from pathlib import Path
+    import re
+
+    root = Path(__file__).resolve().parents[2]
+    spec = (root / "docs/superpowers/specs/2026-11-15-live-overview-totals-spec.md").read_text()
+    inventory = spec.split("## 12. Test inventory", 1)[1].split("### 12.10", 1)[0]
+    required = {}
+    for section in re.split(r"(?=^### 12\.)", inventory, flags=re.MULTILINE):
+        heading = section.splitlines()[0] if section.splitlines() else ""
+        paths = re.findall(r"`(tests/[^`]+\.py)`", heading)
+        for name in re.findall(r"^\| `(test_\w+)` \|", section, flags=re.MULTILINE):
+            assert paths, f"required test has no specified file: {name}"
+            assert name not in required, f"duplicate specification row: {name}"
+            required[name] = paths
+    definitions = defaultdict(list)
+    for path in (root / "tests").rglob("test_*.py"):
+        for node in ast.parse(path.read_text()).body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                definitions[node.name].append(path.relative_to(root).as_posix())
+    assert len(required) == 91
+    for name, allowed in required.items():
+        assert len(definitions[name]) == 1, (name, definitions[name])
+        assert definitions[name][0] in allowed, (name, allowed, definitions[name])
+
+
+def test_disposable_mutation_runner_rejects_missing_target_and_cleans(monkeypatch):
+    from pathlib import Path
+    import tempfile
+    import live_overview_support as support
+
+    roots = []
+    temporary = tempfile.TemporaryDirectory
+
+    def tracked(*args, **kwargs):
+        result = temporary(*args, **kwargs)
+        roots.append(Path(result.name))
+        return result
+
+    monkeypatch.setattr(tempfile, "TemporaryDirectory", tracked)
+    with pytest.raises(AssertionError, match="mutation target must occur exactly once"):
+        support.run_isolated_mutation("src/appio/history_source.py", "missing-target-marker",
+                                     "replacement", (), "never reached")
+    assert roots and all(not root.exists() for root in roots)
+
+
 def test_remote_registration_change_retires_frame_detail_and_files(tmp_path):
     from test_live_overview_client import _scheduler_router, _ready_remote_frame, _answer_next
     from live_overview_support import managed_spec
@@ -3704,7 +3752,7 @@ def test_settlement_superseded_or_duplicate_has_no_publication_effect(tmp_path):
         store.connection.close()
 
 
-def test_held_local_detail_accepts_once_after_forward_frames(tmp_path):
+def test_held_local_detail_accepts_once_after_forward_frames(tmp_path, qtbot, monkeypatch):
     """A held local detail keeps its lifetime while forward frames settle."""
 
     from live_overview_support import LocalPositionStores, _DeliveryQueue, make_managed_router
@@ -3769,6 +3817,68 @@ def test_held_local_detail_accepts_once_after_forward_frames(tmp_path):
             delivery.release("totals")
             del router._settle
             router.close()
+
+    from appio.ui.collector_window import CollectorWindow
+    from test_collector_window import ControlledCoordinator, ControlledSetup
+    from live_overview_support import wait_for_capture_admission
+
+    with LocalPositionStores(tmp_path) as stores:
+        router = make_managed_router(stores.services["local"], _LocalCountingClient(), AppRegistry())
+        entered, release = threading.Event(), threading.Event()
+        successor_release = threading.Event()
+        original = router._read_local_part
+        completed = []
+
+        def held_computation(capture, request, **options):
+            if request.kind == "totals":
+                if request.window == window_a:
+                    entered.set()
+                    assert release.wait(20), "held detail computation was not released"
+                else:
+                    assert successor_release.wait(20), "successor computation was not released"
+            result = original(capture, request, **options)
+            completed.append((request.kind, request.window, result.data_digest))
+            return result
+
+        monkeypatch.setattr(router, "_read_local_part", held_computation)
+        shell = CollectorWindow(ControlledCoordinator(), router, ControlledSetup(),
+                                clock_ns=lambda: 100 * NS)
+        qtbot.addWidget(shell)
+        shell._timer.stop()
+        shell._poll_timer.stop()
+        window_a = Window("since_boot", "boot-a", end_mono_ns=20 * NS)
+        window_b = Window("since_boot", "boot-a", end_mono_ns=30 * NS)
+        scope = retention_scope(KEY, window_a)
+        try:
+            shell.show_window(window_a)
+            wait_local(router)
+            assert shell.apply_ready_frame()
+            wait_for_capture_admission(router)
+            _drain_until(router, entered.is_set)
+            original_token = router._detail.live["totals"]
+            selected_key = original_token.request.app_key
+            scope = retention_scope(selected_key, window_a)
+            assert not release.is_set()
+            shell.show_window(window_b)
+            wait_local(router)
+            assert router.ready(window_b)
+            assert shell.apply_ready_frame()
+            assert shell._displayed == window_b, "frame did not apply while detail computation was held"
+            assert not release.is_set()
+            assert router._detail.live["totals"] is original_token
+            release.set()
+            _drain_until(router, lambda: router.retained(
+                "totals", selected_key, scope, window_b.end_mono_ns) is not None)
+            record = router.retained("totals", selected_key, scope, window_b.end_mono_ns)
+            assert record is not None
+            assert record.value.window == window_a
+            assert record.provenance.accepted_identity.data_digest == local_answer_digest(
+                "totals", selected_key, window_a, record.value)
+            assert len([item for item in completed if item[:2] == ("totals", window_a)]) == 1
+        finally:
+            release.set()
+            successor_release.set()
+            shell.shutdown()
 
 
 def test_scope_owned_detail_survives_forward_frame_generations(tmp_path):
@@ -4476,6 +4586,195 @@ def _forged_frame_settlement(router, window, field, value):
     return token, settlement
 
 
+def test_failed_record_cannot_be_revived_by_pending_retry(tmp_path, qtbot):
+    from appio.ui.main_window import AppIoWindow
+
+    client = _BoundClient()
+    router, store = _empty_router(tmp_path, client, name="failed-view.db")
+    window = Window("since_boot", BOOT, end_mono_ns=140 * NS)
+    scope = retention_scope(KEY, window)
+    view = None
+    try:
+        presentation = _remote_frame(router, client, window)
+        view = AppIoWindow(router, clock_ns=client.clock)
+        qtbot.addWidget(view)
+        view.set_window(window)
+        client.settle(client.only("series"), {
+            "kind": "series", "app_key": KEY, "result": series(1, window),
+            "snapshot": DIGEST, "next_cursor": None})
+        router.drain()
+        client.settle(client.only("totals"), _totals_response(window=window))
+        router.drain()
+        view.refresh_measurements()
+        original_series = view._overview_model.series_provenance
+        assert view._overview_model.share is not None
+        router.request_detail("totals", presentation, window)
+        client.fail(client.only("totals"), RemoteError("unavailable", "share_bad"))
+        router.drain()
+        view.refresh_measurements()
+        assert router.retained("totals", KEY, scope, window.end_mono_ns) is None
+        assert view._overview_model.share is None
+        router.request_detail("totals", presentation, window)
+        view.refresh_measurements()
+        assert router.part_state("totals", KEY, scope).state == "pending"
+        assert router.retained("totals", KEY, scope, window.end_mono_ns) is None
+        assert all(item.text == "unavailable" for item in view._overview_model.kpis)
+        assert view._overview_model.series_provenance == original_series
+        assert view._overview_model.task_points == series(1, window).points
+        client.settle(client.only("totals"), _totals_response(window=window))
+        router.drain()
+        view.refresh_measurements()
+        assert view._overview_model.share.task_total_bytes == 22
+    finally:
+        if view is not None:
+            view.close()
+        router.close()
+        store.connection.close()
+
+
+def test_remote_detail_liveness_across_ten_second_commit(tmp_path, qtbot):
+    from appio.ui.main_window import AppIoWindow
+    from live_overview_transport import QueryTransportHarness
+    from live_overview_support import make_managed_router
+
+    clock = Clock(0)
+    transport = QueryTransportHarness(clock=clock)
+    transport.stream(4)
+    store = AppIoStore(tmp_path / "slow-detail.db")
+    router = make_managed_router(QueryService(store), transport.client, AppRegistry(), clock_ns=clock)
+    window_a = Window("since_boot", "boot-a", end_mono_ns=20 * NS)
+    window_b = Window("since_boot", "boot-a", end_mono_ns=30 * NS)
+    scope = retention_scope(KEY, window_a)
+    view = None
+    try:
+        router.prepare(window_a)
+        wait_local(router)
+        clock.ns = 200_000_000
+        transport.pump()
+        transport.reply(router._occupant[1], [total(17, KEY)], snapshot=DIGEST)
+        assert router.ready(window_a)
+        view = AppIoWindow(router, clock_ns=clock)
+        qtbot.addWidget(view)
+        view.set_window(window_a)
+        transport.pump()
+        series_future = router._occupant[1]
+        assert transport.client.query_transport(series_future).issued_at_ns == 200_000_000
+        clock.ns = 5_150_000_000
+        transport.reply(series_future, series(1, window_a), snapshot=DIGEST)
+        router.drain()
+        transport.pump()
+        totals_future = router._occupant[1]
+        assert router._occupant[0].request.kind == "totals"
+        assert transport.client.query_transport(totals_future).issued_at_ns == 5_150_000_000
+        clock.ns = 10 * NS
+        transport.stream(6)
+        router.prepare(window_b)
+        wait_local(router)
+        assert not router.ready(window_b)
+        assert router._occupant[1] is totals_future
+        clock.ns = 10_100_000_000
+        transport.reply(totals_future, share(1, window_a), snapshot=DIGEST)
+        router.drain()
+        view.refresh_measurements()
+        accepted = router.retained("totals", KEY, scope, window_b.end_mono_ns)
+        assert accepted is not None and accepted.value.window == window_a, (
+            router.part_state("totals", KEY, scope), router._detail,
+            transport.client.query_transport(totals_future), router._retired_tokens)
+        assert accepted.provenance.first_seen_at_ns == 10_100_000_000
+        assert view._overview_model.share.task_total_bytes == 22
+        assert not router.ready(window_b), "replacement must stay pending when totals appears"
+        transport.pump()
+        transport.reply(router._occupant[1], [total(17, KEY)], snapshot=DIGEST)
+        assert router.ready(window_b)
+        view.set_window(window_b)
+        assert view._overview_model.share.window == window_a
+        assert view._overview_model.share_provenance == accepted.provenance
+        assert router.part_state("totals", KEY, scope).state == "pending"
+        assert "share measured: since_boot boot-a through 20000000000 ns" in view._overview_model.detail_line
+        assert max(transport.observed_historical_occupants) == 1
+    finally:
+        if view is not None:
+            view.close()
+        router.close()
+        transport.client.close()
+        for server in transport.servers:
+            server.close()
+        store.connection.close()
+
+
+@pytest.mark.parametrize("kind", ["totals", "series"])
+@pytest.mark.parametrize("schedule", ["settled", "forward_frame_held"])
+def test_remote_detail_after_mixed_store_refusal_uses_local_ownership(tmp_path, kind, schedule, monkeypatch):
+    from test_history_router import BOOT as fixture_boot, source
+    from live_overview_support import add_managed_source, make_managed_router
+
+    local, _ = source(tmp_path / "overlap-local.db", start=100, end=122)
+    imported, _ = source(tmp_path / "overlap-export.db", "iod", start=100, end=120)
+    client = _BoundClient(boot=fixture_boot)
+    router = make_managed_router(QueryService(local), client, AppRegistry(), clock_ns=client.clock)
+    add_managed_source(router, imported, name="export", owner="iod")
+    window = Window("since_boot", fixture_boot, end_mono_ns=130 * NS)
+    release_frame = threading.Event()
+    try:
+        router.prepare(window)
+        wait_local(router)
+        remote_rows = QueryService(imported).ranking(window, "total_bytes")
+        client.settle(client.only("ranking"), {
+            "kind": "ranking", "result": remote_rows, "snapshot": DIGEST,
+            "next_cursor": None,
+        })
+        assert router.ready(window)
+        row, = router.ranking(window, "total_bytes")
+        assert row.total_bytes == 0
+        assert row.coverage.overlap_uncertain_intervals == 1
+        assert router._remote is None
+        assert "mixed-store" in router.daemon_answer_error.reason
+        router.select_detail(row.app_key, window)
+        scope = retention_scope(row.app_key, window)
+        router.request_detail(kind, row.app_id, window)
+        remote_id = remote_rows[0].app_id
+        service = QueryService(imported)
+        remote_value = (service.disk_share(remote_id, window) if kind == "totals"
+                        else service.series(remote_id, window))
+        future = client.only(kind)
+        if schedule == "forward_frame_held":
+            entered = threading.Event()
+            read = router._read_local
+
+            def held_frame(*args, **kwargs):
+                entered.set()
+                assert release_frame.wait(20), "forward frame was not released"
+                return read(*args, **kwargs)
+
+            monkeypatch.setattr(router, "_read_local", held_frame)
+            router.prepare(replace(window, end_mono_ns=140 * NS))
+            _drain_until(router, entered.is_set)
+            assert not router._has_local_history and router._overlap_ranges == []
+        client.settle(future, {
+            "kind": kind, "result": remote_value, "app_key": row.app_key,
+            "snapshot": DIGEST, "next_cursor": None,
+        })
+        router.drain()
+        _drain_until(router, lambda: router.part_state(kind, row.app_key, scope).state == "ok")
+        record = router.retained(kind, row.app_key, scope, window.end_mono_ns)
+        assert record is not None
+        measured = record.value
+        amount = (measured.task_total_bytes if kind == "totals" else
+                  sum(point.read_bytes + point.write_bytes for point in measured.points))
+        assert amount == 0, "remote detail resurrected excluded overlap bytes"
+        assert measured.coverage.overlap_uncertain_intervals == 1
+        assert record.provenance.snapshot is not None
+        assert record.provenance.local_bracket is not None
+        assert future in client.rejected
+        if schedule == "settled":
+            assert router._overlap_ranges == [(fixture_boot, 100 * NS, 120 * NS)]
+    finally:
+        release_frame.set()
+        router.close()
+        local.connection.close()
+        imported.connection.close()
+
+
 def test_local_outcomes_share_settlement_for_frame_part_and_files(tmp_path):
     """Every local variant publishes once through the sole settlement writer.
 
@@ -4616,12 +4915,15 @@ def test_local_outcomes_share_settlement_for_frame_part_and_files(tmp_path):
                 value_copy = copy.copy(forged.value)
                 object.__setattr__(value_copy, "window", value)
                 object.__setattr__(forged, "value", value_copy)
+            elif field == "snapshot_digest":
+                object.__setattr__(forged, "snapshot", replace(forged.snapshot, snapshot_digest=value))
             else:
                 object.__setattr__(forged, field, value)
             object.__setattr__(settlement, "outcome", forged)
             return token, settlement
 
         for label, field, value in (
+            ("snapshot", "snapshot_digest", "b" * 64),
             ("key", "app_key", OTHER_KEY),
             ("type", "value", series(1, window)),
             ("window", "window", other_window),
@@ -5060,9 +5362,11 @@ def test_transport_gap_writer_registration_retirement_and_close(
     with LocalPositionStores(tmp_path, journal_modes={"local": journal_mode}) as stores:
         sql = GapSqlHarness(monkeypatch)
         checked = []
+        admitted_controls = False
 
         def check_controls(probe, statement, parameters):
-            if probe.role != "observer" or statement != "PRAGMA main.data_version":
+            if (not admitted_controls or probe.role != "observer"
+                    or statement != "PRAGMA main.data_version"):
                 return
             connection = probe.connection
             assert connection.execute("PRAGMA query_only").fetchone() == (1,)
@@ -5093,6 +5397,8 @@ def test_transport_gap_writer_registration_retirement_and_close(
             admission = sources.register(spec)
             assert admission.exception(timeout=10) is None, "valid primary pair was rejected"
             first = admission.result(timeout=0)
+            admitted_controls = True
+            sources.observe_async().result(timeout=10)
             assert checked and checked[0] != threading.get_ident()
             writer, observer = sql.connections
             assert writer.role == "writer" and observer.role == "observer"
