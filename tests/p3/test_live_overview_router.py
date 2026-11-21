@@ -56,6 +56,7 @@ from appio.history_types import (
     RemotePosition,
     RetainedRecord,
     SeriesMetadata,
+    SnapshotProvenance,
     applied_endpoint,
     local_answer_digest,
     retention_scope,
@@ -870,6 +871,7 @@ def test_live_records_validate_every_field_and_phase_combination() -> None:
     remote_authority = ("remote", 2, "boot-a", 1)
     local_vector = LocalPositionVector((LocalPosition("local", "gui", 1, 1, 0),))
     remote_position = RemotePosition("boot-a", 1, 0)
+    snapshot = SnapshotProvenance(1, DIGEST, LocalBracket(local_vector, local_vector))
 
     private_inventory = {
         RequestToken: (
@@ -879,11 +881,11 @@ def test_live_records_validate_every_field_and_phase_combination() -> None:
         LocalFrameOutcome: (
             "worker_id", "request", "ranking", "segments", "boundaries", "gaps",
             "known_gaps", "overlaps", "has_local_history", "not_retained",
-            "chronology_unproved", "file_available",
+            "chronology_unproved", "file_available", "snapshot",
         ),
-        LocalPartOutcome: ("worker_id", "request", "app_key", "value", "data_digest"),
+        LocalPartOutcome: ("worker_id", "request", "app_key", "value", "data_digest", "snapshot"),
         LocalFilesOutcome: (
-            "worker_id", "request", "app_key", "table", "coverage", "served_gap_count",
+            "worker_id", "request", "app_key", "table", "coverage", "served_gap_count", "snapshot",
         ),
         RemoteSettlement: ("future", "response", "error"),
         LocalSettlement: ("worker_id", "outcome", "error", "local_bracket"),
@@ -993,7 +995,7 @@ def test_live_records_validate_every_field_and_phase_combination() -> None:
     frame_known_gaps = (("boot-a", 8 * NS, 9 * NS + NS // 2), ("boot-a", 9 * NS, 10 * NS))
     frame = LocalFrameOutcome(
         2, ranking_request, (total(7, KEY), total(8, OTHER_KEY)), frame_segments,
-        frame_boundaries, frame_gaps, frame_known_gaps, (), False, False, False, True,
+        frame_boundaries, frame_gaps, frame_known_gaps, (), False, False, False, True, snapshot,
     )
     # Boundaries are a chronology: valid ordered evidence is the control, and a
     # permutation or repeat of that same evidence is not another valid plan.
@@ -1005,7 +1007,7 @@ def test_live_records_validate_every_field_and_phase_combination() -> None:
     chrono_boundaries = (("boot-a", 4 * NS, "gui", "iod"), ("boot-a", 8 * NS, "iod", "gui"))
     chrono_frame = LocalFrameOutcome(
         2, ranking_request, (total(7, KEY),), chrono_segments,
-        chrono_boundaries, (), (), (), False, False, False, True,
+        chrono_boundaries, (), (), (), False, False, False, True, snapshot,
     )
     assert chrono_frame.boundaries == chrono_boundaries
     assert frame.ranking[0].app_key == KEY
@@ -1096,6 +1098,7 @@ def test_live_records_validate_every_field_and_phase_combination() -> None:
             "not_retained": False,
             "chronology_unproved": False,
             "file_available": True,
+            "snapshot": snapshot,
         }
         _reject(
             f"local_frame.{label}",
@@ -1106,7 +1109,7 @@ def test_live_records_validate_every_field_and_phase_combination() -> None:
     _reject(
         "local_frame.forged-segment",
         lambda: LocalFrameOutcome(2, ranking_request, (total(7, KEY),), (forged_segment,),
-                                  (), (), (), (), False, False, False, True),
+                                  (), (), (), (), False, False, False, True, snapshot),
     )
     # A boundary needs both adjacent *proven* segments. Keep the intended gui/iod
     # owners and vary only `proven`, so the proven-status requirement is the sole
@@ -1123,14 +1126,14 @@ def test_live_records_validate_every_field_and_phase_combination() -> None:
             f"local_frame.{label}",
             lambda segments=segments: LocalFrameOutcome(
                 2, ranking_request, (total(7, KEY),), segments,
-                (("boot-a", 4 * NS, "gui", "iod"),), (), (), (), False, False, False, True),
+                (("boot-a", 4 * NS, "gui", "iod"),), (), (), (), False, False, False, True, snapshot),
         )
 
     # LocalPartOutcome: one kind, one external subject, one canonical digest.
     totals_value = share(7, since_boot)
     part = LocalPartOutcome(
         3, detail_request, KEY, totals_value,
-        local_answer_digest("totals", KEY, since_boot, totals_value),
+        local_answer_digest("totals", KEY, since_boot, totals_value), snapshot,
     )
     assert part.value.window == since_boot
     _assert_frozen(part, "data_digest")
@@ -1162,6 +1165,7 @@ def test_live_records_validate_every_field_and_phase_combination() -> None:
             "app_key": KEY,
             "value": totals_value,
             "data_digest": local_answer_digest("totals", KEY, since_boot, totals_value),
+            "snapshot": snapshot,
         }
         _reject(
             f"local_part.{label}",
@@ -1170,14 +1174,14 @@ def test_live_records_validate_every_field_and_phase_combination() -> None:
     series_request = QueryRequest("series", since_boot, KEY)
     series_part = LocalPartOutcome(
         4, series_request, KEY, series_value,
-        local_answer_digest("series", KEY, since_boot, series_value),
+        local_answer_digest("series", KEY, since_boot, series_value), snapshot,
     )
     assert series_part.value.tier == "raw"
     _reject(
         "local_part.series-key-mismatch-valid-digest",
         lambda: LocalPartOutcome(
             4, series_request, OTHER_KEY, series_value,
-            local_answer_digest("series", OTHER_KEY, since_boot, series_value)),
+            local_answer_digest("series", OTHER_KEY, since_boot, series_value), snapshot),
     )
     forged_value_coverage = coverage()
     object.__setattr__(forged_value_coverage.hook_hits, "vfs_read", -1)
@@ -1185,7 +1189,7 @@ def test_live_records_validate_every_field_and_phase_combination() -> None:
         "local_part.forged-value",
         lambda: LocalPartOutcome(3, detail_request, KEY,
                                  replace(totals_value, coverage=forged_value_coverage),
-                                 "a" * 64),
+                                 "a" * 64, snapshot),
     )
 
     # LocalFilesOutcome: typed table/coverage/served evidence, first page only.
@@ -1195,9 +1199,9 @@ def test_live_records_validate_every_field_and_phase_combination() -> None:
         7, since_boot, 0, 0, 0, 0, 0, 0, 0, 0, 0,
         HookHits(0, 0, 0, 0, 0, 0), 0, 0, overflow, coverage(),
     )
-    files_outcome = LocalFilesOutcome(4, files_request, KEY, file_table, file_coverage, 0)
+    files_outcome = LocalFilesOutcome(4, files_request, KEY, file_table, file_coverage, 0, snapshot)
     assert files_outcome.coverage.served_interval == since_boot
-    assert LocalFilesOutcome(4, files_request, KEY, file_table, file_coverage, None).served_gap_count is None
+    assert LocalFilesOutcome(4, files_request, KEY, file_table, file_coverage, None, snapshot).served_gap_count is None
     _assert_frozen(files_outcome, "table")
     unavailable_overflow = UnknownOwnerOverflow(
         since_boot, "overflow_owner_unknown", 0, 0, 0, coverage(unavailable_reason="not_retained"))
@@ -1233,6 +1237,7 @@ def test_live_records_validate_every_field_and_phase_combination() -> None:
             "table": file_table,
             "coverage": file_coverage,
             "served_gap_count": 0,
+            "snapshot": snapshot,
         }
         _reject(
             f"local_files.{label}",
@@ -1250,7 +1255,7 @@ def test_live_records_validate_every_field_and_phase_combination() -> None:
         7, since_boot, 0, 0, 0, 0, 0, 0, 0, 0, 0,
         HookHits(0, 0, 0, 0, 0, 0), 0, 0, inside_overflow, coverage(),
     )
-    inside = LocalFilesOutcome(4, files_request, KEY, inside_table, inside_coverage, 0)
+    inside = LocalFilesOutcome(4, files_request, KEY, inside_table, inside_coverage, 0, snapshot)
     assert inside.coverage.served_interval == inside_served
 
     wide_served = Window("range", BOOT, 1_000_000_000, 30_000_000_000)
@@ -1265,7 +1270,7 @@ def test_live_records_validate_every_field_and_phase_combination() -> None:
     assert wide_coverage.served_interval == wide_served
     _reject(
         "local_files.served-outside-request",
-        lambda: LocalFilesOutcome(4, files_request, KEY, wide_table, wide_coverage, 0),
+        lambda: LocalFilesOutcome(4, files_request, KEY, wide_table, wide_coverage, 0, snapshot),
     )
 
     # Settlement inputs carry exactly one terminal result or error.
@@ -1381,14 +1386,25 @@ def test_local_detail_is_lazy_selected_subject_only(tmp_path, monkeypatch):
     executing while detail work is held inside its worker.
     """
 
+    from pathlib import Path
+    from appio.history_source import ManagedSourceRegistry
+    from appio.history_types import ManagedSourceSpec
+    from appio.history_router import _LocalCopyBinding, _SourceStamp, _capture_provenance
+
     alpha_id, beta_id, export_alpha_id = 17, 18, 3
     local = _committed_store(
         tmp_path / "local.db", ((ALPHA, alpha_id, 20), (BETA, beta_id, 7)))
     root = None
     router = None
+    source_registry = ManagedSourceRegistry(wake=lambda: None)
+    captures = []
     release = threading.Event()
     try:
-        paths = _registered_paths(("local", local, "gui"))
+        local_path = local.connection.execute("PRAGMA database_list").fetchone()[2]
+        source_registry.register(ManagedSourceSpec(
+            "local", "iod", Path(local_path).as_uri() + "?mode=ro", ())).result(timeout=10)
+        captured = source_registry.capture().result(timeout=15)
+        captures.append(captured)
         scope = Window("range", BOOT, 100 * NS, 140 * NS)
 
         computations: list[tuple[str, str | None, Window]] = []
@@ -1410,7 +1426,7 @@ def test_local_detail_is_lazy_selected_subject_only(tmp_path, monkeypatch):
             lambda service, app_id, window: observe("series", service, app_id, window))
 
         frame = HistoryRouter._read_local(
-            paths, scope, worker_id=1, request=QueryRequest("ranking", scope))
+            captured, scope, worker_id=1, request=QueryRequest("ranking", scope))
         assert isinstance(frame, LocalFrameOutcome)
         assert not hasattr(frame, "parts")
         assert computations == []
@@ -1424,7 +1440,7 @@ def test_local_detail_is_lazy_selected_subject_only(tmp_path, monkeypatch):
         assert frame.file_available is False
 
         part = HistoryRouter._read_local_part(
-            paths, QueryRequest("totals", scope, ALPHA), worker_id=2, app_key=ALPHA)
+            captured, QueryRequest("totals", scope, ALPHA), worker_id=2, app_key=ALPHA)
         assert isinstance(part, LocalPartOutcome)
         assert part.worker_id == 2 and part.value.window == scope
         assert (part.value.task_read_bytes, part.value.task_write_bytes) == (20, 20)
@@ -1436,7 +1452,7 @@ def test_local_detail_is_lazy_selected_subject_only(tmp_path, monkeypatch):
         assert local_ids == [("totals", alpha_id)]  # the private store's own id
 
         series_part = HistoryRouter._read_local_part(
-            paths, QueryRequest("series", scope, ALPHA), worker_id=3, app_key=ALPHA)
+            captured, QueryRequest("series", scope, ALPHA), worker_id=3, app_key=ALPHA)
         assert isinstance(series_part, LocalPartOutcome)
         assert series_part.value.tier == "raw"
         assert sum(point.read_bytes for point in series_part.value.points) == 20
@@ -1448,21 +1464,51 @@ def test_local_detail_is_lazy_selected_subject_only(tmp_path, monkeypatch):
         root = _committed_store(
             tmp_path / "root.db", ((ALPHA, export_alpha_id, 30),),
             owner="iod", start=110, end=120)
-        merged_paths = paths + _registered_paths(("export", root, "iod"))
+        root_path = root.connection.execute("PRAGMA database_list").fetchone()[2]
+        source_registry.register(ManagedSourceSpec(
+            "export", "iod", Path(root_path).as_uri() + "?mode=ro", ())).result(timeout=10)
+        merged_capture = source_registry.capture().result(timeout=15)
+        captures.append(merged_capture)
         computations.clear()
         local_ids.clear()
         merged = HistoryRouter._read_local_part(
-            merged_paths, QueryRequest("totals", scope, ALPHA), worker_id=4, app_key=ALPHA)
+            merged_capture, QueryRequest("totals", scope, ALPHA), worker_id=4, app_key=ALPHA)
         assert isinstance(merged, LocalPartOutcome)
         assert merged.value.task_read_bytes == 50
         assert merged.value.coverage.gap_intervals == 1
-        assert local_ids == [("totals", alpha_id), ("totals", export_alpha_id)]
+        assert set(local_ids) == {("totals", alpha_id), ("totals", export_alpha_id)}
         assert computations == [("totals", ALPHA, scope), ("totals", ALPHA, scope)]
 
         # D03: a held detail computation must not serialize the frame lane.
         computations.clear()
         local_ids.clear()
         router = HistoryRouter(QueryService(local), _IdleClient(), AppRegistry())
+        managed_authority = ("local", tuple(
+            (position.name, position.owner, position.registration_epoch)
+            for position in merged_capture.opening.sources))
+        source_paths = {"local": local_path, "export": root_path}
+        router._local_authority = lambda: managed_authority
+        router.source_position = lambda: merged_capture.opening
+
+        def managed_binding(*, worker_id, token_id=None, request):
+            stamps = tuple(_SourceStamp(position.name, position.owner,
+                                        position.registration_epoch,
+                                        source_paths[position.name], None)
+                           for position in merged_capture.opening.sources)
+            paths = tuple((position.name, source_paths[position.name], position.owner)
+                          for position in merged_capture.opening.sources)
+            return _LocalCopyBinding(worker_id, token_id, request, stamps, paths,
+                                     merged_capture.opening, _capture_provenance(merged_capture))
+
+        real_submit = router._frame_executor.submit
+
+        def managed_submit(_function, paths, window):
+            binding = paths.binding
+            return real_submit(HistoryRouter._read_local, merged_capture, window,
+                               worker_id=binding.worker_id, request=binding.request)
+
+        router._capture_local_binding = managed_binding
+        router._frame_executor.submit = managed_submit
         authority = ("local", (("local", "gui", 1),))
         vector = LocalPositionVector((LocalPosition("local", "gui", 1, 1, 0),))
         entered = threading.Event()
@@ -1477,7 +1523,7 @@ def test_local_detail_is_lazy_selected_subject_only(tmp_path, monkeypatch):
             # worker this hold would outlive the frame assertion below.
             assert release.wait(15), "the detail worker was never released"
             return HistoryRouter._read_local_part(
-                paths, QueryRequest("totals", scope, ALPHA),
+                merged_capture, QueryRequest("totals", scope, ALPHA),
                 worker_id=token.token_id, app_key=ALPHA)
 
         assert router._frame_executor is not router._background_executor
@@ -1501,7 +1547,7 @@ def test_local_detail_is_lazy_selected_subject_only(tmp_path, monkeypatch):
         def held_second():
             assert release.wait(15), "the second detail worker was never released"
             return HistoryRouter._read_local_part(
-                paths, QueryRequest("totals", scope, ALPHA), worker_id=12, app_key=ALPHA)
+                merged_capture, QueryRequest("totals", scope, ALPHA), worker_id=12, app_key=ALPHA)
 
         assert router._submit_background_worker(second, held_second) is not None
         third = RequestToken(
@@ -1536,7 +1582,7 @@ def test_local_detail_is_lazy_selected_subject_only(tmp_path, monkeypatch):
         def held_files(*args, **kwargs):
             files_started.set()
             assert files_release.wait(15), "the Files worker was never released"
-            return original_files(*args, **kwargs)
+            return original_files(merged_capture, *args[1:], **kwargs)
 
         monkeypatch.setattr(router, "_read_local_files", held_files)
         presentation = router.registry.id_for(ALPHA)
@@ -1611,7 +1657,7 @@ def test_local_detail_is_lazy_selected_subject_only(tmp_path, monkeypatch):
                 close_started.set()
                 assert close_release.wait(15), "the close worker was never released"
                 return HistoryRouter._read_local_part(
-                    paths, QueryRequest("totals", scope, ALPHA),
+                    merged_capture, QueryRequest("totals", scope, ALPHA),
                     worker_id=worker_id, app_key=ALPHA)
             return work
 
@@ -1639,6 +1685,9 @@ def test_local_detail_is_lazy_selected_subject_only(tmp_path, monkeypatch):
         release.set()
         if router is not None:
             router.close()
+        for image in captures:
+            source_registry.release_capture(image.capture_id)
+        source_registry.close()
         if root is not None:
             root.connection.close()
         local.connection.close()
@@ -1898,6 +1947,115 @@ def _register_fixture_sources(registry, stores, *names):
     return receipts
 
 
+@pytest.mark.parametrize("journal_mode", ["DELETE", "WAL"])
+def test_capture_validates_ordered_images_and_removes_private_destinations(
+        tmp_path, monkeypatch, journal_mode):
+    """Each actor backs up and deletes its own complete temporary image."""
+
+    import hashlib
+    import tempfile
+    from live_overview_support import LocalPositionStores
+
+    stores = LocalPositionStores(
+        tmp_path, journal_modes={"local": journal_mode, "export": journal_mode})
+    registry = stores.new_managed_registry()
+    probes = _track_source_connections(monkeypatch)
+    temporary_files = []
+    real_mkstemp = tempfile.mkstemp
+
+    def record_mkstemp(*args, **kwargs):
+        descriptor, path = real_mkstemp(*args, **kwargs)
+        temporary_files.append((path, threading.get_ident()))
+        return descriptor, path
+
+    monkeypatch.setattr(tempfile, "mkstemp", record_mkstemp)
+    captures = []
+    try:
+        receipts = _register_fixture_sources(registry, stores, "local", "export")
+        captures.append(registry.capture().result(timeout=15))
+        captures.append(registry.capture().result(timeout=15))
+        first, second = captures
+        assert first.capture_id > 0 and second.capture_id > first.capture_id
+        assert [image.name for image in first.images] == ["export", "local"]
+        assert [image.registration_epoch for image in first.images] == [
+            receipts["export"].registration_epoch, receipts["local"].registration_epoch]
+        assert first.opening == first.closing
+        for image in first.images:
+            assert image.image_digest == hashlib.sha256(image.image).hexdigest()
+        assert len(temporary_files) == 4
+        assert all(not os.path.exists(path) for path, _thread in temporary_files)
+        assert {thread for _path, thread in temporary_files} == {
+            probe.connect_thread for probe in probes}
+        assert all(probe.backup_threads == [probe.connect_thread] * 2 for probe in probes)
+    finally:
+        for captured in captures:
+            registry.release_capture(captured.capture_id)
+        registry.close()
+        stores.close()
+
+
+def test_capture_busy_source_obeys_injected_deadline(tmp_path):
+    """A locked observer fails within the registry's finite capture deadline."""
+
+    from appio.history_source import ManagedSourceRegistry, SourceAdmissionError
+    from live_overview_support import LocalPositionStores
+
+    stores = LocalPositionStores(tmp_path, journal_modes={"local": "DELETE"})
+    clock_reads = []
+
+    def injected_clock():
+        value = time.monotonic_ns()
+        clock_reads.append(value)
+        return value
+
+    registry = ManagedSourceRegistry(
+        wake=lambda: None, clock_ns=injected_clock, busy_timeout_ns=50_000_000)
+    writer = stores.writers["local"]
+    try:
+        _register_fixture_sources(registry, stores, "local")
+        clock_count = len(clock_reads)
+        writer.execute("BEGIN EXCLUSIVE")
+        started = time.monotonic()
+        with pytest.raises(SourceAdmissionError):
+            registry.capture().result(timeout=2)
+        assert time.monotonic() - started < 1.0
+        assert len(clock_reads) > clock_count + 1
+    finally:
+        writer.rollback()
+        registry.close()
+        stores.close()
+
+
+def test_capture_lease_retains_retired_source_until_dependents_drain(tmp_path, monkeypatch):
+    """Retirement ends authority while admitted workers still hold the actor."""
+
+    from live_overview_support import LocalPositionStores
+    from appio.history_source import SourceAdmissionError
+
+    stores = LocalPositionStores(tmp_path)
+    registry = stores.new_managed_registry()
+    probes = _track_source_connections(monkeypatch)
+    try:
+        _register_fixture_sources(registry, stores, "local")
+        capture = registry.capture().result(timeout=10)
+        registry.retain_capture(capture.capture_id)
+        registry.retire("local", "dependent work remains")
+        with pytest.raises(SourceAdmissionError):
+            registry.observe()
+        replacement = registry.register(stores.managed_spec("local", owner="iod"))
+        assert not probes[0].closed.wait(0.1)
+        assert not replacement.done()
+        registry.release_capture(capture.capture_id)
+        assert not probes[0].closed.wait(0.1)
+        assert not replacement.done()
+        registry.release_capture(capture.capture_id)
+        assert probes[0].closed.wait(5)
+        assert replacement.result(timeout=10).registration_epoch > capture.images[0].registration_epoch
+    finally:
+        registry.close()
+        stores.close()
+
+
 def test_capture_retirement_waits_for_admitted_capture(tmp_path, monkeypatch):
     """An admitted capture completes before retirement closes its actor."""
 
@@ -1912,11 +2070,11 @@ def test_capture_retirement_waits_for_admitted_capture(tmp_path, monkeypatch):
     release = threading.Event()
     original_backup = history_source._backup_image
 
-    def blocked_backup(connection):
+    def blocked_backup(connection, **options):
         entered.set()
         if not release.wait(5):
             raise TimeoutError("test did not release source backup")
-        return original_backup(connection)
+        return original_backup(connection, **options)
 
     monkeypatch.setattr(history_source, "_backup_image", blocked_backup)
     try:
@@ -1932,6 +2090,7 @@ def test_capture_retirement_waits_for_admitted_capture(tmp_path, monkeypatch):
         assert captured.images[0].name == "local"
         with pytest.raises(SourceAdmissionError):
             registry.observe()
+        registry.release_capture(captured.capture_id)
     finally:
         release.set()
         registry.close()
@@ -1951,11 +2110,11 @@ def test_capture_serializes_registration_lifecycle(tmp_path, monkeypatch):
     release = threading.Event()
     original_backup = history_source._backup_image
 
-    def blocked_backup(connection):
+    def blocked_backup(connection, **options):
         entered.set()
         if not release.wait(5):
             raise TimeoutError("test did not release source backup")
-        return original_backup(connection)
+        return original_backup(connection, **options)
 
     monkeypatch.setattr(history_source, "_backup_image", blocked_backup)
     original_start = history_source._SourceActor.start
@@ -1986,6 +2145,7 @@ def test_capture_serializes_registration_lifecycle(tmp_path, monkeypatch):
         assert start_calls == ["export"]
         assert tuple(position.name for position in registry.observe().sources) == (
             "export", "local")
+        registry.release_capture(captured.capture_id)
     finally:
         release.set()
         registry.close()
@@ -2369,13 +2529,16 @@ def test_local_observations_require_committed_registered_connections(tmp_path, m
         assert all(character in "0123456789abcdef"
                    for character in captured.snapshot_digest)
 
-        image_connection = sqlite3.connect(":memory:")
+        image_path = tmp_path / "captured.sqlite"
+        image_path.write_bytes(captured.images[0].image)
+        image_connection = sqlite3.connect(image_path)
         try:
-            image_connection.deserialize(captured.images[0].image)
             assert image_connection.execute(
                 "SELECT name FROM app WHERE app_id=1").fetchone()[0] == "committed"
         finally:
             image_connection.close()
+            image_path.unlink()
+        registry.release_capture(captured.capture_id)
 
         gui_spec = ManagedSourceSpec(
             "primary", "gui", stores.paths["local"].as_uri() + "?mode=ro", ())
@@ -2405,6 +2568,436 @@ def test_local_observations_require_committed_registered_connections(tmp_path, m
         registry.close()
         for probe in probes:
             probe.closed.wait(5)
+        stores.close()
+
+
+def test_managed_frame_worker_uses_private_verified_snapshot(tmp_path, monkeypatch):
+    """A frame worker receives immutable capture bytes and removes its file."""
+
+    from concurrent.futures import ThreadPoolExecutor
+    import hashlib
+    import tempfile
+    from live_overview_support import LocalPositionStores
+    from appio.history_types import LocalBracket, SnapshotProvenance
+
+    stores = LocalPositionStores(tmp_path)
+    registry = stores.new_managed_registry()
+    files = []
+    actual_mkstemp = tempfile.mkstemp
+    actual_ranking = QueryService.ranking
+    worker_threads = []
+    detail_calls = []
+    try:
+        _register_fixture_sources(registry, stores, "local")
+        captured = registry.capture().result(timeout=15)
+
+        def tracked_file(*args, **kwargs):
+            descriptor, path = actual_mkstemp(*args, **kwargs)
+            files.append((path, threading.get_ident()))
+            return descriptor, path
+
+        def tracked_ranking(service, *args, **kwargs):
+            worker_threads.append(threading.get_ident())
+            return actual_ranking(service, *args, **kwargs)
+
+        monkeypatch.setattr(tempfile, "mkstemp", tracked_file)
+        monkeypatch.setattr(QueryService, "ranking", tracked_ranking)
+        monkeypatch.setattr(QueryService, "disk_share", lambda *args: detail_calls.append("totals"))
+        monkeypatch.setattr(QueryService, "series", lambda *args: detail_calls.append("series"))
+        window = Window("range", BOOT, 10 * NS, 20 * NS)
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            result = executor.submit(
+                HistoryRouter._read_local, captured, window,
+                worker_id=17, request=QueryRequest("ranking", window)).result(timeout=15)
+        assert result.worker_id == 17
+        assert result.request == QueryRequest("ranking", window)
+        assert result.snapshot == SnapshotProvenance(
+            captured.capture_id, captured.snapshot_digest,
+            LocalBracket(captured.opening, captured.closing))
+        assert {row.app_key for row in result.ranking} == {"scope:/session/unknown"}
+        assert detail_calls == []
+        assert worker_threads and all(thread != threading.get_ident() for thread in worker_threads)
+        assert files and {thread for _path, thread in files} == set(worker_threads)
+        assert all(not os.path.exists(path) for path, _thread in files)
+        assert hashlib.sha256(captured.images[0].image).hexdigest() == captured.images[0].image_digest
+    finally:
+        if "captured" in locals():
+            registry.release_capture(captured.capture_id)
+        registry.close()
+        stores.close()
+
+
+@pytest.mark.parametrize("kind", ["totals", "series"])
+def test_managed_detail_worker_uses_capture_provenance(tmp_path, monkeypatch, kind):
+    from live_overview_support import LocalPositionStores
+    from appio.history_types import LocalBracket, SnapshotProvenance
+
+    stores = LocalPositionStores(tmp_path)
+    registry = stores.new_managed_registry()
+    try:
+        _register_fixture_sources(registry, stores, "local")
+        captured = registry.capture().result(timeout=15)
+        key = "scope:/session/unknown"
+        window = Window("range", BOOT, 10 * NS, 20 * NS)
+        request = QueryRequest(kind, window, key)
+        calls = []
+        for method in ("disk_share", "series"):
+            original = getattr(QueryService, method)
+
+            def tracked(service, app_id, requested_window, *, name=method, call=original):
+                row = service.connection.execute(
+                    "SELECT key FROM app WHERE app_id=?", (app_id,)).fetchone()
+                calls.append((name, row[0], requested_window))
+                return call(service, app_id, requested_window)
+
+            monkeypatch.setattr(QueryService, method, tracked)
+        outcome = HistoryRouter._read_local_part(
+            captured, request, worker_id=9, app_key=key)
+        assert calls == [("disk_share" if kind == "totals" else "series", key, window)]
+        assert outcome.worker_id == 9
+        assert outcome.request == request
+        assert outcome.app_key == key
+        assert outcome.data_digest == local_answer_digest(kind, key, window, outcome.value)
+        assert outcome.snapshot == SnapshotProvenance(
+            captured.capture_id, captured.snapshot_digest,
+            LocalBracket(captured.opening, captured.closing))
+    finally:
+        if "captured" in locals():
+            registry.release_capture(captured.capture_id)
+        registry.close()
+        stores.close()
+
+
+def _assert_one_managed_replacement(tmp_path, registry, stores, captured, observed):
+    """Drive the real shell with pre-captured images through a test-only adapter."""
+
+    from live_overview_support import LiveOverviewHarness
+    from appio.history_router import _LocalCopyBinding, _SourceStamp, _capture_provenance
+
+    replacement = registry.capture().result(timeout=15)
+    replacement_started = threading.Event()
+    replacement_release = threading.Event()
+    harness = None
+    try:
+        shell_dir = tmp_path / "shell"
+        shell_dir.mkdir()
+        harness = LiveOverviewHarness(shell_dir)
+        router = harness.router
+        pending = [captured, replacement]
+        images = {item.capture_id: item for item in pending}
+        authority = ("local", tuple((position.name, position.owner, position.registration_epoch)
+                                     for position in captured.opening.sources))
+        original_submit = router._frame_executor.submit
+        router._remote_authority = lambda: None
+        router._local_authority = lambda: authority
+        router.source_position = lambda: observed
+        router.request_detail = lambda *args, **kwargs: None
+
+        def binding(*, worker_id, token_id=None, request):
+            image = pending.pop(0)
+            stamps = tuple(_SourceStamp(position.name, position.owner,
+                                        position.registration_epoch,
+                                        str(stores.paths[position.name]), None)
+                           for position in image.opening.sources)
+            paths = tuple((position.name, str(stores.paths[position.name]), position.owner)
+                          for position in image.opening.sources)
+            return _LocalCopyBinding(worker_id, token_id, request, stamps, paths,
+                                     image.opening, _capture_provenance(image))
+
+        def submit(_function, paths, window):
+            admitted = paths.binding
+            image = images[admitted.snapshot.capture_id]
+
+            def read():
+                if image.capture_id == replacement.capture_id:
+                    replacement_started.set()
+                    if not replacement_release.wait(10):
+                        raise TimeoutError("replacement worker barrier timed out")
+                return HistoryRouter._read_local(
+                    image, window, worker_id=admitted.worker_id, request=admitted.request)
+
+            return original_submit(read)
+
+        router._capture_local_binding = binding
+        router._frame_executor.submit = submit
+        window = Window("since_boot", BOOT, end_mono_ns=110 * NS)
+        harness.request(window)
+        router._local_future.result(timeout=15)
+        harness.poll()
+        certificate = router.frame_provenance(window)
+        assert certificate.snapshot.capture_id == captured.capture_id
+        assert certificate.answered_source is None and not certificate.certified
+        assert sum(event[0] == "apply" for event in harness.events) == 1
+        harness.ordinary_refresh()
+        assert replacement_started.wait(10)
+        for _ in range(3):
+            harness.ordinary_refresh()
+            harness.poll()
+        assert sum(event[0] == "prepare" for event in harness.events) == 2
+        assert pending == []
+        replacement_release.set()
+        router._local_future.result(timeout=15)
+        harness.poll()
+        certificate = router.frame_provenance(window)
+        assert certificate is not None, ([(event[0]) for event in harness.events],
+                                        harness.shell._pending, harness.shell._displayed,
+                                        router._ready, router._frame_error)
+        assert certificate.certified
+        assert certificate.snapshot.capture_id == replacement.capture_id
+        assert sum(event[0] == "prepare" for event in harness.events) == 2
+        assert not any(event[0] in ("query", "send") for event in harness.events)
+    finally:
+        replacement_release.set()
+        if harness is not None:
+            harness.close()
+        registry.release_capture(replacement.capture_id)
+
+
+def _capture_commit_schedule(tmp_path, monkeypatch, journal_mode, stage):
+    """Exercise a real actor backup or closing read around an external commit."""
+
+    from types import SimpleNamespace
+    from live_overview_support import LocalPositionStores
+    import appio.history_source as history_source
+
+    stores = LocalPositionStores(tmp_path, journal_modes={"local": journal_mode})
+    registry = stores.new_managed_registry()
+    entered = threading.Event()
+    release = threading.Event()
+    captured = None
+    probes = _track_source_connections(monkeypatch)
+    try:
+        _register_fixture_sources(registry, stores, "local")
+        if stage == "during":
+            original_backup = _SourceConnectionProbe.backup
+
+            def backup(probe, target, **options):
+                original_progress = options["progress"]
+
+                def progress(status, remaining, total):
+                    if status == sqlite3.SQLITE_OK and not entered.is_set():
+                        entered.set()
+                        if not release.wait(10):
+                            raise TimeoutError("backup barrier timed out")
+                    original_progress(status, remaining, total)
+
+                options["pages"] = 1
+                options["progress"] = progress
+                return original_backup(probe, target, **options)
+
+            monkeypatch.setattr(_SourceConnectionProbe, "backup", backup)
+        elif stage == "after_backup":
+            original_backup = history_source._backup_image
+
+            def backup(connection, **options):
+                image = original_backup(connection, **options)
+                entered.set()
+                if not release.wait(10):
+                    raise TimeoutError("closing-read barrier timed out")
+                return image
+
+            monkeypatch.setattr(history_source, "_backup_image", backup)
+        future = registry.capture()
+        if stage != "after_closing":
+            assert entered.wait(10)
+            stores.commit("local", "UPDATE app SET name=? WHERE app_id=1", ("changed",))
+            release.set()
+        captured = future.result(timeout=15)
+        if stage == "after_closing":
+            stores.commit("local", "UPDATE app SET name=? WHERE app_id=1", ("changed",))
+        next_position = registry.observe()
+        window = Window("range", BOOT, 10 * NS, 20 * NS)
+        result = HistoryRouter._read_local(
+            captured, window, worker_id=1, request=QueryRequest("ranking", window))
+        bracket = result.snapshot.bracket
+        router = object.__new__(HistoryRouter)
+        router._frame = SimpleNamespace(
+            owner_id=1, window=window, requested_source=captured.opening,
+            local_bracket=bracket, local_settled=True, remote_token=None,
+            retired=False, certificate=None, answered_source=None,
+            ranking_provenance={})
+        router._ready = False
+        router._remote = None
+        router._ranking = list(result.ranking)
+        router._ranking_stamps = {}
+        router._clock_ns = time.monotonic_ns
+        router._local_settlement = LocalSettlement(1, outcome=result, local_bracket=bracket)
+        router._not_retained = result.not_retained
+        router._gap_ranges = list(result.gaps)
+        router._chronology_unproved = result.chronology_unproved
+        assert router._finish_frame_if_terminal()
+        assert probes[0].backup_threads == [probes[0].connect_thread]
+        if stage != "after_closing":
+            _assert_one_managed_replacement(tmp_path, registry, stores, captured, next_position)
+        return captured, router._frame.certificate, next_position
+    finally:
+        release.set()
+        if captured is not None:
+            registry.release_capture(captured.capture_id)
+        registry.close()
+        stores.close()
+
+
+@pytest.mark.parametrize("journal_mode", ["DELETE", "WAL"])
+def test_commit_during_backup_is_uncertified_with_one_replacement(tmp_path, monkeypatch, journal_mode):
+    captured, certificate, observed = _capture_commit_schedule(
+        tmp_path, monkeypatch, journal_mode, "during")
+    assert captured.opening != captured.closing
+    assert certificate.snapshot.bracket == LocalBracket(captured.opening, captured.closing)
+    assert certificate.answered_source is None and not certificate.certified
+    assert observed == captured.closing
+
+
+@pytest.mark.parametrize("journal_mode", ["DELETE", "WAL"])
+def test_commit_after_backup_before_closing_read_is_uncertified(tmp_path, monkeypatch, journal_mode):
+    captured, certificate, observed = _capture_commit_schedule(
+        tmp_path, monkeypatch, journal_mode, "after_backup")
+    assert captured.opening != captured.closing
+    assert certificate.answered_source is None and not certificate.certified
+    assert observed == captured.closing
+
+
+@pytest.mark.parametrize("journal_mode", ["DELETE", "WAL"])
+def test_commit_after_closing_read_is_caught_by_next_comparison(tmp_path, monkeypatch, journal_mode):
+    captured, certificate, observed = _capture_commit_schedule(
+        tmp_path, monkeypatch, journal_mode, "after_closing")
+    assert captured.opening == captured.closing
+    assert certificate.answered_source == captured.opening and certificate.certified
+    assert observed != certificate.answered_source
+
+
+def test_remote_frame_fallback_keeps_local_snapshot_evidence(tmp_path):
+    from types import SimpleNamespace
+    from live_overview_support import LocalPositionStores
+
+    stores = LocalPositionStores(tmp_path)
+    registry = stores.new_managed_registry()
+    try:
+        _register_fixture_sources(registry, stores, "local")
+        captured = registry.capture().result(timeout=15)
+        window = Window("range", BOOT, 10 * NS, 20 * NS)
+        outcome = HistoryRouter._read_local(
+            captured, window, worker_id=1, request=QueryRequest("ranking", window))
+        bracket = outcome.snapshot.bracket
+        router = object.__new__(HistoryRouter)
+        router._frame = SimpleNamespace(
+            owner_id=1, window=window, requested_source=RemotePosition(BOOT, 1, 5),
+            local_bracket=bracket, local_settled=True, remote_token=None,
+            retired=False, certificate=None, answered_source=None,
+            ranking_provenance={})
+        router._ready = False
+        router._remote = None
+        router._ranking = list(outcome.ranking)
+        router._ranking_stamps = {}
+        router._clock_ns = time.monotonic_ns
+        router._local_settlement = LocalSettlement(1, outcome=outcome, local_bracket=bracket)
+        router._not_retained = outcome.not_retained
+        router._gap_ranges = list(outcome.gaps)
+        router._chronology_unproved = outcome.chronology_unproved
+        assert router._finish_frame_if_terminal()
+        certificate = router._frame.certificate
+        assert certificate.answered_source == captured.opening
+        assert certificate.snapshot == outcome.snapshot
+        assert not certificate.certified
+        assert all(item.snapshot == outcome.snapshot
+                   for item in router._frame.ranking_provenance.values())
+    finally:
+        if "captured" in locals():
+            registry.release_capture(captured.capture_id)
+        registry.close()
+        stores.close()
+
+
+def test_frame_outcome_rejects_foreign_capture_binding(tmp_path):
+    from types import SimpleNamespace
+    from live_overview_support import LocalPositionStores
+
+    stores = LocalPositionStores(tmp_path)
+    registry = stores.new_managed_registry()
+    try:
+        _register_fixture_sources(registry, stores, "local")
+        captured = registry.capture().result(timeout=15)
+        window = Window("range", BOOT, 10 * NS, 20 * NS)
+        request = QueryRequest("ranking", window)
+        outcome = HistoryRouter._read_local(captured, window, worker_id=7, request=request)
+        binding = SimpleNamespace(worker_id=7, request=request, snapshot=outcome.snapshot)
+        assert HistoryRouter._admitted_frame_outcome(None, outcome, binding) is outcome
+        for forged_snapshot in (
+            replace(outcome.snapshot, capture_id=captured.capture_id + 1),
+            replace(outcome.snapshot, snapshot_digest="f" * 64),
+        ):
+            with pytest.raises(ValueError, match="snapshot"):
+                HistoryRouter._admitted_frame_outcome(
+                    None, replace(outcome, snapshot=forged_snapshot), binding)
+    finally:
+        if "captured" in locals():
+            registry.release_capture(captured.capture_id)
+        registry.close()
+        stores.close()
+
+
+def test_detail_settlement_rejects_foreign_capture_before_publication(tmp_path):
+    from types import SimpleNamespace
+    from live_overview_support import LocalPositionStores
+
+    stores = LocalPositionStores(tmp_path)
+    registry = stores.new_managed_registry()
+    try:
+        receipt = _register_fixture_sources(registry, stores, "local")["local"]
+        captured = registry.capture().result(timeout=15)
+        key = "scope:/session/unknown"
+        window = Window("range", BOOT, 10 * NS, 20 * NS)
+        request = QueryRequest("totals", window, key)
+        outcome = HistoryRouter._read_local_part(captured, request, worker_id=7, app_key=key)
+        token = RequestToken(
+            7, request, "local", retention_scope(key, window), "detail", 1, None,
+            ("local", (("local", "iod", receipt.registration_epoch),)), captured.opening)
+        binding = SimpleNamespace(
+            token_id=7, worker_id=7, request=request, opening=captured.opening,
+            snapshot=outcome.snapshot)
+        router = object.__new__(HistoryRouter)
+        router._worker_bindings = {7: binding}
+        router._files_bindings = {}
+        router.registry = AppRegistry()
+        published = []
+        rejected = []
+        router._publish_detail = lambda *args, **kwargs: published.append((args, kwargs)) or True
+        router._reject_token = lambda *args: rejected.append(args) or False
+        forged = replace(outcome, snapshot=replace(outcome.snapshot, capture_id=outcome.snapshot.capture_id + 1))
+        assert not router._settle_local(
+            token, LocalSettlement(7, outcome=forged, local_bracket=forged.snapshot.bracket))
+        assert len(rejected) == 1 and published == []
+        assert router._settle_local(
+            token, LocalSettlement(7, outcome=outcome, local_bracket=outcome.snapshot.bracket))
+        assert len(published) == 1
+        assert published[0][1]["snapshot"] == outcome.snapshot
+    finally:
+        if "captured" in locals():
+            registry.release_capture(captured.capture_id)
+        registry.close()
+        stores.close()
+
+
+def test_managed_frame_worker_refuses_forged_capture_image(tmp_path):
+    from live_overview_support import LocalPositionStores
+
+    stores = LocalPositionStores(tmp_path)
+    registry = stores.new_managed_registry()
+    try:
+        _register_fixture_sources(registry, stores, "local")
+        captured = registry.capture().result(timeout=15)
+        forged = copy.copy(captured.images[0])
+        object.__setattr__(forged, "image", forged.image + b"corrupt")
+        altered = copy.copy(captured)
+        object.__setattr__(altered, "images", (forged,))
+        with pytest.raises(ValueError, match="digest"):
+            HistoryRouter._read_local(
+                altered, Window("lifetime"), worker_id=1,
+                request=QueryRequest("ranking", Window("lifetime")))
+    finally:
+        if "captured" in locals():
+            registry.release_capture(captured.capture_id)
+        registry.close()
         stores.close()
 
 

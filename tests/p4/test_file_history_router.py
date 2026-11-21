@@ -141,6 +141,80 @@ def test_local_file_futures_delegate_every_sort_and_NFC_casefold_search(retained
         router.close()
 
 
+@pytest.mark.parametrize("sort", [
+    "bytes_total", "bytes_r", "bytes_w", "reads", "writes", "basename", "dev", "last_seen",
+])
+@pytest.mark.parametrize("direction", ["asc", "desc"])
+def test_managed_files_worker_preserves_served_evidence(retained, sort, direction):
+    """A Files worker uses the immutable image and keeps served-gap evidence."""
+
+    from appio.history_source import ManagedSourceRegistry
+    from appio.history_types import ManagedSourceSpec
+
+    path = retained.db.execute("PRAGMA database_list").fetchone()[2]
+    from pathlib import Path
+    registry = ManagedSourceRegistry(wake=lambda: None)
+    captured = None
+    try:
+        registry.register(ManagedSourceSpec(
+            "local", "iod", Path(path).as_uri() + "?mode=ro", ())).result(timeout=10)
+        captured = registry.capture().result(timeout=15)
+        result = HistoryRouter._read_local_files(
+            captured, WINDOW, APP, 1, sort, direction, None,
+            worker_id=3, request=QueryRequest("files", WINDOW, APP, sort=sort, direction=direction))
+        direct = QueryService(retained.db)
+        assert result.table == direct.file_table(1, WINDOW, sort, direction, None)
+        assert result.coverage == direct.file_coverage(1, WINDOW)
+        assert result.served_gap_count == direct.file_serve_facts(1, WINDOW).gaps_in_served_interval
+        assert result.snapshot.capture_id == captured.capture_id
+        assert result.snapshot.snapshot_digest == captured.snapshot_digest
+    finally:
+        if captured is not None:
+            registry.release_capture(captured.capture_id)
+        registry.close()
+
+
+def test_managed_files_settlement_rejects_foreign_capture(retained):
+    from pathlib import Path
+    from types import SimpleNamespace
+    from appio.history_router import LocalSettlement, RequestToken
+    from appio.history_source import ManagedSourceRegistry
+    from appio.history_types import ManagedSourceSpec
+
+    path = retained.db.execute("PRAGMA database_list").fetchone()[2]
+    registry = ManagedSourceRegistry(wake=lambda: None)
+    captured = None
+    try:
+        receipt = registry.register(ManagedSourceSpec(
+            "local", "iod", Path(path).as_uri() + "?mode=ro", ())).result(timeout=10)
+        captured = registry.capture().result(timeout=15)
+        request = QueryRequest("files", WINDOW, APP)
+        outcome = HistoryRouter._read_local_files(
+            captured, WINDOW, APP, 1, "bytes_total", "desc", None,
+            worker_id=3, request=request)
+        token = RequestToken(
+            3, request, "local", None, "files", 1, None,
+            ("local", (("local", "iod", receipt.registration_epoch),)), captured.opening)
+        binding = SimpleNamespace(token_id=3, worker_id=3, request=request,
+                                  snapshot=outcome.snapshot)
+        router = object.__new__(HistoryRouter)
+        router._worker_bindings = {}
+        router._files_bindings = {3: binding}
+        accepted = []
+        rejected = []
+        router._accept_files_local = lambda *args: accepted.append(args) or True
+        router._reject_token = lambda *args: rejected.append(args) or False
+        forged = replace(outcome, snapshot=replace(outcome.snapshot, snapshot_digest="f" * 64))
+        assert not router._settle_local(token, LocalSettlement(3, outcome=forged))
+        assert len(rejected) == 1 and accepted == []
+        assert router._settle_local(token, LocalSettlement(3, outcome=outcome))
+        assert len(accepted) == 1
+    finally:
+        if captured is not None:
+            registry.release_capture(captured.capture_id)
+        registry.close()
+
+
 def test_local_query_runs_on_bounded_executor_and_invalidated_future_cannot_publish(retained, monkeypatch):
     router = local_router(retained)
     entered, release = threading.Event(), threading.Event()

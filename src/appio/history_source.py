@@ -12,9 +12,12 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 import hashlib
 import math
+import os
 import queue
 import sqlite3
+import tempfile
 import threading
+import time
 from urllib.parse import parse_qsl, unquote, urlsplit
 from typing import Callable
 
@@ -187,6 +190,7 @@ def _open_read_only_connection(spec: ManagedSourceSpec) -> sqlite3.Connection:
     try:
         validate_schema(connection)
 
+        connection.execute("PRAGMA busy_timeout=0").close()
         connection.execute("PRAGMA query_only=ON").close()
         cursor = connection.execute("PRAGMA query_only")
         try:
@@ -223,6 +227,7 @@ def _position(connection: sqlite3.Connection, spec: ManagedSourceSpec,
     cursor = connection.execute("PRAGMA main.data_version")
     try:
         row = cursor.fetchone()
+        cursor.fetchall()
     finally:
         cursor.close()
     if connection.in_transaction:
@@ -233,17 +238,56 @@ def _position(connection: sqlite3.Connection, spec: ManagedSourceSpec,
         spec.name, spec.owner, registration_epoch, row[0], connection.total_changes)
 
 
-def _backup_image(connection: sqlite3.Connection) -> bytes:
+def _snapshot_digest(images: tuple[CapturedSourceImage, ...]) -> str:
+    """Hash the ordered registration identities and image digests."""
+
+    digest = hashlib.sha256()
+    digest.update(b"appio-captured-source-set-v1\0")
+    for image in images:
+        name = image.name.encode("utf-8")
+        digest.update(len(name).to_bytes(4, "big"))
+        digest.update(name)
+        epoch = str(image.registration_epoch).encode("ascii")
+        digest.update(len(epoch).to_bytes(4, "big"))
+        digest.update(epoch)
+        digest.update(bytes.fromhex(image.image_digest))
+    return digest.hexdigest()
+
+
+def _backup_image(connection: sqlite3.Connection, *, clock_ns: Callable[[], int],
+                  deadline_ns: int) -> bytes:
     if connection.in_transaction:
         raise SourceAdmissionError("managed source has an uncommitted transaction")
-    destination = sqlite3.connect(":memory:", isolation_level=None)
+    descriptor, path = tempfile.mkstemp(prefix="appio-source-", suffix=".sqlite")
+    os.close(descriptor)
+    destination = None
     try:
-        connection.backup(destination, pages=128)
+        destination = sqlite3.connect(path, isolation_level=None)
+
+        def progress(status: int, _remaining: int, _total: int) -> None:
+            if status in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED):
+                if clock_ns() >= deadline_ns:
+                    raise SourceAdmissionError("managed source backup timed out")
+
+        connection.backup(destination, pages=128, progress=progress, sleep=0.005)
         if connection.in_transaction or destination.in_transaction:
             raise SourceAdmissionError("managed source backup left a transaction open")
-        return destination.serialize(name="main")
-    finally:
+        validate_schema(destination)
         destination.close()
+        destination = None
+        with open(path, "rb") as image_file:
+            image = image_file.read()
+        if not image:
+            raise SourceAdmissionError("managed source backup produced an empty image")
+        return image
+    finally:
+        if destination is not None:
+            destination.close()
+        for suffix in ("", "-journal", "-wal", "-shm"):
+            try:
+                os.unlink(path + suffix)
+            except FileNotFoundError:
+                pass
 
 
 class _CaptureLease:
@@ -264,15 +308,19 @@ class _SourceActor:
     """Serialize all access to one observer connection on its owner thread."""
 
     def __init__(self, spec: ManagedSourceSpec, registration_epoch: int,
-                 wake: Callable[[], None]) -> None:
+                 wake: Callable[[], None], clock_ns: Callable[[], int],
+                 busy_timeout_ns: int) -> None:
         self.spec = spec
         self.registration_epoch = registration_epoch
         self._wake = wake
+        self._clock_ns = clock_ns
+        self._busy_timeout_ns = busy_timeout_ns
         self._commands: queue.Queue[
             tuple[object, Future | None, _CaptureLease | None]
         ] = queue.Queue()
         self._deferred: list[tuple[object, Future]] = []
         self._leases: set[_CaptureLease] = set()
+        self._serializing: set[_CaptureLease] = set()
         self._stop_queued = False
         self.ready: Future = Future()
         self.closed: Future = Future()
@@ -301,7 +349,7 @@ class _SourceActor:
                     future.set_exception(SourceAdmissionError(
                         f"managed source {self.spec.name!r} is not active"))
                     return future
-                if self._leases:
+                if self._serializing:
                     self._deferred.append((operation, future))
                 else:
                     self._commands.put((operation, future, None))
@@ -320,7 +368,18 @@ class _SourceActor:
                     f"managed source {self.spec.name!r} is not active")
             lease = _CaptureLease(self)
             self._leases.add(lease)
+            self._serializing.add(lease)
             return lease
+
+    def finish_capture(self, lease: _CaptureLease) -> None:
+        """End capture serialization while retaining the actor lease."""
+
+        with self._status_lock:
+            self._serializing.discard(lease)
+            if not self._serializing:
+                for command in self._deferred:
+                    self._commands.put((*command, None))
+                self._deferred.clear()
 
     def close(self) -> Future:
         with self._status_lock:
@@ -343,22 +402,35 @@ class _SourceActor:
             if lease not in self._leases:
                 return
             self._leases.remove(lease)
-            if self._leases:
-                return
-            for command in self._deferred:
-                self._commands.put((*command, None))
-            self._deferred.clear()
-            if self._status == "retiring":
+            self._serializing.discard(lease)
+            if not self._serializing:
+                for command in self._deferred:
+                    self._commands.put((*command, None))
+                self._deferred.clear()
+            if self._status == "retiring" and not self._leases:
                 self._queue_stop_locked()
 
     def _set_status(self, status: str) -> None:
         with self._status_lock:
             self._status = status
 
+    def _observe(self) -> LocalPosition:
+        deadline_ns = self._clock_ns() + self._busy_timeout_ns
+        while True:
+            try:
+                return _position(self._connection, self.spec, self.registration_epoch)
+            except sqlite3.OperationalError as error:
+                code = getattr(error, "sqlite_errorcode", 0) & 0xff
+                if code not in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED):
+                    raise
+                if self._clock_ns() >= deadline_ns:
+                    raise SourceAdmissionError("managed source observation timed out") from None
+                time.sleep(0.005)
+
     def _run(self) -> None:
         try:
             self._connection = _open_read_only_connection(self.spec)
-            initial = _position(self._connection, self.spec, self.registration_epoch)
+            initial = self._observe()
         except BaseException as error:
             self._set_status("failed")
             self._finish_close()
@@ -386,10 +458,11 @@ class _SourceActor:
                     continue
                 try:
                     if operation == "observe":
-                        result = _position(
-                            self._connection, self.spec, self.registration_epoch)
+                        result = self._observe()
                     elif operation == "capture":
-                        result = _backup_image(self._connection)
+                        result = _backup_image(
+                            self._connection, clock_ns=self._clock_ns,
+                            deadline_ns=self._clock_ns() + self._busy_timeout_ns)
                     else:
                         raise SourceAdmissionError("managed source operation is invalid")
                 except BaseException as error:
@@ -424,10 +497,19 @@ class _SourceActor:
 class ManagedSourceRegistry:
     """Own named source actors and return immutable observations and captures."""
 
-    def __init__(self, *, wake: Callable[[], None]) -> None:
+    def __init__(self, *, wake: Callable[[], None],
+                 clock_ns: Callable[[], int] = time.monotonic_ns,
+                 busy_timeout_ns: int = 2_000_000_000) -> None:
         if not callable(wake):
             raise ValueError("wake must be callable")
+        if not callable(clock_ns):
+            raise ValueError("clock_ns must be callable")
+        if (isinstance(busy_timeout_ns, bool) or not isinstance(busy_timeout_ns, int)
+                or busy_timeout_ns <= 0):
+            raise ValueError("busy_timeout_ns must be a positive integer")
         self._wake = wake
+        self._clock_ns = clock_ns
+        self._busy_timeout_ns = busy_timeout_ns
         self._lock = threading.RLock()
         self._active: dict[str, _Registration] = {}
         self._pending: dict[str, _PendingRegistration] = {}
@@ -436,6 +518,7 @@ class ManagedSourceRegistry:
         self._next_capture_id = 1
         self._capture_lock = threading.Lock()
         self._capture_count = 0
+        self._capture_leases: dict[int, tuple[tuple[_CaptureLease, ...], int]] = {}
         self._deferred_admissions: list[Callable[[], None]] = []
         self._capture_executor = ThreadPoolExecutor(
             max_workers=4, thread_name_prefix="appio-source-capture")
@@ -542,12 +625,36 @@ class ManagedSourceRegistry:
             future = self._capture_executor.submit(
                 self._capture, capture_id, registrations, lease_tuple)
         except RuntimeError:
-            self._finish_capture(lease_tuple)
+            self._finish_capture(lease_tuple, retain=False)
             return _failed_future(SourceAdmissionError(
                 "managed source registry is closed"))
         future.add_done_callback(
-            lambda _completed: self._finish_capture(lease_tuple))
+            lambda completed: self._finish_capture(
+                lease_tuple, retain=not completed.cancelled()
+                and completed.exception() is None))
         return future
+
+    def retain_capture(self, capture_id: int) -> None:
+        """Keep a completed capture alive for one additional dependent worker."""
+
+        with self._lock:
+            if capture_id not in self._capture_leases:
+                raise SourceAdmissionError("managed capture is no longer retained")
+            leases, count = self._capture_leases[capture_id]
+            self._capture_leases[capture_id] = (leases, count + 1)
+
+    def release_capture(self, capture_id: int) -> None:
+        """Release one drained dependent without granting publication authority."""
+
+        with self._lock:
+            if capture_id not in self._capture_leases:
+                raise SourceAdmissionError("managed capture is no longer retained")
+            leases, count = self._capture_leases[capture_id]
+            if count > 1:
+                self._capture_leases[capture_id] = (leases, count - 1)
+                return
+            del self._capture_leases[capture_id]
+        self._release_capture_leases(leases)
 
     def close(self) -> None:
         """Reject new work and queue connection closes on all owning actors."""
@@ -582,8 +689,11 @@ class ManagedSourceRegistry:
         for lease in leases:
             lease.release()
 
-    def _finish_capture(self, leases: tuple[_CaptureLease, ...]) -> None:
-        self._release_capture_leases(leases)
+    def _finish_capture(self, leases: tuple[_CaptureLease, ...], *, retain: bool) -> None:
+        for lease in leases:
+            lease.actor.finish_capture(lease)
+        if not retain:
+            self._release_capture_leases(leases)
         with self._lock:
             self._capture_count -= 1
             if self._capture_count or self._closed:
@@ -635,7 +745,8 @@ class ManagedSourceRegistry:
                     f"managed source {spec.name!r} is already registered"))
                 return
             epoch = _allocate_registration_epoch()
-            actor = _SourceActor(spec, epoch, self._wake)
+            actor = _SourceActor(spec, epoch, self._wake, self._clock_ns,
+                                 self._busy_timeout_ns)
             pending = _PendingRegistration(spec, epoch, actor, future)
             self._pending[spec.name] = pending
             self._reserved.pop(spec.name, None)
@@ -801,23 +912,17 @@ class ManagedSourceRegistry:
 
             closing_positions = self._collect(registrations, "observe", leases)
             closing = LocalPositionVector(closing_positions)
-            digest = hashlib.sha256()
-            digest.update(b"appio-captured-source-set-v1\0")
-            for image in images:
-                name = image.name.encode("utf-8")
-                digest.update(len(name).to_bytes(4, "big"))
-                digest.update(name)
-                epoch = str(image.registration_epoch).encode("ascii")
-                digest.update(len(epoch).to_bytes(4, "big"))
-                digest.update(epoch)
-                digest.update(bytes.fromhex(image.image_digest))
-            return CapturedSourceSet(
+            image_tuple = tuple(images)
+            capture = CapturedSourceSet(
                 capture_id,
                 opening,
                 closing,
-                tuple(images),
-                digest.hexdigest(),
+                image_tuple,
+                _snapshot_digest(image_tuple),
             )
+            with self._lock:
+                self._capture_leases[capture_id] = (leases, 1)
+            return capture
 
     def _notify(self) -> None:
         try:

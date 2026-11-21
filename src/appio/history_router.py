@@ -19,16 +19,18 @@ from __future__ import annotations
 
 from collections import defaultdict
 from collections.abc import Callable, Mapping
+from contextlib import contextmanager
 from concurrent.futures import CancelledError, Future, InvalidStateError, ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
+import hashlib
 import json
 import os
 from pathlib import Path
 import queue
 import sqlite3
+import tempfile
 import time
 from typing import Literal
-from types import SimpleNamespace
 
 from .contracts import (
     AppTotal, Direction, DiskShare, FileCoverage, FileSort, FileTable, HistoryPending, Series, Window,
@@ -38,6 +40,7 @@ from .contracts import (
 from .history_types import (
     AcceptedIdentity,
     AnswerProvenance,
+    CapturedSourceSet,
     FrameProvenance,
     LocalBracket,
     LocalPosition,
@@ -46,6 +49,7 @@ from .history_types import (
     RemotePosition,
     RetainedRecord,
     RetentionScope,
+    SnapshotProvenance,
     SourcePosition,
     _boot_text,
     applied_endpoint,
@@ -63,6 +67,8 @@ from .history_validation import (
     _validate_served_bounds,
     validate_query_result,
 )
+from .history_source import _snapshot_digest
+from .migrations import validate_schema
 from .durable import decode_handover
 from .file_runtime import FileAvailability
 from .iodclient import (
@@ -232,6 +238,61 @@ def _private_authority(value: object) -> tuple:
     raise ValueError("request_token.authority must be tagged remote or local")
 
 
+def _validate_worker_snapshot(snapshot: object) -> SnapshotProvenance:
+    if not isinstance(snapshot, SnapshotProvenance):
+        raise ValueError("a local worker requires snapshot provenance")
+    _revalidate_tree(snapshot)
+    return snapshot
+
+
+def _capture_provenance(capture: CapturedSourceSet) -> SnapshotProvenance:
+    if not isinstance(capture, CapturedSourceSet):
+        raise ValueError("a local worker requires an immutable captured source set")
+    CapturedSourceSet.__post_init__(capture)
+    if capture.snapshot_digest != _snapshot_digest(capture.images):
+        raise ValueError("captured source set digest does not match its images")
+    opening = tuple((source.name, source.owner, source.registration_epoch)
+                    for source in capture.opening.sources)
+    closing = tuple((source.name, source.owner, source.registration_epoch)
+                    for source in capture.closing.sources)
+    if opening != closing:
+        raise ValueError("capture registration identities changed")
+    return SnapshotProvenance(
+        capture.capture_id, capture.snapshot_digest,
+        LocalBracket(capture.opening, capture.closing))
+
+
+@contextmanager
+def _captured_sources(capture: CapturedSourceSet):
+    """Open verified images as worker-private SQLite files and remove them."""
+
+    snapshot = _capture_provenance(capture)
+    sources = []
+    owners = {source.name: source.owner for source in capture.opening.sources}
+    with tempfile.TemporaryDirectory(prefix="appio-history-") as directory:
+        try:
+            for image in capture.images:
+                descriptor, path = tempfile.mkstemp(dir=directory, suffix=".sqlite")
+                with os.fdopen(descriptor, "wb") as image_file:
+                    image_file.write(image.image)
+                with open(path, "rb") as image_file:
+                    digest = hashlib.file_digest(image_file, "sha256").hexdigest()
+                if digest != image.image_digest:
+                    raise ValueError("private source image digest mismatch")
+                connection = sqlite3.connect(path, isolation_level=None, timeout=0.2)
+                try:
+                    validate_schema(connection)
+                    service = QueryService(connection)
+                except BaseException:
+                    connection.close()
+                    raise
+                sources.append((image.name, service, owners[image.name]))
+            yield sources, snapshot
+        finally:
+            for _, service, _ in sources:
+                service.connection.close()
+
+
 def _private_source(value: object, field: str) -> SourcePosition:
     if not isinstance(value, (RemotePosition, LocalPositionVector)):
         raise ValueError(f"{field} must be a RemotePosition or LocalPositionVector")
@@ -339,6 +400,7 @@ class LocalFrameOutcome:
     not_retained: bool
     chronology_unproved: bool
     file_available: bool
+    snapshot: SnapshotProvenance
 
     def __post_init__(self) -> None:
         _private_int(self.worker_id, "local_frame.worker_id", minimum=1)
@@ -416,6 +478,7 @@ class LocalFrameOutcome:
                 _private_interval(interval, f"local_frame.{name}[]")
         for name in ("has_local_history", "not_retained", "chronology_unproved", "file_available"):
             _private_bool(getattr(self, name), f"local_frame.{name}")
+        _validate_worker_snapshot(self.snapshot)
 
 
 @dataclass(frozen=True)
@@ -427,6 +490,7 @@ class LocalPartOutcome:
     app_key: str
     value: DiskShare | Series
     data_digest: str
+    snapshot: SnapshotProvenance
 
     def __post_init__(self) -> None:
         _private_int(self.worker_id, "local_part.worker_id", minimum=1)
@@ -449,6 +513,7 @@ class LocalPartOutcome:
             raise ValueError("a local part digest is 64 lowercase hexadecimal characters")
         if self.data_digest != local_answer_digest(request.kind, app_key, request.window, self.value):
             raise ValueError("a local part digest must match its accepted payload")
+        _validate_worker_snapshot(self.snapshot)
 
 
 @dataclass(frozen=True)
@@ -461,6 +526,7 @@ class LocalFilesOutcome:
     table: FileTable
     coverage: FileCoverage
     served_gap_count: int | None
+    snapshot: SnapshotProvenance
 
     def __post_init__(self) -> None:
         _private_int(self.worker_id, "local_files.worker_id", minimum=1)
@@ -500,6 +566,7 @@ class LocalFilesOutcome:
         _validate_served_bounds(served, request)
         if self.served_gap_count is not None:
             _private_int(self.served_gap_count, "local_files.served_gap_count")
+        _validate_worker_snapshot(self.snapshot)
 
 
 @dataclass(frozen=True)
@@ -630,6 +697,7 @@ class _LocalCopyBinding:
     registrations: tuple[_SourceStamp, ...]
     paths: tuple[tuple[str, str, str], ...]
     opening: LocalPositionVector
+    snapshot: SnapshotProvenance | None = None
 
     def __post_init__(self) -> None:
         _private_int(self.worker_id, "local_binding.worker_id", minimum=1)
@@ -658,6 +726,10 @@ class _LocalCopyBinding:
                     != (stamp.name, stamp.owner, stamp.registration_epoch)):
                 raise ValueError(
                     "a local binding opening vector must match its registrations")
+        if self.snapshot is not None:
+            _validate_worker_snapshot(self.snapshot)
+            if self.snapshot.bracket.opening != self.opening:
+                raise ValueError("a local binding snapshot must match its opening vector")
 
 
 @dataclass(frozen=True)
@@ -675,6 +747,7 @@ class _FilesBinding:
     request: QueryRequest
     registrations: tuple[_SourceStamp, ...]
     paths: tuple[tuple[str, str, str], ...]
+    snapshot: SnapshotProvenance | None = None
 
     def __post_init__(self) -> None:
         _private_int(self.worker_id, "files_binding.worker_id", minimum=1)
@@ -695,6 +768,14 @@ class _FilesBinding:
                     or entry[0] != stamp.name or entry[2] != stamp.owner
                     or not isinstance(entry[1], str)):
                 raise ValueError("a Files binding path must match its registration")
+        if self.snapshot is not None:
+            _validate_worker_snapshot(self.snapshot)
+            positions = self.snapshot.bracket.opening.sources
+            identities = tuple((stamp.name, stamp.owner, stamp.registration_epoch)
+                               for stamp in self.registrations)
+            if tuple((position.name, position.owner, position.registration_epoch)
+                     for position in positions) != identities:
+                raise ValueError("a Files binding snapshot must match its registrations")
 
 
 class _FrameCopyPaths(tuple):
@@ -1283,7 +1364,7 @@ class HistoryRouter:
     def _close_local_settlement(self, settlement: LocalSettlement, *,
                                 binding: _LocalCopyBinding | None = None
                                 ) -> LocalSettlement:
-        """Attach the owner-read closing bracket to one local settlement."""
+        """Attach the actor-captured bracket to one admitted local settlement."""
 
         if not isinstance(settlement, LocalSettlement):
             raise ValueError("closing a local bracket needs a local settlement")
@@ -1291,10 +1372,13 @@ class HistoryRouter:
             binding = self._worker_bindings.get(settlement.worker_id)
         if binding is None:
             raise ValueError("a local settlement has no captured copy binding")
-        closing = self._closing_vector(binding)
+        if settlement.outcome is None or binding.snapshot is None:
+            raise ValueError("a local settlement requires its admitted snapshot")
+        snapshot = _validate_worker_snapshot(settlement.outcome.snapshot)
+        if snapshot != binding.snapshot:
+            raise ValueError("a local settlement answered another snapshot")
         return LocalSettlement(settlement.worker_id, outcome=settlement.outcome,
-                               error=settlement.error,
-                               local_bracket=LocalBracket(binding.opening, closing))
+                               error=settlement.error, local_bracket=snapshot.bracket)
 
     def _background_charge(self, owner: str) -> int:
         return sum(1 for charged_owner, _ in self._worker_jobs.values() if charged_owner == owner)
@@ -1610,7 +1694,7 @@ class HistoryRouter:
         return proven_names == {supplying_name}
 
     @staticmethod
-    def _read_local_files(paths, window, key, app_id, sort, direction, search, *,
+    def _read_local_files(capture: CapturedSourceSet, window, key, app_id, sort, direction, search, *,
                           worker_id: int | None = None,
                           request: QueryRequest | None = None) -> LocalFilesOutcome:
         """Read one ownership-proved store on the background executor, never sum IDs.
@@ -1620,27 +1704,14 @@ class HistoryRouter:
         original window and coverage disclosure. Never use _materialize's
         unfiltered F tables or make process retention a prerequisite for F.
 
-        The returned immutable outcome keeps the existing fatal-vs-skippable
-        candidate/provenance proofs inside the worker. Owner settlement in
-        Tasks 6–7 revalidates and completes the outward Future; until then the
-        two optional bindings default to a compatibility derivation so existing
-        fixtures that call this private worker directly keep their shape.
+        The returned immutable outcome includes the capture provenance.
         """
         if request is None:
             request = QueryRequest("files", window, key, sort=sort, direction=direction,
                                    search=search)
         if worker_id is None:
             worker_id = 1
-        sources = []
-        try:
-            for name, path, owner in paths:
-                source = sqlite3.connect(Path(path).as_uri() + "?mode=ro", uri=True, timeout=0.2)
-                copy = sqlite3.connect(":memory:")
-                try:
-                    source.backup(copy)
-                finally:
-                    source.close()
-                sources.append((name, QueryService(copy), owner))
+        with _captured_sources(capture) as (sources, snapshot):
             results = []
             unavailable = WindowUnavailableError("file_source_unavailable", "No authoritative file app receipt.")
             provenance_error = None
@@ -1671,10 +1742,8 @@ class HistoryRouter:
                     unavailable = WindowUnavailableError(
                         "file_source_unavailable", "File ownership cannot be represented by one store.")
                     continue
-                worker = HistoryRouter(service, SimpleNamespace(state=None), AppRegistry())
+                worker = HistoryRouter._snapshot_planner(sources, served)
                 try:
-                    worker._sources = {source: (query, owner) for source, query, owner in sources}
-                    worker._window = served
                     worker._plan(served)
                     if not HistoryRouter._check_file_provenance(worker, served, name):
                         continue  # A discarded mirror cannot supply the rows.
@@ -1683,7 +1752,7 @@ class HistoryRouter:
                     if provenance_error is None:
                         provenance_error = error
                 finally:
-                    worker.close()
+                    worker._close_views()
             if provenance_error is not None:
                 raise provenance_error
             if not results:
@@ -1692,10 +1761,7 @@ class HistoryRouter:
                 raise WindowUnavailableError("file_source_unavailable", "File ownership cannot be represented by one store.")
             result = results[0]
             return LocalFilesOutcome(worker_id, request, key, result.table, result.coverage,
-                                     result.served_gap_count)
-        finally:
-            for _, service, _ in sources:
-                service.connection.close()
+                                     result.served_gap_count, snapshot)
 
     def request_file_view(self, app_id: int, window: Window, sort: FileSort,
                           direction: Direction, search: str | None) -> Future[FileViewResult]:
@@ -2263,156 +2329,110 @@ class HistoryRouter:
                     copy.close()
 
     @staticmethod
-    def _read_local(paths, window, *, worker_id: int | None = None,
-                    request: QueryRequest | None = None) -> LocalFrameOutcome:
-        """Copy, plan, materialise and rank in one frame worker (§3.3).
+    def _snapshot_planner(sources, window):
+        """Initialize a private planner over worker-owned snapshot connections."""
 
-        Returns every routing/materialisation fact the owner needs and never
-        constructs a subject's detail or exposes a database handle. The owner
-        passes its admitted binding with ``paths``; only a direct fixture call
-        with plain paths falls back to the compatibility worker id/request.
-        """
-        if worker_id is None or request is None:
-            admission = getattr(paths, "binding", None)
-            if admission is not None:
-                if worker_id is None:
-                    worker_id = admission.worker_id
-                if request is None:
-                    request = admission.request
-        if request is None:
-            request = QueryRequest("ranking", window)
-        if worker_id is None:
-            worker_id = 1
-        window = request.window
-        sources = []
-        worker = None
-        try:
-            for name, path, owner in paths:
-                source = sqlite3.connect(Path(path).as_uri() + "?mode=ro", uri=True, timeout=0.2)
-                copy = sqlite3.connect(":memory:")
-                try:
-                    source.backup(copy)
-                finally:
-                    source.close()
-                sources.append((name, QueryService(copy), owner))
-            worker = HistoryRouter(sources[0][1], SimpleNamespace(state=None), AppRegistry())
-            worker._sources = {name: (service, owner) for name, service, owner in sources}
-            worker._window = window
-            worker._plan(window)
-            worker._materialize()
-            worker.boundaries = tuple(boundary for boundary in worker.boundaries if all(
-                any(s.boot_id == boundary[0] and s.proven and s.owner == owner and
-                    (s.end_ns == boundary[1] if index == 2 else s.start_ns == boundary[1])
-                    for s in worker.segments)
-                for index, owner in enumerate(boundary[2:], 2)))
-            worker._build_ranking(window)
-            worker._ready = True
-            file_available = False
-            for _, service, _ in sources:
-                try:
-                    if service.connection.execute(
-                            "SELECT 1 FROM boot WHERE file_finalized_through_mono_ns > 0 LIMIT 1"
-                    ).fetchone() is not None:
-                        file_available = True
-                except Exception:
-                    # Optional file metadata must not suppress process history
-                    # or prevent another source from proving file availability.
-                    continue
-            return LocalFrameOutcome(
-                worker_id=worker_id,
-                request=request,
-                ranking=tuple(worker._ranking),
-                segments=tuple(worker.segments),
-                boundaries=tuple(worker.boundaries),
-                gaps=tuple(worker._gap_ranges),
-                known_gaps=tuple(worker._known_gap_ranges),
-                overlaps=tuple(worker._overlap_ranges),
-                has_local_history=bool(worker._has_local_history),
-                not_retained=bool(worker._not_retained),
-                chronology_unproved=bool(worker._chronology_unproved),
-                file_available=bool(file_available),
-            )
-        finally:
-            if worker is not None:
-                worker.close()
-            for _, service, _ in sources:
-                service.connection.close()
-
-    @staticmethod
-    def _open_local_worker(paths, window):
-        """Private copies plus a planner worker for one detail snapshot."""
-
-        sources = []
-        try:
-            for name, path, owner in paths:
-                source = sqlite3.connect(Path(path).as_uri() + "?mode=ro", uri=True, timeout=0.2)
-                copy = sqlite3.connect(":memory:")
-                try:
-                    source.backup(copy)
-                finally:
-                    source.close()
-                sources.append((name, QueryService(copy), owner))
-        except Exception:
-            for _, service, _ in sources:
-                service.connection.close()
-            raise
-        worker = HistoryRouter(sources[0][1], SimpleNamespace(state=None), AppRegistry())
+        worker = object.__new__(HistoryRouter)
         worker._sources = {name: (service, owner) for name, service, owner in sources}
+        worker.registry = AppRegistry()
         worker._window = window
-        return worker, sources
+        worker._views = []
+        worker._ranking = []
+        worker._all_segments = ()
+        worker.segments = ()
+        worker.boundaries = ()
+        worker._gap_ranges = []
+        worker._known_gap_ranges = []
+        worker._overlap_ranges = []
+        worker._has_local_history = False
+        worker._not_retained = False
+        worker._chronology_unproved = False
+        return worker
 
     @staticmethod
-    def _close_local_worker(worker, sources) -> None:
-        if worker is not None:
-            worker.close()
-        for _, service, _ in sources:
-            service.connection.close()
+    def _read_local(capture: CapturedSourceSet, window, *, worker_id: int,
+                    request: QueryRequest) -> LocalFrameOutcome:
+        """Plan and rank a verified immutable capture on the worker thread."""
+
+        if not isinstance(request, QueryRequest) or request.kind != "ranking" or request.window != window:
+            raise ValueError("a local frame request must match its exact window")
+        request = _normalize_request(request)
+        with _captured_sources(capture) as (sources, snapshot):
+            worker = HistoryRouter._snapshot_planner(sources, window)
+            try:
+                worker._plan(window)
+                worker._materialize()
+                worker.boundaries = tuple(boundary for boundary in worker.boundaries if all(
+                    any(s.boot_id == boundary[0] and s.proven and s.owner == owner and
+                        (s.end_ns == boundary[1] if index == 2 else s.start_ns == boundary[1])
+                        for s in worker.segments)
+                    for index, owner in enumerate(boundary[2:], 2)))
+                worker._build_ranking(window)
+                file_available = False
+                for _, service, _ in sources:
+                    try:
+                        if service.connection.execute(
+                                "SELECT 1 FROM boot WHERE file_finalized_through_mono_ns > 0 LIMIT 1"
+                        ).fetchone() is not None:
+                            file_available = True
+                    except Exception:
+                        continue
+                return LocalFrameOutcome(
+                    worker_id=worker_id,
+                    request=request,
+                    ranking=tuple(worker._ranking),
+                    segments=tuple(worker.segments),
+                    boundaries=tuple(worker.boundaries),
+                    gaps=tuple(worker._gap_ranges),
+                    known_gaps=tuple(worker._known_gap_ranges),
+                    overlaps=tuple(worker._overlap_ranges),
+                    has_local_history=bool(worker._has_local_history),
+                    not_retained=bool(worker._not_retained),
+                    chronology_unproved=bool(worker._chronology_unproved),
+                    file_available=bool(file_available),
+                    snapshot=snapshot,
+                )
+            finally:
+                worker._close_views()
 
     @staticmethod
-    def _read_local_part(paths, request: QueryRequest, *, worker_id: int,
-                         app_key: str) -> LocalPartOutcome:
-        """Compute exactly one requested kind for one external subject (§3.3).
+    def _read_local_part(capture: CapturedSourceSet, request: QueryRequest, *,
+                         worker_id: int, app_key: str) -> LocalPartOutcome:
+        """Compute exactly one requested kind for one external subject."""
 
-        Each private snapshot resolves the AppKey to *its own* store-local id,
-        so a registry or another store's numeric id is never used as a database
-        key. Only the requested kind is computed, then the existing merge/tier/
-        peak/residual/coverage reducers combine the per-store answers.
-        """
         normalized = _normalize_request(request)
         if normalized.kind not in ("totals", "series"):
             raise ValueError("a local part request is totals or series")
         if normalized.app_key != app_key:
             raise ValueError("a local part request must name its external subject")
-        worker, sources = HistoryRouter._open_local_worker(paths, normalized.window)
-        try:
-            worker._plan(normalized.window)
-            worker._materialize()
-            parts = []
-            # The materialised views carry the planner's whole-delta retraction;
-            # the raw copies do not. Detail reads must use the retracted snapshots
-            # and resolve the external key inside each of them.
-            for _name, service in worker._views:
-                row = service.connection.execute(
-                    "SELECT app_id FROM app WHERE key=?", (app_key,)).fetchone()
-                if row is None:
-                    continue
+        with _captured_sources(capture) as (sources, snapshot):
+            worker = HistoryRouter._snapshot_planner(sources, normalized.window)
+            try:
+                worker._plan(normalized.window)
+                worker._materialize()
+                parts = []
+                for _name, service in worker._views:
+                    row = service.connection.execute(
+                        "SELECT app_id FROM app WHERE key=?", (app_key,)).fetchone()
+                    if row is None:
+                        continue
+                    if normalized.kind == "totals":
+                        parts.append(service.disk_share(row[0], normalized.window))
+                    else:
+                        parts.append(service.series(row[0], normalized.window))
+                if not parts:
+                    raise KeyError(app_key)
+                coverage = worker._part_coverage(parts)
                 if normalized.kind == "totals":
-                    parts.append(service.disk_share(row[0], normalized.window))
+                    value = HistoryRouter._merge_disk_shares(
+                        parts, parts[0].app_id, normalized.window, coverage)
                 else:
-                    parts.append(service.series(row[0], normalized.window))
-            if not parts:
-                raise KeyError(app_key)
-            coverage = worker._part_coverage(parts)
-            if normalized.kind == "totals":
-                value = HistoryRouter._merge_disk_shares(
-                    parts, parts[0].app_id, normalized.window, coverage)
-            else:
-                value = HistoryRouter._merge_series(
-                    parts, parts[0].app_id, normalized.window, coverage)
-            digest = local_answer_digest(normalized.kind, app_key, normalized.window, value)
-            return LocalPartOutcome(worker_id, normalized, app_key, value, digest)
-        finally:
-            HistoryRouter._close_local_worker(worker, sources)
+                    value = HistoryRouter._merge_series(
+                        parts, parts[0].app_id, normalized.window, coverage)
+                digest = local_answer_digest(normalized.kind, app_key, normalized.window, value)
+                return LocalPartOutcome(worker_id, normalized, app_key, value, digest, snapshot)
+            finally:
+                worker._close_views()
 
     # -- authority and source identity (§3.2) ------------------------------ #
 
@@ -3207,6 +3227,17 @@ class HistoryRouter:
         if settlement.error is not None:
             return self._settle_failure(token, settlement.error)
         outcome = settlement.outcome
+        try:
+            if outcome is None or outcome.worker_id != binding.worker_id:
+                raise ValueError("a local outcome answered another worker")
+            snapshot = _validate_worker_snapshot(outcome.snapshot)
+            if binding.snapshot is None or snapshot != binding.snapshot:
+                raise ValueError("a local outcome answered another snapshot")
+            if token.owner != "files" and settlement.local_bracket != snapshot.bracket:
+                raise ValueError("a local outcome answered another bracket")
+        except Exception:  # noqa: BLE001 - malformed or foreign worker result
+            return self._reject_token(
+                token, settlement, RequestRejected("invalid_result", "invalid_result"))
         if token.owner == "detail":
             if not isinstance(outcome, LocalPartOutcome):
                 return self._reject_token(
@@ -3230,7 +3261,7 @@ class HistoryRouter:
             presentation = self.registry.id_for(outcome.app_key)
             return self._publish_detail(
                 token, replace(outcome.value, app_id=presentation), outcome.data_digest,
-                answered_source=answered, bracket=bracket)
+                answered_source=answered, bracket=bracket, snapshot=snapshot)
         if token.owner == "files":
             if not isinstance(outcome, LocalFilesOutcome):
                 return self._reject_token(
@@ -3286,7 +3317,8 @@ class HistoryRouter:
 
     def _publish_detail(self, token: RequestToken, value: DiskShare | Series,
                         digest: str, *, answered_source: SourcePosition | None,
-                        bracket: LocalBracket | None) -> bool:
+                        bracket: LocalBracket | None,
+                        snapshot: SnapshotProvenance | None = None) -> bool:
         lifetime = self._detail
         if lifetime is None or lifetime.lifetime_id != token.owner_id:
             return False
@@ -3304,7 +3336,7 @@ class HistoryRouter:
         first_seen = slot.stamps[identity]
         provenance = AnswerProvenance(
             kind, app_key, scope, window, identity, first_seen, answered_source,
-            bracket)
+            bracket, snapshot)
         record = RetainedRecord(value, provenance)
         slot.record = record
         slot.phase = "ok"
@@ -3375,28 +3407,33 @@ class HistoryRouter:
             return False
         if frame.remote_token is not None and not frame.remote_settled:
             return False
-        local_mode = isinstance(frame.requested_source, LocalPositionVector)
         if self._remote is not None:
             answered: SourcePosition | None = self._remote_answered
             bracket = None
         else:
-            bracket = frame.local_bracket if local_mode else None
+            bracket = frame.local_bracket
             answered = (bracket.opening
                         if bracket is not None and bracket.opening == bracket.closing
                         else None)
         certified = answered is not None and answered == frame.requested_source
-        self._finish()
+        snapshot = None
+        if bracket is not None:
+            if self._local_settlement is None or self._local_settlement.outcome is None:
+                raise ValueError("a local frame requires its captured snapshot")
+            snapshot = self._local_settlement.outcome.snapshot
         certificate = FrameProvenance(
             frame.owner_id, frame.window, frame.requested_source, answered,
-            bracket, certified)
+            bracket, snapshot=snapshot, certified=certified)
+        self._finish()
         frame.certificate = certificate
         frame.answered_source = answered
-        self._build_ranking_provenance(frame, answered, bracket)
+        self._build_ranking_provenance(frame, answered, bracket, snapshot)
         return True
 
     def _build_ranking_provenance(self, frame: _FrameOwner,
                                   answered: SourcePosition | None,
-                                  bracket: LocalBracket | None) -> None:
+                                  bracket: LocalBracket | None,
+                                  snapshot: SnapshotProvenance | None) -> None:
         remote = self._remote is not None
         digest = self._remote_snapshot if remote else None
         rows = self._remote if remote else self._ranking
@@ -3417,7 +3454,8 @@ class HistoryRouter:
                 stamps[identity] = self._clock_ns()
             provenance[key] = AnswerProvenance(
                 "ranking", key, retention_scope(key, frame.window), frame.window,
-                identity, stamps[identity], row_answered, row_bracket)
+                identity, stamps[identity], row_answered, row_bracket,
+                None if remote else snapshot)
         frame.ranking_provenance = provenance
 
     # -- scheduler: one wire occupant, priority and stable serial (§5.1) --- #
@@ -3539,8 +3577,8 @@ class HistoryRouter:
 
         The submitted copy receives the admitted worker id and request, so a
         result under any other identity is foreign. It is rejected before the
-        owner reads a closing bracket or publishes any frame fact; a worker
-        result is never relabelled as this admission (§3.4, §4.3).
+        owner publishes any frame fact, and a worker result is never relabelled
+        as this admission (§3.4, §4.3).
         """
 
         if not isinstance(outcome, LocalFrameOutcome):
@@ -3552,6 +3590,8 @@ class HistoryRouter:
             raise ValueError("a local frame worker answered another worker binding")
         if outcome.request != binding.request:
             raise ValueError("a local frame worker answered another request")
+        if binding.snapshot is None or outcome.snapshot != binding.snapshot:
+            raise ValueError("a local frame worker answered another snapshot")
         return outcome
 
     def _build_ranking(self, window):
