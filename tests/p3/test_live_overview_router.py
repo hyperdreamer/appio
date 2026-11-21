@@ -5448,7 +5448,8 @@ def test_transport_gap_writer_registration_retirement_and_close(
     from appio.history_source import GapWriteResult, ManagedSourceRegistry, SourceAdmissionError
     from appio.history_types import ManagedSourceSpec
     from appio.iodclient import GapNotice
-    from live_overview_support import GapSqlHarness, LocalPositionStores
+    from live_overview_support import (GapSqlHarness, LocalPositionStores,
+                                       drain_transport_gaps, make_managed_router)
 
     assert tuple(field.name for field in fields(GapWriteResult)) == (
         "registration_epoch", "disposition", "boot_id", "from_mono_ns", "to_mono_ns")
@@ -5546,6 +5547,32 @@ def test_transport_gap_writer_registration_retirement_and_close(
                 assert probe.close_thread == probe.thread
         finally:
             sources.close()
+
+        # Drain an old writer completion after replacement through the router.
+        # The new incarnation must not be invalidated by that completion.
+        router = make_managed_router(stores.services["local"], _IdleClient(), AppRegistry())
+        sources = router._capture_provider
+        primary_spec = sources._active["local"].spec
+        invalidations = []
+        invalidate = router.invalidate
+
+        def observe_invalidation(**options):
+            invalidations.append(options)
+            invalidate(**options)
+
+        monkeypatch.setattr(router, "invalidate", observe_invalidation)
+        try:
+            with sql.hold("COMMIT") as barrier:
+                router.record_transport_gap(replace(notice, from_mono_ns=30 * NS,
+                                                     to_mono_ns=31 * NS))
+                barrier.wait()
+                replacement = sources.replace("local", primary_spec)
+                barrier.release()
+                replacement.result(timeout=10)
+                drain_transport_gaps(router)
+            assert invalidations == [], "retired gap invalidated the replacement epoch"
+        finally:
+            router.close()
 
 
 @pytest.mark.parametrize("mode", ["local", "remote"])
