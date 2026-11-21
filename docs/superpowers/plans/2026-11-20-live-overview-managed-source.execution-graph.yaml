@@ -4,7 +4,7 @@ schema_version: 1
 epoch: 6
 source_plan:
   path: "docs/superpowers/plans/2026-11-20-live-overview-managed-source.md"
-  sha256: "da97a4ac0c1c66b75a85079a8cc3e098a75e173e7f3091ba58af5b09b2f56143"
+  sha256: "c54c11a2d819d18326542aeee0bd47d06f33acecab000935ea662e0e6d44316f"
   commit: "/data/home/henry-arch/.local/state/pi/project-manager/runs/ff4052076ce484e2c2a11776fd034304240f1c4457b5db14d60e70059561fa4a/pm-run-20261115-220910-6cf101c8"
   tasks: 8
 source_documents:

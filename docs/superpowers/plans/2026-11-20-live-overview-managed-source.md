@@ -321,7 +321,7 @@ git commit -m "test(history): prove source retirement snapshot settlement and st
 
 **Lane:** `verification`
 **Depends on:** Task 6
-**Specification:** §13 and §12.9, with preservation of §§4.3–4.5, 6.1 and the prior recovery specification.
+**Specification:** §13, §12.1–§12.9 and §12.10, with preservation of §§4.3–4.5, 6.1 and the prior recovery specification. This task also closes the specification's own named-test inventory: every test name listed in §12 tables must exist exactly once at its specified file, and every preservation gate named by the brief must pass at lane head.
 
 **Files:**
 
@@ -330,6 +330,9 @@ git commit -m "test(history): prove source retirement snapshot settlement and st
 - Modify/Test: `tests/p3/test_collector_owner.py`
 - Modify/Test: `tests/p3/test_history_router.py`
 - Modify/Test: `tests/live_overview_support.py`
+- Modify/Test: `tests/p3/test_live_overview_client.py`
+- Modify/Test: `tests/test_ui.py`
+- Modify/Test: `tests/p3/test_history_overlap_entry.py`
 - Read-only during mutation probes: `src/appio/history_source.py`, `src/appio/history_router.py`, `src/appio/ui/collector_window.py`, `src/appio/collector_owner.py`
 
 **Interfaces:**
@@ -365,7 +368,14 @@ python -m mypy --follow-imports=skip --ignore-missing-imports src/appio/history_
 ```
 
 Compare the exact named-test inventory with the revision-8 specification. If the optional development-only mypy executable is unavailable, record that environmental result without weakening the pytest gates or installing a dependency.
-- [ ] **Step 6: Commit the verified mutation and preservation tests.**
+- [ ] **Step 5b: Complete the specification's §12 named-test inventory and migrate the production-entry integration test.**
+  Parse every backticked `test_*` name from the specification's §§12.1–12.9 tables, collect the top-level definitions with `ast`, and reconcile the two sets. Author a top-level test at its specified file for every name that is absent, driving the production seam the §12 row describes with real fixtures and at least one failing-if-removed assertion. Add no duplicate definition and rename nothing that already exists.
+
+  Then migrate `tests/p3/test_history_overlap_entry.py::test_live_incomplete_reply_cannot_resurrect_export_overlap_in_production_entry`: `run_interactive` now admits its managed source asynchronously and creates the window after admission, so the replaced event loop must wait for owner-thread admission and completion instead of assuming a synchronously constructed `CollectorWindow`, and the legacy `history.local.connection` access must use the managed source position. Preserve the test's scenario: an incomplete live reply must not resurrect an export overlap in the production entry path.
+
+  The preservation gate must pass at lane head, not be reported as an out-of-scope failure.
+
+- [ ] **Step 6: Commit the verified mutation, inventory and preservation tests.**
 
 ```bash
 git add tests/p3/test_live_overview_router.py tests/p3/test_collector_window.py tests/p3/test_collector_owner.py tests/p3/test_history_router.py tests/live_overview_support.py
