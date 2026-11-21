@@ -67,7 +67,7 @@ from .history_validation import (
     _validate_served_bounds,
     validate_query_result,
 )
-from .history_source import _snapshot_digest
+from .history_source import ManagedSourceRegistry, SourceAdmissionError, _snapshot_digest
 from .migrations import validate_schema
 from .durable import decode_handover
 from .file_runtime import FileAvailability
@@ -684,11 +684,10 @@ class _SourceStamp:
 
 @dataclass(frozen=True)
 class _LocalCopyBinding:
-    """Registrations, paths and opening vector captured before one copy (§4.3).
+    """Owner-side request, registration and immutable snapshot association.
 
-    The binding carries no live service, connection, selection or database
-    handle. A worker receives only ``paths``; the owner thread re-checks
-    ``registrations`` and observes ``closing`` before publication.
+    Legacy path slots stay owner-side during the staged constructor cutover.
+    Workers receive the captured bytes and the exact request and worker ID.
     """
 
     worker_id: int
@@ -734,12 +733,10 @@ class _LocalCopyBinding:
 
 @dataclass(frozen=True)
 class _FilesBinding:
-    """The worker association for one local Files job (§3.4).
+    """The request and managed snapshot association for one local Files job.
 
-    A Files worker keeps its existing private-snapshot and served-interval
-    proofs, so it carries no opening vector and no closing bracket. The binding
-    is still the immutable admission evidence: the exact worker id, normalized
-    request and the registered source stamps/paths the worker was given.
+    The captured bracket stays in snapshot provenance. Files keeps its existing
+    private-image ownership and served-interval acceptance predicates.
     """
 
     worker_id: int
@@ -910,7 +907,7 @@ class _FrameOwner:
 
     owner_id: int
     window: Window
-    requested_source: SourcePosition
+    requested_source: SourcePosition | None
     authority: tuple
     local_token: RequestToken
     remote_token: RequestToken | None
@@ -931,11 +928,16 @@ class _FrameOwner:
 
 class HistoryRouter:
     def __init__(self, local: QueryService, client: IodClient, registry: AppRegistry, *,
-                 clock_ns: Callable[[], int] = time.monotonic_ns):
+                 clock_ns: Callable[[], int] = time.monotonic_ns,
+                 _capture_provider: ManagedSourceRegistry | None = None):
         if not callable(clock_ns):
             raise ValueError("clock_ns must be callable")
         self.local, self.client, self.registry = local, client, registry
         self._clock_ns = clock_ns
+        self._capture_provider = _capture_provider
+        self._capture_jobs: dict[int, tuple[RequestToken, Future]] = {}
+        self._worker_captures: dict[int, int] = {}
+        self._frame_jobs: dict[int, Future] = {}
         self._sources = {"local": (local, "gui")}
         # Registration bookkeeping (§4.2): a strictly increasing epoch that is
         # never reused, plus the live service/connection identity, canonical
@@ -1269,6 +1271,8 @@ class HistoryRouter:
         return self._observe_registration(self._current_registration(source_name))
 
     def _local_vector(self) -> LocalPositionVector:
+        if self._capture_provider is not None:
+            return self._capture_provider.observe()
         names = sorted(self._sources, key=lambda name: name.encode("utf-8"))
         return LocalPositionVector(tuple(self.local_position(name) for name in names))
 
@@ -1297,52 +1301,142 @@ class HistoryRouter:
         # file and must be refused, not re-stamped (§4.2).
         self.invalidate()
 
+    def _managed_sources(self) -> ManagedSourceRegistry:
+        if not isinstance(self._capture_provider, ManagedSourceRegistry):
+            raise SourceAdmissionError("history source is not managed")
+        return self._capture_provider
+
     def _capture_local_binding(self, *, worker_id: int, token_id: int | None = None,
-                               request: QueryRequest) -> _LocalCopyBinding:
-        """Capture registrations, paths and the opening vector before a copy.
+                               request: QueryRequest,
+                               capture: CapturedSourceSet | None = None) -> _LocalCopyBinding:
+        """Bind a request to completed actor observations or its exact capture."""
 
-        No live connection or current selection enters the binding handed to a
-        worker. Every source must be committed and bound to its registered file
-        at admission; a failed check publishes no vector.
-        """
-
-        names = sorted(self._sources, key=lambda name: name.encode("utf-8"))
-        stamps, paths, positions = [], [], []
-        for name in names:
-            registration = self._current_registration(name)
-            stamps.append(_SourceStamp(registration.name, registration.owner,
-                                       registration.registration_epoch,
-                                       registration.path, registration.physical))
-            paths.append((name, registration.path, registration.owner))
-            positions.append(self._observe_registration(registration))
-        return _LocalCopyBinding(worker_id, token_id, request, tuple(stamps),
-                                 tuple(paths), LocalPositionVector(tuple(positions)))
+        sources = self._managed_sources()
+        opening = sources.observe() if capture is None else capture.opening
+        stamps = tuple(_SourceStamp(position.name, position.owner,
+                                    position.registration_epoch, "", None)
+                       for position in opening.sources)
+        paths = tuple((position.name, "", position.owner) for position in opening.sources)
+        snapshot = None if capture is None else _capture_provenance(capture)
+        return _LocalCopyBinding(worker_id, token_id, request, stamps, paths, opening, snapshot)
 
     def _capture_files_binding(self, *, worker_id: int, token_id: int,
-                               request: QueryRequest) -> _FilesBinding:
-        """Capture a Files worker association without a UI-thread observer read.
+                               request: QueryRequest,
+                               capture: CapturedSourceSet | None = None) -> _FilesBinding:
+        binding = self._capture_local_binding(
+            worker_id=worker_id, token_id=token_id, request=request, capture=capture)
+        return _FilesBinding(worker_id, token_id, request, binding.registrations,
+                             binding.paths, binding.snapshot)
 
-        Files keeps its existing private-snapshot/served-interval proofs, so it
-        needs no opening vector and must not execute even metadata SQL on the
-        owner connection. The live registration is read only when its object
-        identity matches the current source; a genuine replacement is installed
-        by the normal registration path first.
-        """
+    def _request_local_capture(self, token: RequestToken) -> Future:
+        future = self._managed_sources().capture()
+        self._capture_jobs[token.token_id] = (token, future)
+        if token.owner != "frame":
+            self._bind_background_worker(token.token_id, token.owner, future)
+        return future
 
-        stamps, paths = [], []
-        names = sorted(self._sources, key=lambda name: name.encode("utf-8"))
-        for name in names:
-            service, owner = self._sources[name]
-            registration = self._registrations.get(name)
-            if (registration is None or registration.service is not service
-                    or registration.connection is not service.connection
-                    or registration.owner != owner):
-                registration = self._current_registration(name)
-            stamps.append(_SourceStamp(registration.name, registration.owner,
-                                       registration.registration_epoch,
-                                       registration.path, registration.physical))
-            paths.append((name, registration.path, registration.owner))
-        return _FilesBinding(worker_id, token_id, request, tuple(stamps), tuple(paths))
+    def _release_worker_capture(self, worker_id: int) -> None:
+        capture_id = self._worker_captures.pop(worker_id, None)
+        if capture_id is not None:
+            self._managed_sources().release_capture(capture_id)
+
+    @staticmethod
+    def _discard_capture(sources: ManagedSourceRegistry, future: Future) -> None:
+        if future.cancelled() or future.exception() is not None:
+            return
+        try:
+            sources.release_capture(future.result().capture_id)
+        except SourceAdmissionError:
+            # Registry close already reaps an unclaimed late capture.
+            pass
+
+    def _collect_captures(self) -> bool:
+        """Admit immutable captures to workers after their actor Future completes."""
+
+        changed = False
+        for worker_id, (token, future) in tuple(self._capture_jobs.items()):
+            if not future.done():
+                continue
+            live = (not self._closed and worker_id not in self._retired_tokens
+                    and token.authority == self._current_authority())
+            if token.owner == "frame":
+                live = live and self._frame is not None and not self._frame.retired
+                live = live and self._frame.owner_id == token.owner_id
+            elif token.owner == "detail":
+                live = live and self._detail_token_live(token)
+            else:
+                owner = self._file_owners.get(token.owner_id)
+                live = live and owner is not None and not owner.outward.done()
+            if not live:
+                self._discard_capture(self._managed_sources(), future)
+                self._capture_jobs.pop(worker_id)
+                self._worker_bindings.pop(worker_id, None)
+                self._files_bindings.pop(worker_id, None)
+                self._reap_background_worker(worker_id)
+                continue
+            try:
+                capture = future.result()
+                binding = self._capture_local_binding(
+                    worker_id=worker_id, token_id=worker_id,
+                    request=token.request, capture=capture)
+                identities = tuple((item.name, item.owner, item.registration_epoch)
+                                   for item in capture.opening.sources)
+                sources = self._managed_sources()
+                if identities != sources.registration_vector():
+                    raise SourceAdmissionError("managed source registrations changed")
+                sources.retain_capture(capture.capture_id)
+                sources.release_capture(capture.capture_id)
+                self._worker_captures[worker_id] = capture.capture_id
+                if token.owner == "frame":
+                    token = replace(token, requested_source=capture.opening)
+                    self._frame.local_token = token
+                    self._frame.local_binding = binding
+                    if self._frame.remote_token is None:
+                        self._frame.requested_source = capture.opening
+                    self._worker_bindings[worker_id] = binding
+                    self._local_future = self._frame_executor.submit(
+                        self._read_local, capture, token.request.window,
+                        worker_id=worker_id, request=token.request)
+                    self._frame_jobs[worker_id] = self._local_future
+                    self._file_status = FileAvailability(True, False)
+                else:
+                    if token.owner == "files":
+                        binding = _FilesBinding(
+                            worker_id, worker_id, token.request, binding.registrations,
+                            binding.paths, binding.snapshot)
+                        app_id = self._file_owners[token.owner_id].app_id
+                        reader = self._read_local_files
+
+                        def work(capture=capture, token=token, app_id=app_id, reader=reader):
+                            request = token.request
+                            return reader(capture, request.window, request.app_key, app_id,
+                                          request.sort, request.direction, request.search,
+                                          worker_id=token.token_id, request=request)
+                    else:
+                        reader = self._read_local_part
+
+                        def work(capture=capture, token=token, reader=reader):
+                            return reader(capture, token.request, worker_id=token.token_id,
+                                          app_key=token.request.app_key)
+                    self._worker_jobs[worker_id] = (token.owner, None)
+                    self._submit_background_worker(token, work, binding=binding, reserved=True)
+            except Exception as error:  # noqa: BLE001 - exact current capture/submission failure
+                changed |= self._settle(token, LocalSettlement(worker_id, error=error))
+                if worker_id in self._worker_captures:
+                    self._release_worker_capture(worker_id)
+                else:
+                    self._discard_capture(self._managed_sources(), future)
+                self._reap_background_worker(worker_id)
+            finally:
+                self._capture_jobs.pop(worker_id, None)
+        return changed
+
+    def _reap_terminal_frame_workers(self) -> None:
+        for worker_id, future in tuple(self._frame_jobs.items()):
+            if future.done():
+                self._frame_jobs.pop(worker_id)
+                self._worker_bindings.pop(worker_id, None)
+                self._release_worker_capture(worker_id)
 
     def _closing_vector(self, binding: _LocalCopyBinding) -> LocalPositionVector:
         """Re-check identities and observe the closing vector before publication."""
@@ -1395,7 +1489,8 @@ class HistoryRouter:
 
     def _submit_background_worker(
         self, token: RequestToken, work: Callable[[], LocalOutcome],
-        *, binding: _LocalCopyBinding | None = None,
+        *, binding: _LocalCopyBinding | _FilesBinding | None = None,
+        reserved: bool = False,
     ) -> Future | None:
         """Charge one background slot and submit an immutable-outcome worker.
 
@@ -1409,11 +1504,14 @@ class HistoryRouter:
             raise ValueError("a background worker needs its admitted request token")
         if token.origin != "local" or token.owner not in ("detail", "files"):
             raise ValueError("only a local detail or Files token owns a background worker")
-        if token.token_id in self._worker_jobs:
-            raise ValueError("a request token admits one worker only")
-        if binding is not None and token.owner == "files":
-            raise ValueError("a Files worker carries no opening-vector binding")
-        worker_id = self._reserve_background_worker(token.owner, worker_id=token.token_id)
+        if reserved:
+            if self._worker_jobs.get(token.token_id) != (token.owner, None):
+                raise ValueError("a capture requires its reserved background slot")
+            worker_id = token.token_id
+        else:
+            if token.token_id in self._worker_jobs:
+                raise ValueError("a request token admits one worker only")
+            worker_id = self._reserve_background_worker(token.owner, worker_id=token.token_id)
         if worker_id is None:
             return None
         if binding is None:
@@ -1433,6 +1531,10 @@ class HistoryRouter:
             except Exception:
                 self._reap_background_worker(worker_id)
                 raise
+        elif token.owner == "files":
+            if not isinstance(binding, _FilesBinding):
+                raise ValueError("a Files worker requires its Files binding")
+            self._files_bindings[worker_id] = binding
         else:
             self._worker_bindings[worker_id] = binding
 
@@ -1446,7 +1548,8 @@ class HistoryRouter:
         try:
             future = self._background_executor.submit(run)
         except RuntimeError:
-            self._reap_background_worker(worker_id)
+            if not reserved:
+                self._reap_background_worker(worker_id)
             raise
         self._bind_background_worker(worker_id, token.owner, future)
         return future
@@ -1536,6 +1639,7 @@ class HistoryRouter:
 
         if self._worker_jobs.pop(worker_id, None) is None:
             return
+        self._release_worker_capture(worker_id)
         self._worker_bindings.pop(worker_id, None)
         self._files_bindings.pop(worker_id, None)
         self._legacy_files_workers.discard(worker_id)
@@ -1559,6 +1663,7 @@ class HistoryRouter:
         """
 
         if (self._occupant is not None or self._queue or self._worker_jobs
+                or self._capture_jobs or self._frame_jobs
                 or self._unscheduled or self._file_owners
                 or not self._completed.empty()):
             return True
@@ -1608,7 +1713,10 @@ class HistoryRouter:
         try:
             if error is not None:
                 if not isinstance(error, (WindowUnavailableError, IodClientError)):
-                    error = WindowUnavailableError("file_source_unavailable", "File history could not be read.")
+                    reason = str(error) or type(error).__name__
+                    original = error
+                    error = WindowUnavailableError("file_source_unavailable", reason)
+                    error.__cause__ = original
                 self._file_status = FileAvailability(False, False,
                     "not_retained" if getattr(error, "reason", None) == "not_retained" else "file_source_unavailable")
                 future.set_exception(error)
@@ -1836,31 +1944,25 @@ class HistoryRouter:
             direction=owner.direction, search=owner.search))
 
     def _admit_local_files(self, owner: _FilesOwner) -> None:
-        """Submit one ownership-proved local Files worker on the background lane."""
+        """Reserve a bounded slot and request its actor-owned snapshot."""
 
-        paths = self._local_files_paths()
         request = QueryRequest("files", owner.window, owner.app_key, sort=owner.sort,
                                direction=owner.direction, search=owner.search)
         worker_id = self._allocate_token_id()
         token = RequestToken(
             worker_id, request, "local", None, "files", owner.owner_id, None,
             owner.authority, owner.requested_source)
-
-        def work() -> LocalOutcome:
-            return self._read_local_files(
-                paths, owner.window, owner.app_key, owner.app_id, owner.sort,
-                owner.direction, owner.search, worker_id=worker_id,
-                request=token.request)
-
+        if self._reserve_background_worker("files", worker_id=worker_id) is None:
+            raise RequestRejected("query_busy", "File history queue is full.")
         owner.current = token
         try:
-            future = self._submit_background_worker(token, work)
+            self._files_bindings[worker_id] = self._capture_files_binding(
+                worker_id=worker_id, token_id=worker_id, request=token.request)
+            self._request_local_capture(token)
         except Exception:
+            self._reap_background_worker(worker_id)
             owner.current = None
             raise
-        if future is None:
-            owner.current = None
-            raise RequestRejected("query_busy", "File history queue is full.")
 
     def _enqueue_files_token(self, owner: _FilesOwner, request: QueryRequest) -> RequestToken:
         """Admit one immutable Files page/coverage token as a priority-2 slot."""
@@ -2102,7 +2204,24 @@ class HistoryRouter:
                 break
         self._frame_executor.shutdown(wait=False, cancel_futures=True)
         self._background_executor.shutdown(wait=False, cancel_futures=True)
+        self._reap_terminal_frame_workers()
         self._reap_terminal_background_workers()
+        # Transfer cleanup of running work to terminal callbacks. These callbacks
+        # release only registry resources and never publish or mutate router maps.
+        sources = self._capture_provider
+        for _token, future in self._capture_jobs.values():
+            future.add_done_callback(
+                lambda completed, sources=sources: self._discard_capture(sources, completed))
+        self._capture_jobs.clear()
+        for worker_id, capture_id in tuple(self._worker_captures.items()):
+            if worker_id in self._frame_jobs:
+                future = self._frame_jobs[worker_id]
+            else:
+                future = self._worker_jobs[worker_id][1]
+            future.add_done_callback(
+                lambda completed, sources=sources, capture_id=capture_id:
+                    sources.release_capture(capture_id))
+            self._worker_captures.pop(worker_id)
 
     def _plan(self, window):
         evidence, cuts, gaps = [], defaultdict(dict), set()
@@ -2439,6 +2558,8 @@ class HistoryRouter:
     def _local_authority(self) -> tuple:
         """The current local authority: every registered identity, name-ordered."""
 
+        if self._capture_provider is not None:
+            return ("local", self._capture_provider.registration_vector())
         entries = []
         for name in sorted(self._sources, key=lambda text: text.encode("utf-8")):
             service, owner = self._sources[name]
@@ -2806,6 +2927,10 @@ class HistoryRouter:
         self.local._precheck(window)
         if self._closed:
             raise RuntimeError("history router is closed")
+        self._managed_sources()
+        if self.local_read_in_flight:
+            raise HistoryPending("local frame is still running")
+        self._reap_terminal_frame_workers()
         # Reconcile before admitting a new owner so this frame belongs to the
         # authority observed now rather than retiring itself on its first drain.
         self._reconcile_authority()
@@ -2819,6 +2944,7 @@ class HistoryRouter:
             self._queue = [entry for entry in self._queue
                            if not (entry.token.owner == "frame"
                                    and entry.token.owner_id == previous.owner_id)]
+        self._collect_captures()
         if self._local_future is not None:
             self._local_future.cancel()
         self._local_future = None
@@ -2847,12 +2973,8 @@ class HistoryRouter:
         self._worker_bindings[worker_id] = binding
         self._local_generation = self._generation
         self._local_worker_id = worker_id
-        self._local_paths = binding.paths
+        self._local_paths = None
         authority = self._current_authority()
-        if requested_source is None:
-            # The local capture's opening observation is the requested source;
-            # it costs no third reader pass (§6.1).
-            requested_source = binding.opening
         local_token = RequestToken(
             worker_id, request, "local", None, "frame", self._generation, None,
             authority, binding.opening)
@@ -2868,15 +2990,13 @@ class HistoryRouter:
             self._generation, window, requested_source, authority, local_token,
             remote_token, binding)
         try:
-            self._local_future = self._frame_executor.submit(
-                self._read_local, _FrameCopyPaths(binding), window)
+            self._local_future = self._request_local_capture(local_token)
         except Exception:
             self._worker_bindings.pop(worker_id, None)
             self._local_worker_id = None
             self._frame = None
             raise
         self._dispatch()
-        self._file_status = FileAvailability(True, False)
 
     def preparation_source(self, window: Window) -> SourcePosition | None:
         frame = self._frame
@@ -3233,6 +3353,12 @@ class HistoryRouter:
             snapshot = _validate_worker_snapshot(outcome.snapshot)
             if binding.snapshot is None or snapshot != binding.snapshot:
                 raise ValueError("a local outcome answered another snapshot")
+            sources = getattr(self, "_capture_provider", None)
+            if sources is not None:
+                identities = tuple((item.name, item.owner, item.registration_epoch)
+                                   for item in snapshot.bracket.opening.sources)
+                if identities != sources.registration_vector():
+                    raise ValueError("a local outcome answered retired registrations")
             if token.owner != "files" and settlement.local_bracket != snapshot.bracket:
                 raise ValueError("a local outcome answered another bracket")
         except Exception:  # noqa: BLE001 - malformed or foreign worker result
@@ -3534,7 +3660,11 @@ class HistoryRouter:
         frame = self._frame
         if frame is None or frame.local_settled or self._local_future is None:
             return False
+        if frame.local_token.token_id in self._settled_tokens:
+            return False
         if self._local_generation != self._generation:
+            return False
+        if self._local_worker_id in self._capture_jobs:
             return False
         if not self._local_future.done():
             return False
@@ -3623,51 +3753,26 @@ class HistoryRouter:
         return merged
 
     def _start_local_detail(self, token: RequestToken) -> None:
-        try:
-            binding = self._capture_local_binding(
-                worker_id=token.token_id, token_id=token.token_id,
-                request=token.request)
-        except Exception as error:  # noqa: BLE001 - settles as a failed dependency
-            self._current_detail_failure(token, error)
-            return
-        self._worker_bindings[token.token_id] = binding
-
-        def work() -> LocalOutcome:
-            return self._read_local_part(
-                binding.paths, token.request, worker_id=token.token_id,
-                app_key=token.request.app_key)
-
-        try:
-            future = self._submit_background_worker(token, work, binding=binding)
-        except Exception as error:  # noqa: BLE001 - settles as a failed dependency
-            self._current_detail_failure(token, error)
-            return
-        if future is None:
+        if self._reserve_background_worker("detail", worker_id=token.token_id) is None:
             self._unscheduled[token.token_id] = token
+            return
+        try:
+            self._worker_bindings[token.token_id] = self._capture_local_binding(
+                worker_id=token.token_id, token_id=token.token_id, request=token.request)
+            self._request_local_capture(token)
+        except Exception as error:  # noqa: BLE001 - exact dependency failure
+            self._current_detail_failure(token, error)
+            self._reap_background_worker(token.token_id)
 
     def _schedule_unscheduled(self) -> None:
-        for token_id, token in list(self._unscheduled.items()):
+        for token_id, token in tuple(self._unscheduled.items()):
             if not self._detail_token_live(token) or token_id in self._retired_tokens:
                 self._unscheduled.pop(token_id, None)
                 continue
-            binding = self._worker_bindings.get(token_id)
-            if binding is None:
-                self._unscheduled.pop(token_id, None)
+            if not self._background_capacity("detail"):
                 continue
-
-            def work(binding=binding, token=token) -> LocalOutcome:
-                return self._read_local_part(
-                    binding.paths, token.request, worker_id=token.token_id,
-                    app_key=token.request.app_key)
-
-            try:
-                future = self._submit_background_worker(token, work, binding=binding)
-            except Exception as error:  # noqa: BLE001 - settles as a failed dependency
-                self._unscheduled.pop(token_id, None)
-                self._settle(token, LocalSettlement(token_id, error=error))
-                continue
-            if future is not None:
-                self._unscheduled.pop(token_id, None)
+            self._unscheduled.pop(token_id)
+            self._start_local_detail(token)
 
     def _collect_local_workers(self) -> bool:
         changed = False
@@ -3733,9 +3838,13 @@ class HistoryRouter:
         """Collect, settle, reap and dispatch once; never wait or mutate widgets."""
 
         if self._closed:
+            self._reap_terminal_frame_workers()
+            self._reap_terminal_background_workers()
             return False
         changed = self._reconcile_authority()
+        changed |= self._collect_captures()
         changed |= self._collect_local_frame()
+        self._reap_terminal_frame_workers()
         changed |= self._collect_local_workers()
         changed |= self._collect_remote()
         changed |= self._finish_frame_if_terminal()

@@ -16,7 +16,16 @@ from appio.migrations import open_database
 from appio.query import QueryService
 from appio.ui.files_view import FilesView
 from test_files import APP, ZERO, observation
-from tests.p4.test_file_history_router import Client
+from tests.p4.test_file_history_router import Client, drive
+from live_overview_support import inject_managed_router_sources, wait_for_local_frame
+
+
+@pytest.fixture(autouse=True)
+def managed_sources(monkeypatch):
+    registries = inject_managed_router_sources(monkeypatch)
+    yield
+    for sources in registries:
+        sources.close()
 
 
 BOOT = "boot-A"
@@ -61,7 +70,7 @@ def histories(tmp_path):
         if other is not None:
             router.add_source(QueryService(other), collector_id="other", owner="iod")
         router.prepare(window)
-        router._local_future.result(timeout=10)
+        wait_for_local_frame(router)
         assert router.ready(window)
         return router
 
@@ -76,14 +85,18 @@ def rendered(qtbot, router, window):
     view = FilesView(router)
     qtbot.addWidget(view)
     view.set_window(window)
-    qtbot.waitUntil(lambda: view.state != "loading", timeout=10_000)
+    def settled():
+        router.drain()
+        return view.state != "loading"
+
+    qtbot.waitUntil(settled, timeout=10_000)
     return view
 
 
 def refused(router, window):
     with pytest.raises(WindowUnavailableError) as caught:
-        router.request_file_view(router.registry.id_for(APP), window,
-                                 "bytes_total", "desc", None).result(timeout=10)
+        drive(router, router.request_file_view(
+            router.registry.id_for(APP), window, "bytes_total", "desc", None))
     assert caught.value.reason in {"file_source_unavailable", "not_retained"}
     assert not router.file_source_status().available
 

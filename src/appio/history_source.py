@@ -114,13 +114,6 @@ def _failed_future(error: BaseException) -> Future:
     return future
 
 
-def _safe_error(spec: ManagedSourceSpec, error: BaseException, phase: str) -> SourceAdmissionError:
-    if isinstance(error, SourceAdmissionError):
-        return error
-    return SourceAdmissionError(
-        f"managed source {spec.name!r} {phase} failed")
-
-
 def _validate_file_uri(database_uri: str) -> None:
     """Accept only absolute, file-backed SQLite URIs with non-creating modes."""
 
@@ -424,7 +417,7 @@ class _SourceActor:
                 if code not in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED):
                     raise
                 if self._clock_ns() >= deadline_ns:
-                    raise SourceAdmissionError("managed source observation timed out") from None
+                    raise
                 time.sleep(0.005)
 
     def _run(self) -> None:
@@ -435,7 +428,7 @@ class _SourceActor:
             self._set_status("failed")
             self._finish_close()
             if not self.ready.done():
-                self.ready.set_exception(_safe_error(self.spec, error, "admission"))
+                self.ready.set_exception(error)
             return
 
         self._set_status("active")
@@ -466,7 +459,7 @@ class _SourceActor:
                     else:
                         raise SourceAdmissionError("managed source operation is invalid")
                 except BaseException as error:
-                    future.set_exception(_safe_error(self.spec, error, "operation"))
+                    future.set_exception(error)
                 else:
                     future.set_result(result)
                 self._notify()
@@ -519,6 +512,9 @@ class ManagedSourceRegistry:
         self._capture_lock = threading.Lock()
         self._capture_count = 0
         self._capture_leases: dict[int, tuple[tuple[_CaptureLease, ...], int]] = {}
+        self._claimed_captures: set[int] = set()
+        self._positions: dict[int, LocalPosition] = {}
+        self._observation: tuple[tuple[_Registration, ...], Future] | None = None
         self._deferred_admissions: list[Callable[[], None]] = []
         self._capture_executor = ThreadPoolExecutor(
             max_workers=4, thread_name_prefix="appio-source-capture")
@@ -589,13 +585,49 @@ class ManagedSourceRegistry:
                 return
             self._retire_locked(name, reason)
 
-    def observe(self) -> LocalPositionVector:
-        """Read every active actor in UTF-8 name order."""
+    def registration_vector(self) -> tuple[tuple[str, str, int], ...]:
+        """Return active incarnation identities without scheduling SQLite work."""
 
-        registrations = self._active_snapshot()
+        with self._lock:
+            return tuple((item.spec.name, item.spec.owner, item.registration_epoch)
+                         for item in self._ordered_registrations(self._active))
+
+    def observe_async(self) -> Future:
+        """Request a fresh actor observation, coalescing a pending vector read."""
+
+        with self._lock:
+            registrations = self._active_snapshot()
+            pending = self._observation
+            if pending is not None and pending[0] == registrations and not pending[1].done():
+                return pending[1]
+            future = self._capture_executor.submit(self._observe_sources, registrations)
+            self._observation = (registrations, future)
+            return future
+
+    def _observe_sources(self, registrations: tuple[_Registration, ...]) -> LocalPositionVector:
         positions = self._collect(registrations, "observe")
-        self._verify_current(registrations)
+        with self._lock:
+            self._verify_current(registrations)
+            self._positions.update((position.registration_epoch, position) for position in positions)
         return LocalPositionVector(positions)
+
+    def observe(self) -> LocalPositionVector:
+        """Poll completed observations and request a refresh without waiting.
+
+        During actor work the last completed same-connection positions remain
+        available. A later poll consumes the refreshed vector or its exact error.
+        """
+
+        with self._lock:
+            registrations = self._active_snapshot()
+            pending = self._observation
+            if pending is not None and pending[0] == registrations and pending[1].done():
+                self._observation = None
+                return pending[1].result()
+            if pending is None or pending[0] != registrations:
+                self.observe_async()
+            return LocalPositionVector(tuple(
+                self._positions[item.registration_epoch] for item in registrations))
 
     def capture(self) -> Future:
         """Back up all active sources between opening and closing observations."""
@@ -617,20 +649,19 @@ class ManagedSourceRegistry:
             except BaseException as error:
                 for lease in leases:
                     lease.release()
-                return _failed_future(_safe_error(
-                    registrations[0].spec, error, "capture admission"))
+                return _failed_future(error)
             lease_tuple = tuple(leases)
             self._capture_count += 1
         try:
             future = self._capture_executor.submit(
                 self._capture, capture_id, registrations, lease_tuple)
         except RuntimeError:
-            self._finish_capture(lease_tuple, retain=False)
+            self._finish_capture(capture_id, lease_tuple, retain=False)
             return _failed_future(SourceAdmissionError(
                 "managed source registry is closed"))
         future.add_done_callback(
             lambda completed: self._finish_capture(
-                lease_tuple, retain=not completed.cancelled()
+                capture_id, lease_tuple, retain=not completed.cancelled()
                 and completed.exception() is None))
         return future
 
@@ -640,8 +671,11 @@ class ManagedSourceRegistry:
         with self._lock:
             if capture_id not in self._capture_leases:
                 raise SourceAdmissionError("managed capture is no longer retained")
+            if self._closed:
+                raise SourceAdmissionError("managed source registry is closed")
             leases, count = self._capture_leases[capture_id]
             self._capture_leases[capture_id] = (leases, count + 1)
+            self._claimed_captures.add(capture_id)
 
     def release_capture(self, capture_id: int) -> None:
         """Release one drained dependent without granting publication authority."""
@@ -654,6 +688,7 @@ class ManagedSourceRegistry:
                 self._capture_leases[capture_id] = (leases, count - 1)
                 return
             del self._capture_leases[capture_id]
+            self._claimed_captures.discard(capture_id)
         self._release_capture_leases(leases)
 
     def close(self) -> None:
@@ -663,6 +698,10 @@ class ManagedSourceRegistry:
             if self._closed:
                 return
             self._closed = True
+            for capture_id, (leases, _count) in tuple(self._capture_leases.items()):
+                if capture_id not in self._claimed_captures:
+                    del self._capture_leases[capture_id]
+                    self._release_capture_leases(leases)
             actors: dict[int, _SourceActor] = {}
             for registration in self._active.values():
                 actors[id(registration.actor)] = registration.actor
@@ -689,12 +728,14 @@ class ManagedSourceRegistry:
         for lease in leases:
             lease.release()
 
-    def _finish_capture(self, leases: tuple[_CaptureLease, ...], *, retain: bool) -> None:
+    def _finish_capture(self, capture_id: int, leases: tuple[_CaptureLease, ...], *,
+                        retain: bool) -> None:
         for lease in leases:
             lease.actor.finish_capture(lease)
-        if not retain:
-            self._release_capture_leases(leases)
         with self._lock:
+            retained = retain and capture_id in self._capture_leases
+            if not retained:
+                self._release_capture_leases(leases)
             self._capture_count -= 1
             if self._capture_count or self._closed:
                 deferred = ()
@@ -758,7 +799,7 @@ class ManagedSourceRegistry:
             with self._lock:
                 if self._pending.get(spec.name) is pending:
                     self._pending.pop(spec.name, None)
-            future.set_exception(_safe_error(spec, error, "actor startup"))
+            future.set_exception(error)
             actor.close()
 
     def _registration_ready(self, pending: _PendingRegistration,
@@ -771,7 +812,7 @@ class ManagedSourceRegistry:
                 if self._pending.get(spec.name) is pending:
                     self._pending.pop(spec.name, None)
             if not pending.future.done():
-                pending.future.set_exception(_safe_error(spec, error, "admission"))
+                pending.future.set_exception(error)
             self._notify()
             return
 
@@ -795,6 +836,7 @@ class ManagedSourceRegistry:
             self._pending.pop(spec.name, None)
             self._active[spec.name] = _Registration(
                 spec, pending.registration_epoch, pending.actor, receipt)
+            self._positions[pending.registration_epoch] = ready.result()
         if not pending.future.done():
             pending.future.set_result(receipt)
         self._notify()
@@ -870,10 +912,7 @@ class ManagedSourceRegistry:
                            registrations, leases, strict=True)]
         positions = []
         for future in futures:
-            try:
-                result = future.result()
-            except BaseException as error:
-                raise _safe_error(registrations[0].spec, error, operation) from None
+            result = future.result()
             if not isinstance(result, LocalPosition):
                 raise SourceAdmissionError("managed source returned an invalid position")
             positions.append(result)
@@ -897,10 +936,7 @@ class ManagedSourceRegistry:
             images = []
             for registration, lease in zip(registrations, leases, strict=True):
                 future = registration.actor.submit("capture", lease)
-                try:
-                    image = future.result()
-                except BaseException as error:
-                    raise _safe_error(registration.spec, error, "capture") from None
+                image = future.result()
                 if not isinstance(image, bytes):
                     raise SourceAdmissionError("managed source returned an invalid image")
                 images.append(CapturedSourceImage(
@@ -921,7 +957,10 @@ class ManagedSourceRegistry:
                 _snapshot_digest(image_tuple),
             )
             with self._lock:
-                self._capture_leases[capture_id] = (leases, 1)
+                if not self._closed:
+                    self._capture_leases[capture_id] = (leases, 1)
+                    self._positions.update(
+                        (position.registration_epoch, position) for position in closing_positions)
             return capture
 
     def _notify(self) -> None:

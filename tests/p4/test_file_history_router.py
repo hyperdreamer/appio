@@ -42,6 +42,17 @@ from appio.store import AppIoStore
 from appio.ui.files_view import FilesView
 from tests.p3.test_iodclient import Harness, snapshot_frame
 from tests.p4.test_file_runtime import APP, ZERO, Frames, event
+from live_overview_support import (
+    inject_managed_router_sources, wait_for_capture_admission, wait_for_local_frame,
+)
+
+
+@pytest.fixture(autouse=True)
+def managed_sources(monkeypatch):
+    registries = inject_managed_router_sources(monkeypatch)
+    yield
+    for sources in registries:
+        sources.close()
 
 SORTS = ("bytes_total", "bytes_r", "bytes_w", "reads", "writes", "basename", "dev", "last_seen")
 WINDOW = Window("since_boot", "boot-A", end_mono_ns=H)
@@ -95,7 +106,7 @@ def inject_requested_gap_evidence(db, app_id=1, gaps=1):
 def local_router(retained):
     router = HistoryRouter(QueryService(retained.db), Client(), AppRegistry())
     router.prepare(WINDOW)
-    router._local_future.result(timeout=10)
+    wait_for_local_frame(router)
     assert router.ready(WINDOW)
     return router
 
@@ -232,6 +243,7 @@ def test_local_query_runs_on_bounded_executor_and_invalidated_future_cannot_publ
     monkeypatch.setattr(QueryService, "file_table", blocked)
     try:
         future = router.request_file_view(id_for(router), WINDOW, "bytes_total", "desc", None)
+        wait_for_capture_admission(router)
         assert entered.wait(5)
         # Admission captures one O(1) owner-thread position PRAGMA for its token;
         # no Files query (table/coverage/facts) may touch the UI connection.
@@ -285,7 +297,7 @@ def test_zero_F_is_complete_only_with_authoritative_hour_and_missing_or_pruned_i
         # A bounded range uses hourly units, not the since-boot retained total.
         scoped = Window("range", "boot-A", 0, H)
         router.prepare(scoped)
-        router._local_future.result(timeout=10)
+        wait_for_local_frame(router)
         assert router.ready(scoped)
         with pytest.raises(WindowUnavailableError) as caught:
             drive(router, router.request_file_view(
@@ -325,7 +337,7 @@ def test_mixed_or_excluded_ownership_never_merges_database_local_paths(retained,
     other.db.commit()
     try:
         router.prepare(WINDOW)
-        router._local_future.result(timeout=10)
+        wait_for_local_frame(router)
         assert router.ready(WINDOW)
         with pytest.raises(WindowUnavailableError) as caught:
             drive(router, router.request_file_view(
@@ -379,7 +391,7 @@ class Remote:
         self.requests = []
         self.replies = []
         self.router.prepare(window)
-        self.router._local_future.result(timeout=10)
+        wait_for_local_frame(self.router)
         for _ in range(15):
             self.respond()
             if self.router.ready(window):
@@ -565,6 +577,7 @@ def test_local_cancellation_cannot_turn_bounded_executor_into_unbounded_queue(re
         # Hold the router's single worker at a barrier before cancellation;
         # otherwise canceled-work skipping could make admission pass vacuously.
         futures.append(router.request_file_view(id_for(router), WINDOW, "bytes_total", "desc", None))
+        wait_for_capture_admission(router)
         assert entered.wait(5)
         futures[0].cancel()
         for _ in range(23):
@@ -618,7 +631,7 @@ def test_remote_query_errors_are_typed_without_rewriting_data_reason(tmp_path):
         scope = process_window(100, 110)
         try:
             router.prepare(scope)
-            router._local_future.result(timeout=10)
+            wait_for_local_frame(router)
             assert router._not_retained is False
             assert router.ready(scope)
             rows = router.ranking(scope, "total_bytes")
@@ -637,7 +650,7 @@ def test_remote_query_errors_are_typed_without_rewriting_data_reason(tmp_path):
     scope = Window("lifetime")
     try:
         router.prepare(scope)
-        router._local_future.result(timeout=10)
+        wait_for_local_frame(router)
         assert router.ready(scope)
         rows = router.ranking(scope, "total_bytes")
         assert rows[0].coverage.unavailable_reason == "not_retained"
@@ -698,7 +711,7 @@ def test_retirement_and_cancellation_do_not_set_history_failure_flags(retained):
     router = HistoryRouter(QueryService(retained.db), unavailable_client, AppRegistry())
     try:
         router.prepare(WINDOW)
-        router._local_future.result(timeout=10)
+        wait_for_local_frame(router)
         assert router.ready(WINDOW)
         assert unavailable_client.calls == 1
         assert router._pending is None
@@ -732,7 +745,7 @@ def test_retirement_and_cancellation_do_not_set_history_failure_flags(retained):
     router = HistoryRouter(QueryService(retained.db), cancelled_client, AppRegistry())
     try:
         router.prepare(WINDOW)
-        router._local_future.result(timeout=10)
+        wait_for_local_frame(router)
         assert router.ready(WINDOW)
         assert cancelled_client.calls == 1
         assert router._pending is None
@@ -829,6 +842,7 @@ def test_queued_local_read_blocks_every_replacement_submission(retained, qtbot, 
     try:
         # Seed a genuine router preparation behind the occupied single worker.
         history.prepare(current)
+        wait_for_capture_admission(history)
         queued = history._local_future
         assert queued is not None and queued.running() is False and not queued.done()
         assert history.local_read_in_flight is True

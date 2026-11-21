@@ -1389,7 +1389,7 @@ def test_local_detail_is_lazy_selected_subject_only(tmp_path, monkeypatch):
     from pathlib import Path
     from appio.history_source import ManagedSourceRegistry
     from appio.history_types import ManagedSourceSpec
-    from appio.history_router import _LocalCopyBinding, _SourceStamp, _capture_provenance
+    from live_overview_support import wait_for_capture_admission, wait_for_local_frame
 
     alpha_id, beta_id, export_alpha_id = 17, 18, 3
     local = _committed_store(
@@ -1482,33 +1482,8 @@ def test_local_detail_is_lazy_selected_subject_only(tmp_path, monkeypatch):
         # D03: a held detail computation must not serialize the frame lane.
         computations.clear()
         local_ids.clear()
-        router = HistoryRouter(QueryService(local), _IdleClient(), AppRegistry())
-        managed_authority = ("local", tuple(
-            (position.name, position.owner, position.registration_epoch)
-            for position in merged_capture.opening.sources))
-        source_paths = {"local": local_path, "export": root_path}
-        router._local_authority = lambda: managed_authority
-        router.source_position = lambda: merged_capture.opening
-
-        def managed_binding(*, worker_id, token_id=None, request):
-            stamps = tuple(_SourceStamp(position.name, position.owner,
-                                        position.registration_epoch,
-                                        source_paths[position.name], None)
-                           for position in merged_capture.opening.sources)
-            paths = tuple((position.name, source_paths[position.name], position.owner)
-                          for position in merged_capture.opening.sources)
-            return _LocalCopyBinding(worker_id, token_id, request, stamps, paths,
-                                     merged_capture.opening, _capture_provenance(merged_capture))
-
-        real_submit = router._frame_executor.submit
-
-        def managed_submit(_function, paths, window):
-            binding = paths.binding
-            return real_submit(HistoryRouter._read_local, merged_capture, window,
-                               worker_id=binding.worker_id, request=binding.request)
-
-        router._capture_local_binding = managed_binding
-        router._frame_executor.submit = managed_submit
+        router = HistoryRouter(QueryService(local), _IdleClient(), AppRegistry(),
+                               _capture_provider=source_registry)
         authority = ("local", (("local", "gui", 1),))
         vector = LocalPositionVector((LocalPosition("local", "gui", 1, 1, 0),))
         entered = threading.Event()
@@ -1530,7 +1505,7 @@ def test_local_detail_is_lazy_selected_subject_only(tmp_path, monkeypatch):
         assert router._submit_background_worker(token, held_detail) is not None
         assert entered.wait(5)
         router.prepare(scope)
-        outcome = router._local_future.result(timeout=10)
+        outcome = wait_for_local_frame(router)
         assert isinstance(outcome, LocalFrameOutcome)
         assert release.is_set() is False, "the frame waited for the held detail"
         assert router.ready(scope)
@@ -1582,7 +1557,7 @@ def test_local_detail_is_lazy_selected_subject_only(tmp_path, monkeypatch):
         def held_files(*args, **kwargs):
             files_started.set()
             assert files_release.wait(15), "the Files worker was never released"
-            return original_files(merged_capture, *args[1:], **kwargs)
+            return original_files(*args, **kwargs)
 
         monkeypatch.setattr(router, "_read_local_files", held_files)
         presentation = router.registry.id_for(ALPHA)
@@ -1590,6 +1565,7 @@ def test_local_detail_is_lazy_selected_subject_only(tmp_path, monkeypatch):
             router.request_file_view(presentation, scope, "bytes_total", "desc", None)
             for _ in range(4)
         ]
+        wait_for_capture_admission(router)
         assert files_started.wait(5)
         helper_files = RequestToken(
             21, QueryRequest("files", scope, ALPHA), "local", None, "files", 6, None,
@@ -1619,6 +1595,7 @@ def test_local_detail_is_lazy_selected_subject_only(tmp_path, monkeypatch):
         )
         assert router._submit_background_worker(extra_files, held_helper_files) is None
 
+        wait_for_capture_admission(router)
         files_release.set()
         # Worker threads only enqueue immutable settlements; the outward Files
         # Futures publish solely on the owner drain. A terminal worker therefore
@@ -1994,10 +1971,281 @@ def test_capture_validates_ordered_images_and_removes_private_destinations(
         stores.close()
 
 
+def test_managed_router_submits_bound_captures_through_normal_entry_points(tmp_path):
+    """Frame and selected detail use actor captures with their admitted identity."""
+
+    from live_overview_support import LocalPositionStores, make_managed_router, wait_for_local_frame
+
+    with LocalPositionStores(tmp_path) as stores:
+        router = make_managed_router(stores.services["local"], _IdleClient(), AppRegistry())
+        try:
+            window = Window("range", BOOT, 10 * NS, 20 * NS)
+            router.prepare(window)
+            outcome = wait_for_local_frame(router)
+            assert isinstance(outcome, LocalFrameOutcome)
+            assert outcome.worker_id == router._frame.local_token.token_id
+            assert outcome.request == router._frame.local_token.request
+            assert router.ready(window)
+            assert router.frame_provenance(window).snapshot == outcome.snapshot
+            row, = router.ranking(window, "total_bytes")
+            router.select_detail(row.app_key, window)
+            for kind in ("totals", "series"):
+                router.request_detail(kind, row.app_id, window)
+                scope = retention_scope(row.app_key, window)
+                _drain_until(router, lambda: router.part_state(kind, row.app_key, scope).state == "ok")
+                record = router.retained(kind, row.app_key, scope, window.end_mono_ns)
+                assert record.provenance.snapshot is not None
+                assert record.provenance.snapshot.capture_id > outcome.snapshot.capture_id
+                assert record.value.window == window
+            assert router._capture_provider._capture_leases == {}
+        finally:
+            router.close()
+
+
+def test_reprepare_reaps_completed_capture_before_admitting_new_frame(tmp_path, monkeypatch):
+    """Replacing a completed capture submits only the new frame's worker."""
+
+    from live_overview_support import LocalPositionStores, make_managed_router, wait_for_local_frame
+
+    with LocalPositionStores(tmp_path) as stores:
+        router = make_managed_router(stores.services["local"], _IdleClient(), AppRegistry())
+        window = Window("range", BOOT, 10 * NS, 20 * NS)
+        release = threading.Event()
+        reader = router._read_local
+
+        def held_reader(capture, *args, **options):
+            assert release.wait(10)
+            return reader(capture, *args, **options)
+
+        monkeypatch.setattr(router, "_read_local", held_reader)
+        try:
+            router.prepare(window)
+            first = router._local_future.result(timeout=10)
+            first_worker = router._local_worker_id
+            router.prepare(window)
+            assert router._frame_jobs == {}, "reprepare submitted the obsolete captured frame"
+            assert first_worker not in router._capture_jobs
+            assert first.capture_id not in router._capture_provider._capture_leases
+            release.set()
+            outcome = wait_for_local_frame(router)
+            assert router.ready(window)
+            assert outcome.worker_id != first_worker
+            assert outcome.snapshot.capture_id > first.capture_id
+        finally:
+            release.set()
+            router.close()
+
+
+@pytest.mark.parametrize("owner", ["frame", "detail"])
+def test_managed_capture_failure_preserves_current_owner_error(tmp_path, monkeypatch, owner):
+    """Capture failure retains its original exception at the owner boundary."""
+
+    import appio.history_source as history_source
+    from live_overview_support import LocalPositionStores, make_managed_router, wait_for_local_frame
+
+    with LocalPositionStores(tmp_path) as stores:
+        router = make_managed_router(stores.services["local"], _IdleClient(), AppRegistry())
+        window = Window("range", BOOT, 10 * NS, 20 * NS)
+        error = sqlite3.OperationalError("snapshot validation cannot read schema")
+        try:
+            if owner == "detail":
+                router.prepare(window)
+                wait_for_local_frame(router)
+                assert router.ready(window)
+                row, = router.ranking(window, "total_bytes")
+                router.select_detail(row.app_key, window)
+
+            def invalid_image(connection):
+                raise error
+
+            monkeypatch.setattr(history_source, "validate_schema", invalid_image)
+            if owner == "frame":
+                router.prepare(window)
+                _drain_until(router, lambda: router._frame.error is not None)
+                with pytest.raises(Exception) as caught:
+                    router.ready(window)
+            else:
+                router.request_detail("totals", row.app_id, window)
+                scope = retention_scope(row.app_key, window)
+                _drain_until(router, lambda: router.part_state("totals", row.app_key, scope).state == "failed")
+                assert router.part_state("totals", row.app_key, scope).reason == str(error)
+                with pytest.raises(Exception) as caught:
+                    router.disk_share(row.app_id, window)
+            assert caught.value is error, "owner replaced the source operation failure"
+            assert router._capture_provider._capture_leases == {}
+        finally:
+            router.close()
+
+
+def test_observe_returns_without_waiting_for_held_capture(tmp_path, monkeypatch):
+    """A source-driven owner poll stays responsive while backup is held."""
+
+    import appio.history_source as history_source
+    from live_overview_support import LocalPositionStores
+
+    stores = LocalPositionStores(tmp_path)
+    registry = stores.new_managed_registry()
+    router = HistoryRouter(stores.services["local"], _IdleClient(), AppRegistry(),
+                           _capture_provider=registry)
+    entered, release, returned = threading.Event(), threading.Event(), threading.Event()
+    original_backup = history_source._backup_image
+    observations = []
+
+    def held_backup(connection, **options):
+        entered.set()
+        assert release.wait(5)
+        return original_backup(connection, **options)
+
+    def owner_poll():
+        try:
+            observations.append(router.source_position())
+        finally:
+            returned.set()
+
+    monkeypatch.setattr(history_source, "_backup_image", held_backup)
+    owner = None
+    try:
+        _register_fixture_sources(registry, stores, "local")
+        router.prepare(Window("range", BOOT, 10 * NS, 20 * NS))
+        capture = router._local_future
+        assert entered.wait(5)
+        owner = threading.Thread(target=owner_poll)
+        owner.start()
+        assert returned.wait(0.5), "owner observation waited behind the held backup"
+        assert observations[0].sources[0].name == "local"
+    finally:
+        release.set()
+        if owner is not None:
+            owner.join(timeout=5)
+        if "capture" in locals():
+            capture.result(timeout=10)
+        router.close()
+        registry.close()
+        stores.close()
+
+
+def test_capture_completed_after_close_reaps_unclaimed_lease(tmp_path, monkeypatch):
+    """Closing during backup leaves no consumer that can claim the result."""
+
+    import appio.history_source as history_source
+    from live_overview_support import LocalPositionStores
+
+    stores = LocalPositionStores(tmp_path)
+    registry = stores.new_managed_registry()
+    entered, release = threading.Event(), threading.Event()
+    original_backup = history_source._backup_image
+
+    def held_backup(connection, **options):
+        entered.set()
+        assert release.wait(5)
+        return original_backup(connection, **options)
+
+    monkeypatch.setattr(history_source, "_backup_image", held_backup)
+    captured = None
+    try:
+        _register_fixture_sources(registry, stores, "local")
+        actor = registry._active["local"].actor
+        capture = registry.capture()
+        assert entered.wait(5)
+        registry.close()
+        assert not actor.closed.done()
+        release.set()
+        captured = capture.result(timeout=10)
+        closed = threading.Event()
+        actor.closed.add_done_callback(lambda completed: closed.set())
+        assert closed.wait(1), "late capture kept its actor alive after registry close"
+        assert registry._capture_leases == {}
+    finally:
+        release.set()
+        if captured is not None and captured.capture_id in registry._capture_leases:
+            registry.release_capture(captured.capture_id)
+        registry.close()
+        stores.close()
+
+
+@pytest.mark.parametrize("owner", ["frame", "detail"])
+def test_managed_router_close_keeps_worker_lease_until_terminal_cleanup(tmp_path, monkeypatch, owner):
+    """A claimed capture survives close until its real worker terminates."""
+
+    from live_overview_support import (
+        LocalPositionStores, make_managed_router, wait_for_capture_admission, wait_for_local_frame,
+    )
+
+    with LocalPositionStores(tmp_path) as stores:
+        router = make_managed_router(stores.services["local"], _IdleClient(), AppRegistry())
+        sources = router._capture_provider
+        actor = sources._active["local"].actor
+        window = Window("range", BOOT, 10 * NS, 20 * NS)
+        entered, release = threading.Event(), threading.Event()
+        try:
+            if owner == "detail":
+                router.prepare(window)
+                wait_for_local_frame(router)
+                assert router.ready(window)
+                row, = router.ranking(window, "total_bytes")
+                router.select_detail(row.app_key, window)
+            method = "_read_local" if owner == "frame" else "_read_local_part"
+            reader = getattr(router, method)
+
+            def held_reader(capture, *args, **options):
+                entered.set()
+                assert release.wait(10)
+                return reader(capture, *args, **options)
+
+            monkeypatch.setattr(router, method, held_reader)
+            if owner == "frame":
+                router.prepare(window)
+            else:
+                router.request_detail("totals", row.app_id, window)
+            wait_for_capture_admission(router)
+            assert entered.wait(5)
+            future = (router._local_future if owner == "frame"
+                      else next(iter(router._worker_jobs.values()))[1])
+            router.close()
+            assert sources._capture_leases
+            assert not actor.closed.done()
+            release.set()
+            future.result(timeout=10)
+            actor.closed.result(timeout=5)
+            router.drain()
+            assert sources._capture_leases == {}
+            assert router._worker_jobs == {}
+            assert not router._ready
+        finally:
+            release.set()
+            router.close()
+
+
+def test_capture_preserves_original_sqlite_validation_failure(tmp_path, monkeypatch):
+    """An actor's exact SQLite diagnostic survives the capture Future."""
+
+    import appio.history_source as history_source
+    from live_overview_support import LocalPositionStores
+
+    stores = LocalPositionStores(tmp_path)
+    registry = stores.new_managed_registry()
+    error = sqlite3.OperationalError("private image schema read failed")
+    try:
+        _register_fixture_sources(registry, stores, "local")
+
+        def invalid_image(connection):
+            raise error
+
+        monkeypatch.setattr(history_source, "validate_schema", invalid_image)
+        with pytest.raises(Exception) as caught:
+            registry.capture().result(timeout=10)
+        assert caught.value is error, "capture replaced the underlying SQLite failure"
+        assert str(caught.value) == "private image schema read failed"
+        assert registry._capture_leases == {}
+    finally:
+        registry.close()
+        stores.close()
+
+
 def test_capture_busy_source_obeys_injected_deadline(tmp_path):
     """A locked observer fails within the registry's finite capture deadline."""
 
-    from appio.history_source import ManagedSourceRegistry, SourceAdmissionError
+    from appio.history_source import ManagedSourceRegistry
     from live_overview_support import LocalPositionStores
 
     stores = LocalPositionStores(tmp_path, journal_modes={"local": "DELETE"})
@@ -2016,8 +2264,10 @@ def test_capture_busy_source_obeys_injected_deadline(tmp_path):
         clock_count = len(clock_reads)
         writer.execute("BEGIN EXCLUSIVE")
         started = time.monotonic()
-        with pytest.raises(SourceAdmissionError):
+        with pytest.raises(Exception) as caught:
             registry.capture().result(timeout=2)
+        assert isinstance(caught.value, sqlite3.OperationalError)
+        assert str(caught.value) == "database is locked"
         assert time.monotonic() - started < 1.0
         assert len(clock_reads) > clock_count + 1
     finally:
@@ -2241,8 +2491,8 @@ def test_local_vector_observes_each_registered_connection_without_hashing(
             probe.sql.clear()
             probe.execute_threads.clear()
 
-        first = registry.observe()
-        second = registry.observe()
+        first = registry.observe_async().result(timeout=10)
+        second = registry.observe_async().result(timeout=10)
         assert isinstance(first, LocalPositionVector)
         assert tuple(position.name for position in first.sources) == ("export", "local")
         assert second == first
@@ -2280,7 +2530,8 @@ def test_local_vector_changes_for_every_existing_commit_path(tmp_path, monkeypat
         _register_fixture_sources(registry, stores, "local", "export")
 
         def positions():
-            return {position.name: position for position in registry.observe().sources}
+            vector = registry.observe_async().result(timeout=10)
+            return {position.name: position for position in vector.sources}
 
         def committed_change(name, operation):
             before = positions()
@@ -2380,7 +2631,7 @@ def test_local_registration_add_remove_replace_and_reopen_never_repeat_token(
             initial.data_version, initial.total_changes)
 
         failed = registry.replace("local", invalid)
-        with pytest.raises(SourceAdmissionError):
+        with pytest.raises(ValueError, match="schema validation requires user_version"):
             failed.result(timeout=10)
         with pytest.raises(SourceAdmissionError):
             registry.observe()
@@ -2501,21 +2752,21 @@ def test_local_observations_require_committed_registered_connections(tmp_path, m
         assert probe.write_error is not None
         assert "not authorized" in probe.write_error.lower()
 
-        before = registry.observe()
+        before = registry.observe_async().result(timeout=10)
 
         writer = stores.writers["local"]
         writer.execute("UPDATE app SET name='pending' WHERE app_id=1")
-        while_writer_transaction = registry.observe()
+        while_writer_transaction = registry.observe_async().result(timeout=10)
         assert writer.in_transaction
         assert while_writer_transaction == before
         assert writer.execute("SELECT name FROM app WHERE app_id=1").fetchone()[0] == "pending"
         writer.rollback()
         assert not writer.in_transaction
-        assert registry.observe() == before
+        assert registry.observe_async().result(timeout=10) == before
 
         writer.execute("UPDATE app SET name='committed' WHERE app_id=1")
         writer.commit()
-        committed = registry.observe()
+        committed = registry.observe_async().result(timeout=10)
         assert committed.sources[0].data_version > before.sources[0].data_version
 
         captured = registry.capture().result(timeout=15)
@@ -2559,7 +2810,7 @@ def test_local_observations_require_committed_registered_connections(tmp_path, m
         probe.begin_transaction_on_next_check = True
         prior_sql = len(probe.sql)
         with pytest.raises(SourceAdmissionError, match="uncommitted transaction"):
-            registry.observe()
+            registry.observe_async().result(timeout=10)
         assert len(probe.sql) == prior_sql
         assert probe.transaction_opened
         registry.close()
@@ -2668,106 +2919,64 @@ def test_managed_detail_worker_uses_capture_provenance(tmp_path, monkeypatch, ki
         stores.close()
 
 
-def _assert_one_managed_replacement(tmp_path, registry, stores, captured, observed):
-    """Drive the real shell with pre-captured images through a test-only adapter."""
+def _assert_one_managed_replacement(harness, captured):
+    """Hold a real replacement worker and observe the shell's coalescing gate."""
 
-    from live_overview_support import LiveOverviewHarness
-    from appio.history_router import _LocalCopyBinding, _SourceStamp, _capture_provenance
+    from live_overview_support import wait_for_capture_admission, wait_for_local_frame
 
-    replacement = registry.capture().result(timeout=15)
+    router = harness.router
+    window = router._frame.window
     replacement_started = threading.Event()
     replacement_release = threading.Event()
-    harness = None
+    reader = router._read_local
+    replacements = []
+
+    def held_replacement(capture, window, **binding):
+        replacements.append(capture)
+        replacement_started.set()
+        assert replacement_release.wait(10), "replacement worker barrier timed out"
+        return reader(capture, window, **binding)
+
+    router._read_local = held_replacement
     try:
-        shell_dir = tmp_path / "shell"
-        shell_dir.mkdir()
-        harness = LiveOverviewHarness(shell_dir)
-        router = harness.router
-        pending = [captured, replacement]
-        images = {item.capture_id: item for item in pending}
-        authority = ("local", tuple((position.name, position.owner, position.registration_epoch)
-                                     for position in captured.opening.sources))
-        original_submit = router._frame_executor.submit
-        router._remote_authority = lambda: None
-        router._local_authority = lambda: authority
-        router.source_position = lambda: observed
-        router.request_detail = lambda *args, **kwargs: None
-
-        def binding(*, worker_id, token_id=None, request):
-            image = pending.pop(0)
-            stamps = tuple(_SourceStamp(position.name, position.owner,
-                                        position.registration_epoch,
-                                        str(stores.paths[position.name]), None)
-                           for position in image.opening.sources)
-            paths = tuple((position.name, str(stores.paths[position.name]), position.owner)
-                          for position in image.opening.sources)
-            return _LocalCopyBinding(worker_id, token_id, request, stamps, paths,
-                                     image.opening, _capture_provenance(image))
-
-        def submit(_function, paths, window):
-            admitted = paths.binding
-            image = images[admitted.snapshot.capture_id]
-
-            def read():
-                if image.capture_id == replacement.capture_id:
-                    replacement_started.set()
-                    if not replacement_release.wait(10):
-                        raise TimeoutError("replacement worker barrier timed out")
-                return HistoryRouter._read_local(
-                    image, window, worker_id=admitted.worker_id, request=admitted.request)
-
-            return original_submit(read)
-
-        router._capture_local_binding = binding
-        router._frame_executor.submit = submit
-        window = Window("since_boot", BOOT, end_mono_ns=110 * NS)
-        harness.request(window)
-        router._local_future.result(timeout=15)
-        harness.poll()
-        certificate = router.frame_provenance(window)
-        assert certificate.snapshot.capture_id == captured.capture_id
-        assert certificate.answered_source is None and not certificate.certified
-        assert sum(event[0] == "apply" for event in harness.events) == 1
         harness.ordinary_refresh()
-        assert replacement_started.wait(10)
+        wait_for_capture_admission(router)
+        assert replacement_started.wait(5)
         for _ in range(3):
             harness.ordinary_refresh()
             harness.poll()
         assert sum(event[0] == "prepare" for event in harness.events) == 2
-        assert pending == []
+        assert len(replacements) == 1
         replacement_release.set()
-        router._local_future.result(timeout=15)
+        outcome = wait_for_local_frame(router)
         harness.poll()
         certificate = router.frame_provenance(window)
-        assert certificate is not None, ([(event[0]) for event in harness.events],
-                                        harness.shell._pending, harness.shell._displayed,
-                                        router._ready, router._frame_error)
         assert certificate.certified
-        assert certificate.snapshot.capture_id == replacement.capture_id
+        assert certificate.snapshot == outcome.snapshot
+        assert certificate.snapshot.capture_id == replacements[0].capture_id
+        assert certificate.snapshot.capture_id > captured.capture_id
+        harness.ordinary_refresh()
         assert sum(event[0] == "prepare" for event in harness.events) == 2
         assert not any(event[0] in ("query", "send") for event in harness.events)
     finally:
         replacement_release.set()
-        if harness is not None:
-            harness.close()
-        registry.release_capture(replacement.capture_id)
+        router._read_local = reader
 
 
 def _capture_commit_schedule(tmp_path, monkeypatch, journal_mode, stage):
-    """Exercise a real actor backup or closing read around an external commit."""
+    """Drive production preparation and actor backup around an external commit."""
 
-    from types import SimpleNamespace
-    from live_overview_support import LocalPositionStores
+    from live_overview_support import LiveOverviewHarness, wait_for_local_frame
     import appio.history_source as history_source
 
-    stores = LocalPositionStores(tmp_path, journal_modes={"local": journal_mode})
-    registry = stores.new_managed_registry()
+    probes = _track_source_connections(monkeypatch)
+    harness = LiveOverviewHarness(tmp_path, journal_modes={"local": journal_mode})
+    router = harness.router
+    router.client = _IdleClient()
+    registry = router._capture_provider
     entered = threading.Event()
     release = threading.Event()
-    captured = None
-    probes = _track_source_connections(monkeypatch)
     try:
-        _register_fixture_sources(registry, stores, "local")
         if stage == "during":
             original_backup = _SourceConnectionProbe.backup
 
@@ -2775,10 +2984,9 @@ def _capture_commit_schedule(tmp_path, monkeypatch, journal_mode, stage):
                 original_progress = options["progress"]
 
                 def progress(status, remaining, total):
-                    if status == sqlite3.SQLITE_OK and not entered.is_set():
+                    if probe is probes[0] and status == sqlite3.SQLITE_OK and not entered.is_set():
                         entered.set()
-                        if not release.wait(10):
-                            raise TimeoutError("backup barrier timed out")
+                        assert release.wait(10), "backup barrier timed out"
                     original_progress(status, remaining, total)
 
                 options["pages"] = 1
@@ -2791,51 +2999,37 @@ def _capture_commit_schedule(tmp_path, monkeypatch, journal_mode, stage):
 
             def backup(connection, **options):
                 image = original_backup(connection, **options)
-                entered.set()
-                if not release.wait(10):
-                    raise TimeoutError("closing-read barrier timed out")
+                if connection is probes[0] and not entered.is_set():
+                    entered.set()
+                    assert release.wait(10), "closing-read barrier timed out"
                 return image
 
             monkeypatch.setattr(history_source, "_backup_image", backup)
-        future = registry.capture()
+        window = Window("since_boot", BOOT, end_mono_ns=110 * NS)
+        harness.request(window)
+        capture_future = router._local_future
         if stage != "after_closing":
             assert entered.wait(10)
-            stores.commit("local", "UPDATE app SET name=? WHERE app_id=1", ("changed",))
+            harness.stores.commit("local", "UPDATE app SET name=? WHERE app_id=1", ("changed",))
             release.set()
-        captured = future.result(timeout=15)
+        captured = capture_future.result(timeout=15)
         if stage == "after_closing":
-            stores.commit("local", "UPDATE app SET name=? WHERE app_id=1", ("changed",))
-        next_position = registry.observe()
-        window = Window("range", BOOT, 10 * NS, 20 * NS)
-        result = HistoryRouter._read_local(
-            captured, window, worker_id=1, request=QueryRequest("ranking", window))
-        bracket = result.snapshot.bracket
-        router = object.__new__(HistoryRouter)
-        router._frame = SimpleNamespace(
-            owner_id=1, window=window, requested_source=captured.opening,
-            local_bracket=bracket, local_settled=True, remote_token=None,
-            retired=False, certificate=None, answered_source=None,
-            ranking_provenance={})
-        router._ready = False
-        router._remote = None
-        router._ranking = list(result.ranking)
-        router._ranking_stamps = {}
-        router._clock_ns = time.monotonic_ns
-        router._local_settlement = LocalSettlement(1, outcome=result, local_bracket=bracket)
-        router._not_retained = result.not_retained
-        router._gap_ranges = list(result.gaps)
-        router._chronology_unproved = result.chronology_unproved
-        assert router._finish_frame_if_terminal()
-        assert probes[0].backup_threads == [probes[0].connect_thread]
+            harness.stores.commit("local", "UPDATE app SET name=? WHERE app_id=1", ("changed",))
+        next_position = registry.observe_async().result(timeout=10)
+        outcome = wait_for_local_frame(router)
+        assert outcome.snapshot.capture_id == captured.capture_id
+        assert outcome.worker_id == router._frame.local_token.token_id
+        harness.poll()
+        certificate = router.frame_provenance(window)
+        assert certificate.snapshot == outcome.snapshot
+        assert sum(event[0] == "apply" for event in harness.events) == 1
+        assert probes[0].backup_threads[0] == probes[0].connect_thread
         if stage != "after_closing":
-            _assert_one_managed_replacement(tmp_path, registry, stores, captured, next_position)
-        return captured, router._frame.certificate, next_position
+            _assert_one_managed_replacement(harness, captured)
+        return captured, certificate, next_position
     finally:
         release.set()
-        if captured is not None:
-            registry.release_capture(captured.capture_id)
-        registry.close()
-        stores.close()
+        harness.close()
 
 
 @pytest.mark.parametrize("journal_mode", ["DELETE", "WAL"])

@@ -576,6 +576,99 @@ class LocalPositionStores:
         self.close()
 
 
+def make_managed_router(local, client, registry, **options):
+    """Inject real observer-only actors during the staged constructor cutover."""
+
+    from pathlib import Path
+    from appio.history_router import HistoryRouter
+    from appio.history_source import ManagedSourceRegistry
+    from appio.history_types import ManagedSourceSpec
+
+    sources = ManagedSourceRegistry(wake=lambda: None)
+
+    def register(name, service):
+        path = service.connection.execute("PRAGMA database_list").fetchone()[2]
+        spec = ManagedSourceSpec(name, "iod", Path(path).as_uri() + "?mode=ro", ())
+        sources.register(spec).result(timeout=10)
+
+    register("local", local)
+    router = HistoryRouter(local, client, registry, _capture_provider=sources, **options)
+    add_source = router.add_source
+    close = router.close
+
+    def add_managed_source(service, *, collector_id, owner):
+        register(collector_id, service)
+        add_source(service, collector_id=collector_id, owner=owner)
+
+    def close_managed_router():
+        close()
+        sources.close()
+
+    router.add_source = add_managed_source
+    router.close = close_managed_router
+    return router
+
+
+def inject_managed_router_sources(monkeypatch):
+    """Give legacy Files fixtures real source actors through the private seam."""
+
+    from pathlib import Path
+    from appio.history_router import HistoryRouter
+    from appio.history_source import ManagedSourceRegistry
+    from appio.history_types import ManagedSourceSpec
+
+    initialize = HistoryRouter.__init__
+    add_source = HistoryRouter.add_source
+    registries = []
+
+    def register(sources, name, service):
+        path = service.connection.execute("PRAGMA database_list").fetchone()[2]
+        sources.register(ManagedSourceSpec(
+            name, "iod", Path(path).as_uri() + "?mode=ro", ())).result(timeout=10)
+
+    def managed_init(router, local, client, registry, **options):
+        sources = ManagedSourceRegistry(wake=lambda: None)
+        registries.append(sources)
+        register(sources, "local", local)
+        initialize(router, local, client, registry, _capture_provider=sources, **options)
+
+    def managed_add(router, service, *, collector_id, owner):
+        register(router._capture_provider, collector_id, service)
+        add_source(router, service, collector_id=collector_id, owner=owner)
+
+    monkeypatch.setattr(HistoryRouter, "__init__", managed_init)
+    monkeypatch.setattr(HistoryRouter, "add_source", managed_add)
+    return registries
+
+
+def wait_for_capture_admission(router, *, timeout=15.0):
+    """Drive the owner until completed captures have reached real workers."""
+
+    import time
+
+    deadline = time.monotonic() + timeout
+    while router._capture_jobs:
+        router.drain()
+        assert time.monotonic() < deadline, "capture admission did not finish"
+        time.sleep(0.001)
+
+
+def wait_for_local_frame(router, *, timeout=15.0):
+    """Drain capture admission and return the actual terminal frame outcome."""
+
+    import time
+
+    deadline = time.monotonic() + timeout
+    while True:
+        router.drain()
+        future = router._local_future
+        captures = getattr(router, "_capture_jobs", {})
+        if future is not None and future.done() and router._local_worker_id not in captures:
+            return future.result(timeout=0)
+        assert time.monotonic() < deadline, "local frame did not finish"
+        time.sleep(0.001)
+
+
 class _DeliveryQueue:
     """Hold actual queued local completions without blocking their workers."""
 
@@ -634,7 +727,7 @@ class LiveOverviewHarness:
 
     _KINDS = frozenset(("ranking", "series", "totals", "files", "coverage"))
 
-    def __init__(self, directory=None, *, qtbot=None) -> None:
+    def __init__(self, directory=None, *, qtbot=None, journal_modes=None) -> None:
         from PyQt6.QtWidgets import QApplication
         from appio.history_router import HistoryRouter
         from appio.iodclient import AppRegistry
@@ -663,13 +756,13 @@ class LiveOverviewHarness:
         self.app = QApplication.instance() or QApplication([])
         self.age_clock = Clock(ns=100 * 10**9)
         self.recovery_clock = Clock(ns=100 * 10**9)
-        self.stores = LocalPositionStores(directory)
+        self.stores = LocalPositionStores(directory, journal_modes=journal_modes)
         self.transport = QueryTransportHarness(clock=self.age_clock)
         self.registry = AppRegistry()
         for key in (DEFAULT_KEY, "unit:beta.service"):
             app_id = self.registry.id_for(key)
             self.transport.register_subject(app_id, key)
-        self.router = HistoryRouter(
+        self.router = make_managed_router(
             self.stores.services["local"], self.transport.client, self.registry,
             clock_ns=self.age_clock)
         self.stores.attach(self.router)
@@ -692,7 +785,11 @@ class LiveOverviewHarness:
             if held and future is not None and future.done():
                 self._delivery.entered.set()
                 return False
-            return collect_frame()
+            changed = collect_frame()
+            shell = getattr(self, "shell", None)
+            if shell is not None and shell._pending_source is None and shell._pending is not None:
+                shell._pending_source = self.router.preparation_source(shell._pending)
+            return changed
 
         self.router._collect_local_frame = collect_when_deliverable
         self._install_spies()
