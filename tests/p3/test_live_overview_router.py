@@ -4703,7 +4703,7 @@ def test_remote_detail_liveness_across_ten_second_commit(tmp_path, qtbot):
 
 
 @pytest.mark.parametrize("kind", ["totals", "series"])
-@pytest.mark.parametrize("schedule", ["settled", "forward_frame_held"])
+@pytest.mark.parametrize("schedule", ["settled", "forward_frame_held", "replacement_local_completed"])
 def test_remote_detail_after_mixed_store_refusal_uses_local_ownership(tmp_path, kind, schedule, monkeypatch):
     from test_history_router import BOOT as fixture_boot, source
     from live_overview_support import add_managed_source, make_managed_router
@@ -4750,6 +4750,14 @@ def test_remote_detail_after_mixed_store_refusal_uses_local_ownership(tmp_path, 
             router.prepare(replace(window, end_mono_ns=140 * NS))
             _drain_until(router, entered.is_set)
             assert not router._has_local_history and router._overlap_ranges == []
+        elif schedule == "replacement_local_completed":
+            desired = Window("range", fixture_boot, 130 * NS, 140 * NS)
+            router.prepare(desired)
+            wait_local(router)
+            assert not router.ready(desired)
+            assert router._applied_window == window
+            assert router._local_settlement.outcome.request.window == desired
+            assert not router._has_local_history and router._overlap_ranges == []
         client.settle(future, {
             "kind": kind, "result": remote_value, "app_key": row.app_key,
             "snapshot": DIGEST, "next_cursor": None,
@@ -4773,6 +4781,63 @@ def test_remote_detail_after_mixed_store_refusal_uses_local_ownership(tmp_path, 
         router.close()
         local.connection.close()
         imported.connection.close()
+
+
+@pytest.mark.parametrize("kind", ["totals", "series"])
+def test_remote_detail_keeps_imported_only_ranking_ownership(tmp_path, kind):
+    from test_history_router import BOOT as fixture_boot, source
+    from live_overview_support import add_managed_source, make_managed_router
+
+    local = AppIoStore(tmp_path / "empty-primary.db")
+    imported, _ = source(tmp_path / "export-only.db", "iod", start=100, end=120, amount=20)
+    daemon, _ = source(tmp_path / "daemon-private.db", "iod", start=100, end=120, amount=30)
+    client = _BoundClient(boot=fixture_boot)
+    router = make_managed_router(QueryService(local), client, AppRegistry(), clock_ns=client.clock)
+    add_managed_source(router, imported, name="export", owner="iod")
+    window = Window("since_boot", fixture_boot, end_mono_ns=130 * NS)
+    try:
+        router.prepare(window)
+        wait_local(router)
+        service = QueryService(daemon)
+        remote_rows = service.ranking(window, "total_bytes")
+        client.settle(client.only("ranking"), {
+            "kind": "ranking", "result": remote_rows, "snapshot": DIGEST,
+            "next_cursor": None,
+        })
+        assert router.ready(window)
+        row, = router.ranking(window, "total_bytes")
+        assert row.total_bytes == 40
+        assert router._remote is None
+        assert "mixed-store" in router.daemon_answer_error.reason
+        assert not router._has_local_history and router._overlap_ranges == []
+        router.select_detail(row.app_key, window)
+        scope = retention_scope(row.app_key, window)
+        router.request_detail(kind, row.app_id, window)
+        future = client.only(kind)
+        remote_id = remote_rows[0].app_id
+        remote_value = (service.disk_share(remote_id, window) if kind == "totals"
+                        else service.series(remote_id, window))
+        client.settle(future, {
+            "kind": kind, "result": remote_value, "app_key": row.app_key,
+            "snapshot": DIGEST, "next_cursor": None,
+        })
+        router.drain()
+        _drain_until(router, lambda: router.part_state(kind, row.app_key, scope).state == "ok")
+        record = router.retained(kind, row.app_key, scope, window.end_mono_ns)
+        assert record is not None
+        measured = record.value
+        amount = (measured.task_total_bytes if kind == "totals" else
+                  sum(point.read_bytes + point.write_bytes for point in measured.points))
+        assert amount == 40, "detail replaced the admitted export contribution with a refused daemon source"
+        assert measured.window == window
+        assert record.provenance.snapshot is not None
+        assert record.provenance.local_bracket is not None
+        assert future in client.rejected
+    finally:
+        router.close()
+        local.connection.close()
+        imported.connection.close()
+        daemon.connection.close()
 
 
 def test_local_outcomes_share_settlement_for_frame_part_and_files(tmp_path):

@@ -787,7 +787,11 @@ class _PartSlot:
 
 @dataclass
 class _DetailLifetime:
-    """One selected subject/scope lifetime; resets allocate a new id."""
+    """One selected subject/scope lifetime; resets allocate a new id.
+
+    The selected ranking proof survives preparation. ``local_tokens`` binds its
+    local ownership decision to pending remote requests until they terminate.
+    """
 
     app_key: str
     family: tuple
@@ -796,6 +800,8 @@ class _DetailLifetime:
     slots: dict[tuple[str, RetentionScope], _PartSlot] = field(default_factory=dict)
     live: dict[str, RequestToken] = field(default_factory=dict)
     successors: dict[str, RequestToken] = field(default_factory=dict)
+    ranking_provenance: AnswerProvenance | None = None
+    local_tokens: set[int] = field(default_factory=set)
 
 
 @dataclass
@@ -2777,8 +2783,11 @@ class HistoryRouter:
         family = self._window_family(key, window)
         endpoint = applied_endpoint(window)
         lifetime = self._detail
+        ranking_provenance = self.ranking_provenance(key, window)
         if (lifetime is not None and lifetime.app_key == key
                 and lifetime.family == family):
+            if ranking_provenance is not None:
+                lifetime.ranking_provenance = ranking_provenance
             if endpoint is None:
                 self._applied_window = window
                 return
@@ -2789,7 +2798,9 @@ class HistoryRouter:
                 self._applied_window = window
                 return
         self._retire_detail_lifetime()
-        self._detail = _DetailLifetime(key, family, self._next_lifetime_id, endpoint)
+        self._detail = _DetailLifetime(
+            key, family, self._next_lifetime_id, endpoint,
+            ranking_provenance=ranking_provenance)
         self._next_lifetime_id += 1
         self._applied_window = window
 
@@ -2813,10 +2824,17 @@ class HistoryRouter:
         authority = self._current_authority()
         requested_source = self.source_position() if origin == "remote" else self._local_vector()
         slot_id = self._allocate_token_id() if origin == "remote" else None
+        ranking_provenance = lifetime.ranking_provenance
+        local_ownership = (
+            ranking_provenance is not None
+            and ranking_provenance.measured_window == window
+            and ranking_provenance.local_bracket is not None)
         token = RequestToken(
             token_id, QueryRequest(kind, window, key), origin, scope, "detail",
             lifetime.lifetime_id, slot_id, authority, requested_source,
         )
+        if origin == "remote" and local_ownership:
+            lifetime.local_tokens.add(token_id)
         slot = lifetime.slots.get((kind, scope))
         if slot is None:
             slot = _PartSlot(kind, scope)
@@ -2872,6 +2890,7 @@ class HistoryRouter:
                     if successor is not None:
                         self._retired_tokens.add(successor.token_id)
                         self._unscheduled.pop(successor.token_id, None)
+                        lifetime.local_tokens.discard(successor.token_id)
                     token = self._admit_detail(lifetime, kind, key, window, scope)
                     lifetime.successors[kind] = token
                     lifetime.live[kind] = live  # the older live owner keeps the wire
@@ -3349,10 +3368,12 @@ class HistoryRouter:
         live = lifetime.live.get(kind)
         if live is not None and live.token_id == token.token_id:
             del lifetime.live[kind]
+        lifetime.local_tokens.discard(token.token_id)
         successor = lifetime.successors.pop(kind, None)
         if successor is not None:
             self._retired_tokens.add(successor.token_id)
             self._unscheduled.pop(successor.token_id, None)
+            lifetime.local_tokens.discard(successor.token_id)
         return True
 
     def _settle_remote(self, token: RequestToken, settlement: RemoteSettlement) -> bool:
@@ -3412,22 +3433,17 @@ class HistoryRouter:
             if answered is None or answered != token.requested_source:
                 return self._reject_token(
                     token, settlement, RequestRejected("invalid_result", "invalid_result"))
-            local_settlement = self._local_settlement
-            applied_local = None if local_settlement is None else local_settlement.outcome
-            applied_ownership = (
-                isinstance(applied_local, LocalFrameOutcome)
-                and applied_local.request.window == token.request.window
-                and (applied_local.has_local_history or bool(applied_local.overlaps)))
-            if self._remote is None and (
-                    self._has_local_history or self._overlap_ranges or applied_ownership):
-                # Ranking kept the ownership-filtered local frame. Recompute
-                # this exact detail through the same managed-source reducers.
+            lifetime = self._detail
+            if token.token_id in lifetime.local_tokens:
+                # The admitted ranking's source decision stays with this exact
+                # detail across preparation and later applied-frame adoption.
+                # Recompute through the same managed-source reducers.
+                lifetime.local_tokens.discard(token.token_id)
                 self.client.reject_query_result(future)
                 self._settled_tokens.add(token.token_id)
                 local_token = replace(
                     token, token_id=self._allocate_token_id(), origin="local",
                     slot_id=None, requested_source=self._local_vector())
-                lifetime = self._detail
                 if lifetime.live.get(kind) == token:
                     lifetime.live[kind] = local_token
                 else:
