@@ -49,8 +49,7 @@ def test_two_valid_stores_with_different_served_intervals_are_ambiguous(
         read_files(ordered)
     assert (caught.value.reason, str(caught.value)) == (
         "file_source_unavailable", "File ownership cannot be represented by one store.")
-    assert observed == [(name, S if name == "A" else served_b)
-                        for name, _, _ in ordered]
+    assert observed == [("A", S), ("B", served_b)]
 
 
 def test_outside_candidate_owner_and_gap_do_not_fail_the_only_survivor(tab_store):
