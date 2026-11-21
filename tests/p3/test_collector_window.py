@@ -3660,15 +3660,22 @@ def test_transport_gap_startup_and_callback_shutdown_order(qapp, tmp_path, monke
     from PyQt6.QtCore import QEventLoop, QTimer
     from PyQt6 import QtWidgets
     from appio import history_source, iodclient, store as store_module
+    from appio.contracts import Window as HistoryWindow
 
     original_store = store_module.AppIoStore
     original_registry = history_source.ManagedSourceRegistry
     original_router = cw.HistoryRouter
     bootstraps, registries, clients, windows = [], [], [], []
-    events, uncaught = [], []
+    actor_registrations, gap_writers, database_locks, registration_locks = [], [], [], []
+    events, uncaught, pre_admission_checks = [], [], []
     owner_thread = threading.get_ident()
-    admission = Future()
     original_error = ValueError(f"{phase} startup failed")
+    registration_retry_entered = threading.Event()
+    release_registration_retry = threading.Event()
+    registration_lock_held = threading.Event()
+    writer_retry_entered = threading.Event()
+    release_writer_retry = threading.Event()
+    writer_lock_held = threading.Event()
     loop = QEventLoop()
 
     class Application:
@@ -3679,8 +3686,9 @@ def test_transport_gap_startup_and_callback_shutdown_order(qapp, tmp_path, monke
             pass
 
         def exec(self):
-            QTimer.singleShot(0, finish_admission)
-            QTimer.singleShot(250, loop.quit)
+            QTimer.singleShot(0, inspect_before_admission)
+            QTimer.singleShot(40, release_primary_lock)
+            QTimer.singleShot(2000, loop.quit)
             loop.exec()
             return 1 if phase != "success" else 0
 
@@ -3696,51 +3704,146 @@ def test_transport_gap_startup_and_callback_shutdown_order(qapp, tmp_path, monke
 
     def bootstrap(path):
         result = original_store(path)
+        raw_connection = result.connection
+
+        class ObservedBootstrapConnection:
+            def execute(self, *args, **kwargs):
+                return raw_connection.execute(*args, **kwargs)
+
+            def close(self):
+                events.append(("bootstrap_close", threading.get_ident()))
+                raw_connection.close()
+
+            def __getattr__(self, name):
+                return getattr(raw_connection, name)
+
+        result.connection = ObservedBootstrapConnection()
         bootstraps.append(result)
         return result
 
     def registry(**kwargs):
-        result = original_registry(**kwargs)
+        wake_callback = kwargs["wake"]
+
+        def observed_wake():
+            events.append(("source_wake", threading.get_ident()))
+            wake_callback()
+
+        def retry_wait(delay):
+            if registration_lock_held.is_set():
+                events.append(("registration_retry", threading.get_ident()))
+                registration_retry_entered.set()
+                release_registration_retry.wait(3)
+                if phase == "admission":
+                    raise sqlite3.OperationalError("synthetic primary pairing failure")
+                return
+            if writer_lock_held.is_set():
+                events.append(("gap_writer_wait", threading.get_ident()))
+                writer_retry_entered.set()
+                release_writer_retry.wait(3)
+            else:
+                time.sleep(delay)
+
+        options = dict(kwargs)
+        options["wake"] = observed_wake
+        options["retry_wait"] = retry_wait
+        result = original_registry(**options)
         register = result.register
-        result.register = lambda spec: admission
-        result.real_register = register
+        close = result.close
+        blocker = sqlite3.connect(str(tmp_path / "startup.db"), timeout=0)
+        blocker.execute("BEGIN IMMEDIATE")
+        registration_locks.append(blocker)
+        registration_lock_held.set()
+
+        def observed_register(spec):
+            future = register(spec)
+            actor_registrations.append(future)
+            future.add_done_callback(
+                lambda _done: events.append(("actor_future_done", threading.get_ident())))
+            return future
+
+        def observed_close():
+            events.append(("registry_close", threading.get_ident()))
+            close()
+
+        result.register = observed_register
+        result.close = observed_close
         registries.append(result)
         return result
 
-    def finish_admission():
-        events.append(("admission", threading.get_ident()))
-        if phase == "admission":
-            admission.set_exception(original_error)
-        else:
-            sources = registries[0]
-            from appio.history_types import ManagedSourceSpec
-            actual = sources.real_register(ManagedSourceSpec(
-                "local", "gui", (tmp_path / "startup.db").as_uri() + "?mode=rw&cache=shared", ()))
-            def completed(done):
-                try:
-                    admission.set_result(done.result())
-                except BaseException as error:
-                    admission.set_exception(error)
-            actual.add_done_callback(completed)
+    def inspect_before_admission():
+        if not registration_retry_entered.is_set():
+            QTimer.singleShot(1, inspect_before_admission)
+            return
+        forbidden = {"client", "router", "window", "pump", "prepare"}
+        activity = [event for event in events if event[0] in forbidden]
+        pre_admission_checks.append((
+            bool(actor_registrations and not actor_registrations[0].done()),
+            not activity,
+            registration_retry_entered.is_set(),
+            threading.get_ident(),
+        ))
+
+    def release_primary_lock():
+        events.append(("registration_lock_release", threading.get_ident()))
+        for blocker in registration_locks:
+            if blocker.in_transaction:
+                blocker.execute("ROLLBACK")
+            blocker.close()
+        registration_locks.clear()
+        registration_lock_held.clear()
+        release_registration_retry.set()
+
+    def primary_admitted():
+        return bool(
+            actor_registrations
+            and actor_registrations[0].done()
+            and actor_registrations[0].exception() is None
+        )
 
     class Client:
         state = iodclient.ClientState()
         def __init__(self, *args, **kwargs):
-            events.append(("client", admission.done()))
+            events.append(("client", primary_admitted()))
             self.on_gap = kwargs["on_gap"]
             self.clock = kwargs["clock_ns"]
             clients.append(self)
         def close(self):
             events.append(("client_close", threading.get_ident()))
-            self.on_gap(iodclient.GapNotice("", 0, 0, None, None, "disconnect"))
+            self.on_gap(iodclient.GapNotice(
+                "startup-boot", 1, 2, 1, 2, "disconnect"))
         def pump(self):
-            pass
+            events.append(("pump", primary_admitted(), threading.get_ident()))
 
     def router(*args, **kwargs):
-        events.append(("router", threading.get_ident()))
+        events.append(("router", threading.get_ident(), primary_admitted()))
         if phase == "router":
             raise original_error
-        return original_router(*args, **kwargs)
+        instance = original_router(*args, **kwargs)
+        prepare = instance.prepare
+        record_transport_gap = instance.record_transport_gap
+        close = instance.close
+
+        def observed_prepare(window):
+            events.append(("prepare", primary_admitted(), threading.get_ident()))
+            return prepare(window)
+
+        def observed_gap(notice):
+            events.append(("gap_submit", threading.get_ident()))
+            record_transport_gap(notice)
+            future = instance._gap_writes[-1].future
+            gap_writers.append(future)
+            future.add_done_callback(lambda _done: events.append((
+                "gap_writer_done", bool(windows and windows[-1].closed),
+                threading.get_ident())))
+
+        def observed_close():
+            events.append(("router_close", threading.get_ident()))
+            close()
+
+        instance.prepare = observed_prepare
+        instance.record_transport_gap = observed_gap
+        instance.close = observed_close
+        return instance
 
     class Coordinator:
         resume_handover = None
@@ -3763,28 +3866,46 @@ def test_transport_gap_startup_and_callback_shutdown_order(qapp, tmp_path, monke
             try:
                 bootstraps[0].connection.execute("SELECT 1")
             except sqlite3.ProgrammingError:
-                events.append(("bootstrap_closed", True))
+                events.append(("bootstrap_closed", True, threading.get_ident()))
             else:
-                events.append(("bootstrap_closed", False))
+                events.append(("bootstrap_closed", False, threading.get_ident()))
             if phase == "window":
                 raise original_error
             self.coordinator, self.history = coordinator, history
             self.clock = kwargs["age_clock_ns"]
             self.refreshes = self.polls = 0
+            self.closed = False
+            self.late_touches = 0
             windows.append(self)
         def show(self):
             pass
         def refresh(self):
+            if self.closed:
+                self.late_touches += 1
             self.refreshes += 1
             if phase == "refresh":
                 raise original_error
+            self.coordinator.client.pump()
+            if phase == "success":
+                blocker = sqlite3.connect(str(args.db), timeout=0)
+                blocker.execute("BEGIN IMMEDIATE")
+                database_locks.append(blocker)
+                writer_lock_held.set()
+            self.history.prepare(HistoryWindow("since_boot", BOOT, end_mono_ns=END))
             # A real actor completion after startup must only arm polling.
             registries[0].observe_async()
         def _arm_poll(self):
+            if self.closed:
+                self.late_touches += 1
+                return
             self.polls += 1
             QTimer.singleShot(0, loop.quit)
         def shutdown(self):
+            self.closed = True
+            events.append(("window_shutdown", threading.get_ident()))
             self.coordinator.close()
+            if phase == "success":
+                writer_retry_entered.wait(1)
             self.history.close()
 
     monkeypatch.setattr(store_module, "AppIoStore", bootstrap)
@@ -3799,25 +3920,78 @@ def test_transport_gap_startup_and_callback_shutdown_order(qapp, tmp_path, monke
         application.exit(91)
     monkeypatch.setattr(cw.sys, "excepthook", exception_hook)
     args = SimpleNamespace(db=tmp_path / "startup.db", interval=1, proc_root="/fixture", cgroup_root="/fixture")
+    try:
+        if phase == "success":
+            assert cw.run_interactive(args) == 0
+            assert windows[0].refreshes == 1
+            assert windows[0].polls >= 1
+            assert windows[0].clock is clients[0].clock
+            assert gap_writers
+            assert writer_retry_entered.wait(2)
+            assert not gap_writers[0].done()
+        else:
+            with pytest.raises(Exception) as caught:
+                cw.run_interactive(args)
+            expected_error = (
+                actor_registrations[0].exception()
+                if phase == "admission" else original_error
+            )
+            assert caught.value is expected_error
+            assert ("exit", 1) in events
+    finally:
+        for blocker in database_locks:
+            if blocker.in_transaction:
+                blocker.execute("ROLLBACK")
+            blocker.close()
+        for blocker in registration_locks:
+            if blocker.in_transaction:
+                blocker.execute("ROLLBACK")
+            blocker.close()
+        registration_locks.clear()
+        registration_lock_held.clear()
+        release_registration_retry.set()
+        release_writer_retry.set()
+
     if phase == "success":
-        assert cw.run_interactive(args) == 0
-        assert windows[0].refreshes == 1
-        assert windows[0].polls >= 1
-        assert windows[0].clock is clients[0].clock
-    else:
-        with pytest.raises(ValueError) as caught:
-            cw.run_interactive(args)
-        assert caught.value is original_error
-        assert ("exit", 1) in events
+        gap_writers[0].result(timeout=5)
+        qapp.processEvents()
+        assert any(name == "gap_writer_done" and closed
+                   for name, closed, *_ in events)
+        assert windows[0].closed
+        assert windows[0].late_touches == 0
+        shutdown = [name for name, *_ in events if name in {
+            "window_shutdown", "coordinator_close", "client_close",
+            "router_close", "registry_close",
+        }]
+        assert shutdown[:4] == [
+            "window_shutdown", "coordinator_close", "client_close", "router_close",
+        ]
+        assert shutdown[4:] and all(name == "registry_close" for name in shutdown[4:])
+        assert shutdown.index("client_close") < shutdown.index("registry_close")
     assert uncaught == []
-    assert all(ready for name, ready in events if name == "client")
-    assert all(closed for name, closed in events if name == "bootstrap_closed")
-    assert all(thread == owner_thread for name, thread in events
-               if name in ("router", "window", "coordinator_close", "client_close"))
+    assert pre_admission_checks
+    assert all(pending and no_activity and retrying and thread == owner_thread
+               for pending, no_activity, retrying, thread in pre_admission_checks)
+    assert actor_registrations and actor_registrations[0].done()
+    if phase == "admission":
+        assert actor_registrations[0].exception() is not None
+    else:
+        assert actor_registrations[0].exception() is None
+    assert any(event[0] == "source_wake" and event[1] != owner_thread
+               for event in events)
+    assert all(event[1] for event in events if event[0] == "client")
+    assert all(event[2] for event in events if event[0] == "router")
+    assert all(event[1] for event in events if event[0] in ("pump", "prepare"))
+    assert all(event[1] and event[2] == owner_thread
+               for event in events if event[0] == "bootstrap_closed")
+    assert [event[1] for event in events if event[0] == "bootstrap_close"] == [owner_thread]
+    assert all(event[1] == owner_thread for event in events
+               if event[0] in ("router", "window", "coordinator_close", "client_close",
+                               "router_close", "registry_close", "window_shutdown"))
     assert registries[0]._closed
     assert not registries[0].registration_vector()
     if clients:
-        assert any(name == "client_close" for name, _ in events)
+        assert any(event[0] == "client_close" for event in events)
 
 
 def test_ordinary_refresh_retries_failed_gap_once(real_files_shell, monkeypatch):
