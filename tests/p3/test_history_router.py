@@ -110,7 +110,26 @@ def source(path, owner="gui", *, boot=BOOT, app_id=17, key="/usr/bin/shared",
 
 
 def router(store):
-    return HistoryRouter(QueryService(store), Client(), AppRegistry())
+    from live_overview_support import make_managed_router
+    return make_managed_router(QueryService(store), Client(), AppRegistry())
+
+
+@pytest.fixture(autouse=True)
+def managed_history_cleanup(monkeypatch):
+    import live_overview_support
+
+    create = live_overview_support.make_managed_router
+    histories = []
+
+    def tracked(*args, **options):
+        history = create(*args, **options)
+        histories.append(history)
+        return history
+
+    monkeypatch.setattr(live_overview_support, "make_managed_router", tracked)
+    yield
+    for history in histories:
+        history.close()
 
 
 def window(start=100, end=140, boot=BOOT):
@@ -118,10 +137,10 @@ def window(start=100, end=140, boot=BOOT):
 
 
 def result(router, scope):
+    from live_overview_support import wait_for_local_frame
+
     router.prepare(scope)
-    work = getattr(router, "_local_future", None)
-    if work is not None:
-        work.result(timeout=10)
+    wait_for_local_frame(router)
     assert router.ready(scope)
     return router.ranking(scope, "total_bytes")
 
@@ -506,14 +525,267 @@ def test_settled_pruned_lifetime_summary_is_not_replaced_with_zero(tmp_path):
     assert "not_retained" not in history.view_state
 
 
+@pytest.mark.parametrize("journal_mode", ["DELETE", "WAL"])
+def test_transport_gap_unknown_boot_bounds_and_epoch_fallback(tmp_path, monkeypatch, journal_mode):
+    """No-write outcomes preserve positions and successful callbacks invalidate."""
+    from appio.iodclient import GapNotice
+    from live_overview_support import drain_transport_gaps, make_managed_router
+
+    local, _ = source(tmp_path / "gaps.db")
+    local.connection.execute(f"PRAGMA journal_mode={journal_mode}")
+    local.connection.execute("DELETE FROM collector_epoch WHERE source='gui'")
+    local.connection.commit()
+    history = make_managed_router(QueryService(local), Client(), AppRegistry())
+    sources = history._capture_provider
+    notifications = []
+    monkeypatch.setattr(history, "_notify", lambda: notifications.append(history._generation))
+    notice = GapNotice(BOOT, 9, 77, 110 * NS, 120 * NS, "disconnect")
+    try:
+        assert callable(getattr(history, "retry_transport_gaps", None))
+        initial = sources.observe_async().result(timeout=10)
+        generation = history._generation
+        ignored = (GapNotice("", 0, 0, 0, NS, "disconnect"),
+                   replace(notice, from_mono_ns=None), replace(notice, to_mono_ns=None),
+                   replace(notice, from_mono_ns=-1))
+        for item in ignored:
+            assert history.record_transport_gap(item) is None
+        history.record_transport_gap(replace(notice, boot_id="missing"))
+        drain_transport_gaps(history)
+        assert history._generation == generation
+        assert sources.observe_async().result(timeout=10) == initial
+        assert history.gap_persistence_error is None
+        assert local.connection.execute("SELECT count(*) FROM gap").fetchone() == (0,)
+        history.record_transport_gap(notice)
+        drain_transport_gaps(history)
+        assert history._generation == generation + 1
+        assert local.connection.execute(
+            "SELECT boot_id,source,epoch,seq,from_mono_ns,to_mono_ns,reason FROM gap"
+        ).fetchall() == [(BOOT, "gui", 1, 0, 110 * NS, 120 * NS, "gui_absent")]
+        inserted = sources.observe_async().result(timeout=10)
+        assert inserted != initial
+        duplicate = replace(notice, iod_epoch=10, seq=99, reason="cursor_not_retained")
+        history.record_transport_gap(duplicate)
+        for item in history._gap_writes:
+            item.future.exception(timeout=10)
+        history.retry_transport_gaps()
+        drain_transport_gaps(history)
+        assert history._generation == generation + 2
+        assert notifications == [generation + 1, generation + 2]
+        assert sources.observe_async().result(timeout=10) == inserted
+        assert history.transport_issues == [*ignored, replace(notice, boot_id="missing"),
+                                            notice, duplicate]
+        local.connection.execute("INSERT INTO collector_epoch VALUES('gui',?,4,NULL,0)", (BOOT,))
+        local.connection.commit()
+        history.record_transport_gap(replace(notice, from_mono_ns=121 * NS, to_mono_ns=122 * NS))
+        drain_transport_gaps(history)
+        assert local.connection.execute("SELECT epoch,seq FROM gap ORDER BY gap_id").fetchall() == [
+            (1, 0), (4, 0)]
+    finally:
+        history.close()
+        local.connection.close()
+
+
+@pytest.mark.parametrize("journal_mode", ["DELETE", "WAL"])
+@pytest.mark.parametrize("winner", ["external", "actor", "reader"])
+def test_transport_gap_atomic_dedup_with_concurrent_writers(
+        tmp_path, monkeypatch, journal_mode, winner):
+    """The duplicate check shares the insert's immediate transaction."""
+    from appio.iodclient import GapNotice
+    from live_overview_support import (Clock, GapSqlHarness, _Barrier,
+                                      drain_transport_gaps, make_managed_router)
+
+    local, _ = source(tmp_path / "contended.db")
+    local.connection.execute(f"PRAGMA journal_mode={journal_mode}")
+    local.connection.commit()
+    sql = GapSqlHarness(monkeypatch)
+    clock = Clock()
+    retry = _Barrier()
+    waits = []
+
+    def retry_wait(seconds):
+        waits.append(seconds)
+        clock.advance_ns(int(seconds * NS))
+        if not retry.entered.is_set():
+            retry._pause()
+
+    history = make_managed_router(QueryService(local), Client(), AppRegistry(),
+        source_options={"clock_ns": clock, "retry_wait": retry_wait})
+    external = sqlite3.connect(tmp_path / "contended.db", isolation_level=None, timeout=0)
+    notice = GapNotice(BOOT, 9, 8, 110 * NS, 120 * NS, "disconnect")
+    duplicate_checks = []
+
+    def observe_duplicate_check(probe, statement, parameters):
+        if probe.role == "writer" and statement.startswith("SELECT 1 FROM gap"):
+            duplicate_checks.append(probe.in_transaction)
+
+    sql.before_execute = observe_duplicate_check
+    try:
+        before = history._capture_provider.observe_async().result(timeout=10)
+        if winner in ("external", "reader"):
+            external.execute("BEGIN IMMEDIATE" if winner == "external" else "BEGIN")
+            external.execute("SELECT * FROM boot").fetchall()
+            history.record_transport_gap(notice)
+            if winner == "reader" and journal_mode == "WAL":
+                drain_transport_gaps(history)
+                assert external.execute("SELECT count(*) FROM gap").fetchone() == (0,)
+            else:
+                retry.wait()
+                assert history.transport_issues == [notice]
+                assert history.pending_work
+                assert not history.drain()
+            if winner == "external":
+                external.execute("INSERT INTO gap(boot_id,source,epoch,seq,from_mono_ns,to_mono_ns,reason) "
+                    "VALUES(?,'gui',1,0,?,?,'gui_absent')", (BOOT, 110 * NS, 120 * NS))
+                external.execute("UPDATE app SET name='collector committed' WHERE app_id=17")
+            external.execute("COMMIT")
+            retry.release()
+        else:
+            with sql.hold("COMMIT") as committing:
+                history.record_transport_gap(notice)
+                committing.wait()
+                with pytest.raises(sqlite3.OperationalError) as caught:
+                    external.execute("BEGIN IMMEDIATE")
+                assert caught.value.sqlite_errorcode & 0xff == sqlite3.SQLITE_BUSY
+                committing.release()
+                drain_transport_gaps(history)
+            external.execute("BEGIN IMMEDIATE")
+            duplicate = external.execute("SELECT 1 FROM gap WHERE boot_id=? AND source='gui' "
+                "AND from_mono_ns=? AND to_mono_ns=? AND reason='gui_absent'",
+                (BOOT, 110 * NS, 120 * NS)).fetchall()
+            assert duplicate == [(1,)]
+            external.execute("UPDATE app SET name='collector committed' WHERE app_id=17")
+            external.execute("COMMIT")
+        drain_transport_gaps(history)
+        assert history.gap_persistence_error is None
+        assert local.connection.execute("SELECT source,epoch,seq,from_mono_ns,to_mono_ns,reason FROM gap").fetchall() == [
+            ("gui", 1, 0, 110 * NS, 120 * NS, "gui_absent")]
+        assert duplicate_checks and all(duplicate_checks)
+        if winner != "reader":
+            assert local.connection.execute("SELECT name FROM app WHERE app_id=17").fetchone() == (
+                "collector committed",)
+        if journal_mode == "WAL":
+            external.execute("PRAGMA wal_checkpoint(PASSIVE)").fetchall()
+        after = history._capture_provider.observe_async().result(timeout=10)
+        assert after.sources[0].data_version != before.sources[0].data_version
+        assert len(waits) <= 9 and all(0 <= wait <= 0.01 for wait in waits)
+    finally:
+        retry.release()
+        external.close()
+        history.close()
+        local.connection.close()
+
+
+@pytest.mark.parametrize("fault", ["busy_begin", "busy_commit", "locked", "io", "after_commit"])
+def test_transport_gap_writer_failure_retry_and_commit_ambiguity(tmp_path, monkeypatch, fault):
+    """Exact errors fence preparation and retries deduplicate ambiguous commits."""
+    from appio.iodclient import GapNotice
+    from live_overview_support import (Clock, GapSqlHarness, drain_transport_gaps,
+                                      make_managed_router, wait_for_local_frame)
+
+    local, _ = source(tmp_path / "failures.db")
+    sql = GapSqlHarness(monkeypatch)
+    clock = Clock()
+    waits = []
+
+    def retry_wait(seconds):
+        waits.append(seconds)
+        clock.advance_ns(200_000_000)
+
+    history = make_managed_router(QueryService(local), Client(), AppRegistry(),
+        source_options={"clock_ns": clock, "retry_wait": retry_wait})
+    code = (sqlite3.SQLITE_BUSY if fault.startswith("busy") else
+            sqlite3.SQLITE_LOCKED if fault == "locked" else sqlite3.SQLITE_IOERR)
+    error = sqlite3.OperationalError(f"injected {fault}")
+    error.sqlite_errorcode = code
+    attempts = []
+    active = True
+
+    def fail(probe, statement, parameters):
+        target = "COMMIT" if fault in ("busy_commit", "after_commit") else "BEGIN IMMEDIATE"
+        if active and probe.role == "writer" and statement == target:
+            attempts.append(statement)
+            raise error
+
+    if fault == "after_commit":
+        sql.after_execute = fail
+    else:
+        sql.before_execute = fail
+    notice = GapNotice(BOOT, 9, 7, 110 * NS, 120 * NS, "disconnect")
+    scope = Window("lifetime")
+    try:
+        history.record_transport_gap(notice)
+        history.prepare(scope)
+        drain_transport_gaps(history)
+        assert history.gap_persistence_error is error
+        assert not history._capture_jobs and not history._frame_jobs
+        with pytest.raises(sqlite3.OperationalError) as caught:
+            history.ready(scope)
+        assert caught.value is error
+        assert not history.frame_provenance(scope)
+        assert 1 <= len(attempts) <= 10
+        if code in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED):
+            assert len(attempts) > 1 and waits and clock() <= NS
+        first_attempts = len(attempts)
+        for _ in range(4):
+            history.drain()
+        assert len(attempts) == first_attempts
+        assert local.connection.execute("SELECT count(*) FROM gap").fetchone() == (
+            1 if fault == "after_commit" else 0,)
+        active = False
+        if fault == "io":
+            second = replace(notice, from_mono_ns=121 * NS, to_mono_ns=122 * NS)
+            second_error = sqlite3.OperationalError("second notice failed")
+
+            def fail_second(probe, statement, parameters):
+                if (probe.role == "writer" and statement.startswith("INSERT INTO gap")
+                        and parameters[2] == 121 * NS):
+                    raise second_error
+
+            sql.before_execute = fail_second
+            history.record_transport_gap(second)
+            drain_transport_gaps(history)
+            assert history.gap_persistence_error is error
+            history.retry_transport_gaps()
+            drain_transport_gaps(history)
+            assert history.gap_persistence_error is second_error
+            sql.before_execute = lambda *args: None
+        history.retry_transport_gaps()
+        drain_transport_gaps(history)
+        assert history.gap_persistence_error is None
+        expected_rows = 2 if fault == "io" else 1
+        assert local.connection.execute("SELECT count(*) FROM gap").fetchone() == (expected_rows,)
+        if fault == "io":
+            active = True
+            sql.before_execute = fail
+            history.record_transport_gap(replace(notice, from_mono_ns=123 * NS, to_mono_ns=124 * NS))
+            drain_transport_gaps(history)
+            assert history.gap_persistence_error is error
+            active = False
+            sources = history._capture_provider
+            spec = sources._active["local"].spec
+            sources.replace("local", spec).result(timeout=10)
+            history.retry_transport_gaps()
+            assert history.gap_persistence_error is error
+            assert all(item.future is None for item in history._gap_writes)
+        history.prepare(scope)
+        wait_for_local_frame(history)
+        assert history.ready(scope)
+        assert history.frame_provenance(scope).certified
+    finally:
+        history.close()
+        local.connection.close()
+
+
 def test_transport_loss_is_local_and_does_not_override_a_complete_export(tmp_path):
     from appio.iodclient import GapNotice
     local, _ = source(tmp_path / "local.db")
     root, _ = source(tmp_path / "root.db", "iod", start=110, end=130)
     history = router(local)
     notice = GapNotice(BOOT, 1, 1, 110*NS, 130*NS, "disconnect")
+    from live_overview_support import drain_transport_gaps
     history.record_transport_gap(notice)
     history.record_transport_gap(notice)
+    drain_transport_gaps(history)
     assert local.connection.execute("SELECT count(*) FROM gap WHERE reason='gui_absent'").fetchone()[0] == 1
     assert root.connection.execute("SELECT count(*) FROM gap").fetchone()[0] == 0
     history.add_source(QueryService(root), collector_id="root", owner="iod")

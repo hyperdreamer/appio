@@ -348,11 +348,12 @@ class _Barrier:
 class LocalPositionStores:
     """Two actual file-backed sources and independent, committed writers.
 
-    Registered observers are the persistent QueryService connections. Worker
-    barriers never replace an observer or manufacture a source position.
+    Managed observers are persistent source-actor connections and writers are
+    independent committed SQLite connections. Worker barriers never replace an
+    observer or manufacture a source position.
     """
 
-    def __init__(self, directory=None) -> None:
+    def __init__(self, directory=None, *, journal_modes=None) -> None:
         import os
         import sqlite3
         import tempfile
@@ -364,8 +365,12 @@ class LocalPositionStores:
         self.root = Path(self._temporary.name)
         self.paths = {name: self.root / f"{name}.db" for name in ("local", "export")}
         self.stores = {name: AppIoStore(path) for name, path in self.paths.items()}
-        for store in self.stores.values():
-            store.connection.execute("PRAGMA journal_mode=WAL")
+        modes = journal_modes or {"local": "WAL", "export": "WAL"}
+        for name, store in self.stores.items():
+            mode = modes.get(name, "WAL")
+            if mode not in ("DELETE", "WAL"):
+                raise ValueError(f"unsupported fixture journal mode {mode!r}")
+            store.connection.execute(f"PRAGMA journal_mode={mode}")
             store.start_boot("boot-a", 1, 0, 1000.0, "gui")
             store.connection.commit()
         self._seed_local()
@@ -375,6 +380,7 @@ class LocalPositionStores:
             for name, path in self.paths.items()
         }
         self.router = None
+        self.managed_registry = None
         self._extra_connections: list[object] = []
         self._barriers: list[_Barrier] = []
         self._closed = False
@@ -407,6 +413,25 @@ class LocalPositionStores:
                              (1000 + second) * 10**9, records, ())
             frame, state = baseline_seed(tick) if seq == 0 else aggregate_tick(state, tick)
             store.record_tick(frame, state)
+
+    def managed_spec(self, name: str, *, owner: str = "iod"):
+        """Describe one fixture file without sharing its SQLite connection."""
+        from appio.history_types import ManagedSourceSpec
+
+        if name not in self.paths:
+            raise KeyError(name)
+        mode = "?mode=rw&cache=shared" if name == "local" and owner == "gui" else "?mode=ro"
+        return ManagedSourceSpec(name, owner, self.paths[name].as_uri() + mode, ())
+
+    def new_managed_registry(self, *, wake=None):
+        """Create one registry whose actors own persistent fixture observers."""
+        from appio.history_source import ManagedSourceRegistry
+
+        if self.managed_registry is not None:
+            raise RuntimeError("a managed registry is already attached")
+        self.managed_registry = ManagedSourceRegistry(
+            wake=(lambda: None) if wake is None else wake)
+        return self.managed_registry
 
     def attach(self, router) -> None:
         if self.router is not None:
@@ -536,6 +561,8 @@ class LocalPositionStores:
         self._closed = True
         for barrier in self._barriers:
             barrier.release()
+        if self.managed_registry is not None:
+            self.managed_registry.close()
         for connection in (*self.writers.values(), *self._extra_connections):
             connection.close()
         for store in self.stores.values():
@@ -547,6 +574,199 @@ class LocalPositionStores:
 
     def __exit__(self, *exc) -> None:
         self.close()
+
+
+def make_managed_router(local, client, registry, *, source_options=None, **options):
+    """Use actor-owned primary and imported sources during constructor cutover."""
+
+    from pathlib import Path
+    from appio.history_router import HistoryRouter
+    from appio.history_source import ManagedSourceRegistry
+    from appio.history_types import ManagedSourceSpec
+
+    sources = ManagedSourceRegistry(wake=lambda: None, **(source_options or {}))
+
+    def register(name, service, owner):
+        path = service.connection.execute("PRAGMA database_list").fetchone()[2]
+        mode = "?mode=rw&cache=shared" if name == "local" else "?mode=ro"
+        spec = ManagedSourceSpec(name, owner, Path(path).as_uri() + mode, ())
+        if any(entry[0] == name for entry in sources.registration_vector()):
+            sources.replace(name, spec).result(timeout=10)
+        else:
+            sources.register(spec).result(timeout=10)
+
+    register("local", local, "gui")
+    router = HistoryRouter(local, client, registry, _capture_provider=sources, **options)
+    add_source = router.add_source
+    close = router.close
+
+    def add_managed_source(service, *, collector_id, owner):
+        register(collector_id, service, owner)
+        add_source(service, collector_id=collector_id, owner=owner)
+
+    def close_managed_router():
+        close()
+        sources.close()
+
+    router.add_source = add_managed_source
+    router.close = close_managed_router
+    return router
+
+
+def inject_managed_router_sources(monkeypatch):
+    """Give legacy Files fixtures real source actors through the private seam."""
+
+    from pathlib import Path
+    from appio.history_router import HistoryRouter
+    from appio.history_source import ManagedSourceRegistry
+    from appio.history_types import ManagedSourceSpec
+
+    initialize = HistoryRouter.__init__
+    add_source = HistoryRouter.add_source
+    registries = []
+
+    def register(sources, name, service, owner):
+        path = service.connection.execute("PRAGMA database_list").fetchone()[2]
+        mode = "?mode=rw&cache=shared" if name == "local" else "?mode=ro"
+        sources.register(ManagedSourceSpec(
+            name, owner, Path(path).as_uri() + mode, ())).result(timeout=10)
+
+    def managed_init(router, local, client, registry, **options):
+        sources = ManagedSourceRegistry(wake=lambda: None)
+        registries.append(sources)
+        register(sources, "local", local, "gui")
+        initialize(router, local, client, registry, _capture_provider=sources, **options)
+
+    def managed_add(router, service, *, collector_id, owner):
+        register(router._capture_provider, collector_id, service, owner)
+        add_source(router, service, collector_id=collector_id, owner=owner)
+
+    monkeypatch.setattr(HistoryRouter, "__init__", managed_init)
+    monkeypatch.setattr(HistoryRouter, "add_source", managed_add)
+    return registries
+
+
+def wait_for_capture_admission(router, *, timeout=15.0):
+    """Drive the owner until completed captures have reached real workers."""
+
+    import time
+
+    deadline = time.monotonic() + timeout
+    while router._capture_jobs:
+        router.drain()
+        assert time.monotonic() < deadline, "capture admission did not finish"
+        time.sleep(0.001)
+
+
+def wait_for_local_frame(router, *, timeout=15.0):
+    """Drain capture admission and return the actual terminal frame outcome."""
+
+    import time
+
+    deadline = time.monotonic() + timeout
+    while True:
+        router.drain()
+        future = router._local_future
+        captures = getattr(router, "_capture_jobs", {})
+        if future is not None and future.done() and router._local_worker_id not in captures:
+            return future.result(timeout=0)
+        assert time.monotonic() < deadline, "local frame did not finish"
+        time.sleep(0.001)
+
+
+class GapSqlHarness:
+    """Instrument real actor connections and inject ordered SQLite faults."""
+
+    def __init__(self, monkeypatch) -> None:
+        import appio.history_source as source_module
+
+        original = source_module.sqlite3
+        harness = self
+        self.connections = []
+        self.before_execute = lambda probe, sql, parameters: None
+        self.after_execute = lambda probe, sql, parameters: None
+        self.observer_uri = None
+
+        class Connection:
+            def __init__(self, connection, role, options):
+                self.connection = connection
+                self.role = role
+                self.options = options
+                self.thread = threading.get_ident()
+                self.closed = threading.Event()
+                self.close_thread = None
+                self.sql = []
+                self.authorizer = None
+
+            def execute(self, sql, parameters=()):
+                self.sql.append(sql)
+                harness.before_execute(self, sql, parameters)
+                cursor = self.connection.execute(sql, parameters)
+                try:
+                    harness.after_execute(self, sql, parameters)
+                except BaseException:
+                    cursor.close()
+                    raise
+                return cursor
+
+            def set_authorizer(self, callback):
+                self.authorizer = callback
+                self.connection.set_authorizer(callback)
+
+            def close(self):
+                self.close_thread = threading.get_ident()
+                try:
+                    self.connection.close()
+                finally:
+                    self.closed.set()
+
+            def __getattr__(self, name):
+                return getattr(self.connection, name)
+
+        class SqliteProxy:
+            def __getattr__(self, name):
+                return getattr(original, name)
+
+            def connect(self, database, *args, **options):
+                role = None
+                if isinstance(database, str) and database.startswith("file:"):
+                    role = "writer" if "mode=rw" in database else "observer"
+                    if role == "observer" and harness.observer_uri is not None:
+                        database = harness.observer_uri
+                connection = original.connect(database, *args, **options)
+                if role is None:
+                    return connection
+                probe = Connection(connection, role, options)
+                harness.connections.append(probe)
+                return probe
+
+        monkeypatch.setattr(source_module, "sqlite3", SqliteProxy())
+
+    @contextmanager
+    def hold(self, statement, *, role="writer"):
+        barrier = _Barrier()
+        before = self.before_execute
+
+        def pause(probe, sql, parameters):
+            before(probe, sql, parameters)
+            if probe.role == role and sql == statement and not barrier.entered.is_set():
+                barrier._pause()
+
+        self.before_execute = pause
+        try:
+            yield barrier
+        finally:
+            barrier.release()
+            self.before_execute = before
+
+
+def drain_transport_gaps(router):
+    """Wait in a test for admitted writes, then use the real owner drain."""
+
+    for submission in tuple(router._gap_writes):
+        if submission.future is not None:
+            submission.future.exception(timeout=10)
+    router.drain()
 
 
 class _DeliveryQueue:
@@ -607,7 +827,7 @@ class LiveOverviewHarness:
 
     _KINDS = frozenset(("ranking", "series", "totals", "files", "coverage"))
 
-    def __init__(self, directory=None, *, qtbot=None) -> None:
+    def __init__(self, directory=None, *, qtbot=None, journal_modes=None) -> None:
         from PyQt6.QtWidgets import QApplication
         from appio.history_router import HistoryRouter
         from appio.iodclient import AppRegistry
@@ -636,16 +856,17 @@ class LiveOverviewHarness:
         self.app = QApplication.instance() or QApplication([])
         self.age_clock = Clock(ns=100 * 10**9)
         self.recovery_clock = Clock(ns=100 * 10**9)
-        self.stores = LocalPositionStores(directory)
+        self.stores = LocalPositionStores(directory, journal_modes=journal_modes)
         self.transport = QueryTransportHarness(clock=self.age_clock)
         self.registry = AppRegistry()
         for key in (DEFAULT_KEY, "unit:beta.service"):
             app_id = self.registry.id_for(key)
             self.transport.register_subject(app_id, key)
-        self.router = HistoryRouter(
+        self.router = make_managed_router(
             self.stores.services["local"], self.transport.client, self.registry,
             clock_ns=self.age_clock)
         self.stores.attach(self.router)
+        self.transport.client._on_gap = self.router.record_transport_gap
         self.events: list[tuple] = []
         self.worker_charges: list[tuple] = []
         self._futures: dict[object, object] = {}
@@ -665,7 +886,11 @@ class LiveOverviewHarness:
             if held and future is not None and future.done():
                 self._delivery.entered.set()
                 return False
-            return collect_frame()
+            changed = collect_frame()
+            shell = getattr(self, "shell", None)
+            if shell is not None and shell._pending_source is None and shell._pending is not None:
+                shell._pending_source = self.router.preparation_source(shell._pending)
+            return changed
 
         self.router._collect_local_frame = collect_when_deliverable
         self._install_spies()
