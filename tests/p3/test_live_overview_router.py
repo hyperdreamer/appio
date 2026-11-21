@@ -1663,7 +1663,8 @@ def test_local_detail_is_lazy_selected_subject_only(tmp_path, monkeypatch):
         if router is not None:
             router.close()
         for image in captures:
-            source_registry.release_capture(image.capture_id)
+            if image.capture_id in source_registry._capture_leases:
+                source_registry.release_capture(image.capture_id)
         source_registry.close()
         if root is not None:
             root.connection.close()
@@ -2793,8 +2794,9 @@ def test_local_observations_require_committed_registered_connections(tmp_path, m
 
         gui_spec = ManagedSourceSpec(
             "primary", "gui", stores.paths["local"].as_uri() + "?mode=ro", ())
-        with pytest.raises(SourceAdmissionError, match="writer pairing"):
-            registry.register(gui_spec).result(timeout=5)
+        receipt = registry.register(gui_spec).result(timeout=5)
+        assert receipt.owner == "gui"
+        assert registry._active["primary"].actor._writer is None
 
         memory_spec = ManagedSourceSpec(
             "memory", "iod", "file::memory:?mode=memory&cache=shared", ())
@@ -2969,11 +2971,12 @@ def _capture_commit_schedule(tmp_path, monkeypatch, journal_mode, stage):
     from live_overview_support import LiveOverviewHarness, wait_for_local_frame
     import appio.history_source as history_source
 
-    probes = _track_source_connections(monkeypatch)
+    _track_source_connections(monkeypatch)
     harness = LiveOverviewHarness(tmp_path, journal_modes={"local": journal_mode})
     router = harness.router
     router.client = _IdleClient()
     registry = router._capture_provider
+    primary_observer = registry._active["local"].actor._connection
     entered = threading.Event()
     release = threading.Event()
     try:
@@ -2984,7 +2987,7 @@ def _capture_commit_schedule(tmp_path, monkeypatch, journal_mode, stage):
                 original_progress = options["progress"]
 
                 def progress(status, remaining, total):
-                    if probe is probes[0] and status == sqlite3.SQLITE_OK and not entered.is_set():
+                    if probe is primary_observer and status == sqlite3.SQLITE_OK and not entered.is_set():
                         entered.set()
                         assert release.wait(10), "backup barrier timed out"
                     original_progress(status, remaining, total)
@@ -2999,7 +3002,7 @@ def _capture_commit_schedule(tmp_path, monkeypatch, journal_mode, stage):
 
             def backup(connection, **options):
                 image = original_backup(connection, **options)
-                if connection is probes[0] and not entered.is_set():
+                if connection is primary_observer and not entered.is_set():
                     entered.set()
                     assert release.wait(10), "closing-read barrier timed out"
                 return image
@@ -3023,7 +3026,7 @@ def _capture_commit_schedule(tmp_path, monkeypatch, journal_mode, stage):
         certificate = router.frame_provenance(window)
         assert certificate.snapshot == outcome.snapshot
         assert sum(event[0] == "apply" for event in harness.events) == 1
-        assert probes[0].backup_threads[0] == probes[0].connect_thread
+        assert primary_observer.backup_threads[0] == primary_observer.connect_thread
         if stage != "after_closing":
             _assert_one_managed_replacement(harness, captured)
         return captured, certificate, next_position
@@ -4701,3 +4704,280 @@ def test_local_worker_capacity_counts_retired_jobs_and_keeps_frame_independent(t
         frame_release.set()
         router.close()
         frames.db.close()
+
+
+@pytest.mark.parametrize("journal_mode", ["DELETE", "WAL"])
+def test_transport_gap_observer_visibility_rejects_divergent_pair(
+        tmp_path, monkeypatch, journal_mode):
+    """A lock or a committed lookalike cannot replace the random pairing row."""
+    from appio.history_source import ManagedSourceRegistry, SourceAdmissionError
+    from appio.history_types import ManagedSourceSpec
+    from appio.iodclient import GapNotice
+    from live_overview_support import GapSqlHarness, LocalPositionStores
+
+    with LocalPositionStores(tmp_path, journal_modes={"local": journal_mode,
+                                                    "export": journal_mode}) as stores:
+        sql = GapSqlHarness(monkeypatch)
+        assert callable(getattr(ManagedSourceRegistry, "record_transport_gap", None))
+        spec = ManagedSourceSpec("local", "gui",
+            stores.paths["local"].as_uri() + "?mode=rw&cache=shared", ())
+        sql.observer_uri = stores.paths["export"].as_uri() + "?mode=ro&cache=shared"
+        third = sqlite3.connect(stores.paths["export"].as_uri() + "?mode=rw&cache=shared",
+                                uri=True, isolation_level=None)
+        for locked in (False, True):
+            sources = ManagedSourceRegistry(wake=lambda: None)
+            if locked:
+                third.execute("BEGIN IMMEDIATE")
+                third.execute("UPDATE boot SET started_wall=started_wall WHERE boot_id='boot-a'")
+            try:
+                with pytest.raises(SourceAdmissionError,
+                                   match="^gap writer binding is unprovable$"):
+                    sources.register(spec).result(timeout=10)
+                assert sources.registration_vector() == ()
+                assert stores.stores["local"].connection.execute(
+                    "SELECT boot_id FROM boot").fetchall() == [("boot-a",)]
+                assert stores.stores["local"].connection.execute(
+                    "SELECT count(*) FROM gap").fetchone() == (0,)
+            finally:
+                third.rollback()
+                sources.close()
+        third.close()
+
+        sql.observer_uri = None
+        sources = ManagedSourceRegistry(wake=lambda: None)
+        seen_nonces = []
+
+        def see_challenge(probe, statement, parameters):
+            if probe.role == "observer" and statement.startswith("SELECT boot_id,boot_order"):
+                assert probe.connection.execute("PRAGMA read_uncommitted").fetchone() == (1,)
+                nonce = parameters[0]
+                assert len(nonce) == 64
+                assert stores.writers["local"].execute(
+                    "SELECT 1 FROM boot WHERE boot_id=?", (nonce,)).fetchall() == []
+                seen_nonces.append(nonce)
+
+        sql.before_execute = see_challenge
+        try:
+            receipt = sources.register(spec).result(timeout=10)
+            assert len(seen_nonces) == 1
+            assert sources.observe().sources[0].registration_epoch == receipt.registration_epoch
+            sql.before_execute = lambda *args: None
+            notice = GapNotice("boot-a", 7, 1, 22 * NS, 23 * NS, "disconnect")
+            visibility_error = SourceAdmissionError(
+                "gap writer result is not visible to managed source")
+
+            def fail_visibility(probe, statement, parameters):
+                if probe.role == "observer" and "FROM gap" in statement:
+                    raise visibility_error
+
+            sql.before_execute = fail_visibility
+            with pytest.raises(SourceAdmissionError) as caught:
+                sources.record_transport_gap(notice).result(timeout=10)
+            assert caught.value is visibility_error
+            assert stores.stores["local"].connection.execute(
+                "SELECT count(*) FROM gap WHERE reason='gui_absent'").fetchone() == (1,)
+            sql.before_execute = lambda *args: None
+            retried = sources.record_transport_gap(notice).result(timeout=10)
+            assert retried.disposition == "duplicate"
+            assert len(seen_nonces) == 1
+        finally:
+            sources.close()
+            assert all(probe.closed.wait(5) for probe in sql.connections)
+
+
+@pytest.mark.parametrize("journal_mode", ["DELETE", "WAL"])
+def test_transport_gap_writer_registration_retirement_and_close(
+        tmp_path, monkeypatch, journal_mode):
+    """Both controls, incarnation retirement and actor-thread close are enforced."""
+    from appio.history_source import GapWriteResult, ManagedSourceRegistry, SourceAdmissionError
+    from appio.history_types import ManagedSourceSpec
+    from appio.iodclient import GapNotice
+    from live_overview_support import GapSqlHarness, LocalPositionStores
+
+    assert tuple(field.name for field in fields(GapWriteResult)) == (
+        "registration_epoch", "disposition", "boot_id", "from_mono_ns", "to_mono_ns")
+    result = GapWriteResult(1, "inserted", "boot-a", 0, 1)
+    with pytest.raises(FrozenInstanceError):
+        result.disposition = "duplicate"
+    for changes in ({"registration_epoch": True}, {"registration_epoch": 0},
+                    {"disposition": "other"}, {"boot_id": ""},
+                    {"from_mono_ns": True}, {"from_mono_ns": -1},
+                    {"to_mono_ns": 0}, {"to_mono_ns": 2**63}):
+        with pytest.raises(ValueError):
+            replace(result, **changes)
+    with LocalPositionStores(tmp_path, journal_modes={"local": journal_mode}) as stores:
+        sql = GapSqlHarness(monkeypatch)
+        checked = []
+
+        def check_controls(probe, statement, parameters):
+            if probe.role != "observer" or statement != "PRAGMA main.data_version":
+                return
+            connection = probe.connection
+            assert connection.execute("PRAGMA query_only").fetchone() == (1,)
+            assert connection.execute("PRAGMA read_uncommitted").fetchone() == (0,)
+            for forbidden in ("PRAGMA query_only=OFF", "PRAGMA read_uncommitted=ON",
+                              "UPDATE boot SET started_wall=started_wall",
+                              "ATTACH ':memory:' AS forbidden"):
+                with pytest.raises(sqlite3.DatabaseError, match="not authorized"):
+                    connection.execute(forbidden)
+            connection.set_authorizer(None)
+            try:
+                with pytest.raises(sqlite3.OperationalError, match="readonly"):
+                    connection.execute("UPDATE boot SET started_wall=started_wall")
+            finally:
+                connection.set_authorizer(probe.authorizer)
+            checked.append(threading.get_ident())
+
+        sql.before_execute = check_controls
+        sources = ManagedSourceRegistry(wake=lambda: None)
+        spec = ManagedSourceSpec("local", "gui",
+            stores.paths["local"].as_uri() + "?mode=rw&cache=shared", ())
+        notice = GapNotice("boot-a", 7, 1, 22 * NS, 23 * NS, "disconnect")
+        try:
+            for unmanaged in (stores.stores["local"].connection, stores.services["local"]):
+                with pytest.raises(SourceAdmissionError, match="ManagedSourceSpec"):
+                    sources.register(unmanaged).result(timeout=0)
+            assert sources.registration_vector() == ()
+            admission = sources.register(spec)
+            assert admission.exception(timeout=10) is None, "valid primary pair was rejected"
+            first = admission.result(timeout=0)
+            assert checked and checked[0] != threading.get_ident()
+            writer, observer = sql.connections
+            assert writer.role == "writer" and observer.role == "observer"
+            assert writer.thread == observer.thread
+            assert observer.options["cached_statements"] == 0
+            with pytest.raises(sqlite3.ProgrammingError):
+                writer.connection.execute("SELECT 1")
+            with sql.hold("COMMIT") as barrier:
+                old = sources.record_transport_gap(notice)
+                barrier.wait()
+                queued = sources.record_transport_gap(replace(notice, from_mono_ns=24 * NS,
+                                                               to_mono_ns=25 * NS))
+                replacement = sources.replace("local", spec)
+                assert sources.registration_vector() == ()
+                assert not replacement.done()
+                barrier.release()
+                assert old.result(timeout=10).registration_epoch == first.registration_epoch
+                with pytest.raises(SourceAdmissionError, match="retired"):
+                    queued.result(timeout=10)
+                second = replacement.result(timeout=10)
+                assert second.registration_epoch > first.registration_epoch
+            with sql.hold("BEGIN IMMEDIATE") as barrier:
+                admitted = sources.record_transport_gap(replace(notice, from_mono_ns=26 * NS,
+                                                                 to_mono_ns=27 * NS))
+                barrier.wait()
+                shutdown_queued = sources.record_transport_gap(replace(notice, from_mono_ns=28 * NS,
+                                                                       to_mono_ns=29 * NS))
+                close_error = None
+                try:
+                    sources.close()
+                except sqlite3.ProgrammingError as error:
+                    close_error = error
+                assert close_error is None, "registry close accessed SQLite on the caller thread"
+                assert not admitted.done()
+                assert not sql.connections[-1].closed.is_set()
+                with pytest.raises(SourceAdmissionError, match="closed"):
+                    sources.record_transport_gap(notice).result(timeout=0)
+                barrier.release()
+                assert admitted.result(timeout=10).disposition == "inserted"
+                assert shutdown_queued.result(timeout=10).disposition == "inserted"
+            for probe in sql.connections:
+                assert probe.closed.wait(5)
+                assert probe.close_thread == probe.thread
+        finally:
+            sources.close()
+
+
+@pytest.mark.parametrize("mode", ["local", "remote"])
+def test_transport_gap_fence_error_and_later_gap_ordering(tmp_path, monkeypatch, mode):
+    """A preceding write gates the new owner and a later write retires it."""
+    from appio.iodclient import GapNotice
+    from live_overview_support import (GapSqlHarness, LocalPositionStores,
+        drain_transport_gaps, make_managed_router, wait_for_local_frame)
+
+    with LocalPositionStores(tmp_path) as stores:
+        sql = GapSqlHarness(monkeypatch)
+        client = _IdleClient() if mode == "local" else _BoundClient(boot="boot-a")
+        router = make_managed_router(stores.services["local"], client, AppRegistry())
+        notice = GapNotice("boot-a", 7, 1, 21 * NS, 22 * NS, "disconnect")
+        scope = Window("range", "boot-a", 10 * NS, 30 * NS)
+        capture = router._capture_provider.capture
+        captures = []
+
+        def record_capture():
+            captures.append(router._generation)
+            return capture()
+
+        monkeypatch.setattr(router._capture_provider, "capture", record_capture)
+        try:
+            with sql.hold("BEGIN IMMEDIATE") as barrier:
+                assert router.record_transport_gap(notice) is None
+                barrier.wait()
+                assert router.transport_issues == [notice]
+                router.prepare(scope)
+                generation = router._generation
+                if mode == "local":
+                    assert router.preparation_source(scope) is None
+                assert router.pending_work and not router.local_read_in_flight
+                assert not captures and not router._capture_jobs and not router._frame_jobs
+                if mode == "remote":
+                    assert not client.requests
+                assert router.drain() is False
+                barrier.release()
+                drain_transport_gaps(router)
+            assert captures == [generation]
+            assert router._generation == generation
+            outcome = wait_for_local_frame(router)
+            assert outcome.known_gaps == (("boot-a", 21 * NS, 22 * NS),)
+            if mode == "local":
+                assert router.preparation_source(scope) == outcome.snapshot.bracket.opening
+                assert router.ready(scope)
+            later = replace(notice, from_mono_ns=23 * NS, to_mono_ns=24 * NS)
+            router.record_transport_gap(later)
+            drain_transport_gaps(router)
+            assert router._generation == generation + 1
+            assert not router.ready(scope)
+            repeated = replace(notice, from_mono_ns=27 * NS, to_mono_ns=28 * NS)
+            prior_captures = len(captures)
+            with sql.hold("BEGIN IMMEDIATE") as barrier:
+                router.record_transport_gap(repeated)
+                barrier.wait()
+                router.prepare(scope)
+                fenced_generation = router._generation
+                router.record_transport_gap(repeated)
+                barrier.release()
+                drain_transport_gaps(router)
+            assert router._generation == fenced_generation + 1, "later duplicate entered an earlier fence"
+            assert len(captures) == prior_captures
+            if mode == "local":
+                sources = router._capture_provider
+                primary_spec = sources._active["local"].spec
+                invalidations = []
+                invalidate = router.invalidate
+
+                def observe_invalidation(**options):
+                    invalidations.append(options)
+                    invalidate(**options)
+
+                monkeypatch.setattr(router, "invalidate", observe_invalidation)
+                with sql.hold("COMMIT") as barrier:
+                    router.record_transport_gap(replace(notice, from_mono_ns=29 * NS,
+                                                         to_mono_ns=30 * NS))
+                    barrier.wait()
+                    replacement = sources.replace("local", primary_spec)
+                    barrier.release()
+                    replacement.result(timeout=10)
+                    drain_transport_gaps(router)
+                assert invalidations == [], "retired gap invalidated the replacement epoch"
+                actor = sources._active["local"].actor
+                with sql.hold("COMMIT") as barrier:
+                    router.record_transport_gap(replace(notice, from_mono_ns=25 * NS,
+                                                         to_mono_ns=26 * NS))
+                    barrier.wait()
+                    router.close()
+                    barrier.release()
+                    actor.closed.result(timeout=10)
+                router.drain()
+                assert not router.pending_work, "closed gap completion kept the poll charged"
+        finally:
+            router.close()

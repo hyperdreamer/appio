@@ -3632,6 +3632,73 @@ def test_close_during_probe_drops_all_late_effects(qtbot, monkeypatch):
         setup.release.set()
 
 
+@pytest.mark.parametrize("journal_mode", ["DELETE", "WAL"])
+def test_transport_gap_callback_persists_before_frame_capture(qtbot, tmp_path, monkeypatch, journal_mode):
+    """A real bounded wire callback returns while the actor fences preparation."""
+    from appio.ipc_models import StreamCursor
+    from appio.ipc_protocol import encode_frame
+    from appio.iodclient import AppRegistry
+    from live_overview_support import (GapSqlHarness, LocalPositionStores,
+        drain_transport_gaps, make_managed_router, wait_for_local_frame)
+    from live_overview_transport import QueryTransportHarness
+    from tests.p3.test_iodclient import gap_frame
+
+    with LocalPositionStores(tmp_path, journal_modes={"local": journal_mode}) as stores:
+        sql = GapSqlHarness(monkeypatch)
+        peer = QueryTransportHarness(cursor=None)
+        history_ref = []
+        peer.client._on_gap = lambda notice: history_ref[0].record_transport_gap(notice)
+        history = make_managed_router(stores.services["local"], peer.client, AppRegistry())
+        history_ref.append(history)
+        shell, _, _, _ = controlled_build(qtbot, history=history, pump=peer.pump)
+        shell._timer.stop()
+        shell._poll_timer.stop()
+        captures = []
+        capture = history._capture_provider.capture
+
+        def capture_after_gap():
+            captures.append(stores.stores["local"].connection.execute(
+                "SELECT count(*) FROM gap WHERE reason='gui_absent'").fetchone()[0])
+            return capture()
+
+        monkeypatch.setattr(history._capture_provider, "capture", capture_after_gap)
+        scope = Window("range", "boot-a", 10 * 10**9, 30 * 10**9)
+        try:
+            with sql.hold("BEGIN IMMEDIATE") as barrier:
+                peer.server.sendall(encode_frame(gap_frame(previous=None,
+                    current=StreamCursor("boot-a", 7, 1), start=21 * 10**9, end=22 * 10**9)))
+                peer.pump()
+                assert len(history.transport_issues) == 1
+                assert history.transport_issues[0].from_mono_ns == 21 * 10**9
+                barrier.wait()
+                shell.show_window(scope)
+                assert shell._pending == scope
+                assert captures == [] and peer.query_frames == []
+                assert not history.local_read_in_flight and history.pending_work
+                shell._poll_history()
+                assert shell._pending == scope and captures == []
+                barrier.release()
+                drain_transport_gaps(history)
+            assert captures == [1]
+            outcome = wait_for_local_frame(history)
+            assert outcome.known_gaps == (("boot-a", 21 * 10**9, 22 * 10**9),)
+            assert history.preparation_source(scope) == outcome.snapshot.bracket.opening
+            assert shell.apply_ready_frame(context="poll")
+            assert shell._displayed == scope
+            generation = history._generation
+            rows = stores.stores["local"].connection.execute("SELECT count(*) FROM gap").fetchone()
+            peer.server.close()
+            peer.client.pump()
+            assert history.transport_issues[-1].from_mono_ns is None
+            drain_transport_gaps(history)
+            assert history._generation == generation
+            assert stores.stores["local"].connection.execute("SELECT count(*) FROM gap").fetchone() == rows
+        finally:
+            shell.shutdown()
+            for server in peer.servers:
+                server.close()
+
+
 @pytest.fixture
 def real_files_shell(qtbot, tmp_path, monkeypatch):
     from dataclasses import replace
@@ -3642,6 +3709,7 @@ def real_files_shell(qtbot, tmp_path, monkeypatch):
     from appio.history_router import HistoryRouter
     from appio.iodclient import AppRegistry
     from appio.query import QueryService
+    from live_overview_support import make_managed_router, wait_for_local_frame
     from tests.p3.test_iodclient import Harness
     from tests.p4.test_file_runtime import Frames, event
 
@@ -3656,7 +3724,7 @@ def real_files_shell(qtbot, tmp_path, monkeypatch):
     runtime.consume(*frames.tick(0))
     runtime.consume(*frames.tick(FILE_HOUR_NS, amount=200))
     harness = Harness()
-    history = HistoryRouter(QueryService(frames.db), harness.client, AppRegistry())
+    history = make_managed_router(QueryService(frames.db), harness.client, AppRegistry())
     harness.client._on_gap = history.record_transport_gap
     harness.client.pump()
     window, coordinator, _, setup = controlled_build(qtbot, history=history)
@@ -3666,7 +3734,7 @@ def real_files_shell(qtbot, tmp_path, monkeypatch):
     monkeypatch.setattr(window, "_submit_probe", lambda **_kwargs: False)
     target = Window("since_boot", "boot-A", end_mono_ns=FILE_HOUR_NS)
     window.show_window(target)
-    history._local_future.result(timeout=5)
+    wait_for_local_frame(history)
     assert window.apply_ready_frame()
     view = window.files_view
 
@@ -3737,8 +3805,11 @@ class HeldFileDelivery:
 
         monkeypatch.setattr(history, "_read_local_files", held)
         monkeypatch.setattr(view, "_deliver", capture)
+        from live_overview_support import wait_for_capture_admission
+
         charged = set(history._worker_jobs)
         view.request_refresh()
+        wait_for_capture_admission(history)
         assert self.started.wait(1)
         admitted = set(history._worker_jobs) - charged
         self.worker_future = history._worker_jobs[next(iter(admitted))][1]
@@ -3795,6 +3866,10 @@ def invalidate_shell(shell, route, monkeypatch, *, defer_tick=True):
             shell.harness.eof()
         window._pump = shell.harness.client.pump
         window.refresh()
+        if route == "pump":
+            from live_overview_support import drain_transport_gaps
+            with shell.view.transient_scope():
+                drain_transport_gaps(history)
     elif route in ("reconcile", "tick_local", "healthy_tick"):
         if route != "healthy_tick":
             coordinator.invalidate_on = route
@@ -3833,13 +3908,15 @@ def invalidate_shell(shell, route, monkeypatch, *, defer_tick=True):
 
 
 def apply_replacement(shell):
+    from live_overview_support import wait_for_local_frame
+
     window, history, view = shell.window, shell.history, shell.view
     if window._pending is None:
         # Call the class driver because the default-invalidator tests defer the
         # instance driver until after their pre-next-tick delivery observation.
         CollectorWindow._tick_target(window)
     assert window._pending == shell.target
-    history._local_future.result(timeout=5)
+    wait_for_local_frame(history)
     assert window.apply_ready_frame()
     assert not view._transient and view._scope_ready
 

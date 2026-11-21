@@ -1,26 +1,29 @@
 """Managed, actor-owned SQLite sources for local history observations.
 
 Each source actor owns one long-lived observer connection and performs every
-SQLite operation, including backup and close, on its own thread. Registry
-results contain immutable records only. The source URI and connection never
-leave the actor.
+SQLite operation, including backup and close, on its own thread. The primary
+GUI actor also owns its paired gap writer. Registry results contain immutable
+records only. The source URI and connections stay on their owning actor.
 """
 
 from __future__ import annotations
 
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import hashlib
 import math
 import os
 import queue
+import secrets
 import sqlite3
 import tempfile
 import threading
 import time
-from urllib.parse import parse_qsl, unquote, urlsplit
-from typing import Callable
+from urllib.parse import parse_qsl, unquote, urlencode, urlsplit, urlunsplit
+from typing import Callable, Literal
 
+from .contracts import SQLITE_INT_MAX, validate_enum, validate_sqlite_integer
+from .iodclient import GapNotice
 from .history_types import (
     CapturedSourceImage,
     CapturedSourceSet,
@@ -30,11 +33,49 @@ from .history_types import (
 )
 from .migrations import validate_schema
 
-__all__ = ["ManagedSourceRegistry", "SourceAdmissionError"]
+__all__ = ["GapWriteResult", "ManagedSourceRegistry", "SourceAdmissionError"]
 
 
 class SourceAdmissionError(RuntimeError):
     """A managed source could not be safely admitted or observed."""
+
+
+@dataclass(frozen=True)
+class GapWriteResult:
+    registration_epoch: int
+    disposition: Literal["inserted", "duplicate", "unknown_boot"]
+    boot_id: str
+    from_mono_ns: int
+    to_mono_ns: int
+
+    def __post_init__(self) -> None:
+        if (isinstance(self.registration_epoch, bool)
+                or not isinstance(self.registration_epoch, int)
+                or self.registration_epoch <= 0):
+            raise ValueError("gap registration_epoch must be a positive integer")
+        validate_enum(self.disposition, ("inserted", "duplicate", "unknown_boot"),
+                      "gap disposition")
+        if not isinstance(self.boot_id, str) or not self.boot_id:
+            raise ValueError("gap boot_id must be nonempty text")
+        validate_sqlite_integer(self.from_mono_ns, "gap.from_mono_ns")
+        validate_sqlite_integer(self.to_mono_ns, "gap.to_mono_ns")
+        if self.from_mono_ns >= self.to_mono_ns:
+            raise ValueError("gap bounds must be strictly increasing")
+
+
+@dataclass(frozen=True)
+class _GapWrite:
+    notice: GapNotice
+
+
+def _validate_gap_notice(notice: GapNotice) -> None:
+    if not isinstance(notice, GapNotice):
+        raise ValueError("gap writer requires a GapNotice")
+    GapNotice.__post_init__(notice)
+    if not notice.boot_id:
+        raise ValueError("gap writer requires a boot identity")
+    validate_sqlite_integer(notice.from_mono_ns, "gap.from_mono_ns")
+    validate_sqlite_integer(notice.to_mono_ns, "gap.to_mono_ns")
 
 
 @dataclass(frozen=True)
@@ -64,7 +105,14 @@ class _PendingRegistration:
 _STOP = object()
 _EPOCH_LOCK = threading.Lock()
 _NEXT_REGISTRATION_EPOCH = 1
-_READ_ONLY_PRAGMAS = frozenset(("data_version", "database_list", "user_version"))
+_READ_ONLY_PRAGMAS = frozenset((
+    "data_version", "database_list", "user_version", "query_only", "read_uncommitted"))
+_GAP_RETRY_NS = 1_000_000_000
+_GAP_ATTEMPTS = 10
+_GAP_RETRY_SECONDS = 0.01
+_GAP_PREDICATE = (
+    "SELECT 1 FROM gap WHERE boot_id=? AND source='gui' "
+    "AND from_mono_ns=? AND to_mono_ns=? AND reason='gui_absent'")
 _WRITE_ACTION_NAMES = (
     "SQLITE_INSERT",
     "SQLITE_UPDATE",
@@ -169,7 +217,19 @@ def _connection_options(spec: ManagedSourceSpec) -> dict[str, object]:
     return options
 
 
-def _open_read_only_connection(spec: ManagedSourceSpec) -> sqlite3.Connection:
+def _query(connection: sqlite3.Connection, statement: str, parameters: tuple = ()) -> list:
+    """Finish every SQLite cursor before the actor changes transaction state."""
+
+    cursor = connection.execute(statement, parameters)
+    try:
+        return cursor.fetchall()
+    finally:
+        cursor.close()
+
+
+def _open_read_only_connection(
+        spec: ManagedSourceSpec, *, authorizer: Callable | None = None,
+) -> sqlite3.Connection:
     _validate_file_uri(spec.database_uri)
     options = _connection_options(spec)
     isolation_level = options.pop("isolation_level", None)
@@ -184,6 +244,7 @@ def _open_read_only_connection(spec: ManagedSourceSpec) -> sqlite3.Connection:
         validate_schema(connection)
 
         connection.execute("PRAGMA busy_timeout=0").close()
+        connection.execute("PRAGMA read_uncommitted=OFF").close()
         connection.execute("PRAGMA query_only=ON").close()
         cursor = connection.execute("PRAGMA query_only")
         try:
@@ -192,7 +253,7 @@ def _open_read_only_connection(spec: ManagedSourceSpec) -> sqlite3.Connection:
             cursor.close()
         if query_only is None or query_only[0] != 1:
             raise SourceAdmissionError("managed source query-only mode is unavailable")
-        connection.set_authorizer(_read_only_authorizer)
+        connection.set_authorizer(authorizer or _read_only_authorizer)
         return connection
     except BaseException:
         connection.close()
@@ -205,12 +266,16 @@ def _read_only_authorizer(action: int, first: str | None, second: str | None,
         return sqlite3.SQLITE_DENY
     if action == sqlite3.SQLITE_PRAGMA:
         pragma = "" if first is None else first.lower()
-        if second is not None or pragma not in _READ_ONLY_PRAGMAS:
-            return sqlite3.SQLITE_DENY
+        if second is None and pragma in _READ_ONLY_PRAGMAS:
+            return sqlite3.SQLITE_OK
+        return sqlite3.SQLITE_DENY
     if action == sqlite3.SQLITE_FUNCTION and second is not None:
         if second.lower() == "load_extension":
             return sqlite3.SQLITE_DENY
-    return sqlite3.SQLITE_OK
+    if action in (sqlite3.SQLITE_SELECT, sqlite3.SQLITE_READ,
+                  sqlite3.SQLITE_FUNCTION, sqlite3.SQLITE_RECURSIVE):
+        return sqlite3.SQLITE_OK
+    return sqlite3.SQLITE_DENY
 
 
 def _position(connection: sqlite3.Connection, spec: ManagedSourceSpec,
@@ -302,12 +367,15 @@ class _SourceActor:
 
     def __init__(self, spec: ManagedSourceSpec, registration_epoch: int,
                  wake: Callable[[], None], clock_ns: Callable[[], int],
-                 busy_timeout_ns: int) -> None:
+                 busy_timeout_ns: int, retry_wait: Callable[[float], None]) -> None:
         self.spec = spec
         self.registration_epoch = registration_epoch
         self._wake = wake
         self._clock_ns = clock_ns
         self._busy_timeout_ns = busy_timeout_ns
+        self._retry_wait = retry_wait
+        self._pairing = False
+        self._writer: sqlite3.Connection | None = None
         self._commands: queue.Queue[
             tuple[object, Future | None, _CaptureLease | None]
         ] = queue.Queue()
@@ -334,7 +402,7 @@ class _SourceActor:
     def start(self) -> None:
         self._thread.start()
 
-    def submit(self, operation: str, lease: _CaptureLease | None = None) -> Future:
+    def submit(self, operation: str | _GapWrite, lease: _CaptureLease | None = None) -> Future:
         future: Future = Future()
         with self._status_lock:
             if lease is None:
@@ -347,7 +415,7 @@ class _SourceActor:
                 else:
                     self._commands.put((operation, future, None))
             elif (lease.actor is not self or lease not in self._leases
-                  or self._status not in ("active", "retiring")):
+                  or self._status not in ("active", "retiring", "draining")):
                 future.set_exception(SourceAdmissionError(
                     f"managed source {self.spec.name!r} is not active"))
             else:
@@ -374,11 +442,11 @@ class _SourceActor:
                     self._commands.put((*command, None))
                 self._deferred.clear()
 
-    def close(self) -> Future:
+    def close(self, *, drain_gaps: bool = False) -> Future:
         with self._status_lock:
-            if self._status not in ("retiring", "closed", "failed"):
-                self._status = "retiring"
-            if self._status == "retiring" and not self._leases:
+            if self._status not in ("retiring", "draining", "closed", "failed"):
+                self._status = "draining" if drain_gaps else "retiring"
+            if self._status in ("retiring", "draining") and not self._leases:
                 self._queue_stop_locked()
             elif self._status == "failed" and not self.closed.done():
                 # The opening path always completes ``closed`` after cleanup.
@@ -400,7 +468,7 @@ class _SourceActor:
                 for command in self._deferred:
                     self._commands.put((*command, None))
                 self._deferred.clear()
-            if self._status == "retiring" and not self._leases:
+            if self._status in ("retiring", "draining") and not self._leases:
                 self._queue_stop_locked()
 
     def _set_status(self, status: str) -> None:
@@ -420,9 +488,158 @@ class _SourceActor:
                     raise
                 time.sleep(0.005)
 
+    def _observer_authorizer(self, action, first, second, database, source) -> int:
+        if (self._pairing and action == sqlite3.SQLITE_PRAGMA
+                and first is not None and first.lower() == "read_uncommitted"):
+            return sqlite3.SQLITE_OK
+        return _read_only_authorizer(action, first, second, database, source)
+
+    def _retry_writer(self, operation: Callable):
+        deadline = self._clock_ns() + _GAP_RETRY_NS
+        for attempt in range(_GAP_ATTEMPTS):
+            try:
+                return operation()
+            except BaseException as error:
+                if self._writer.in_transaction:
+                    _query(self._writer, "ROLLBACK")
+                code = getattr(error, "sqlite_errorcode", 0) & 0xff
+                if (code not in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED)
+                        or attempt + 1 == _GAP_ATTEMPTS
+                        or self._clock_ns() >= deadline):
+                    raise
+                remaining = (deadline - self._clock_ns()) / 1_000_000_000
+                if remaining <= 0:
+                    raise
+                self._retry_wait(min(_GAP_RETRY_SECONDS, remaining))
+                if self._clock_ns() >= deadline:
+                    raise
+
+    def _open_primary(self) -> None:
+        """Create and challenge the only writer/observer pair for this epoch."""
+
+        try:
+            _validate_file_uri(self.spec.database_uri)
+            parsed = urlsplit(self.spec.database_uri)
+            parameters = dict(parse_qsl(parsed.query))
+            if parameters != {"mode": "rw", "cache": "shared"}:
+                raise SourceAdmissionError("primary URI requires mode=rw&cache=shared")
+            options = _connection_options(self.spec)
+            if ("isolation_level" in options
+                    or options.get("cached_statements", 0) != 0):
+                raise SourceAdmissionError("primary connection options conflict with pairing")
+            self._writer = sqlite3.connect(
+                self.spec.database_uri, uri=True, isolation_level=None,
+                check_same_thread=True, timeout=0, cached_statements=0)
+            _query(self._writer, "PRAGMA busy_timeout=0")
+            _query(self._writer, "PRAGMA foreign_keys=ON")
+            _query(self._writer, "PRAGMA synchronous=FULL")
+            if (_query(self._writer, "PRAGMA foreign_keys") != [(1,)]
+                    or _query(self._writer, "PRAGMA synchronous") != [(2,)]
+                    or self._writer.in_transaction):
+                raise SourceAdmissionError("primary writer controls are unavailable")
+            validate_schema(self._writer)
+            observer_uri = urlunsplit(parsed._replace(
+                query=urlencode({"mode": "ro", "cache": "shared"})))
+            observer_spec = replace(self.spec, database_uri=observer_uri,
+                                    connect_options=(("cached_statements", "0"), ("timeout", "0")))
+            self._connection = _open_read_only_connection(
+                observer_spec, authorizer=self._observer_authorizer)
+            self._retry_writer(self._challenge_pair)
+            if _query(self._connection, "PRAGMA query_only") != [(1,)]:
+                raise SourceAdmissionError("primary observer is not query-only")
+            for statement in ("PRAGMA query_only=OFF", "PRAGMA read_uncommitted=ON",
+                              "UPDATE boot SET source=source WHERE 0"):
+                try:
+                    _query(self._connection, statement)
+                except sqlite3.DatabaseError as error:
+                    if getattr(error, "sqlite_errorcode", 0) != sqlite3.SQLITE_AUTH:
+                        raise
+                else:
+                    raise SourceAdmissionError("primary observer authorizer is unavailable")
+        except BaseException as error:
+            raise SourceAdmissionError("gap writer binding is unprovable") from error
+
+    def _challenge_pair(self) -> None:
+        writer, observer = self._writer, self._connection
+        if writer.in_transaction or observer.in_transaction:
+            raise SourceAdmissionError("pairing requires committed connections")
+        _query(writer, "BEGIN IMMEDIATE")
+        try:
+            for _ in range(10):
+                nonce = secrets.token_hex(32)
+                order = secrets.randbelow(SQLITE_INT_MAX) + 1
+                if not _query(writer, "SELECT 1 FROM boot WHERE boot_id=? OR boot_order=?",
+                              (nonce, order)):
+                    break
+            else:
+                raise SourceAdmissionError("pairing challenge identities collided")
+            _query(writer, "INSERT INTO boot(boot_id,boot_order,started_mono_ns,started_wall,source) "
+                   "VALUES(?,?,0,0,'gui')", (nonce, order))
+            self._pairing = True
+            _query(observer, "PRAGMA read_uncommitted=ON")
+            if _query(observer, "SELECT boot_id,boot_order FROM boot WHERE boot_id=? AND boot_order=?",
+                      (nonce, order)) != [(nonce, order)]:
+                raise SourceAdmissionError("pairing challenge is invisible")
+            _query(writer, "ROLLBACK")
+            for connection in (writer, observer):
+                if _query(connection, "SELECT 1 FROM boot WHERE boot_id=?", (nonce,)):
+                    raise SourceAdmissionError("pairing challenge survived rollback")
+        finally:
+            try:
+                if writer.in_transaction:
+                    _query(writer, "ROLLBACK")
+            finally:
+                self._pairing = True
+                try:
+                    _query(observer, "PRAGMA read_uncommitted=OFF")
+                    if _query(observer, "PRAGMA read_uncommitted") != [(0,)]:
+                        raise SourceAdmissionError("pairing mode could not be restored")
+                finally:
+                    self._pairing = False
+
+    def _write_gap(self, notice: GapNotice) -> GapWriteResult:
+        _validate_gap_notice(notice)
+        if self._writer is None:
+            raise SourceAdmissionError("managed source has no primary gap writer")
+
+        def transaction() -> GapWriteResult:
+            writer, observer = self._writer, self._connection
+            if writer.in_transaction or observer.in_transaction:
+                raise SourceAdmissionError("gap write requires committed connections")
+            bounds = (notice.boot_id, notice.from_mono_ns, notice.to_mono_ns)
+            _query(writer, "BEGIN IMMEDIATE")
+            disposition: Literal["inserted", "duplicate", "unknown_boot"]
+            if not _query(writer, "SELECT 1 FROM boot WHERE boot_id=?", (notice.boot_id,)):
+                disposition = "unknown_boot"
+                _query(writer, "ROLLBACK")
+            elif _query(writer, _GAP_PREDICATE, bounds):
+                disposition = "duplicate"
+                _query(writer, "ROLLBACK")
+            else:
+                epoch = _query(writer, "SELECT epoch FROM collector_epoch WHERE source='gui'")
+                _query(writer, "INSERT INTO gap(boot_id,source,epoch,seq,from_mono_ns,to_mono_ns,reason) "
+                       "VALUES(?,'gui',?,0,?,?,'gui_absent')",
+                       (notice.boot_id, epoch[0][0] if epoch else 1,
+                        notice.from_mono_ns, notice.to_mono_ns))
+                _query(writer, "COMMIT")
+                disposition = "inserted"
+            if writer.in_transaction or observer.in_transaction:
+                raise SourceAdmissionError("gap write left a transaction open")
+            boot_visible = bool(_query(observer, "SELECT 1 FROM boot WHERE boot_id=?", (notice.boot_id,)))
+            gap_visible = bool(_query(observer, _GAP_PREDICATE, bounds))
+            if ((disposition == "unknown_boot" and boot_visible)
+                    or (disposition != "unknown_boot" and not (boot_visible and gap_visible))):
+                raise SourceAdmissionError("gap writer result is not visible to managed source")
+            return GapWriteResult(self.registration_epoch, disposition, *bounds)
+
+        return self._retry_writer(transaction)
+
     def _run(self) -> None:
         try:
-            self._connection = _open_read_only_connection(self.spec)
+            if self.spec.name == "local" and self.spec.owner == "gui":
+                self._open_primary()
+            else:
+                self._connection = _open_read_only_connection(self.spec)
             initial = self._observe()
         except BaseException as error:
             self._set_status("failed")
@@ -441,9 +658,13 @@ class _SourceActor:
                     break
                 assert future is not None
                 with self._status_lock:
-                    admitted = (self._status == "active" or (
-                        lease is not None and lease in self._leases
-                        and self._status == "retiring"))
+                    admitted = (self._status == "active"
+                                or (self._status == "draining" and isinstance(operation, _GapWrite))
+                                or (lease is not None and lease in self._leases
+                                    and self._status in ("retiring", "draining")))
+                if not future.set_running_or_notify_cancel():
+                    self._notify()
+                    continue
                 if not admitted:
                     future.set_exception(SourceAdmissionError(
                         f"managed source {self.spec.name!r} is retired"))
@@ -456,6 +677,8 @@ class _SourceActor:
                         result = _backup_image(
                             self._connection, clock_ns=self._clock_ns,
                             deadline_ns=self._clock_ns() + self._busy_timeout_ns)
+                    elif isinstance(operation, _GapWrite):
+                        result = self._write_gap(operation.notice)
                     else:
                         raise SourceAdmissionError("managed source operation is invalid")
                 except BaseException as error:
@@ -469,11 +692,13 @@ class _SourceActor:
 
     def _finish_close(self) -> None:
         connection, self._connection = self._connection, None
-        if connection is not None:
-            try:
-                connection.close()
-            except sqlite3.Error:
-                pass
+        writer, self._writer = self._writer, None
+        for owned in (writer, connection):
+            if owned is not None:
+                try:
+                    owned.close()
+                except sqlite3.Error:
+                    pass
         self._set_status("closed")
         if not self.closed.done():
             self.closed.set_result(None)
@@ -492,17 +717,21 @@ class ManagedSourceRegistry:
 
     def __init__(self, *, wake: Callable[[], None],
                  clock_ns: Callable[[], int] = time.monotonic_ns,
-                 busy_timeout_ns: int = 2_000_000_000) -> None:
+                 busy_timeout_ns: int = 2_000_000_000,
+                 retry_wait: Callable[[float], None] = time.sleep) -> None:
         if not callable(wake):
             raise ValueError("wake must be callable")
         if not callable(clock_ns):
             raise ValueError("clock_ns must be callable")
+        if not callable(retry_wait):
+            raise ValueError("retry_wait must be callable")
         if (isinstance(busy_timeout_ns, bool) or not isinstance(busy_timeout_ns, int)
                 or busy_timeout_ns <= 0):
             raise ValueError("busy_timeout_ns must be a positive integer")
         self._wake = wake
         self._clock_ns = clock_ns
         self._busy_timeout_ns = busy_timeout_ns
+        self._retry_wait = retry_wait
         self._lock = threading.RLock()
         self._active: dict[str, _Registration] = {}
         self._pending: dict[str, _PendingRegistration] = {}
@@ -530,9 +759,6 @@ class ManagedSourceRegistry:
         with self._lock:
             if self._closed:
                 return _failed_future(SourceAdmissionError("managed source registry is closed"))
-            if spec.owner == "gui":
-                return _failed_future(SourceAdmissionError(
-                    "GUI source registration requires writer pairing admission"))
             name = spec.name
             if (name in self._active or name in self._pending or name in self._reserved):
                 return _failed_future(SourceAdmissionError(
@@ -562,15 +788,29 @@ class ManagedSourceRegistry:
                     f"managed source {name!r} already has a pending change"))
             retiring = self._retire_locked(name, "replaced")
             self._reserved[name] = future
-        if spec.owner == "gui":
-            self._fail_reservation(name, future, SourceAdmissionError(
-                "GUI source registration requires writer pairing admission"))
-        elif retiring is None:
+        if retiring is None:
             self._start_registration(spec, future)
         else:
             retiring.add_done_callback(
                 lambda completed: self._start_after_retirement(
                     spec, future, completed))
+        return future
+
+    def record_transport_gap(self, notice: GapNotice) -> Future[GapWriteResult]:
+        """Admit a bounded notice to the active primary pair without waiting."""
+
+        with self._lock:
+            if self._closed:
+                return _failed_future(SourceAdmissionError("managed source registry is closed"))
+            try:
+                _validate_gap_notice(notice)
+            except Exception as error:
+                return _failed_future(error)
+            primary = self._active.get("local")
+            if primary is None or primary.spec.owner != "gui":
+                return _failed_future(SourceAdmissionError("primary GUI source is not active"))
+            future = primary.actor.submit(_GapWrite(notice))
+        self._notify()
         return future
 
     def retire(self, name: str, reason: str) -> None:
@@ -720,7 +960,7 @@ class ManagedSourceRegistry:
             self._retiring.clear()
             self._deferred_admissions.clear()
             for actor in actors.values():
-                actor.close()
+                actor.close(drain_gaps=True)
         self._capture_executor.shutdown(wait=False, cancel_futures=True)
 
     @staticmethod
@@ -787,7 +1027,7 @@ class ManagedSourceRegistry:
                 return
             epoch = _allocate_registration_epoch()
             actor = _SourceActor(spec, epoch, self._wake, self._clock_ns,
-                                 self._busy_timeout_ns)
+                                 self._busy_timeout_ns, self._retry_wait)
             pending = _PendingRegistration(spec, epoch, actor, future)
             self._pending[spec.name] = pending
             self._reserved.pop(spec.name, None)

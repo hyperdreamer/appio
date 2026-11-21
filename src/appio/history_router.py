@@ -67,7 +67,9 @@ from .history_validation import (
     _validate_served_bounds,
     validate_query_result,
 )
-from .history_source import ManagedSourceRegistry, SourceAdmissionError, _snapshot_digest
+from .history_source import (
+    GapWriteResult, ManagedSourceRegistry, SourceAdmissionError, _snapshot_digest,
+)
 from .migrations import validate_schema
 from .durable import decode_handover
 from .file_runtime import FileAvailability
@@ -926,6 +928,23 @@ class _FrameOwner:
     remote_answered: SourcePosition | None = None
 
 
+@dataclass(eq=False)
+class _GapSubmission:
+    notice: GapNotice
+    registration_epoch: int | None
+    future: Future[GapWriteResult] | None
+    error: Exception | None = None
+
+
+@dataclass(frozen=True)
+class _Preparation:
+    owner_id: int
+    window: Window
+    authority: tuple
+    requested_source: SourcePosition | None
+    fence: tuple[_GapSubmission, ...]
+
+
 class HistoryRouter:
     def __init__(self, local: QueryService, client: IodClient, registry: AppRegistry, *,
                  clock_ns: Callable[[], int] = time.monotonic_ns,
@@ -1006,6 +1025,8 @@ class HistoryRouter:
         self._not_retained = False
         self._chronology_unproved = False
         self.transport_issues: list[GapNotice] = []
+        self._gap_writes: list[_GapSubmission] = []
+        self._preparation: _Preparation | None = None
         self._all_segments = ()
         # Two independent execution lanes (§3.3): a frame copy may never queue
         # behind lazy detail or Files work, and vice versa. `_executor` stays a
@@ -1662,7 +1683,9 @@ class HistoryRouter:
         the console's poll armed; it never waits for a target calculation.
         """
 
-        if (self._occupant is not None or self._queue or self._worker_jobs
+        if (self._preparation is not None
+                or any(item.future is not None for item in self._gap_writes)
+                or self._occupant is not None or self._queue or self._worker_jobs
                 or self._capture_jobs or self._frame_jobs
                 or self._unscheduled or self._file_owners
                 or not self._completed.empty()):
@@ -2116,8 +2139,12 @@ class HistoryRouter:
         self._settle_file(owner.outward, owner.generation, error=error)
         return True
 
-    def invalidate(self) -> None:
-        self._generation += 1
+    def invalidate(self, *, _before_preparation: bool = False) -> None:
+        # A fenced preparation has allocated an owner but has issued no work.
+        # Earlier writes retire the prior delivery before activating that owner.
+        if not _before_preparation:
+            self._generation += 1
+            self._preparation = None
         self._cancel_file_requests()
         self._file_status = FileAvailability(True, False)
         self._local_generation = -1
@@ -2164,23 +2191,78 @@ class HistoryRouter:
         self._sources[collector_id] = (service, owner)
         self.invalidate()
 
+    def _primary_registration_epoch(self) -> int | None:
+        for name, owner, epoch in self._managed_sources().registration_vector():
+            if name == "local" and owner == "gui":
+                return epoch
+        return None
+
     def record_transport_gap(self, notice: GapNotice) -> None:
-        """Persist bounded visibility loss locally, without creating root gaps."""
+        """Append the callback immediately and enqueue qualifying actor work."""
+
+        if self._closed:
+            return
         self.transport_issues.append(notice)
+        if not isinstance(notice, GapNotice):
+            raise ValueError("transport gap requires a GapNotice")
+        GapNotice.__post_init__(notice)
         if (not notice.boot_id or notice.from_mono_ns is None or notice.to_mono_ns is None
                 or notice.from_mono_ns < 0):
             return
-        connection = self.local.connection
-        if connection.execute("SELECT 1 FROM boot WHERE boot_id=?", (notice.boot_id,)).fetchone() is None:
+        epoch = self._primary_registration_epoch()
+        future = self._managed_sources().record_transport_gap(notice)
+        self._gap_writes.append(_GapSubmission(notice, epoch, future))
+
+    @property
+    def gap_persistence_error(self) -> Exception | None:
+        return next((item.error for item in self._gap_writes if item.error is not None), None)
+
+    def retry_transport_gaps(self) -> None:
+        """Retry each failed notice once on its original active primary epoch."""
+
+        if self._closed:
             return
-        exists = connection.execute("SELECT 1 FROM gap WHERE boot_id=? AND source='gui' "
-            "AND from_mono_ns=? AND to_mono_ns=? AND reason='gui_absent'",
-            (notice.boot_id, notice.from_mono_ns, notice.to_mono_ns)).fetchone()
-        if not exists:
-            epoch = connection.execute("SELECT epoch FROM collector_epoch WHERE source='gui'").fetchone()
-            AppIoStore(connection).record_gap(notice.boot_id, "gui", epoch[0] if epoch else 1,
-                0, notice.from_mono_ns, notice.to_mono_ns, "gui_absent")
-        self.invalidate()
+        if self._drain_transport_gaps():
+            self._notify()
+        epoch = self._primary_registration_epoch()
+        for item in self._gap_writes:
+            if (item.error is not None and item.future is None
+                    and epoch is not None and item.registration_epoch == epoch):
+                item.future = self._managed_sources().record_transport_gap(item.notice)
+
+    def _drain_transport_gaps(self) -> bool:
+        changed = False
+        epoch = None if self._closed else self._primary_registration_epoch()
+        for item in tuple(self._gap_writes):
+            future = item.future
+            if future is None or not future.done():
+                continue
+            item.future = None
+            try:
+                result = future.result()
+                if not isinstance(result, GapWriteResult):
+                    raise ValueError("gap writer returned an invalid result")
+                GapWriteResult.__post_init__(result)
+                if (result.registration_epoch != item.registration_epoch
+                        or (result.boot_id, result.from_mono_ns, result.to_mono_ns)
+                        != (item.notice.boot_id, item.notice.from_mono_ns, item.notice.to_mono_ns)):
+                    raise ValueError("gap writer answered another notice or registration")
+            except Exception as error:
+                item.error = error
+                changed = True
+                continue
+            item.error = None
+            self._gap_writes.remove(item)
+            if result.registration_epoch != epoch:
+                continue
+            if result.disposition in ("inserted", "duplicate"):
+                preparation = self._preparation
+                fenced = preparation is not None and item in preparation.fence
+                self.invalidate(_before_preparation=fenced)
+                if fenced:
+                    self.view_state = "loading"
+                changed = True
+        return changed
 
     def _close_views(self):
         for _, service in self._views:
@@ -2222,6 +2304,8 @@ class HistoryRouter:
                 lambda completed, sources=sources, capture_id=capture_id:
                     sources.release_capture(capture_id))
             self._worker_captures.pop(worker_id)
+        if sources is not None:
+            sources.close()
 
     def _plan(self, window):
         evidence, cuts, gaps = [], defaultdict(dict), set()
@@ -2928,8 +3012,10 @@ class HistoryRouter:
         if self._closed:
             raise RuntimeError("history router is closed")
         self._managed_sources()
-        if self.local_read_in_flight:
+        if self.local_read_in_flight or self._preparation is not None:
             raise HistoryPending("local frame is still running")
+        if self._drain_transport_gaps():
+            self._notify()
         self._reap_terminal_frame_workers()
         # Reconcile before admitting a new owner so this frame belongs to the
         # authority observed now rather than retiring itself on its first drain.
@@ -2944,6 +3030,7 @@ class HistoryRouter:
             self._queue = [entry for entry in self._queue
                            if not (entry.token.owner == "frame"
                                    and entry.token.owner_id == previous.owner_id)]
+        self._frame = None
         self._collect_captures()
         if self._local_future is not None:
             self._local_future.cancel()
@@ -2966,6 +3053,43 @@ class HistoryRouter:
         self._frame_error = None
         self._ranking_stamps = {}
         self.view_state = "loading"
+        epoch = self._primary_registration_epoch()
+        fence = tuple(item for item in self._gap_writes
+                      if epoch is not None and item.registration_epoch == epoch)
+        preparation = _Preparation(self._generation, window, self._current_authority(),
+                                   requested_source, fence)
+        self._preparation = preparation
+        if fence:
+            self._advance_preparation()
+        else:
+            self._start_preparation(preparation)
+
+    def _advance_preparation(self) -> bool:
+        preparation = self._preparation
+        if preparation is None:
+            return False
+        if any(item.future is not None for item in preparation.fence):
+            return False
+        error = next((item.error for item in preparation.fence if item.error is not None), None)
+        try:
+            if error is not None:
+                raise error
+            if (preparation.owner_id != self._generation
+                    or preparation.authority != self._current_authority()):
+                raise SourceAdmissionError("managed source registrations changed")
+            self._start_preparation(preparation)
+        except Exception as caught:
+            self._preparation = None
+            self._frame_error = caught
+            self.view_state = "unavailable: local history evidence"
+        return True
+
+    def _start_preparation(self, preparation: _Preparation) -> None:
+        """Activate the already allocated frame after all earlier gap drains."""
+
+        window = preparation.window
+        requested_source = preparation.requested_source
+        self._preparation = None
         worker_id = self._allocate_token_id()
         request = QueryRequest("ranking", window)
         binding = self._capture_local_binding(
@@ -2974,12 +3098,12 @@ class HistoryRouter:
         self._local_generation = self._generation
         self._local_worker_id = worker_id
         self._local_paths = None
-        authority = self._current_authority()
+        authority = preparation.authority
         local_token = RequestToken(
             worker_id, request, "local", None, "frame", self._generation, None,
             authority, binding.opening)
         remote_token = None
-        if remote_mode:
+        if isinstance(requested_source, RemotePosition):
             remote_token = RequestToken(
                 self._allocate_token_id(), request, "remote", None, "frame",
                 self._generation, self._allocate_token_id(), authority,
@@ -2999,6 +3123,9 @@ class HistoryRouter:
         self._dispatch()
 
     def preparation_source(self, window: Window) -> SourcePosition | None:
+        preparation = self._preparation
+        if preparation is not None and preparation.window == window:
+            return preparation.requested_source
         frame = self._frame
         if frame is None or frame.window != window or frame.retired:
             return None
@@ -3838,10 +3965,14 @@ class HistoryRouter:
         """Collect, settle, reap and dispatch once; never wait or mutate widgets."""
 
         if self._closed:
+            if self._gap_writes:
+                self._drain_transport_gaps()
             self._reap_terminal_frame_workers()
             self._reap_terminal_background_workers()
             return False
-        changed = self._reconcile_authority()
+        changed = self._drain_transport_gaps()
+        changed |= self._reconcile_authority()
+        changed |= self._advance_preparation()
         changed |= self._collect_captures()
         changed |= self._collect_local_frame()
         self._reap_terminal_frame_workers()
