@@ -106,6 +106,38 @@ def _assert_frozen(record: object, name: str) -> None:
         setattr(record, name, getattr(record, name))
 
 
+def test_remote_registration_change_retires_frame_detail_and_files(tmp_path):
+    from test_live_overview_client import _scheduler_router, _ready_remote_frame, _answer_next
+    from live_overview_support import managed_spec
+
+    window = Window("since_boot", BOOT, end_mono_ns=140 * NS)
+    router, transport, store = _scheduler_router(tmp_path)
+    imported = AppIoStore(tmp_path / "imported-authority.db")
+    try:
+        presentation = _ready_remote_frame(router, transport, window)
+        router.select_detail(KEY, window)
+        router.request_detail("totals", presentation, window)
+        _answer_next(router, transport, share(1, window))
+        scope = retention_scope(KEY, window)
+        assert router.retained("totals", KEY, scope, window.end_mono_ns) is not None
+        files = router.request_file_view(presentation, window, "bytes_total", "desc", None)
+        frame = router._frame
+        current = router._current_authority()
+        router.add_managed_source(managed_spec(imported, "imported", "iod")).result(timeout=10)
+        assert router._current_authority() == current
+        assert router.drain() is True
+        assert frame.retired
+        assert router._detail is None
+        assert router.retained("totals", KEY, scope, window.end_mono_ns) is None
+        assert files.done()
+        assert files.exception() is not None
+        assert router.frame_provenance(window) is None
+    finally:
+        router.close()
+        store.connection.close()
+        imported.connection.close()
+
+
 def test_managed_source_rejects_empty_option_value() -> None:
     from appio.history_types import ManagedSourceSpec
 
@@ -1686,8 +1718,8 @@ def test_worker_ids_are_never_reused_across_helper_and_files_admission(tmp_path,
     release = threading.Event()
     entered = threading.Event()
     submitted: list[Future] = []
+    capture = None
     try:
-        paths = _registered_paths(("local", local, "gui"))
         scope = Window("range", BOOT, 100 * NS, 140 * NS)
         from live_overview_support import make_managed_router
 
@@ -1700,6 +1732,7 @@ def test_worker_ids_are_never_reused_across_helper_and_files_admission(tmp_path,
 
         assert router.ready(scope)
         assert router.pending_work is False
+        capture = router.sources.capture().result(timeout=15)
 
         actual_submit = router._background_executor.submit
 
@@ -1722,7 +1755,7 @@ def test_worker_ids_are_never_reused_across_helper_and_files_admission(tmp_path,
             entered.set()
             assert release.wait(15), "the helper worker was never released"
             return HistoryRouter._read_local_part(
-                paths, QueryRequest("totals", scope, ALPHA),
+                capture, QueryRequest("totals", scope, ALPHA),
                 worker_id=helper_id, app_key=ALPHA)
 
         helper_job = router._submit_background_worker(helper, held_detail)
@@ -1732,6 +1765,8 @@ def test_worker_ids_are_never_reused_across_helper_and_files_admission(tmp_path,
 
         presentation = router.registry.id_for(ALPHA)
         router.request_file_view(presentation, scope, "bytes_total", "desc", None)
+        from live_overview_support import wait_for_capture_admission
+        wait_for_capture_admission(router)
 
         def held_helper_worker():
             assert False, "a queued helper worker must never run in this control"
@@ -1788,6 +1823,8 @@ def test_worker_ids_are_never_reused_across_helper_and_files_admission(tmp_path,
         release.set()
         if router is not None:
             router.close()
+            if capture is not None and capture.capture_id in router.sources._capture_leases:
+                router.sources.release_capture(capture.capture_id)
         local.connection.close()
 
 
@@ -4407,8 +4444,9 @@ def test_local_outcomes_share_settlement_for_frame_part_and_files(tmp_path):
             assert [entry for entry in settlements
                     if entry[0] == token.token_id] == [
                         (token.token_id, "frame", True)], label
-            with pytest.raises(ValueError):
+            with pytest.raises(RequestRejected) as caught:
                 router.ready(window)
+            assert caught.value.reason == "invalid_result"
 
         # A clean frame restores the supported readiness context the remaining
         # arms need; the malformed frames changed only their own owner.
@@ -4661,10 +4699,10 @@ def test_local_worker_capacity_counts_retired_jobs_and_keeps_frame_independent(t
         assert release_files.wait(20), "the Files worker was never released"
         return original_files(*args, **kwargs)
 
-    def held_frame(paths, window_arg):
+    def held_frame(paths, window_arg, **kwargs):
         frame_entered.set()
         assert frame_release.wait(20), "the frame worker was never released"
-        return original_read(paths, window_arg)
+        return original_read(paths, window_arg, **kwargs)
 
     router._read_local_part = held_part
     router._read_local_files = held_files
@@ -4689,10 +4727,16 @@ def test_local_worker_capacity_counts_retired_jobs_and_keeps_frame_independent(t
         router.select_detail(FILE_APP, window)
         assert router.request_detail("series", presentation, window).state == "pending"
         assert router.request_detail("totals", presentation, window).state == "pending"
-        _drain_until(router, detail_entered.is_set)
+        from live_overview_support import wait_for_capture_admission
+        wait_for_capture_admission(router)
         assert detail_entered.is_set()
         assert router._background_charge("detail") == 2
         assert len(submitted) == 2 and router._unscheduled == {}
+        router.prepare(window)
+        assert wait_local(router) is not None
+        assert router.ready(window) is True
+        assert not release_detail.is_set()
+        assert len(submitted) == 2
 
         # Eight Files workers fill the Files budget and the ten-job ceiling.
         # They queue behind the held detail worker; admission, not execution, is
@@ -4701,6 +4745,7 @@ def test_local_worker_capacity_counts_retired_jobs_and_keeps_frame_independent(t
             router.request_file_view(presentation, window, "bytes_total", "desc", None)
             for _ in range(8)
         ]
+        wait_for_capture_admission(router)
         assert router._background_charge("files") == 8
         assert len(router._worker_jobs) == 10
         assert len(submitted) == 10
@@ -4726,6 +4771,7 @@ def test_local_worker_capacity_counts_retired_jobs_and_keeps_frame_independent(t
         # on its own charge rather than running out of budget.
         release_detail.set()
         _drain_until(router, lambda: router._background_charge("detail") == 1)
+        wait_for_capture_admission(router)
         assert len(submitted) == 11, "exactly one waiting detail was admitted"
         assert router._background_charge("files") == 8
         assert len(router._worker_jobs) == 9
@@ -4737,6 +4783,7 @@ def test_local_worker_capacity_counts_retired_jobs_and_keeps_frame_independent(t
         router._read_local = held_frame
         frame_window = Window("range", FILE_BOOT, 0, FILE_HOUR_NS)
         router.prepare(frame_window)
+        wait_for_capture_admission(router)
         assert frame_entered.wait(10)
         running = router._local_future
         assert router.local_read_in_flight is True

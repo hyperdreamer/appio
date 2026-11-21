@@ -1759,6 +1759,7 @@ def test_collector_window_wires_stall_caption_to_real_files_view(qtbot, tmp_path
     release = threading.Event()
     try:
         window._tick_target()
+        qtbot.waitUntil(lambda: (window._tick_target(), window._pending is not None)[1], timeout=5000)
         first = window._pending
         assert first is not None
         qtbot.waitUntil(lambda: history.ready(first), timeout=5000)
@@ -1774,13 +1775,15 @@ def test_collector_window_wires_stall_caption_to_real_files_view(qtbot, tmp_path
         entered = threading.Event()
         original_read = history._read_local
 
-        def held_read(paths, requested):
+        def held_read(paths, requested, **kwargs):
             entered.set()
             assert release.wait(5), "local history read was not released"
-            return original_read(paths, requested)
+            return original_read(paths, requested, **kwargs)
 
         monkeypatch.setattr(history, "_read_local", held_read)
         window.show_window(first)
+        from live_overview_support import wait_for_capture_admission
+        wait_for_capture_admission(history)
         assert entered.wait(2)
         now[0] += STALL_BUDGET_NS
         window._poll_history()
@@ -2354,13 +2357,14 @@ def test_real_history_router_gates_rendering_until_ready(qtbot, tmp_path):
     try:
         window.refresh()
         requested = Window(kind="since_boot", boot_id=BOOT, end_mono_ns=END)
+        qtbot.waitUntil(lambda: (window.refresh(), window._pending == requested)[1], timeout=5000)
         # The requested scope is pending; no displayed alias exists yet.
         assert window._pending == requested
         assert window._target == requested
         assert window._prepared is None
         if not window.history_visible:
             assert "loading" in window.history_state.text()
-        qtbot.waitUntil(lambda: window.history_visible is True, timeout=5000)
+        qtbot.waitUntil(lambda: (window.apply_ready_frame(), window.history_visible)[1], timeout=5000)
         assert window._prepared == requested
         assert history.ready(window._prepared)
         # An applied but empty ranking is a settled panel, never an indefinite
@@ -2515,10 +2519,10 @@ def test_window_keeps_in_flight_history_for_the_same_scope(qtbot, tmp_path, monk
 
     read_local = history._read_local
 
-    def slow_local_snapshot(*args):
+    def slow_local_snapshot(*args, **kwargs):
         # Model a loaded history worker; the daemon itself answers immediately.
         stopping.wait(0.18)
-        return read_local(*args)
+        return read_local(*args, **kwargs)
 
     monkeypatch.setattr(history, "_read_local", slow_local_snapshot)
     history_ref.append(history)
@@ -3146,8 +3150,9 @@ def test_retired_pending_preparation_is_replaced_once(qtbot):
 def test_prepare_failure_after_loading_keeps_frame_closed_and_retries_on_later_tick(
     real_files_shell, monkeypatch, owner, boundary, resolution
 ):
-    import sqlite3
-    from appio.query import QueryService
+    from appio.history_source import SourceAdmissionError
+    from appio.history_types import ManagedSourceSpec
+    from live_overview_support import wait_for_local_frame
 
     shell = real_files_shell
     window, history = shell.window, shell.history
@@ -3163,50 +3168,58 @@ def test_prepare_failure_after_loading_keeps_frame_closed_and_retries_on_later_t
 
     monkeypatch.setattr(history, "prepare", record)
     history.invalidate()
-    memory = None
-    try:
-        with monkeypatch.context() as failure:
-            if boundary == "transaction":
-                shell.frames.db.execute("BEGIN")
-                message = "uncommitted transaction"
-            elif boundary == "memory_source":
-                memory = sqlite3.connect(":memory:")
-                history._sources["memory"] = (QueryService(memory), "gui")
-                message = "file-backed SQLite"
-            else:
-                def reject(*_args, **_kwargs):
-                    raise RuntimeError("synthetic submit refusal")
-                failure.setattr(history._executor, "submit", reject)
-                message = "synthetic submit refusal"
-            if owner == "clock":
-                window.refresh()
-            else:
-                with pytest.raises((ValueError, RuntimeError), match=message):
-                    window.show_window(target)
-            assert history.view_state == "loading"
-            assert window._pending is None
-            marker = window._prepare_retry
-            assert marker.owner == owner and marker.window == target
-            assert message in window._prepare_error
-            assert not shell.view._scope_ready
-            assert window._displayed == displayed
-            assert files_snapshot(shell.view) == snapshot
-            assert window.apply_ready_frame() is False
-            assert calls == [target]
-            if owner == "explicit":
-                window._tick_target()
-                assert calls == [target] and window._prepare_retry is marker
-            else:
-                # A repeated clock failure renews, rather than consumes, its marker.
-                window._tick_target()
-                assert calls == [target, target]
-                assert window._prepare_retry is not marker
-    finally:
-        if shell.frames.db.in_transaction:
-            shell.frames.db.rollback()
-        if memory is not None:
-            history._sources.pop("memory")
-            memory.close()
+    def await_failure():
+        deadline = time.monotonic() + 5
+        while window._prepare_retry is None:
+            window.apply_ready_frame()
+            assert time.monotonic() < deadline, "managed preparation failure was not delivered"
+            time.sleep(0.001)
+
+    with monkeypatch.context() as failure:
+        if boundary == "transaction":
+            actor = history.sources._active["local"].actor
+            def reject_observation():
+                raise ValueError("history source has an uncommitted transaction")
+            failure.setattr(actor, "_observe", reject_observation)
+            message = "uncommitted transaction"
+        elif boundary == "memory_source":
+            invalid = ManagedSourceSpec("memory", "iod", ":memory:", ())
+            def reject_capture():
+                return history.sources.register(invalid)
+            failure.setattr(history.sources, "capture", reject_capture)
+            message = "absolute file URI"
+        else:
+            def reject(*_args, **_kwargs):
+                raise RuntimeError("synthetic submit refusal")
+            failure.setattr(history._frame_executor, "submit", reject)
+            message = "synthetic submit refusal"
+        if owner == "clock":
+            window.refresh()
+        else:
+            window.show_window(target)
+        await_failure()
+        assert history.view_state in ("loading", "unavailable: local history evidence")
+        assert window._pending is None
+        marker = window._prepare_retry
+        assert marker.owner == owner and marker.window == target
+        assert message in window._prepare_error
+        assert not shell.view._scope_ready
+        assert window._displayed == displayed
+        assert files_snapshot(shell.view) == snapshot
+        assert window.apply_ready_frame() is False
+        assert calls == [target]
+        if owner == "explicit":
+            window._tick_target()
+            assert calls == [target] and window._prepare_retry is marker
+        else:
+            window._tick_target()
+            await_failure()
+            assert calls == [target, target]
+            assert window._prepare_retry is not marker
+    # A coalesced actor observation may still carry the injected failure.
+    pending_observation = history.sources.observe_async()
+    pending_observation.exception(timeout=5)
+    history.sources.observe_async().result(timeout=5)
     previous_calls = len(calls)
     if resolution == "no_target":
         with monkeypatch.context() as no_target:
@@ -3234,7 +3247,7 @@ def test_prepare_failure_after_loading_keeps_frame_closed_and_retries_on_later_t
     assert calls[-1] == target and window._pending == target
     assert window._prepare_retry is None and window._prepare_error is None
     assert window.error_label.text() == ""
-    history._local_future.result(timeout=5)
+    wait_for_local_frame(history)
     assert window.apply_ready_frame()
     assert window._displayed == target
 
@@ -3641,6 +3654,201 @@ def test_close_during_probe_drops_all_late_effects(qtbot, monkeypatch):
         setup.release.set()
 
 
+@pytest.mark.parametrize("phase", ["success", "admission", "router", "coordinator", "setup", "window", "refresh"])
+def test_transport_gap_startup_and_callback_shutdown_order(qapp, tmp_path, monkeypatch, phase):
+    import sqlite3
+    from PyQt6.QtCore import QEventLoop, QTimer
+    from PyQt6 import QtWidgets
+    from appio import history_source, iodclient, store as store_module
+
+    original_store = store_module.AppIoStore
+    original_registry = history_source.ManagedSourceRegistry
+    original_router = cw.HistoryRouter
+    bootstraps, registries, clients, windows = [], [], [], []
+    events, uncaught = [], []
+    owner_thread = threading.get_ident()
+    admission = Future()
+    original_error = ValueError(f"{phase} startup failed")
+    loop = QEventLoop()
+
+    class Application:
+        def processEvents(self):
+            qapp.processEvents()
+
+        def setDesktopFileName(self, name):
+            pass
+
+        def exec(self):
+            QTimer.singleShot(0, finish_admission)
+            QTimer.singleShot(250, loop.quit)
+            loop.exec()
+            return 1 if phase != "success" else 0
+
+        def exit(self, code=0):
+            events.append(("exit", code))
+            loop.quit()
+
+        def quit(self):
+            self.exit()
+
+    application = Application()
+    monkeypatch.setattr(QtWidgets, "QApplication", SimpleNamespace(instance=lambda: application))
+
+    def bootstrap(path):
+        result = original_store(path)
+        bootstraps.append(result)
+        return result
+
+    def registry(**kwargs):
+        result = original_registry(**kwargs)
+        register = result.register
+        result.register = lambda spec: admission
+        result.real_register = register
+        registries.append(result)
+        return result
+
+    def finish_admission():
+        events.append(("admission", threading.get_ident()))
+        if phase == "admission":
+            admission.set_exception(original_error)
+        else:
+            sources = registries[0]
+            from appio.history_types import ManagedSourceSpec
+            actual = sources.real_register(ManagedSourceSpec(
+                "local", "gui", (tmp_path / "startup.db").as_uri() + "?mode=rw&cache=shared", ()))
+            def completed(done):
+                try:
+                    admission.set_result(done.result())
+                except BaseException as error:
+                    admission.set_exception(error)
+            actual.add_done_callback(completed)
+
+    class Client:
+        state = iodclient.ClientState()
+        def __init__(self, *args, **kwargs):
+            events.append(("client", admission.done()))
+            self.on_gap = kwargs["on_gap"]
+            self.clock = kwargs["clock_ns"]
+            clients.append(self)
+        def close(self):
+            events.append(("client_close", threading.get_ident()))
+            self.on_gap(iodclient.GapNotice("", 0, 0, None, None, "disconnect"))
+        def pump(self):
+            pass
+
+    def router(*args, **kwargs):
+        events.append(("router", threading.get_ident()))
+        if phase == "router":
+            raise original_error
+        return original_router(*args, **kwargs)
+
+    class Coordinator:
+        resume_handover = None
+        def __init__(self, **kwargs):
+            if phase == "coordinator":
+                raise original_error
+            self.client = kwargs["client"]
+        def close(self):
+            events.append(("coordinator_close", threading.get_ident()))
+            self.client.close()
+
+    def setup(**kwargs):
+        if phase == "setup":
+            raise original_error
+        return object()
+
+    class Window:
+        def __init__(self, coordinator, history, setup, **kwargs):
+            events.append(("window", threading.get_ident()))
+            try:
+                bootstraps[0].connection.execute("SELECT 1")
+            except sqlite3.ProgrammingError:
+                events.append(("bootstrap_closed", True))
+            else:
+                events.append(("bootstrap_closed", False))
+            if phase == "window":
+                raise original_error
+            self.coordinator, self.history = coordinator, history
+            self.clock = kwargs["age_clock_ns"]
+            self.refreshes = self.polls = 0
+            windows.append(self)
+        def show(self):
+            pass
+        def refresh(self):
+            self.refreshes += 1
+            if phase == "refresh":
+                raise original_error
+            # A real actor completion after startup must only arm polling.
+            registries[0].observe_async()
+        def _arm_poll(self):
+            self.polls += 1
+            QTimer.singleShot(0, loop.quit)
+        def shutdown(self):
+            self.coordinator.close()
+            self.history.close()
+
+    monkeypatch.setattr(store_module, "AppIoStore", bootstrap)
+    monkeypatch.setattr(history_source, "ManagedSourceRegistry", registry)
+    monkeypatch.setattr(iodclient, "IodClient", Client)
+    monkeypatch.setattr(cw, "HistoryRouter", router)
+    monkeypatch.setattr(cw, "CollectorCoordinator", Coordinator)
+    monkeypatch.setattr(cw, "SetupClient", setup)
+    monkeypatch.setattr(cw, "CollectorWindow", Window)
+    def exception_hook(kind, error, traceback):
+        uncaught.append(error)
+        application.exit(91)
+    monkeypatch.setattr(cw.sys, "excepthook", exception_hook)
+    args = SimpleNamespace(db=tmp_path / "startup.db", interval=1, proc_root="/fixture", cgroup_root="/fixture")
+    if phase == "success":
+        assert cw.run_interactive(args) == 0
+        assert windows[0].refreshes == 1
+        assert windows[0].polls >= 1
+        assert windows[0].clock is clients[0].clock
+    else:
+        with pytest.raises(ValueError) as caught:
+            cw.run_interactive(args)
+        assert caught.value is original_error
+        assert ("exit", 1) in events
+    assert uncaught == []
+    assert all(ready for name, ready in events if name == "client")
+    assert all(closed for name, closed in events if name == "bootstrap_closed")
+    assert all(thread == owner_thread for name, thread in events
+               if name in ("router", "window", "coordinator_close", "client_close"))
+    assert registries[0]._closed
+    assert not registries[0].registration_vector()
+    if clients:
+        assert any(name == "client_close" for name, _ in events)
+
+
+def test_ordinary_refresh_retries_failed_gap_once(real_files_shell, monkeypatch):
+    import sqlite3
+    from appio.iodclient import GapNotice
+    from live_overview_support import drain_transport_gaps
+
+    shell = real_files_shell
+    sources = shell.history.sources
+    write = sources.record_transport_gap
+    attempts = []
+    def fail_once(notice):
+        attempts.append(notice)
+        if len(attempts) == 1:
+            future = Future()
+            future.set_exception(sqlite3.OperationalError("synthetic gap failure"))
+            return future
+        return write(notice)
+    monkeypatch.setattr(sources, "record_transport_gap", fail_once)
+    notice = GapNotice("boot-A", 1, 1, 1, 2, "disconnect")
+    shell.history.record_transport_gap(notice)
+    drain_transport_gaps(shell.history)
+    assert shell.history.gap_persistence_error is not None
+    shell.window._poll_history()
+    assert len(attempts) == 1
+    shell.window.refresh()
+    drain_transport_gaps(shell.history)
+    assert attempts == [notice, notice]
+    assert shell.history.gap_persistence_error is None
+
+
 @pytest.mark.parametrize("journal_mode", ["DELETE", "WAL"])
 def test_transport_gap_callback_persists_before_frame_capture(qtbot, tmp_path, monkeypatch, journal_mode):
     """A real bounded wire callback returns while the actor fences preparation."""
@@ -3694,6 +3902,9 @@ def test_transport_gap_callback_persists_before_frame_capture(qtbot, tmp_path, m
             assert history.preparation_source(scope) == outcome.snapshot.bracket.opening
             assert shell.apply_ready_frame(context="poll")
             assert shell._displayed == scope
+            assert shell._pending_source is None
+            assert shell._displayed_certified is True
+            assert shell._displayed_source == outcome.snapshot.bracket.opening
             generation = history._generation
             rows = stores.stores["local"].connection.execute("SELECT count(*) FROM gap").fetchone()
             peer.server.close()
@@ -3762,7 +3973,7 @@ def real_files_shell(qtbot, tmp_path, monkeypatch):
     window.open_files_unavailable()
     view.set_sort("bytes_r", "asc")
     view.search_field.setText("alpha")
-    qtbot.waitUntil(pumped(lambda: not view._outstanding), timeout=5000)
+    qtbot.waitUntil(pumped(lambda: not view._outstanding and not history.pending_work), timeout=5000)
     assert view.model.rowCount() == 24
     view.table.setFixedHeight(100)
     qtbot.wait(10)
@@ -3807,7 +4018,10 @@ class HeldFileDelivery:
             # the wrapper forwards the worker id/request keywords untouched.
             return read(*args, **kwargs)
 
+        deliver = view._deliver
         def capture(generation, future):
+            if future is not getattr(self, "future", None) or generation != self.generation:
+                return deliver(generation, future)
             self.transient_at_settlement.append(view._transient)
             self.payloads.append((generation, future))
             self.delivered.set()
@@ -3896,18 +4110,17 @@ def invalidate_shell(shell, route, monkeypatch, *, defer_tick=True):
                               "seq": frames.seq,
                               "cutoff_mono_ns": frames.state.checkpoint_mono_ns}}))
         assert len(shell.owner._exports) == 1, window.error_label.text()
-        assert len(history._sources) == 2
+        registration = next(iter(shell.owner._export_registrations.values()))
+        registration.result(timeout=10)
+        with shell.view.transient_scope(retire_on_exit=True):
+            history.drain()
+        assert len(history.sources.registration_vector()) == 2
     elif route == "source_prepare":
-        # The source position, not the clock endpoint, is the replacement
-        # trigger. A committed change through the registered connection's own
-        # file changes its total_changes while the requested Window stays the
-        # same, which is exactly one gated replacement (§6.1).
+        # Commit to the shared main database, then consume this actor's fresh observation.
         frames = shell.frames
-        frames.db.execute(
-            "CREATE TEMP TABLE IF NOT EXISTS source_advance(marker INTEGER)"
-        )
-        frames.db.execute("INSERT INTO source_advance VALUES (1)")
+        frames.db.execute("UPDATE boot SET started_wall=started_wall+1 WHERE boot_id='boot-A'")
         frames.db.commit()
+        history.sources.observe_async().result(timeout=10)
         window._clock_ns = lambda: shell.target.end_mono_ns - 1
         window._tick_target()
     elif route == "explicit_prepare":
@@ -3923,6 +4136,8 @@ def apply_replacement(shell):
     if window._pending is None:
         # Call the class driver because the default-invalidator tests defer the
         # instance driver until after their pre-next-tick delivery observation.
+        if window._retry_after is not None:
+            window._clock_ns = lambda: window._retry_after
         CollectorWindow._tick_target(window)
     assert window._pending == shell.target
     wait_for_local_frame(history)
@@ -4991,6 +5206,21 @@ def test_unchanged_certified_local_or_remote_source_is_quiescent(qtbot, mode):
     assert view._exact_authority_epoch == epoch_before + 1
 
 
+def test_certificate_from_another_router_generation_does_not_advance_displayed_source(qtbot):
+    history = ControlledHistory()
+    history._generation = 4
+    window, _, history, _ = controlled_build(qtbot, history=history)
+    window._timer.stop()
+    window._poll_timer.stop()
+    window.show_window(scope_window())
+    history.become_ready(scope_window())
+    assert history.frame_provenance(scope_window()).generation != history._generation
+    assert window.apply_ready_frame()
+    assert window._displayed == scope_window()
+    assert window._displayed_source is None
+    assert window._displayed_certified is False
+
+
 def test_pending_source_advances_coalesce_without_retiring_detail(qtbot):
     """Multiple source advances while pending coalesce into one replacement."""
 
@@ -5407,7 +5637,7 @@ def test_native_composition_binds_one_age_clock_domain(qtbot, tmp_path):
     )
     from appio.query import QueryService
     from appio.store import AppIoStore
-    from live_overview_support import Clock, total
+    from live_overview_support import Clock, total, make_managed_router, wait_for_local_frame
     from live_overview_transport import QueryTransportHarness
 
     key = "unit:alpha.service"
@@ -5456,7 +5686,7 @@ def test_native_composition_binds_one_age_clock_domain(qtbot, tmp_path):
         transport.pump()
         _token, future = router._occupant
         assert router._local_future is not None
-        assert router._local_future.result(timeout=20) is not None
+        assert wait_for_local_frame(router) is not None
         transport.reply(future, [total(17, key, peak=1024)], snapshot="a" * 64)
         assert router.ready(pending) is True
         assert window.apply_ready_frame(now=recovery()) is True
@@ -5502,7 +5732,7 @@ def test_native_composition_binds_one_age_clock_domain(qtbot, tmp_path):
         deadline_transport.pump()
         _deadline_token, ranking_future = deadline_router._occupant
         assert deadline_router._local_future is not None
-        deadline_router._local_future.result(timeout=20)
+        wait_for_local_frame(deadline_router)
         state = deadline_transport.client.query_transport(ranking_future)
         issued = state.issued_at_ns
         assert issued == age()
@@ -5601,7 +5831,7 @@ def test_real_local_detail_completion_is_not_consumed_by_readiness_without_notif
         def query(self, request):
             raise AssertionError(f"local history issued a remote query: {request.kind}")
 
-    from live_overview_support import make_managed_router
+    from live_overview_support import make_managed_router, wait_for_local_frame, wait_for_capture_admission
 
     history = make_managed_router(QueryService(store), IdleClient(), AppRegistry())
 
@@ -5651,12 +5881,8 @@ def test_real_local_detail_completion_is_not_consumed_by_readiness_without_notif
     original_part = history._read_local_part
 
     def held_series(paths, request, **kwargs):
-        if request.kind == "series":
-            series_worker["id"] = kwargs["worker_id"]
-            series_worker["request"] = request
-            series_worker["app_key"] = kwargs["app_key"]
-            series_entered.set()
-            assert release_series.wait(30), "the held local series worker was not released"
+        series_entered.set()
+        assert release_series.wait(30), "the held local detail worker was not released"
         return original_part(paths, request, **kwargs)
 
     monkeypatch.setattr(history, "_read_local_part", held_series)
@@ -5664,12 +5890,17 @@ def test_real_local_detail_completion_is_not_consumed_by_readiness_without_notif
         target = Window("since_boot", BOOT, end_mono_ns=140 * ns)
         assert window._submit_prepare(target, "explicit", now=140 * ns)
         assert history._local_future is not None
-        history._local_future.result(timeout=10)
+        wait_for_local_frame(history)
         assert window.apply_ready_frame(now=140 * ns) is True
+        from live_overview_support import wait_for_capture_admission
+        wait_for_capture_admission(history)
         history._completed.reset_put_count()
         view = window.view
         assert view is not None and view._subject_app_id is not None
         assert series_entered.wait(5)
+        series_token = history._detail.live["series"]
+        series_worker.update(id=series_token.token_id, request=series_token.request,
+                             app_key=series_token.request.app_key)
         worker_id = series_worker["id"]
         series_future = history._worker_jobs[worker_id][1]
         assert series_future is not None
@@ -5719,7 +5950,7 @@ def test_real_local_detail_completion_is_not_consumed_by_readiness_without_notif
         if schedule == "after-first-drain":
             assert notifications == []
             assert history.pending_work is True
-            assert window._poll_timer.isActive()
+            assert window._poll_timer.isActive(), window.error_label.text()
             window._poll_history()
         assert history.pending_work is False
         assert history.part_state(

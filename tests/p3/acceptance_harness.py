@@ -22,6 +22,7 @@ import shutil
 import socket
 import sqlite3
 import stat
+import tempfile
 import time
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -136,6 +137,7 @@ class P3Harness:
         self.guis = []
         self.imports = []
         self.query_routers = {}
+        self.source_actors = set()
         self.gui = None
         self.daemon = None
         self.last_reply = None
@@ -193,6 +195,9 @@ class P3Harness:
     def __enter__(self):
         self.root.mkdir(parents=True, exist_ok=True)
         self.root.chmod(0o755)
+        private_tmp = self.root / "private-tmp"
+        private_tmp.mkdir()
+        self.stack.enter_context(patch.object(tempfile, "tempdir", str(private_tmp)))
         self._guard_opens()
         try:
             shutil.copytree(FIXTURES / "proc", self.proc, symlinks=True)
@@ -233,7 +238,18 @@ class P3Harness:
                 self.daemon.stop()
                 self.daemon.selector.close()
         finally:
+            for actor in self.source_actors:
+                actor.closed.result(timeout=10)
             self.stack.close()
+
+    def _close_history(self, history):
+        sources = history.sources
+        self.source_actors.update(item.actor for item in sources._active.values())
+        self.source_actors.update(item.actor for item in sources._pending.values())
+        history.close()
+        history._frame_executor.shutdown(wait=True, cancel_futures=True)
+        history._background_executor.shutdown(wait=True, cancel_futures=True)
+        sources._capture_executor.shutdown(wait=True, cancel_futures=True)
 
     def stat_metadata(self, real):
         uid, gid = self.owners.get((real.st_dev, real.st_ino), (0, 987))
@@ -542,9 +558,10 @@ class P3Harness:
             return
         query_history = self.query_routers.pop(id(gui), None)
         if query_history is not None:
-            query_history.close()
+            self._close_history(query_history)
+        self.source_actors.update(item.actor for item in gui.history.sources._active.values())
         gui.window.shutdown()
-        gui.history.sources.close()
+        self._close_history(gui.history)
         future = gui.history._local_future
         if future is not None and not future.cancelled():
             future.result(timeout=5)
@@ -608,20 +625,33 @@ class P3Harness:
         with sqlite3.connect(Path(path).as_uri()+"?mode=ro", uri=True) as connection:
             return canonical_rows(connection)
 
+    def _drain_gui_history(self, gui):
+        def drained():
+            gui.window.apply_ready_frame()
+            return not gui.history.pending_work and gui.client.pending_requests == 0
+        self.until(drained, process_events=False)
+
     def rpc(self, request):
         if not self.guis:
             raise AssertionError("open a GUI before using its verified RPC client")
         self.settle()
+        self._drain_gui_history(self.gui)
         future = self.gui.client.query(request)
         self.until(future.done)
         return future.result()
 
     def query(self, window: Window, *, gui=None):
         gui = gui or self.gui
+        self._drain_gui_history(gui)
         previous = self.query_routers.pop(id(gui), None)
         if previous is not None:
-            previous.close()
-        history = HistoryRouter(gui.history.sources, gui.client, gui.history.registry,
+            self._close_history(previous)
+        sources = ManagedSourceRegistry(wake=lambda: None)
+        for item in tuple(gui.history.sources._active.values()):
+            future = sources.register(item.spec)
+            self.until(future.done, process_events=False)
+            future.result(timeout=0)
+        history = HistoryRouter(sources, gui.client, gui.history.registry,
                                 clock_ns=lambda: self.clock.ns)
         try:
             history.prepare(window)
@@ -631,7 +661,7 @@ class P3Harness:
             self.query_routers[id(gui)] = history
             return history.ranking(window, "total_bytes")
         except BaseException:
-            history.close()
+            self._close_history(history)
             raise
 
     def disk_share(self, app_id: int, window: Window, *, gui=None):
@@ -639,7 +669,17 @@ class P3Harness:
         history = self.query_routers.get(id(gui))
         if history is None:
             raise AssertionError("query must be completed before reading its disk share")
-        return history.disk_share(app_id, window)
+        from appio.contracts import HistoryPending
+        result = []
+        def ready():
+            try:
+                result.append(history.disk_share(app_id, window))
+                return True
+            except HistoryPending:
+                history.drain()
+                return False
+        self.until(ready, process_events=False)
+        return result[0]
 
     def render(self, window, *, gui=None):
         gui = gui or self.gui
@@ -660,6 +700,7 @@ class P3Harness:
         self.until(displayed(since), process_events=False)
         shell.show_window(window)
         self.until(displayed(window), process_events=False)
+        self._drain_gui_history(gui)
 
     def wire(self, message, *, response_type=None):
         """One actual AF_UNIX exchange, including invalid/adversarial requests."""

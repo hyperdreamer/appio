@@ -160,7 +160,7 @@ def add_managed_source(history, store, *, collector_id, owner):
     return history.add_source(spec).result(timeout=10)
 
 
-def test_router_requires_managed_sources_and_accepts_only_specs(tmp_path):
+def test_router_requires_managed_sources_and_accepts_only_specs(tmp_path, monkeypatch):
     local, _ = source(tmp_path / "local.db")
     imported, _ = source(tmp_path / "imported.db", "iod")
     sources = ManagedSourceRegistry(wake=lambda: None)
@@ -177,8 +177,29 @@ def test_router_requires_managed_sources_and_accepts_only_specs(tmp_path):
         imported_spec = spec("imported", imported, "iod")
         history.add_source(imported_spec).result(timeout=10)
         assert {name for name, _, _ in sources.registration_vector()} == {"local", "imported"}
+        calls = []
+        register = sources.register
+        def observed_register(spec):
+            calls.append(spec)
+            return register(spec)
+        monkeypatch.setattr(sources, "register", observed_register)
+        identities = sources.registration_vector()
+        for invalid in (QueryService(local), local.connection):
+            with pytest.raises(SourceAdmissionError, match="^history source is not managed$"):
+                history.add_source(invalid)
+        assert calls == []
+        assert sources.registration_vector() == identities
+        # The compatibility entry point forwards the exact immutable spec.
+        forwarded = []
+        response = Future()
+        monkeypatch.setattr(history, "add_managed_source",
+                            lambda spec: forwarded.append(spec) or response)
+        assert history.add_source(imported_spec) is response
+        assert forwarded == [imported_spec]
     finally:
         history.close()
+        assert sources._closed
+        assert sources.registration_vector() == ()
         sources.close()
 
     for invalid in (QueryService(local), local.connection):

@@ -902,6 +902,27 @@ class _Preparation:
     fence: tuple[_GapSubmission, ...]
 
 
+@dataclass(frozen=True)
+class _LocalFileChoices:
+    window: Window | None = None
+    applications: tuple[tuple[str, str, int], ...] = ()
+    error: Exception | None = None
+
+    def file_applications(self, window: Window) -> tuple[tuple[str, str, int], ...]:
+        if self.window != window:
+            raise HistoryPending("file application choices are still loading")
+        if self.error is not None:
+            raise self.error
+        return self.applications
+
+
+@dataclass(frozen=True)
+class _CaptureMetadata:
+    snapshot: SnapshotProvenance
+    boot_id: str | None
+    choices: _LocalFileChoices
+
+
 class HistoryRouter:
     def __init__(self, sources: ManagedSourceRegistry, client: IodClient,
                  registry: AppRegistry, *,
@@ -916,6 +937,14 @@ class HistoryRouter:
         self._capture_jobs: dict[int, tuple[RequestToken, Future]] = {}
         self._worker_captures: dict[int, int] = {}
         self._frame_jobs: dict[int, Future] = {}
+        self._frame_metadata: dict[int, Future] = {}
+        self.local = _LocalFileChoices()
+        self._boot_id: str | None = None
+        self._boot_registrations = sources.registration_vector()
+        self._boot_capture: Future | None = None
+        self._boot_future: Future | None = None
+        self._boot_error: Exception | None = None
+        self._registrations_seen = sources.registration_vector()
         self.segments: tuple[HistorySegment, ...] = ()
         self.boundaries: tuple[tuple[str, int, str, str], ...] = ()
         self.view_state = "unavailable"
@@ -1170,6 +1199,84 @@ class HistoryRouter:
                 and window.end_mono_ns - window.start_mono_ns > MAX_RANGE_NS):
             select_tier(window, None)
 
+    @staticmethod
+    def _read_capture_metadata(capture: CapturedSourceSet, window: Window | None) -> _CaptureMetadata:
+        with _captured_sources(capture) as (sources, snapshot):
+            boot_id = None
+            applications = {}
+            choice_error = None
+            successful_sources = 0
+            for name, service, _owner in sources:
+                if name == "local":
+                    row = service.connection.execute(
+                        "SELECT boot_id FROM boot ORDER BY boot_order DESC LIMIT 1").fetchone()
+                    if row is not None:
+                        boot_id = _boot_text(row[0], "local boot")
+                if window is not None:
+                    try:
+                        rows = service.file_applications(window)
+                    except Exception as error:
+                        choice_error = error
+                        continue
+                    successful_sources += 1
+                    for key, label, total in rows:
+                        previous = applications.get(key)
+                        if previous is None or total > previous[1]:
+                            applications[key] = (label, total)
+            choices = _LocalFileChoices(window, tuple(
+                (key, label, total) for key, (label, total) in sorted(applications.items())),
+                choice_error if not successful_sources else None)
+            return _CaptureMetadata(snapshot, boot_id, choices)
+
+    def _local_boot(self) -> str | None:
+        """Select the primary boot from completed actor-captured evidence."""
+
+        if self._closed:
+            return None
+        identities = self.sources.registration_vector()
+        if (tuple(item for item in identities if item[0] == "local")
+                != tuple(item for item in self._boot_registrations if item[0] == "local")):
+            self._boot_id = None
+        self._collect_boot()
+        if self._boot_error is not None:
+            error, self._boot_error = self._boot_error, None
+            raise error
+        if self._boot_id is None and self._boot_capture is None and self._boot_future is None:
+            self._boot_capture = self.sources.capture()
+        return self._boot_id
+
+    def _collect_boot(self) -> None:
+        capture_future = self._boot_capture
+        if capture_future is not None and capture_future.done():
+            self._boot_capture = None
+            capture = None
+            try:
+                capture = capture_future.result()
+                self.sources.retain_capture(capture.capture_id)
+                self.sources.release_capture(capture.capture_id)
+                self._boot_future = self._frame_executor.submit(
+                    self._read_capture_metadata, capture, None)
+                sources = self.sources
+                self._boot_future.add_done_callback(
+                    lambda completed, capture_id=capture.capture_id:
+                        sources.release_capture(capture_id))
+            except Exception as error:
+                self._boot_error = error
+                if capture is not None:
+                    self._discard_capture(self.sources, capture_future)
+        future = self._boot_future
+        if future is not None and future.done():
+            self._boot_future = None
+            try:
+                metadata = future.result()
+                identities = tuple((item.name, item.owner, item.registration_epoch)
+                                   for item in metadata.snapshot.bracket.opening.sources)
+                if identities == self.sources.registration_vector():
+                    self._boot_id = metadata.boot_id
+                    self._boot_registrations = identities
+            except Exception as error:
+                self._boot_error = error
+
     def local_position(self, source_name: str) -> LocalPosition:
         """Return the last completed actor observation for one source."""
 
@@ -1294,9 +1401,21 @@ class HistoryRouter:
                     if self._frame.remote_token is None:
                         self._frame.requested_source = capture.opening
                     self._worker_bindings[worker_id] = binding
-                    self._local_future = self._frame_executor.submit(
-                        self._read_local, capture, token.request.window,
-                        worker_id=worker_id, request=token.request)
+                    reader = self._read_local
+                    metadata_future = Future()
+                    self._frame_metadata[worker_id] = metadata_future
+                    def read_frame(capture=capture, token=token, reader=reader,
+                                   metadata_future=metadata_future):
+                        try:
+                            metadata = HistoryRouter._read_capture_metadata(capture, token.request.window)
+                            metadata_future.set_result(metadata)
+                            return reader(capture, token.request.window,
+                                          worker_id=token.token_id, request=token.request)
+                        except BaseException as error:
+                            if not metadata_future.done():
+                                metadata_future.set_exception(error)
+                            raise
+                    self._local_future = self._frame_executor.submit(read_frame)
                     self._frame_jobs[worker_id] = self._local_future
                     self._file_status = FileAvailability(True, False)
                 else:
@@ -1335,6 +1454,7 @@ class HistoryRouter:
         for worker_id, future in tuple(self._frame_jobs.items()):
             if future.done():
                 self._frame_jobs.pop(worker_id)
+                self._frame_metadata.pop(worker_id, None)
                 self._worker_bindings.pop(worker_id, None)
                 self._release_worker_capture(worker_id)
 
@@ -1557,7 +1677,8 @@ class HistoryRouter:
         the console's poll armed; it never waits for a target calculation.
         """
 
-        if (self._preparation is not None
+        if (self._boot_capture is not None or self._boot_future is not None
+                or self._preparation is not None
                 or any(item.future is not None for item in self._gap_writes)
                 or self._occupant is not None or self._queue or self._worker_jobs
                 or self._capture_jobs or self._frame_jobs
@@ -2167,6 +2288,11 @@ class HistoryRouter:
                 lambda completed, sources=sources, capture_id=capture_id:
                     sources.release_capture(capture_id))
             self._worker_captures.pop(worker_id)
+        if self._boot_capture is not None:
+            self._boot_capture.add_done_callback(
+                lambda completed: self._discard_capture(sources, completed))
+            self._boot_capture = None
+        self.sources.close()
 
     def _plan(self, window):
         evidence, cuts, gaps = [], defaultdict(dict), set()
@@ -2545,10 +2671,13 @@ class HistoryRouter:
         """Retire obsolete owners before collecting or dispatching (§3.2)."""
 
         current = self._current_authority()
+        registrations = self.sources.registration_vector()
+        registrations_changed = registrations != self._registrations_seen
+        self._registrations_seen = registrations
         if self._authority is None:
             self._authority = current
             return False
-        if current == self._authority:
+        if current == self._authority and not registrations_changed:
             return False
         self._retire_authority(current)
         return True
@@ -3186,6 +3315,7 @@ class HistoryRouter:
             # The existing availability seam owns a local copy failure; it is
             # never a successful empty measurement or a remote diagnostic.
             frame.error = error
+            self._local_generation = None
             self._ready = False
             self._file_status = FileAvailability(
                 False, False, "file_source_unavailable")
@@ -3389,12 +3519,25 @@ class HistoryRouter:
             return False
         try:
             outcome = self._admitted_frame_outcome(outcome, binding)
-        except Exception as error:  # noqa: BLE001 - the existing readiness error seam
-            return self._settle_failure(token, error)
+        except Exception:  # noqa: BLE001 - malformed frame evidence
+            return self._reject_token(
+                token, settlement, RequestRejected("invalid_result", "invalid_result"))
         bracket = settlement.local_bracket
         if bracket is None or bracket.opening != binding.opening:
-            return self._settle_failure(
-                token, ValueError("a local frame requires its owner-read bracket"))
+            return self._reject_token(
+                token, settlement, RequestRejected("invalid_result", "invalid_result"))
+        metadata_future = self._frame_metadata.get(token.token_id)
+        if metadata_future is not None:
+            try:
+                metadata = metadata_future.result(timeout=0)
+                if metadata.snapshot != outcome.snapshot or metadata.choices.window != token.request.window:
+                    raise ValueError("capture metadata answered another snapshot")
+            except Exception:
+                return self._reject_token(
+                    token, settlement, RequestRejected("invalid_result", "invalid_result"))
+            self.local = metadata.choices
+            self._boot_id = metadata.boot_id
+            self._boot_registrations = self.sources.registration_vector()
         self.segments, self.boundaries = outcome.segments, outcome.boundaries
         self._gap_ranges = list(outcome.gaps)
         self._known_gap_ranges = list(outcome.known_gaps)
@@ -3831,6 +3974,7 @@ class HistoryRouter:
             self._reap_terminal_frame_workers()
             self._reap_terminal_background_workers()
             return False
+        self._collect_boot()
         changed = self._drain_transport_gaps()
         changed |= self._reconcile_authority()
         changed |= self._advance_preparation()
@@ -3855,19 +3999,28 @@ class HistoryRouter:
                 "incomplete: boot chronology unproved" if self._chronology_unproved
                 else "ready"))
 
+    def _take_preparation_error(self, window: Window) -> Exception | None:
+        if window != self._window:
+            return None
+        if self._frame_error is not None:
+            error, self._frame_error = self._frame_error, None
+            return error
+        frame = self._frame
+        if frame is not None and not frame.retired and frame.error is not None:
+            error, frame.error = frame.error, None
+            return error
+        return None
+
     def ready(self, window: Window) -> bool:
         if window != self._window:
             return False
         self.drain()
-        if self._frame_error is not None:
-            error, self._frame_error = self._frame_error, None
+        error = self._take_preparation_error(window)
+        if error is not None:
             raise error
         frame = self._frame
         if frame is None or frame.retired:
             return False
-        if frame.error is not None:
-            error, frame.error = frame.error, None
-            raise error
         return self._ready
 
     def _require(self, window):

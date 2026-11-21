@@ -614,15 +614,7 @@ def make_managed_router(local, client, registry, *, source_options=None, **optio
             sources.register(spec).result(timeout=10)
 
     register("local", local, "gui")
-    router = HistoryRouter(sources, client, registry, **options)
-    close = router.close
-
-    def close_managed_router():
-        close()
-        sources.close()
-
-    router.close = close_managed_router
-    return router
+    return HistoryRouter(sources, client, registry, **options)
 
 
 def wait_for_capture_admission(router, *, timeout=15.0):
@@ -865,11 +857,7 @@ class LiveOverviewHarness:
             if held and future is not None and future.done():
                 self._delivery.entered.set()
                 return False
-            changed = collect_frame()
-            shell = getattr(self, "shell", None)
-            if shell is not None and shell._pending_source is None and shell._pending is not None:
-                shell._pending_source = self.router.preparation_source(shell._pending)
-            return changed
+            return collect_frame()
 
         self.router._collect_local_frame = collect_when_deliverable
         self._install_spies()
