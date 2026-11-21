@@ -3687,7 +3687,6 @@ def test_transport_gap_startup_and_callback_shutdown_order(qapp, tmp_path, monke
 
         def exec(self):
             QTimer.singleShot(0, inspect_before_admission)
-            QTimer.singleShot(40, release_primary_lock)
             QTimer.singleShot(2000, loop.quit)
             loop.exec()
             return 1 if phase != "success" else 0
@@ -3782,6 +3781,7 @@ def test_transport_gap_startup_and_callback_shutdown_order(qapp, tmp_path, monke
             registration_retry_entered.is_set(),
             threading.get_ident(),
         ))
+        release_primary_lock()
 
     def release_primary_lock():
         events.append(("registration_lock_release", threading.get_ident()))
@@ -5287,7 +5287,7 @@ def _remote_client(*, generation: int = 2, epoch: int = 7, seq: int = 3):
 
 
 @pytest.mark.parametrize("mode", ["local", "remote"])
-def test_unchanged_certified_local_or_remote_source_is_quiescent(qtbot, mode):
+def test_unchanged_certified_local_or_remote_source_is_quiescent(qtbot, mode, tmp_path):
     """Only the endpoint-free scope and the certified source permit a prepare."""
 
     history = ControlledHistory(ready=True)
@@ -5378,6 +5378,38 @@ def test_unchanged_certified_local_or_remote_source_is_quiescent(qtbot, mode):
     # A repeated observation under the same new authority never resets again.
     window.apply_ready_frame(now=recovery[0])
     assert view._exact_authority_epoch == epoch_before + 1
+
+    if mode == "local":
+        from appio.history_types import retention_scope
+        from appio.iodclient import AppRegistry, ClientState
+        from live_overview_support import Clock, LocalPositionStores, make_managed_router, wait_for_local_frame
+
+        with LocalPositionStores(tmp_path) as stores:
+            age = Clock(10**9)
+            router = make_managed_router(stores.services["local"],
+                SimpleNamespace(state=ClientState()), AppRegistry(), clock_ns=age)
+            exact = Window("since_boot", "boot-a", end_mono_ns=20 * 10**9)
+            key = "unit:alpha.service"
+            scope = retention_scope(key, exact)
+            try:
+                router.prepare(exact)
+                wait_for_local_frame(router)
+                assert router.ready(exact)
+                assert router.frame_provenance(exact).certified
+                router.select_detail(key, exact)
+                app_id = router.registry.id_for(key)
+                router.request_detail("totals", app_id, exact)
+                qtbot.waitUntil(lambda: (router.drain(), router.part_state("totals", key, scope).state == "ok")[1])
+                accepted = router.retained("totals", key, scope, exact.end_mono_ns)
+                assert accepted.provenance.first_seen_at_ns == 10**9
+                age.advance_ns(2 * 10**9)
+                router.request_detail("totals", app_id, exact)
+                qtbot.waitUntil(lambda: (router.drain(), router.part_state("totals", key, scope).state == "ok")[1])
+                repeated = router.retained("totals", key, scope, exact.end_mono_ns)
+                assert repeated.provenance.accepted_identity == accepted.provenance.accepted_identity
+                assert repeated.provenance.first_seen_at_ns == 10**9, "identical local identity was restamped"
+            finally:
+                router.close()
 
 
 def test_certificate_from_another_router_generation_does_not_advance_displayed_source(qtbot):
@@ -5796,6 +5828,298 @@ def test_no_frame_deferred_apply_uses_ordinary_gate_but_poll_never_submits(qtbot
         assert window.apply_ready_frame(now=now[0], context="ordinary") is False
         assert history.prepare_calls == []
         assert _recovery_fields(window) == before
+    finally:
+        window.shutdown()
+
+
+def _status_case_inputs(case):
+    from appio.contracts import LAUNCH_WINDOW_MESSAGE, RANGE_TOO_LONG_MESSAGE
+    from appio.history_types import AcceptedIdentity, AnswerProvenance, retention_scope
+    from appio.ui.render_model import MeasurementStatus, PresentationRefusal
+
+    window = scope_window()
+    key = "unit:alpha.service"
+    answer = AnswerProvenance("totals", key, retention_scope(key, window), window,
+        AcceptedIdentity("totals", key, window, "b" * 64), 38 * 10**9, None, None)
+    absent = MeasurementStatus(False, False, "absent", "absent", None, None, ())
+    values = replace(absent, has_displayed_values=True, share_state="ok", displayed_answers=(answer,))
+    peak = replace(absent, displayed_answers=(replace(answer, kind="ranking",
+        accepted_identity=AcceptedIdentity("ranking", key, window, "a" * 64)),))
+    pending = replace(absent, share_state="pending")
+    failed = replace(absent, share_state="failed", share_reason="share_bad")
+    refusal = PresentationRefusal("shell_prepare", Window("launch", BOOT, launch_id=7),
+                                 "launch_attribution", LAUNCH_WINDOW_MESSAGE)
+    age = "oldest answer 2 s ago"
+    definitions = {
+        "S01": ({"refusal": refusal, "measurement": values, "any_work": True}, "1", LAUNCH_WINDOW_MESSAGE, age),
+        "S02": ({"refusal": replace(refusal, origin="direct_view"), "prepare_error": "appio: disk read failed"}, "1", LAUNCH_WINDOW_MESSAGE, None),
+        "S03": ({"refusal": replace(refusal, reason="unsupported_window", text=RANGE_TOO_LONG_MESSAGE), "measurement": values}, "1", RANGE_TOO_LONG_MESSAGE, age),
+        "S04": ({"prepare_error": "appio: disk read failed", "measurement": values, "any_work": True}, "2", "appio: disk read failed", age),
+        "S05": ({"busy": True, "retry_after": 40 * 10**9, "view_state": "unavailable", "measurement": values}, "3", "history read has not completed (unavailable); the reader is still busy", age),
+        "S06": ({"busy": True, "view_state": "loading", "any_work": True}, "3", "history read has not completed (loading); the reader is still busy", None),
+        "S07": ({"retry_after": 41_000_000_001, "view_state": "unavailable", "measurement": values}, "4", "history read has not completed (unavailable); retrying in 2 s", age),
+        "S08": ({"has_frame": False, "has_target": False, "has_sample": False}, "5a", "waiting for the first sample", None),
+        "S09": ({"has_frame": False, "view_state": "loading", "any_work": True}, "5b", "loading history (loading)", None),
+        "S10": ({"measurement": values, "any_work": True}, "6a", "updating (ready)", age),
+        "S11": ({"measurement": values, "any_work": True, "view_state": "loading"}, "6a", "updating (loading)", age),
+        "S12": ({"measurement": values}, "6b", "live", age),
+        "S13": ({"measurement": replace(absent, ranking_empty=True), "any_work": True}, "6c", "no applications observed", None),
+        "S14": ({"measurement": pending}, "6d", "loading measurements (ready)", None),
+        "S15": ({"measurement": replace(pending, series_state="failed", series_reason="series_bad")}, "6d", "loading measurements (ready)", None),
+        "S16": ({"measurement": replace(failed, series_state="failed", series_reason="series_bad")}, "6e", "measurements unavailable: share_bad", None),
+        "S17": ({"measurement": replace(absent, series_state="failed", series_reason="series_bad")}, "6e", "measurements unavailable: series_bad", None),
+        "S18": ({"measurement": replace(failed, series_state="ok")}, "6e", "measurements unavailable: share_bad", None),
+        "S19": ({}, "6f", "", None),
+        "S20": ({"measurement": replace(peak, share_state="pending")}, "6d", "loading measurements (ready)", age),
+        "S21": ({"measurement": peak}, "6f", "", age),
+    }
+    overrides, row, text, age_text = definitions[case]
+    inputs = dict(refusal=None, prepare_error=None, busy=False, retry_after=None,
+        now_ns=40 * 10**9, has_frame=True, has_target=True, has_sample=True,
+        any_work=False, view_state="ready", measurement=absent, age_now_ns=40 * 10**9)
+    inputs.update(overrides)
+    return inputs, (row, text, age_text)
+
+
+def _assert_status_case(qtbot, monkeypatch, case):
+    from appio.ui.render_model import _choose_overview_status
+
+    inputs, expected = _status_case_inputs(case)
+    choice = _choose_overview_status(**inputs)
+    assert (choice.row, choice.text, choice.age_text) == expected, case
+    window, _, history, _ = controlled_build(qtbot)
+    window._timer.stop()
+    window._poll_timer.stop()
+    view = window.view
+    history.view_state = inputs["view_state"]
+    history.pending_work_flag = inputs["any_work"]
+    history.local_read_busy = inputs["busy"]
+    window._displayed = scope_window() if inputs["has_frame"] else None
+    window._target = scope_window() if inputs["has_target"] else None
+    window._pending = scope_window() if not inputs["has_frame"] and inputs["has_sample"] else None
+    window._stalled = inputs["busy"]
+    window._retry_after = inputs["retry_after"]
+    window._presentation_refusal = inputs["refusal"]
+    window._prepare_error = inputs["prepare_error"]
+    if inputs["prepare_error"]:
+        window._prepare_retry = cw.PrepareRetry(scope_window(), "explicit", 2 * 10**9)
+    calls = []
+    choose = cw._choose_overview_status
+    monkeypatch.setattr(cw, "_choose_overview_status", lambda **kw: calls.append(kw) or choose(**kw))
+    monkeypatch.setattr(view, "measurement_status", lambda: inputs["measurement"])
+    monkeypatch.setattr(window, "_age_clock_ns", lambda: inputs["age_now_ns"])
+    before = _recovery_fields(window)
+    counts = (list(history.prepare_calls), history.ranking_reads, list(history.file_requests))
+    try:
+        window._update_overview_status(inputs["now_ns"])
+        assert len(calls) == 1
+        assert window.history_state.text() == expected[1]
+        assert window.history_state.isHidden() == (expected[1] == "")
+        assert view.overview_age.isHidden() == (expected[2] is None)
+        if expected[2] is not None:
+            assert view.overview_age.text() == expected[2]
+        assert _recovery_fields(window) == before
+        assert (list(history.prepare_calls), history.ranking_reads, list(history.file_requests)) == counts
+    finally:
+        window.shutdown()
+        monkeypatch.setattr(cw, "_choose_overview_status", choose)
+
+
+@pytest.mark.parametrize("case", [f"S{number:02d}" for number in range(1, 22)])
+def test_live_status_tree_selects_exactly_one_reachable_row(qtbot, monkeypatch, case):
+    _assert_status_case(qtbot, monkeypatch, case)
+
+
+@pytest.mark.parametrize("case", ["S08", "S09"])
+def test_live_status_initial_frame_pending(qtbot, monkeypatch, case):
+    _assert_status_case(qtbot, monkeypatch, case)
+
+
+def test_live_status_first_and_retry_details_pending_without_peak(qtbot, monkeypatch):
+    for case in ("S14", "S12", "S16", "S14"):
+        _assert_status_case(qtbot, monkeypatch, case)
+
+
+@pytest.mark.parametrize("case", ["S18", "S19"])
+def test_live_status_unsupported_lifetime_and_unranked_subject_are_settled(qtbot, monkeypatch, case):
+    _assert_status_case(qtbot, monkeypatch, case)
+
+
+@pytest.mark.parametrize("case", ["S01", "S02", "S03", "S04"])
+def test_live_status_refusal_and_operational_error_precedence(qtbot, monkeypatch, case):
+    _assert_status_case(qtbot, monkeypatch, case)
+
+
+def test_live_status_early_retirement_expired_floor_still_busy(qtbot, monkeypatch):
+    _assert_status_case(qtbot, monkeypatch, "S05")
+    window, history, now, deferred = _deferred_fixture(qtbot)
+    try:
+        history.local_read_busy = True
+        window._retry_after = now[0]
+        window._stalled = True
+        window.show_window(deferred)
+        assert history.prepare_calls == []
+        assert window._deferred_target == deferred
+        assert window._retry_after == now[0]
+        assert window.history_state.text().endswith("the reader is still busy")
+    finally:
+        window.shutdown()
+
+
+@pytest.mark.parametrize("case", ["S01", "S05", "S07", "S10", "S12", "S21", "S06", "S08", "S14"])
+def test_age_label_survives_busy_retry_refusal_and_idle_status(qtbot, monkeypatch, case):
+    _assert_status_case(qtbot, monkeypatch, case)
+
+
+def test_clock_only_age_update_issues_no_queries_or_reacceptance(qtbot, monkeypatch):
+    inputs, _expected = _status_case_inputs("S12")
+    window, _, history, _ = controlled_build(qtbot)
+    window._timer.stop()
+    window._poll_timer.stop()
+    now = [40 * 10**9]
+    window._displayed = scope_window()
+    history.view_state = "ready"
+    view = window.view
+    monkeypatch.setattr(view, "measurement_status", lambda: inputs["measurement"])
+    monkeypatch.setattr(window, "_age_clock_ns", lambda: now[0])
+    before = _recovery_fields(window)
+    counts = (list(history.prepare_calls), history.ranking_reads, list(history.file_requests))
+    widgets = view._total_chart, view._donut, view._share_bars
+    try:
+        window._update_overview_status(now[0])
+        assert view.overview_age.text() == "oldest answer 2 s ago"
+        now[0] += 10**9
+        window._update_overview_status(now[0])
+        assert view.overview_age.text() == "oldest answer 3 s ago"
+        assert window.history_state.text() == "live"
+        assert _recovery_fields(window) == before
+        assert widgets == (view._total_chart, view._donut, view._share_bars)
+        assert (list(history.prepare_calls), history.ranking_reads, list(history.file_requests)) == counts
+        assert inputs["measurement"].displayed_answers[0].first_seen_at_ns == 38 * 10**9
+    finally:
+        window.shutdown()
+
+
+@pytest.mark.parametrize("trace", ["shell_refusal", "operational_retry", "direct_refusal"])
+def test_refusal_presentation_lifecycle_preserves_age_and_recovery_owners(qtbot, monkeypatch, trace):
+    from appio.contracts import LAUNCH_WINDOW_MESSAGE
+    from appio.history_types import AcceptedIdentity
+    from live_overview_support import Clock, IdentityExactOnlyQuery, series, share, total
+
+    history = ControlledHistory()
+    age = Clock(0)
+    service = IdentityExactOnlyQuery([total(1, "unit:alpha.service")])
+    key = "unit:alpha.service"
+    a = Window("since_boot", BOOT, end_mono_ns=20 * 10**9)
+    b = Window("since_boot", BOOT, end_mono_ns=30 * 10**9)
+    launch = Window("launch", BOOT, launch_id=7)
+    service.set_share(a, share(1, a))
+    service.set_series(a, series(1, a))
+    service.identities[("totals", key, a)] = AcceptedIdentity("totals", key, a, "b" * 64)
+    service.identities[("series", key, a)] = AcceptedIdentity("series", key, a, "c" * 64)
+    for name in ("ranking", "disk_share", "series", "exact_answer_identity"):
+        monkeypatch.setattr(history, name, getattr(service, name), raising=False)
+    window, _, _, _ = controlled_build(qtbot, history=history)
+    window._timer.stop()
+    window._poll_timer.stop()
+    view = window.view
+    view._clock_ns = age
+    view._detail_service._clock_ns = age
+    window._age_clock_ns = age
+    window._clock_ns = age
+    view.set_window(a)
+    window._displayed = window._target = a
+    history.view_state = "ready"
+    prepare = history.prepare
+    attempts = []
+
+    def guarded_prepare(requested):
+        attempts.append(requested)
+        if requested.kind == "launch":
+            raise WindowUnavailableError("launch_attribution", LAUNCH_WINDOW_MESSAGE)
+        return prepare(requested)
+
+    monkeypatch.setattr(history, "prepare", guarded_prepare)
+    try:
+        age.ns = 2 * 10**9
+        if trace == "shell_refusal":
+            with pytest.raises(WindowUnavailableError):
+                window.show_window(launch)
+            assert attempts == [launch] and history.prepare_calls == []
+            assert window._presentation_refusal.origin == "shell_prepare"
+            assert window.history_state.text() == LAUNCH_WINDOW_MESSAGE
+            assert view.overview_age.text() == "oldest answer 2 s ago"
+            age.ns = 3 * 10**9
+            with pytest.raises(WindowUnavailableError):
+                window._tick_target(now=age())
+            assert attempts == [launch, launch]
+            age.ns = 4 * 10**9
+            calls = dict(service.calls)
+            view.refresh_measurements()
+            window._update_overview_status(age())
+            assert service.calls == calls
+            assert view.overview_age.text() == "oldest answer 4 s ago"
+            age.ns = 5 * 10**9
+            service.set_pending("series", 1, b)
+            service.set_pending("totals", 1, b)
+            window.show_window(b)
+            assert attempts == [launch, launch, b]
+            assert history.prepare_calls == [b]
+            assert window._presentation_refusal is None
+            assert window.history_state.text() == "updating (loading)"
+            age.ns = 6 * 10**9
+            history.become_ready(b)
+            history.pending_work_flag = True
+            assert window.apply_ready_frame(now=age())
+            assert window.history_state.text() == "updating (ready)"
+            assert view.overview_age.text() == "oldest answer 6 s ago"
+            age.ns = 7 * 10**9
+            service.set_share(b, share(1, b))
+            service.set_series(b, series(1, b))
+            for kind in ("totals", "series"):
+                service.identities[(kind, key, b)] = AcceptedIdentity(kind, key, b, "d" * 64)
+            view.refresh()
+            history.pending_work_flag = False
+            window._update_overview_status(age())
+            assert window.history_state.text() == "live"
+            assert view.overview_age.text() == "oldest answer 0 s ago"
+        elif trace == "operational_retry":
+            history.prepare_failures.append(OSError("disk read failed"))
+            with pytest.raises(OSError, match="disk read failed"):
+                window.show_window(b)
+            marker = window._prepare_retry
+            assert marker == cw.PrepareRetry(b, "explicit", 2 * 10**9)
+            assert window.history_state.text() == "appio: disk read failed"
+            assert window._retry_after is None
+            age.ns = 3 * 10**9
+            window._tick_target(now=age())
+            window.apply_ready_frame(now=age(), context="poll")
+            assert attempts == [b]
+            assert window._prepare_retry is marker
+            age.ns = 4 * 10**9
+            window.show_window(b)
+            assert attempts == [b, b]
+            assert window._prepare_retry is None
+            assert window.history_state.text() == "updating (loading)"
+            assert view.overview_age.text() == "oldest answer 4 s ago"
+        else:
+            view.set_window(launch)
+            window._update_overview_status(age())
+            assert window._presentation_refusal.origin == "direct_view"
+            assert window.history_state.text() == LAUNCH_WINDOW_MESSAGE
+            assert view.overview_age.isHidden()
+            calls = dict(service.calls)
+            view.refresh_measurements()
+            window._update_overview_status(age())
+            assert service.calls == calls
+            assert attempts == []
+            age.ns = 4 * 10**9
+            view.set_window(a)
+            window._update_overview_status(age())
+            assert window._presentation_refusal is None
+            assert window.history_state.text() == "live"
+            assert view.overview_age.text() == "oldest answer 0 s ago"
+            assert window._retry_after is None and window._prepare_retry is None
     finally:
         window.shutdown()
 

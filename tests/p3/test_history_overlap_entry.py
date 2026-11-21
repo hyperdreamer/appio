@@ -61,6 +61,8 @@ def test_live_incomplete_reply_cannot_resurrect_export_overlap_in_production_ent
         local, _ = source(tmp_path / "gui.db", boot=BOOT, start=10, end=22)
         local.connection.execute("UPDATE app SET key=?, name=?", (APP, "fixture"))
         local.connection.commit()
+        assert local.connection.execute("SELECT count(*) FROM handover").fetchone() == (0,)
+        assert local.connection.execute("SELECT read_bytes FROM app_boot_total").fetchone() == (20,)
         local.connection.close()
         export_path = tmp_path / "verified-export.db"
         with sqlite3.connect(export_path) as copy:
@@ -90,8 +92,8 @@ def test_live_incomplete_reply_cannot_resurrect_export_overlap_in_production_ent
                 info = path.lstat()
                 assert stat.S_ISSOCK(info.st_mode) and stat.S_IMODE(info.st_mode) == 0o660
 
-            client = raw_client(socket_path, **kwargs, peer_reader=lambda sock: Peer(88, 0, 987),
-                                path_verifier=verify, clock_ns=lambda: clock.ns)
+            client = raw_client(socket_path, **{**kwargs, "clock_ns": lambda: clock.ns},
+                                peer_reader=lambda sock: Peer(88, 0, 987), path_verifier=verify)
             holder["client"] = client
             return client
 
@@ -100,8 +102,14 @@ def test_live_incomplete_reply_cannot_resurrect_export_overlap_in_production_ent
             raise AssertionError("an answering daemon must not start a GUI collector")
 
         def run_event_loop(application):
-            window = next(widget for widget in application.topLevelWidgets()
-                          if type(widget) is ui.CollectorWindow and not widget._closed)
+            deadline = time.monotonic() + 10
+            window = None
+            while window is None:
+                application.processEvents()
+                window = next((widget for widget in application.topLevelWidgets()
+                               if type(widget) is ui.CollectorWindow and not widget._closed), None)
+                assert time.monotonic() < deadline, "managed primary admission did not create the window"
+                time.sleep(0.001)
             window._timer.stop()
 
             def step_daemon():
@@ -117,6 +125,7 @@ def test_live_incomplete_reply_cannot_resurrect_export_overlap_in_production_ent
             def settle():
                 after = window.facts_applied
                 deadline = time.monotonic() + 10
+                window.refresh()
 
                 def current():
                     return (window.facts_applied > after
@@ -136,7 +145,9 @@ def test_live_incomplete_reply_cannot_resurrect_export_overlap_in_production_ent
                                 clock_ns(), floor
                             )
                     drive()
-                    window.refresh()
+                    window._tick_target()
+                    window.apply_ready_frame()
+                    time.sleep(0.001)
                     assert time.monotonic() < deadline, (
                         window.history_state.text(), window.error_label.text())
                 window._poll_timer.stop()
@@ -159,20 +170,40 @@ def test_live_incomplete_reply_cannot_resurrect_export_overlap_in_production_ent
             settle()
             # Use the production export validator/coordinator, not add_source.
             window.coordinator.accept_export(exported)
-            window.refresh()
+            admissions = tuple(window.coordinator._export_registrations.values())
+            deadline = time.monotonic() + 10
+            while not all(future.done() for future in admissions):
+                drive()
+                window.history.drain()
+                time.sleep(0.001)
+                assert time.monotonic() < deadline, "managed export admission did not finish"
+            for admission in admissions:
+                admission.result(timeout=0)
             settle()
             finish_probe()
             history, scope = window.history, window._prepared
             assert holder["client"].state.verified and holder["client"].state.answering
             assert not local_opens
             assert scope.boot_id == BOOT and scope.kind == "since_boot"
-            assert len(history._sources) == 2
+            assert len(history.sources.registration_vector()) == 2
             assert history._overlap_ranges == [(BOOT, 10 * NS, 20 * NS)]
-            assert history.local.connection.execute("SELECT count(*) FROM handover").fetchone()[0] == 0
-            assert history.local.connection.execute("SELECT read_bytes FROM app_boot_total").fetchone()[0] == 20
+            local_position = history.local_position("local")
+            assert (local_position.name, local_position.owner) == ("local", "gui")
+            captured_local = next(position for position in
+                                  history.frame_provenance(scope).snapshot.bracket.opening.sources
+                                  if position.name == "local")
+            assert captured_local.registration_epoch == local_position.registration_epoch
             filtered, = history._ranking
             assert (filtered.total_bytes, filtered.read_bytes, filtered.write_bytes,
                     filtered.coverage.overlap_uncertain_intervals) == (0, 0, 0, 1)
+            # Drain historical work admitted by the displayed production view
+            # before the independent wire-ranking control takes the peer slot.
+            deadline = time.monotonic() + 10
+            while history.pending_work:
+                step_daemon()
+                history.drain()
+                time.sleep(0.001)
+                assert time.monotonic() < deadline, "displayed history did not finish"
             # Prove the live socket still offers the conflicting, honestly
             # incomplete 100 B answer, not an unanswered-client fallback.
             reply = holder["client"].query(QueryRequest("ranking", scope))
@@ -188,8 +219,23 @@ def test_live_incomplete_reply_cannot_resurrect_export_overlap_in_production_ent
             assert not remote_row.coverage.complete
             assert response["snapshot"] is not None and response.get("next_cursor") is None
             row, = history.ranking(scope, "total_bytes")
-            share = history.disk_share(row.app_id, scope)
-            series = history.series(row.app_id, scope)
+            from appio.contracts import HistoryPending
+
+            def detail(kind):
+                getter = history.disk_share if kind == "totals" else history.series
+                deadline = time.monotonic() + 10
+                while True:
+                    history.drain()
+                    try:
+                        return getter(row.app_id, scope)
+                    except HistoryPending:
+                        step_daemon()
+                        time.sleep(0.001)
+                        assert time.monotonic() < deadline, f"local {kind} did not settle"
+
+            share = detail("totals")
+            series = detail("series")
+            window.view.refresh_measurements()
             labels = {name: window.view.findChild(QLabel, name).text()
                       for name in ("total_value", "read_value", "write_value", "coverage_label")}
             observed = (row.total_bytes, row.read_bytes, row.write_bytes,

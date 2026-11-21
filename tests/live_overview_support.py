@@ -645,6 +645,92 @@ def wait_for_local_frame(router, *, timeout=15.0):
         time.sleep(0.001)
 
 
+def run_isolated_mutation(source_path, old, new, nodes, expected_assertion, *, timeout=90):
+    """Run one copied-source mutation with passing and restored controls.
+
+    The returned receipt retains logs and the absolute copy path after cleanup.
+    Only call-phase assertion failures matching the named discriminator count.
+    """
+    import os
+    from pathlib import Path
+    import shutil
+    import subprocess
+    import sys
+    import tempfile
+    import xml.etree.ElementTree as ET
+
+    receipt = dict(source_path=source_path, old=old, new=new, nodes=tuple(nodes),
+                   expected_assertion=expected_assertion, classification="unexercised")
+    temporary = tempfile.TemporaryDirectory(prefix="appio-mutation-")
+    copy = Path(temporary.name) / "repo"
+    receipt["copy_path"] = str(copy)
+    try:
+        shutil.copytree(Path.cwd(), copy, symlinks=True, ignore=shutil.ignore_patterns(
+            ".git", ".superpowers", ".venv", "venv", "node_modules", "__pycache__",
+            ".pytest_cache", ".mypy_cache", ".ruff_cache", ".codegraph", "build", "dist",
+            "*.egg-info", "*.pyc", "*.db", "*.sqlite", "*.sock", "*.log", "core.*"))
+        env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1", QT_QPA_PLATFORM="offscreen",
+                   PYTEST_QT_API="pyqt6", PYTHONPATH=f"{copy}/src:{copy}/tests")
+        proof = subprocess.run([sys.executable, "-c",
+            "from pathlib import Path; import appio.history_source as m; "
+            "assert Path(m.__file__).is_relative_to(Path.cwd()); print(m.__file__)"],
+            cwd=copy, env=env, text=True, capture_output=True, timeout=30)
+        receipt["import_proof"] = proof.stdout + proof.stderr
+        assert proof.returncode == 0, receipt["import_proof"]
+        target = copy / source_path
+        original = target.read_text()
+        assert original.count(old) == 1, "mutation target must occur exactly once"
+
+        def run(phase):
+            xml = Path(temporary.name) / f"{phase}.xml"
+            command = [sys.executable, "-m", "pytest", "-q", "--tb=short",
+                       f"--junitxml={xml}", *nodes]
+            try:
+                result = subprocess.run(command, cwd=copy, env=env, text=True,
+                                        capture_output=True, timeout=timeout)
+                receipt[f"{phase}_exit"] = result.returncode
+                receipt[f"{phase}_log"] = result.stdout + result.stderr
+            except subprocess.TimeoutExpired as error:
+                receipt[f"{phase}_exit"] = "timeout"
+                receipt[f"{phase}_log"] = str(error)
+            if xml.exists():
+                root = ET.parse(xml).getroot()
+                failures = [failure.text or "" for failure in root.iter("failure")]
+                receipt[f"{phase}_failures"] = failures
+                receipt[f"{phase}_errors"] = [error.text or "" for error in root.iter("error")]
+                receipt[f"{phase}_cases"] = [
+                    {"name": case.get("name"), "module": case.get("classname"),
+                     "status": "error" if case.find("error") is not None else
+                               "failed" if case.find("failure") is not None else
+                               "skipped" if case.find("skipped") is not None else "passed"}
+                    for case in root.iter("testcase")]
+            else:
+                receipt[f"{phase}_failures"] = []
+                receipt[f"{phase}_errors"] = ["pytest produced no result document"]
+
+        run("baseline")
+        if receipt["baseline_exit"] != 0:
+            return receipt
+        try:
+            target.write_text(original.replace(old, new, 1))
+            run("mutant")
+        finally:
+            target.write_text(original)
+            run("restored")
+        failures = receipt["mutant_failures"]
+        asserted = [text for text in failures if expected_assertion in text
+                    and ("AssertionError" in text or "DID NOT RAISE" in text
+                         or "\nE   assert " in text)]
+        if (receipt["mutant_exit"] == 1 and asserted and not receipt["mutant_errors"]
+                and receipt["restored_exit"] == 0):
+            receipt["classification"] = "killed"
+        receipt["assertions"] = asserted
+        return receipt
+    finally:
+        temporary.cleanup()
+        assert not copy.exists(), "disposable mutation copy survived cleanup"
+
+
 class GapSqlHarness:
     """Instrument real actor connections and inject ordered SQLite faults."""
 

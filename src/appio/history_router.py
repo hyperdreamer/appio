@@ -787,7 +787,11 @@ class _PartSlot:
 
 @dataclass
 class _DetailLifetime:
-    """One selected subject/scope lifetime; resets allocate a new id."""
+    """One selected subject/scope lifetime; resets allocate a new id.
+
+    The selected ranking proof survives preparation. ``local_tokens`` binds its
+    local ownership decision to pending remote requests until they terminate.
+    """
 
     app_key: str
     family: tuple
@@ -796,6 +800,8 @@ class _DetailLifetime:
     slots: dict[tuple[str, RetentionScope], _PartSlot] = field(default_factory=dict)
     live: dict[str, RequestToken] = field(default_factory=dict)
     successors: dict[str, RequestToken] = field(default_factory=dict)
+    ranking_provenance: AnswerProvenance | None = None
+    local_tokens: set[int] = field(default_factory=set)
 
 
 @dataclass
@@ -961,6 +967,9 @@ class HistoryRouter:
         self._detail: _DetailLifetime | None = None
         self._next_lifetime_id = 1
         self._applied_window: Window | None = None
+        #: Immutable row proofs from the last observed applied ranking. A newly
+        #: selected subject needs its ownership decision during preparation too.
+        self._applied_ranking_provenance: dict[str, AnswerProvenance] = {}
         #: One wire occupant and its priority-stable queue (§5.1).
         self._queue: list[_QueueEntry] = []
         self._occupant: tuple[RequestToken, Future] | None = None
@@ -2255,6 +2264,7 @@ class HistoryRouter:
 
     def close(self):
         self.invalidate()
+        self._applied_ranking_provenance = {}
         self._close_views()
         self._queue = []
         self._closed = True
@@ -2686,6 +2696,7 @@ class HistoryRouter:
         """One authority transition: clear detail and retire its admitted frame."""
 
         self._authority = current
+        self._applied_ranking_provenance = {}
         changed = self._retire_detail_lifetime()
         frame = self._frame
         if frame is not None and not frame.retired:
@@ -2777,8 +2788,13 @@ class HistoryRouter:
         family = self._window_family(key, window)
         endpoint = applied_endpoint(window)
         lifetime = self._detail
+        ranking_provenance = self._applied_ranking_provenance.get(key)
+        if ranking_provenance is None or ranking_provenance.measured_window != window:
+            ranking_provenance = self.ranking_provenance(key, window)
         if (lifetime is not None and lifetime.app_key == key
                 and lifetime.family == family):
+            if ranking_provenance is not None:
+                lifetime.ranking_provenance = ranking_provenance
             if endpoint is None:
                 self._applied_window = window
                 return
@@ -2789,7 +2805,9 @@ class HistoryRouter:
                 self._applied_window = window
                 return
         self._retire_detail_lifetime()
-        self._detail = _DetailLifetime(key, family, self._next_lifetime_id, endpoint)
+        self._detail = _DetailLifetime(
+            key, family, self._next_lifetime_id, endpoint,
+            ranking_provenance=ranking_provenance)
         self._next_lifetime_id += 1
         self._applied_window = window
 
@@ -2813,10 +2831,17 @@ class HistoryRouter:
         authority = self._current_authority()
         requested_source = self.source_position() if origin == "remote" else self._local_vector()
         slot_id = self._allocate_token_id() if origin == "remote" else None
+        ranking_provenance = lifetime.ranking_provenance
+        local_ownership = (
+            ranking_provenance is not None
+            and ranking_provenance.measured_window == window
+            and ranking_provenance.local_bracket is not None)
         token = RequestToken(
             token_id, QueryRequest(kind, window, key), origin, scope, "detail",
             lifetime.lifetime_id, slot_id, authority, requested_source,
         )
+        if origin == "remote" and local_ownership:
+            lifetime.local_tokens.add(token_id)
         slot = lifetime.slots.get((kind, scope))
         if slot is None:
             slot = _PartSlot(kind, scope)
@@ -2872,6 +2897,7 @@ class HistoryRouter:
                     if successor is not None:
                         self._retired_tokens.add(successor.token_id)
                         self._unscheduled.pop(successor.token_id, None)
+                        lifetime.local_tokens.discard(successor.token_id)
                     token = self._admit_detail(lifetime, kind, key, window, scope)
                     lifetime.successors[kind] = token
                     lifetime.live[kind] = live  # the older live owner keeps the wire
@@ -3349,10 +3375,12 @@ class HistoryRouter:
         live = lifetime.live.get(kind)
         if live is not None and live.token_id == token.token_id:
             del lifetime.live[kind]
+        lifetime.local_tokens.discard(token.token_id)
         successor = lifetime.successors.pop(kind, None)
         if successor is not None:
             self._retired_tokens.add(successor.token_id)
             self._unscheduled.pop(successor.token_id, None)
+            lifetime.local_tokens.discard(successor.token_id)
         return True
 
     def _settle_remote(self, token: RequestToken, settlement: RemoteSettlement) -> bool:
@@ -3412,6 +3440,26 @@ class HistoryRouter:
             if answered is None or answered != token.requested_source:
                 return self._reject_token(
                     token, settlement, RequestRejected("invalid_result", "invalid_result"))
+            lifetime = self._detail
+            if token.token_id in lifetime.local_tokens:
+                # The admitted ranking's source decision stays with this exact
+                # detail across preparation and later applied-frame adoption.
+                # Recompute through the same managed-source reducers.
+                lifetime.local_tokens.discard(token.token_id)
+                self.client.reject_query_result(future)
+                self._settled_tokens.add(token.token_id)
+                local_token = replace(
+                    token, token_id=self._allocate_token_id(), origin="local",
+                    slot_id=None, requested_source=self._local_vector())
+                if lifetime.live.get(kind) == token:
+                    lifetime.live[kind] = local_token
+                else:
+                    lifetime.successors[kind] = local_token
+                slot = lifetime.slots[(kind, token.scope)]
+                if slot.token == token:
+                    slot.token = local_token
+                self._start_local_detail(local_token)
+                return True
             digest = actual.get("snapshot")
             presentation = self.registry.id_for(token.request.app_key)
             return self._publish_detail(
@@ -4035,6 +4083,8 @@ class HistoryRouter:
             rows = [replace(row, coverage=replace(row.coverage, complete=False,
                                                    unavailable_reason="not_retained"))
                     for row in rows]
+        assert self._frame is not None
+        self._applied_ranking_provenance = dict(self._frame.ranking_provenance)
         return sorted(rows, key=lambda row: (-getattr(row, "total_bytes" if metric == "total_bytes" else metric),
                                              row.app_key.encode("utf-8")))
 
