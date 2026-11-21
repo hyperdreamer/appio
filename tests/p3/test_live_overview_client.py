@@ -41,7 +41,7 @@ from appio.iodclient import AppRegistry, IodClientError, RequestRejected
 from appio.ipc_models import QueryRequest
 from appio.query import QueryService
 from appio.store import AppIoStore
-from live_overview_support import coverage, series, share, total
+from live_overview_support import coverage, series, share, total, wait_for_local_frame, wait_for_capture_admission
 from live_overview_transport import QueryTransportHarness
 
 KEY = "unit:alpha.service"
@@ -1135,8 +1135,11 @@ def _scheduler_router(tmp_path, *, name="scheduler.db"):
     # One peer snapshot proves the file capability set and a cursor; a status
     # reply alone carries no capabilities.
     transport.stream(4)
-    router = HistoryRouter(QueryService(store), transport.client, AppRegistry(),
-                           clock_ns=transport.clock)
+    from live_overview_support import make_managed_router
+
+    router = make_managed_router(
+        QueryService(store), transport.client, AppRegistry(), clock_ns=transport.clock)
+
     return router, transport, store
 
 
@@ -1148,7 +1151,7 @@ def _ready_remote_frame(router, transport, window):
     assert transport.query_kinds[-1] == "ranking"
     token, future = router._occupant
     assert token.owner == "frame"
-    assert router._local_future.result(timeout=20) is not None
+    assert wait_for_local_frame(router) is not None
     transport.reply(future, [total(17, KEY)], snapshot=SNAPSHOT)
     assert router.ready(window) is True
     assert router._remote is not None
@@ -1222,7 +1225,7 @@ def test_all_history_queries_share_one_priority_stable_scheduler(tmp_path):
         assert transport.query_kinds == ["ranking"]
 
         # Completing ranking dispatches the earlier detail admission first.
-        assert router._local_future.result(timeout=20) is not None
+        assert wait_for_local_frame(router) is not None
         transport.reply(ranking_future, [total(17, KEY)], snapshot=SNAPSHOT)
         assert router.ready(window) is True
         transport.pump()
@@ -1453,17 +1456,20 @@ def test_frame_failure_or_local_fallback_certifies_no_remote_position(tmp_path):
     local = _process_store(tmp_path / "mixed.db", ((mixed_key, 17, 20),))
     transport = QueryTransportHarness(cursor=RemotePosition(BOOT, 7, 3))
     transport.stream(4)
-    router = HistoryRouter(QueryService(local), transport.client, AppRegistry(),
-                           clock_ns=transport.clock)
+    from live_overview_support import make_managed_router
+
+    router = make_managed_router(
+        QueryService(local), transport.client, AppRegistry(), clock_ns=transport.clock)
+
     try:
         release = threading.Event()
         entered = threading.Event()
         real_read = router._read_local
 
-        def held_copy(paths, wanted):
+        def held_copy(paths, wanted, **kwargs):
             entered.set()
             assert release.wait(20), "the local ownership copy was never released"
-            return real_read(paths, wanted)
+            return real_read(paths, wanted, **kwargs)
 
         router._read_local = held_copy
         router.prepare(window)
@@ -1471,6 +1477,7 @@ def test_frame_failure_or_local_fallback_certifies_no_remote_position(tmp_path):
         assert transport.query_kinds == ["ranking"]
         ranking_token, ranking_future = router._occupant
         assert ranking_token.owner == "frame"
+        wait_for_capture_admission(router)
         assert entered.wait(10)
 
         # Remote completion first: the ranking answer waits privately for the
@@ -1488,7 +1495,7 @@ def test_frame_failure_or_local_fallback_certifies_no_remote_position(tmp_path):
         # evicts the cache entry this exact Future produced.
         router._read_local = real_read
         release.set()
-        assert router._local_future.result(timeout=20) is not None
+        assert wait_for_local_frame(router) is not None
         assert router.ready(window) is True
         assert router._remote is None and router._remote_answered is None
         assert router.daemon_answer_error is not None
@@ -1498,7 +1505,8 @@ def test_frame_failure_or_local_fallback_certifies_no_remote_position(tmp_path):
         certificate = router.frame_provenance(window)
         assert certificate is not None
         assert certificate.requested_source == RemotePosition(BOOT, 7, 4)
-        assert certificate.answered_source is None
+        assert certificate.answered_source == certificate.local_bracket.opening
+        assert certificate.answered_source != certificate.requested_source
         assert certificate.certified is False
         assert router.ranking_provenance(mixed_key, window).accepted_identity.kind == "ranking"
 
@@ -1511,7 +1519,7 @@ def test_frame_failure_or_local_fallback_certifies_no_remote_position(tmp_path):
             router.ranking(window, "total_bytes")
         transport.pump()
         token, future = router._occupant
-        assert router._local_future.result(timeout=20) is not None
+        assert wait_for_local_frame(router) is not None
         transport.reply(future, [total(17, mixed_key)], snapshot=SNAPSHOT)
         assert router.ready(window) is True
         replaced = router.frame_provenance(window)
@@ -1522,7 +1530,7 @@ def test_frame_failure_or_local_fallback_certifies_no_remote_position(tmp_path):
         router.prepare(window)
         transport.pump()
         token, failed = router._occupant
-        assert router._local_future.result(timeout=20) is not None
+        assert wait_for_local_frame(router) is not None
         transport.error(failed, "daemon_error", "collector exploded")
         assert router.ready(window) is True
         assert router._remote is None and router._remote_answered is None
@@ -1530,7 +1538,8 @@ def test_frame_failure_or_local_fallback_certifies_no_remote_position(tmp_path):
         assert router.daemon_answer_error.reason == "daemon_error"
         failed_certificate = router.frame_provenance(window)
         assert failed_certificate.certified is False
-        assert failed_certificate.answered_source is None
+        assert failed_certificate.answered_source == failed_certificate.local_bracket.opening
+        assert failed_certificate.answered_source != failed_certificate.requested_source
         assert router._ranking  # locally proved rows remain
     finally:
         release.set()
@@ -1547,14 +1556,17 @@ def test_frame_failure_or_local_fallback_certifies_no_remote_position(tmp_path):
         empty_store.connection.commit()
         empty_transport = QueryTransportHarness(cursor=RemotePosition(BOOT, 7, 3))
         empty_transport.stream(4)
-        empty_router = HistoryRouter(
+        from live_overview_support import make_managed_router
+
+        empty_router = make_managed_router(
             QueryService(empty_store), empty_transport.client, AppRegistry(),
             clock_ns=empty_transport.clock)
+
         try:
             empty_router.prepare(other)
             empty_transport.pump()
             token, future = empty_router._occupant
-            assert empty_router._local_future.result(timeout=20) is not None
+            assert wait_for_local_frame(empty_router) is not None
             empty_transport.reply(future, value, snapshot=SNAPSHOT,
                                   next_cursor=cursor)
             assert empty_router.ready(other) is True
@@ -1563,7 +1575,8 @@ def test_frame_failure_or_local_fallback_certifies_no_remote_position(tmp_path):
             assert empty_router.daemon_answer_error.reason == reason
             certificate = empty_router.frame_provenance(other)
             assert certificate.certified is False
-            assert certificate.answered_source is None
+            assert certificate.answered_source == certificate.local_bracket.opening
+            assert certificate.answered_source != certificate.requested_source
             assert empty_transport.client.cached_responses == 0
         finally:
             empty_router.close()

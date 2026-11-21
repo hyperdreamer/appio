@@ -58,7 +58,22 @@ def tab_store(tmp_path):
 
 
 def read_files(stores, window=R, key=A, app_id=101):
-    paths = tuple((name, db.execute("PRAGMA database_list").fetchone()[2], owner)
-                  for name, db, owner in stores)
-    return HistoryRouter._read_local_files(paths, window, key, app_id,
-                                          "bytes_total", "desc", None)
+    from pathlib import Path
+    from appio.history_source import ManagedSourceRegistry
+    from appio.history_types import ManagedSourceSpec
+
+    registry = ManagedSourceRegistry(wake=lambda: None)
+    captured = None
+    try:
+        for name, db, owner in stores:
+            path = db.execute("PRAGMA database_list").fetchone()[2]
+            mode = "?mode=rw&cache=shared" if name == "local" and owner == "gui" else "?mode=ro"
+            registry.register(ManagedSourceSpec(
+                name, owner, Path(path).as_uri() + mode, ())).result(timeout=10)
+        captured = registry.capture().result(timeout=15)
+        return HistoryRouter._read_local_files(
+            captured, window, key, app_id, "bytes_total", "desc", None)
+    finally:
+        if captured is not None:
+            registry.release_capture(captured.capture_id)
+        registry.close()

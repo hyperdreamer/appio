@@ -1,6 +1,7 @@
 """History selection uses durable intervals, never matching local surrogate IDs."""
 from concurrent.futures import Future
 from dataclasses import replace
+from pathlib import Path
 import sqlite3
 import threading
 import time
@@ -10,7 +11,8 @@ import pytest
 from appio.contracts import HistoryPending, Window, WindowUnavailableError
 from appio.handover import HandoverOffer, baseline_seed, capture_handover
 from appio.history_router import DaemonAnswerError, HistoryRouter, HistorySegment
-from appio.history_types import RemotePosition, retention_scope
+from appio.history_source import ManagedSourceRegistry, SourceAdmissionError
+from appio.history_types import ManagedSourceSpec, RemotePosition, retention_scope
 from appio.iodclient import AppRegistry, ClientState, QueryTransportState
 from appio.ipc_models import StreamCursor
 from appio.procs import AppKeyInputs, IoReadOutcome, ProcessIdentity, StableProcRecord
@@ -145,6 +147,67 @@ def result(router, scope):
     return router.ranking(scope, "total_bytes")
 
 
+def wait_local(router):
+    from live_overview_support import wait_for_local_frame
+
+    return wait_for_local_frame(router)
+
+
+def add_managed_source(history, store, *, collector_id, owner):
+    path = store.connection.execute("PRAGMA database_list").fetchone()[2]
+    mode = "?mode=rw&cache=shared" if owner == "gui" and collector_id == "local" else "?mode=ro"
+    spec = ManagedSourceSpec(collector_id, owner, Path(path).as_uri() + mode, ())
+    return history.add_source(spec).result(timeout=10)
+
+
+def test_router_requires_managed_sources_and_accepts_only_specs(tmp_path, monkeypatch):
+    local, _ = source(tmp_path / "local.db")
+    imported, _ = source(tmp_path / "imported.db", "iod")
+    sources = ManagedSourceRegistry(wake=lambda: None)
+
+    def spec(name, store, owner):
+        path = store.connection.execute("PRAGMA database_list").fetchone()[2]
+        mode = "?mode=rw&cache=shared" if owner == "gui" else "?mode=ro"
+        return ManagedSourceSpec(name, owner, Path(path).as_uri() + mode, ())
+
+    local_spec = spec("local", local, "gui")
+    sources.register(local_spec).result(timeout=10)
+    history = HistoryRouter(sources, Client(), AppRegistry())
+    try:
+        imported_spec = spec("imported", imported, "iod")
+        history.add_source(imported_spec).result(timeout=10)
+        assert {name for name, _, _ in sources.registration_vector()} == {"local", "imported"}
+        calls = []
+        register = sources.register
+        def observed_register(spec):
+            calls.append(spec)
+            return register(spec)
+        monkeypatch.setattr(sources, "register", observed_register)
+        identities = sources.registration_vector()
+        for invalid in (QueryService(local), local.connection):
+            with pytest.raises(SourceAdmissionError, match="^history source is not managed$"):
+                history.add_source(invalid)
+        assert calls == []
+        assert sources.registration_vector() == identities
+        # The compatibility entry point forwards the exact immutable spec.
+        forwarded = []
+        response = Future()
+        monkeypatch.setattr(history, "add_managed_source",
+                            lambda spec: forwarded.append(spec) or response)
+        assert history.add_source(imported_spec) is response
+        assert forwarded == [imported_spec]
+    finally:
+        history.close()
+        assert sources._closed
+        assert sources.registration_vector() == ()
+        sources.close()
+
+    for invalid in (QueryService(local), local.connection):
+        with pytest.raises(SourceAdmissionError, match="^history source is not managed$"):
+            HistoryRouter(invalid, Client(), AppRegistry())
+
+
+
 def detail(router, app_id, method, scope, *, key):
     """Select, admit and drain one local detail until it is accepted."""
 
@@ -173,7 +236,8 @@ def test_adjacent_sources_merge_by_appkey_not_database_ids(tmp_path):
     local, _ = source(tmp_path / "local.db", app_id=17)
     root, _ = source(tmp_path / "root.db", "iod", app_id=3, start=110, end=130, amount=30)
     history = router(local)
-    history.add_source(QueryService(root), collector_id="export", owner="iod")
+    add_managed_source(history, root, collector_id="export", owner="iod")
+
     rows = result(history, window())
     assert len(rows) == 1
     assert (rows[0].rchar, rows[0].wchar, rows[0].read_bytes, rows[0].write_bytes) == (50, 50, 50, 50)
@@ -188,7 +252,8 @@ def test_same_surrogate_in_two_stores_is_not_same_app(tmp_path):
     local, _ = source(tmp_path / "local.db", app_id=3, key="/bin/first")
     root, _ = source(tmp_path / "root.db", "iod", app_id=3, key="/bin/second", start=110, end=130)
     history = router(local)
-    history.add_source(QueryService(root), collector_id="root", owner="iod")
+    add_managed_source(history, root, collector_id="root", owner="iod")
+
     rows = result(history, window())
     assert {row.app_key for row in rows} == {"exe:/bin/first", "exe:/bin/second"}
     assert len({row.app_id for row in rows}) == 2
@@ -204,7 +269,8 @@ def test_overlap_without_handover_is_a_gap_not_an_owner_guess(tmp_path):
     local, _ = source(tmp_path / "local.db", start=100, end=120)
     root, _ = source(tmp_path / "root.db", "iod", start=110, end=130)
     history = router(local)
-    history.add_source(QueryService(root), collector_id="root", owner="iod")
+    add_managed_source(history, root, collector_id="root", owner="iod")
+
     rows = result(history, window())
     assert sum(row.read_bytes for row in rows) == 0  # both indivisible deltas straddle uncertainty
     assert any(not segment.proven and segment.start_ns == 110*NS for segment in history.segments)
@@ -217,7 +283,8 @@ def test_duplicate_exports_do_not_duplicate_receipts(tmp_path):
     root, _ = source(tmp_path / "root.db", "iod", start=110, end=130)
     history = router(local)
     for name in ("export-a", "export-b"):
-        history.add_source(QueryService(root), collector_id=name, owner="iod")
+        add_managed_source(history, root, collector_id=name, owner="iod")
+
     rows = result(history, window())
     assert sum(row.read_bytes for row in rows) == 40
 
@@ -268,7 +335,8 @@ def test_old_mixed_totals_without_raw_corrections_are_unavailable(tmp_path):
     local.connection.execute("DELETE FROM sample")
     local.connection.commit()
     history = router(local)
-    history.add_source(QueryService(root), collector_id="root", owner="iod")
+    add_managed_source(history, root, collector_id="root", owner="iod")
+
     result(history, Window("lifetime"))
     assert "not_retained" in history.view_state
     assert not any(s.proven and s.collector_id == "local" for s in history.segments)
@@ -299,7 +367,7 @@ def test_a_frame_prefetches_only_its_default_subject_and_loads_the_rest_on_deman
     history = router(AppIoStore(tmp_path / "empty.db"))
     client = answering_remote(history)
     history.prepare(scope)
-    history._local_future.result(timeout=10)
+    wait_local(history)
     ranking, ranking_future = client.pending[0]
     assert ranking.kind == "ranking"
     ranking_future.set_result({"kind": "ranking", "result": expected, "snapshot": SNAPSHOT,
@@ -346,7 +414,7 @@ def test_a_part_binds_its_window_and_never_blanks_the_ranking(tmp_path):
 
     def answer(history, client, *, part_window=None):
         history.prepare(scope)
-        history._local_future.result(timeout=10)
+        wait_local(history)
         ranking, ranking_future = client.pending[0]
         assert ranking.kind == "ranking"
         ranking_future.set_result({"kind": "ranking", "result": expected,
@@ -401,6 +469,7 @@ def test_old_scope_remote_response_never_populates_new_scope(tmp_path):
     assert not history.ready(first)
     request, pending = client.pending[0]
     assert request.window == first
+    wait_local(history)
     history.prepare(second)
     # The single wire occupant is not preempted; the replacement ranking waits.
     assert len(client.pending) == 1
@@ -420,7 +489,8 @@ def test_two_boots_keep_monotonic_time_and_device_names_boot_scoped(tmp_path):
     local, _ = source(tmp_path / "local.db", boot="boot-a")
     root, _ = source(tmp_path / "root.db", "iod", boot="boot-b", app_id=3, amount=30)
     history = router(local)
-    history.add_source(QueryService(root), collector_id="root", owner="iod")
+    add_managed_source(history, root, collector_id="root", owner="iod")
+
     rows = result(history, Window("lifetime"))
     assert sum(row.read_bytes for row in rows) == 50
     assert {s.boot_id for s in history.segments} == {"boot-a", "boot-b"}
@@ -431,7 +501,8 @@ def test_shared_boot_order_evidence_beats_the_order_sources_were_added(tmp_path)
     root, _ = source(tmp_path / "root.db", "iod", boot="boot-old")
     root.start_boot("boot-new", 2, 0, 1000.0, "iod")
     history = router(local)
-    history.add_source(QueryService(root), collector_id="root", owner="iod")
+    add_managed_source(history, root, collector_id="root", owner="iod")
+
     result(history, Window("lifetime"))
     assert [segment.boot_id for segment in history.segments] == ["boot-old", "boot-new"]
 
@@ -440,7 +511,8 @@ def test_disjoint_boot_orders_are_explicitly_not_a_proven_global_chronology(tmp_
     local, _ = source(tmp_path / "local.db", boot="boot-a")
     root, _ = source(tmp_path / "root.db", "iod", boot="boot-b")
     history = router(local)
-    history.add_source(QueryService(root), collector_id="root", owner="iod")
+    add_managed_source(history, root, collector_id="root", owner="iod")
+
     rows = result(history, Window("lifetime"))
     assert sum(row.read_bytes for row in rows) == 40
     assert "chronology" in history.view_state
@@ -462,7 +534,8 @@ def test_discarding_one_uncorrectable_boot_keeps_other_boot_lifetime_bytes(tmp_p
     local.connection.execute("DELETE FROM sample WHERE boot_id=?", (BOOT,))
     local.connection.commit()
     history = router(local)
-    history.add_source(QueryService(root), collector_id="root", owner="iod")
+    add_managed_source(history, root, collector_id="root", owner="iod")
+
     rows = result(history, Window("lifetime"))
     assert sum(row.read_bytes for row in rows) == 30
     assert "not_retained" in history.view_state
@@ -508,8 +581,9 @@ def test_pruned_mirror_is_not_a_second_contributor_or_a_false_retention_gap(tmp_
     old.connection.execute("DELETE FROM sample")
     old.connection.commit()
     history = router(local)
-    history.add_source(QueryService(old), collector_id=old_name, owner="iod")
-    history.add_source(QueryService(new), collector_id=new_name, owner="iod")
+    add_managed_source(history, old, collector_id=old_name, owner="iod")
+    add_managed_source(history, new, collector_id=new_name, owner="iod")
+
     rows = result(history, Window("lifetime"))
     assert sum(row.read_bytes for row in rows) == 40
     assert "not_retained" not in history.view_state
@@ -788,7 +862,8 @@ def test_transport_loss_is_local_and_does_not_override_a_complete_export(tmp_pat
     drain_transport_gaps(history)
     assert local.connection.execute("SELECT count(*) FROM gap WHERE reason='gui_absent'").fetchone()[0] == 1
     assert root.connection.execute("SELECT count(*) FROM gap").fetchone()[0] == 0
-    history.add_source(QueryService(root), collector_id="root", owner="iod")
+    add_managed_source(history, root, collector_id="root", owner="iod")
+
     rows = result(history, Window("lifetime"))
     assert sum(row.read_bytes for row in rows) == 40
     assert all(row.coverage.gap_intervals == 0 for row in rows)
@@ -814,7 +889,8 @@ def test_restart_preserves_both_daemon_epochs_and_marks_the_restart_gap(tmp_path
     root = AppIoStore(path)
     local, _ = source(tmp_path / "local.db", boot="different-boot")
     history = router(local)
-    history.add_source(QueryService(root), collector_id="root", owner="iod")
+    add_managed_source(history, root, collector_id="root", owner="iod")
+
     scope = Window("range", BOOT_ID, 100*NS, 140*NS)
     rows = result(history, scope)
     assert sum(row.read_bytes for row in rows) == 80
@@ -888,7 +964,8 @@ def test_remote_evidence_rejections_have_no_numeric_fallback(tmp_path, variant):
     history.prepare(scope)
     history.client.pending[0][1].set_result({"kind": "ranking", "result": rows,
         "snapshot": SNAPSHOT, "next_cursor": "more" if variant == "paginated" else None})
-    history._local_future.result(timeout=10)
+    wait_local(history)
+
     assert history.ready(scope)
     ranked = history.ranking(scope, "total_bytes")
     assert ranked == []
@@ -929,7 +1006,7 @@ def test_incomplete_remote_history_is_retained_with_honest_coverage(tmp_path):
         answer_pending()
         work = getattr(history, "_local_future", None)
         if work is not None:
-            work.result(timeout=10)
+            wait_local(history)
         if history.ready(scope):
             break
     assert history.ready(scope)
@@ -957,7 +1034,7 @@ def test_remote_fallback_uses_scoped_ownership_not_filtered_counters(
     answering_remote(history)
     try:
         history.prepare(scope)
-        history._local_future.result(timeout=10)
+        wait_local(history)
         for _ in range(4):
             for request, future in history.client.pending:
                 if future.done():
@@ -993,9 +1070,7 @@ def test_empty_or_partial_remote_answer_cannot_replace_proved_local_bytes(tmp_pa
     history.prepare(scope)
     history.client.pending[0][1].set_result({"kind": "ranking", "result": [],
         "snapshot": SNAPSHOT, "next_cursor": None})
-    work = getattr(history, "_local_future", None)
-    if work is not None:
-        work.result(timeout=10)
+    wait_local(history)
     assert history.ready(scope)
     rows = history.ranking(scope, "total_bytes")
     assert sum(row.read_bytes for row in rows) == 20

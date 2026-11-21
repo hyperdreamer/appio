@@ -23,6 +23,7 @@ import gzip
 import hashlib
 import json
 import os
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -35,6 +36,8 @@ from PyQt6.QtWidgets import QApplication, QLabel
 
 from appio.contracts import Window
 from appio.history_router import HistoryRouter
+from appio.history_source import ManagedSourceRegistry
+from appio.history_types import ManagedSourceSpec
 from appio.iodclient import AppRegistry, ClientState
 from appio.query import QueryService
 from appio.ui.files_view import FilesView
@@ -101,15 +104,30 @@ def _capture_path() -> Path | None:
 
 def _assert_served(snapshot: Path, expected: dict, *, expected_apps: int, check_rows: bool) -> None:
     before = _sha256(snapshot)
+    working = tempfile.TemporaryDirectory(prefix="appio-real-store-")
+    working_path = Path(working.name) / "history.sqlite"
+    shutil.copyfile(snapshot, working_path)
+    from appio.migrations import migrate_empty
+    with sqlite3.connect(working_path) as upgrade:
+        migrate_empty(upgrade)
+    upgrade.close()
     connection = sqlite3.connect(f"file:{snapshot}?mode=ro", uri=True)
     app = QApplication.instance() or QApplication([])
     try:
         requested = Window("since_boot", expected["boot_id"], end_mono_ns=expected["file_finalized_through_mono_ns"])
-        router = HistoryRouter(QueryService(connection), _NoDaemon(), AppRegistry())
+        sources = ManagedSourceRegistry(wake=lambda: None)
+        sources.register(ManagedSourceSpec(
+            "local", "iod", working_path.as_uri() + "?mode=ro", ())).result(timeout=10)
+        router = HistoryRouter(sources, _NoDaemon(), AppRegistry())
+
+
         try:
             router.prepare(requested)
-            router._local_future.result(timeout=600)
-            assert router._consume_local() is True, "the local window must settle before rendering"
+            deadline = time.monotonic() + 600
+            while not router.ready(requested):
+                assert time.monotonic() < deadline
+                time.sleep(0.01)
+            assert router.ready(requested) is True, "the local window must settle before rendering"
 
             view = FilesView(router)
             view.resize(1100, 700)
@@ -117,6 +135,7 @@ def _assert_served(snapshot: Path, expected: dict, *, expected_apps: int, check_
             view.show()
             deadline = time.monotonic() + 600
             while time.monotonic() < deadline and view.state == "loading":
+                router.drain()
                 app.processEvents()
                 time.sleep(0.05)
             app.processEvents()
@@ -141,8 +160,10 @@ def _assert_served(snapshot: Path, expected: dict, *, expected_apps: int, check_
                 view.close()
         finally:
             router.close()
+            sources.close()
     finally:
         connection.close()
+        working.cleanup()
         assert _sha256(snapshot) == before, "acceptance must not modify its input"
 
 

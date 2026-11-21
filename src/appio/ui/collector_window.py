@@ -34,7 +34,7 @@ import threading
 import time
 from typing import TYPE_CHECKING, Callable, Literal
 
-from PyQt6.QtCore import QObject, Qt, QTimer, pyqtSignal
+from PyQt6.QtCore import QObject, Qt, QTimer, pyqtSignal, pyqtSlot
 from PyQt6.QtWidgets import (
     QCheckBox,
     QDialog,
@@ -566,6 +566,7 @@ class CollectorWindow(QMainWindow):
         self._target: Window | None = None
         self._displayed: Window | None = None
         self._pending: Window | None = None
+        self._pending_origin: Literal["clock", "explicit"] = "clock"
         self._pending_since: int | None = None
         self._stalled = False
         self._retry_after: int | None = None
@@ -840,6 +841,9 @@ class CollectorWindow(QMainWindow):
             if self._pump is not None:
                 with self.files_view.transient_scope():
                     self._pump()
+            retry_gaps = getattr(self.history, "retry_transport_gaps", None)
+            if callable(retry_gaps):
+                retry_gaps()
             self._tick_target()
             applied = self.apply_ready_frame()
             if (
@@ -1230,28 +1234,13 @@ class CollectorWindow(QMainWindow):
             self._render_files_message()
             raise
         except Exception as error:
-            self._pending = None
-            self._pending_source = None
-            self._pending_since = None
-            # An operational attempt supersedes only a shell_prepare refusal;
-            # a direct_view refusal stays until supported adoption.
-            if (
-                self._presentation_refusal is not None
-                and self._presentation_refusal.origin == "shell_prepare"
-            ):
-                self._presentation_refusal = None
-            self._prepare_retry = PrepareRetry(wanted, origin, now)
-            self._prepare_error = f"appio: {str(error) or type(error).__name__}"
-            self._show_error(self._prepare_error)
-            self._error_owner = "prepare_retry"
-            self._show_pending_status(now)
-            self._poll_timer.stop()
-            self._render_files_message()
+            self._record_prepare_failure(wanted, origin, now, error)
             if origin == "explicit":
                 raise
             return False
 
         self._pending = wanted
+        self._pending_origin = origin
         # Read the gate's exact stored capture; never recapture the cursor or
         # local vector independently in the shell (§6.1).
         capture = getattr(self.history, "preparation_source", None)
@@ -1276,6 +1265,22 @@ class CollectorWindow(QMainWindow):
         self._arm_poll()
         return True
 
+    def _record_prepare_failure(self, wanted: Window, origin: Literal["clock", "explicit"],
+                                now: int, error: Exception) -> None:
+        self._pending = None
+        self._pending_source = None
+        self._pending_since = None
+        if (self._presentation_refusal is not None
+                and self._presentation_refusal.origin == "shell_prepare"):
+            self._presentation_refusal = None
+        self._prepare_retry = PrepareRetry(wanted, origin, now)
+        self._prepare_error = f"appio: {str(error) or type(error).__name__}"
+        self._show_error(self._prepare_error)
+        self._error_owner = "prepare_retry"
+        self._show_pending_status(now)
+        self._poll_timer.stop()
+        self._render_files_message()
+
     def apply_ready_frame(
         self, *, now: int | None = None, context: Literal["ordinary", "poll"] = "ordinary"
     ) -> bool:
@@ -1291,9 +1296,18 @@ class CollectorWindow(QMainWindow):
         # batch reaches the view before any later refresh and status/age are
         # composed even on early returns.
         changed = self._drain_history()
+        if self._pending is not None and self._pending_source is None:
+            capture = getattr(self.history, "preparation_source", None)
+            if callable(capture):
+                self._pending_source = capture(self._pending)
         self._observe_source()
         if changed:
             self._notify_measurements()
+        if self._pending is not None and isinstance(self.history, HistoryRouter):
+            error = self.history._take_preparation_error(self._pending)
+            if error is not None:
+                self._record_prepare_failure(self._pending, self._pending_origin, now, error)
+                return False
         self._update_overview_status(now)
         # (2) A pending frame retired underneath us: the frozen retirement owns
         # the floor and no replacement is submitted inline.
@@ -1385,6 +1399,7 @@ class CollectorWindow(QMainWindow):
             provenance = lookup(window)
         certified = (
             provenance is not None
+            and provenance.generation == getattr(self.history, "_generation", provenance.generation)
             and provenance.window == window
             and provenance.certified is True
             and provenance.requested_source == self._pending_source
@@ -1437,6 +1452,8 @@ class CollectorWindow(QMainWindow):
             self._update_overview_status(now)
             if self._pending is None and not getattr(self.history, "pending_work", False):
                 self._poll_timer.stop()
+            else:
+                self._arm_poll()
         except WindowUnavailableError as error:
             self._show_refusal_error(error)
         except Exception as error:
@@ -1516,15 +1533,21 @@ class CollectorWindow(QMainWindow):
                 return None
             boot_id = cursor.boot_id
         else:
-            connection = getattr(getattr(self.history, "local", None), "connection", None)
-            if connection is None:
-                return None
-            row = connection.execute(
-                "SELECT boot_id FROM boot ORDER BY boot_order DESC LIMIT 1"
-            ).fetchone()
-            if row is None or not row[0]:
-                return None
-            boot_id = str(row[0])
+            lookup = getattr(self.history, "_local_boot", None)
+            if callable(lookup):
+                boot_id = lookup()
+                if boot_id is None:
+                    return None
+            else:
+                connection = getattr(getattr(self.history, "local", None), "connection", None)
+                if connection is None:
+                    return None
+                row = connection.execute(
+                    "SELECT boot_id FROM boot ORDER BY boot_order DESC LIMIT 1"
+                ).fetchone()
+                if row is None or not row[0]:
+                    return None
+                boot_id = str(row[0])
         now = self._clock_ns() if now_ns is None else now_ns
         end = (now // RAW_BUCKET_NS + 1) * RAW_BUCKET_NS
         return Window(kind="since_boot", boot_id=boot_id, end_mono_ns=end)
@@ -2016,8 +2039,9 @@ def run_interactive(args) -> int:
 
     from PyQt6.QtWidgets import QApplication
 
+    from ..history_source import ManagedSourceRegistry
+    from ..history_types import ManagedSourceSpec
     from ..iodclient import AppRegistry, IodClient
-    from ..query import QueryService
     from ..store import AppIoStore
 
     application = QApplication.instance() or QApplication([sys.argv[0]])
@@ -2030,59 +2054,122 @@ def run_interactive(args) -> int:
 
     database_path = Path(args.db)
     store = AppIoStore(database_path)
-    local_service = QueryService(store)
     registry = AppRegistry()
-    wake = _wake_object()
-    router_holder: dict[str, HistoryRouter] = {}
+    client_wake = _wake_object()
+    source_wake = _wake_object()
+    sources = ManagedSourceRegistry(wake=source_wake.woke.emit)
+    primary_spec = ManagedSourceSpec(
+        "local", "gui", database_path.absolute().as_uri() + "?mode=rw&cache=shared", ())
+    registration = sources.register(primary_spec)
+    client = router = coordinator = window = None
+    startup_error: BaseException | None = None
+    bootstrap_open = True
+    startup_finished = False
+
+    def close_bootstrap() -> None:
+        nonlocal bootstrap_open
+        if bootstrap_open:
+            bootstrap_open = False
+            store.connection.close()
+
+    def close_resources() -> None:
+        nonlocal client, router, coordinator, window
+        try:
+            if window is not None:
+                closing, window = window, None
+                closing.shutdown()
+                coordinator = client = router = None
+            else:
+                try:
+                    if coordinator is not None:
+                        closing, coordinator = coordinator, None
+                        closing.close()
+                        client = None
+                    elif client is not None:
+                        closing, client = client, None
+                        closing.close()
+                finally:
+                    if router is not None:
+                        closing, router = router, None
+                        closing.close()
+        finally:
+            sources.close()
+            close_bootstrap()
 
     def on_gap(notice) -> None:
-        router = router_holder.get("router")
         if router is not None:
             router.record_transport_gap(notice)
 
-    client = IodClient(SOCKET_PATH, on_gap=on_gap, on_change=wake.woke.emit,
-                       clock_ns=age_clock_ns)
-    router = HistoryRouter(local_service, client, registry, clock_ns=age_clock_ns)
-    router_holder["router"] = router
+    def start_after_registration() -> None:
+        nonlocal client, router, coordinator, window, startup_finished, startup_error
+        if startup_finished or not registration.done():
+            return
+        startup_finished = True
+        try:
+            registration.result()
+            close_bootstrap()
+            client = IodClient(SOCKET_PATH, on_gap=on_gap, on_change=client_wake.woke.emit,
+                               clock_ns=age_clock_ns)
+            router = HistoryRouter(sources, client, registry, clock_ns=age_clock_ns)
 
-    def local_factory() -> LiveCollector:
-        # The coordinator's lazy factory owns the decision to collect locally.
-        # An accepted export is a pending incoming handover, not a reason to
-        # discard the persisted cutoff and start a fresh baseline.
-        offer = coordinator.resume_handover
-        return LiveCollector(
-            proc_root=args.proc_root,
-            cgroup_root=args.cgroup_root,
-            database_path=database_path,
-            source="gui",
-            baseline_only=offer is None,
-            resume_handover=offer,
-        )
+            def local_factory() -> LiveCollector:
+                offer = coordinator.resume_handover
+                return LiveCollector(
+                    proc_root=args.proc_root,
+                    cgroup_root=args.cgroup_root,
+                    database_path=database_path,
+                    source="gui",
+                    baseline_only=offer is None,
+                    resume_handover=offer,
+                )
 
-    coordinator = CollectorCoordinator(
-        local_factory=local_factory,
-        client=client,
-        history=router,
-        lease=GuiLease(_gui_lease_path()),
-        clock=SystemClock(),
-    )
-    window = CollectorWindow(
-        coordinator,
-        router,
-        SetupClient(launch=_launch_helper, probe=production_probe),
-        age_clock_ns=age_clock_ns,
-        pump=client.pump,
-        refresh_interval_ms=max(1, int(round(args.interval * 1000))),
-    )
-    # Scheduled through the event loop, never called from inside pump(): the
-    # client emits while it is still decoding frames, so a direct slot would
-    # re-enter pump(). A zero-delay timer is that hand-off -- every settled reply
-    # is one event-loop turn, not one poll interval.
-    wake.woke.connect(lambda: QTimer.singleShot(0, window.refresh))
-    window.show()
-    window.refresh()
+            coordinator = CollectorCoordinator(
+                local_factory=local_factory,
+                client=client,
+                history=router,
+                lease=GuiLease(_gui_lease_path()),
+                clock=SystemClock(),
+            )
+            window = CollectorWindow(
+                coordinator,
+                router,
+                SetupClient(launch=_launch_helper, probe=production_probe),
+                age_clock_ns=age_clock_ns,
+                pump=client.pump,
+                refresh_interval_ms=max(1, int(round(args.interval * 1000))),
+            )
+            window.show()
+            window.refresh()
+        except BaseException as error:
+            startup_error = error
+            try:
+                close_resources()
+            except Exception:
+                pass
+            finally:
+                application.exit(1)
+
+    class SourceDelivery(QObject):
+        @pyqtSlot()
+        def receive(self) -> None:
+            if window is None:
+                start_after_registration()
+            else:
+                window._arm_poll()
+
+        @pyqtSlot()
+        def refresh_client(self) -> None:
+            if window is not None:
+                window.refresh()
+
+    delivery = SourceDelivery()
+    source_wake.woke.connect(delivery.receive, Qt.ConnectionType.QueuedConnection)
+    client_wake.woke.connect(delivery.refresh_client, Qt.ConnectionType.QueuedConnection)
+    registration.add_done_callback(lambda _completed: source_wake.woke.emit())
     try:
-        return application.exec()
+        exit_code = application.exec()
     finally:
-        window.shutdown()
-        store.connection.close()
+        close_resources()
+    if startup_error is not None:
+        raise startup_error
+    return exit_code

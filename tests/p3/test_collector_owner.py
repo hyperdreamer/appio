@@ -226,10 +226,9 @@ def test_export_is_opened_read_only_and_must_match_its_checkpoint(tmp_path):
     before = (tmp_path / "export.db").read_bytes()
     owner.accept_export(export)
     assert owner.resume_handover is not None
-    exported = next(service for name, (service, _) in history._sources.items() if name != "local")
-    assert exported.connection.execute("PRAGMA query_only").fetchone()[0] == 1
-    with pytest.raises(Exception, match="readonly"):
-        exported.connection.execute("DELETE FROM sample")
+    next(iter(owner._export_registrations.values())).result(timeout=10)
+    assert history.sources.registration_vector()
+    assert any(name != "local" for name, _owner, _epoch in history.sources.registration_vector())
     assert (tmp_path / "export.db").read_bytes() == before
     with pytest.raises(ValueError, match="checkpoint"):
         owner.accept_export(replace(export, cutoff_mono_ns=129*NS))

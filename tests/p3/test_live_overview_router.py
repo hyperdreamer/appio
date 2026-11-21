@@ -106,6 +106,38 @@ def _assert_frozen(record: object, name: str) -> None:
         setattr(record, name, getattr(record, name))
 
 
+def test_remote_registration_change_retires_frame_detail_and_files(tmp_path):
+    from test_live_overview_client import _scheduler_router, _ready_remote_frame, _answer_next
+    from live_overview_support import managed_spec
+
+    window = Window("since_boot", BOOT, end_mono_ns=140 * NS)
+    router, transport, store = _scheduler_router(tmp_path)
+    imported = AppIoStore(tmp_path / "imported-authority.db")
+    try:
+        presentation = _ready_remote_frame(router, transport, window)
+        router.select_detail(KEY, window)
+        router.request_detail("totals", presentation, window)
+        _answer_next(router, transport, share(1, window))
+        scope = retention_scope(KEY, window)
+        assert router.retained("totals", KEY, scope, window.end_mono_ns) is not None
+        files = router.request_file_view(presentation, window, "bytes_total", "desc", None)
+        frame = router._frame
+        current = router._current_authority()
+        router.add_managed_source(managed_spec(imported, "imported", "iod")).result(timeout=10)
+        assert router._current_authority() == current
+        assert router.drain() is True
+        assert frame.retired
+        assert router._detail is None
+        assert router.retained("totals", KEY, scope, window.end_mono_ns) is None
+        assert files.done()
+        assert files.exception() is not None
+        assert router.frame_provenance(window) is None
+    finally:
+        router.close()
+        store.connection.close()
+        imported.connection.close()
+
+
 def test_managed_source_rejects_empty_option_value() -> None:
     from appio.history_types import ManagedSourceSpec
 
@@ -1482,8 +1514,8 @@ def test_local_detail_is_lazy_selected_subject_only(tmp_path, monkeypatch):
         # D03: a held detail computation must not serialize the frame lane.
         computations.clear()
         local_ids.clear()
-        router = HistoryRouter(QueryService(local), _IdleClient(), AppRegistry(),
-                               _capture_provider=source_registry)
+        router = HistoryRouter(source_registry, _IdleClient(), AppRegistry())
+
         authority = ("local", (("local", "gui", 1),))
         vector = LocalPositionVector((LocalPosition("local", "gui", 1, 1, 0),))
         entered = threading.Event()
@@ -1565,6 +1597,7 @@ def test_local_detail_is_lazy_selected_subject_only(tmp_path, monkeypatch):
             router.request_file_view(presentation, scope, "bytes_total", "desc", None)
             for _ in range(4)
         ]
+        from live_overview_support import wait_for_capture_admission
         wait_for_capture_admission(router)
         assert files_started.wait(5)
         helper_files = RequestToken(
@@ -1685,16 +1718,21 @@ def test_worker_ids_are_never_reused_across_helper_and_files_admission(tmp_path,
     release = threading.Event()
     entered = threading.Event()
     submitted: list[Future] = []
+    capture = None
     try:
-        paths = _registered_paths(("local", local, "gui"))
         scope = Window("range", BOOT, 100 * NS, 140 * NS)
-        router = HistoryRouter(QueryService(local), _IdleClient(), AppRegistry())
+        from live_overview_support import make_managed_router
+
+        router = make_managed_router(QueryService(local), _IdleClient(), AppRegistry())
+
         authority = ("local", (("local", "gui", 1),))
         vector = LocalPositionVector((LocalPosition("local", "gui", 1, 1, 0),))
         router.prepare(scope)
-        assert isinstance(router._local_future.result(timeout=10), LocalFrameOutcome)
+        assert isinstance(wait_local(router), LocalFrameOutcome)
+
         assert router.ready(scope)
         assert router.pending_work is False
+        capture = router.sources.capture().result(timeout=15)
 
         actual_submit = router._background_executor.submit
 
@@ -1717,7 +1755,7 @@ def test_worker_ids_are_never_reused_across_helper_and_files_admission(tmp_path,
             entered.set()
             assert release.wait(15), "the helper worker was never released"
             return HistoryRouter._read_local_part(
-                paths, QueryRequest("totals", scope, ALPHA),
+                capture, QueryRequest("totals", scope, ALPHA),
                 worker_id=helper_id, app_key=ALPHA)
 
         helper_job = router._submit_background_worker(helper, held_detail)
@@ -1727,6 +1765,8 @@ def test_worker_ids_are_never_reused_across_helper_and_files_admission(tmp_path,
 
         presentation = router.registry.id_for(ALPHA)
         router.request_file_view(presentation, scope, "bytes_total", "desc", None)
+        from live_overview_support import wait_for_capture_admission
+        wait_for_capture_admission(router)
 
         def held_helper_worker():
             assert False, "a queued helper worker must never run in this control"
@@ -1783,6 +1823,8 @@ def test_worker_ids_are_never_reused_across_helper_and_files_admission(tmp_path,
         release.set()
         if router is not None:
             router.close()
+            if capture is not None and capture.capture_id in router.sources._capture_leases:
+                router.sources.release_capture(capture.capture_id)
         local.connection.close()
 
 
@@ -1813,8 +1855,10 @@ def _source_stores(tmp_path):
 
 def _source_router(tmp_path):
     local, imported = _source_stores(tmp_path)
-    history = HistoryRouter(QueryService(local), _IdleClient(), AppRegistry())
-    history.add_source(QueryService(imported), collector_id="imported", owner="iod")
+    from live_overview_support import add_managed_source, make_managed_router
+
+    history = make_managed_router(QueryService(local), _IdleClient(), AppRegistry())
+    add_managed_source(history, imported, name="imported", owner="iod")
     return history, local, imported
 
 
@@ -2086,8 +2130,8 @@ def test_observe_returns_without_waiting_for_held_capture(tmp_path, monkeypatch)
 
     stores = LocalPositionStores(tmp_path)
     registry = stores.new_managed_registry()
-    router = HistoryRouter(stores.services["local"], _IdleClient(), AppRegistry(),
-                           _capture_provider=registry)
+    router = HistoryRouter(registry, _IdleClient(), AppRegistry())
+
     entered, release, returned = threading.Event(), threading.Event(), threading.Event()
     original_backup = history_source._backup_image
     observations = []
@@ -3214,7 +3258,7 @@ def test_local_frame_rejects_a_foreign_worker_binding(tmp_path):
         for corrupt, expected in (("worker", "worker"), ("request", "request")):
             history.prepare(scope)
             admitted = history._local_worker_id
-            outcome = history._local_future.result(timeout=15)
+            outcome = wait_worker(history)
             assert isinstance(outcome, LocalFrameOutcome)
             # The submitted worker answers under its own admission; a matching
             # default id would only be a consumer rewrite of a foreign result.
@@ -3239,7 +3283,7 @@ def test_local_frame_rejects_a_foreign_worker_binding(tmp_path):
         # its own admitted binding.
         history.prepare(scope)
         admitted = history._local_worker_id
-        assert isinstance(history._local_future.result(timeout=15), LocalFrameOutcome)
+        assert isinstance(wait_local(history), LocalFrameOutcome)
         assert history.ready(scope) is True
         assert history._local_settlement.outcome.worker_id == admitted
         assert history.local_position("local").name == "local"
@@ -3354,9 +3398,30 @@ class _BoundClient:
 def _empty_router(tmp_path, client, *, name):
     store = AppIoStore(tmp_path / name)
     store.connection.commit()
-    router = HistoryRouter(
-        QueryService(store), client, AppRegistry(), clock_ns=client.clock)
+    from live_overview_support import make_managed_router
+
+    router = make_managed_router(QueryService(store), client, AppRegistry(), clock_ns=client.clock)
+
     return router, store
+
+
+def wait_local(router):
+    from live_overview_support import wait_for_local_frame
+
+    return wait_for_local_frame(router)
+
+
+def wait_worker(router):
+    import time
+
+    deadline = time.monotonic() + 20
+    while router._capture_jobs:
+        router.drain()
+        assert time.monotonic() < deadline
+        time.sleep(0.001)
+    future = router._local_future
+    assert future is not None
+    return future.result(timeout=20)
 
 
 def _remote_frame(router, client, window, *, key=KEY, app_id=17):
@@ -3364,7 +3429,7 @@ def _remote_frame(router, client, window, *, key=KEY, app_id=17):
 
     router.prepare(window)
     assert router._local_future is not None
-    router._local_future.result(timeout=15)
+    wait_local(router)
     future = client.only("ranking")
     client.settle(future, {
         "kind": "ranking",
@@ -3454,8 +3519,9 @@ def test_settlement_rejects_each_selector_shape_or_binding_violation(tmp_path):
         # A duplicate ranking identity is a frame-ranking rejection, and the
         # rejected candidate is evicted before any notification.
         router.prepare(window)
-        router._local_future.result(timeout=15)
+        wait_local(router)
         duplicate = client.only("ranking")
+
         client.settle(duplicate, {
             "kind": "ranking",
             "result": [total(17, KEY), total(18, KEY)],
@@ -3526,6 +3592,7 @@ def test_settlement_superseded_or_duplicate_has_no_publication_effect(tmp_path):
         # A superseded frame generation cannot publish its delayed ranking.
         router.prepare(window)
         stale_ranking = client.only("ranking")
+        wait_local(router)
         router.prepare(window)
         client.settle(stale_ranking, {
             "kind": "ranking", "result": [total(17, KEY)], "snapshot": DIGEST,
@@ -3535,7 +3602,7 @@ def test_settlement_superseded_or_duplicate_has_no_publication_effect(tmp_path):
         assert router._remote is None
         assert router.frame_provenance(window) is None
         # Complete the replacement frame so the wire is free for the detail arm.
-        router._local_future.result(timeout=15)
+        wait_local(router)
         client.settle(client.only("ranking"), {
             "kind": "ranking", "result": [total(17, KEY)], "snapshot": DIGEST,
             "next_cursor": None,
@@ -3661,6 +3728,7 @@ def test_scope_owned_detail_survives_forward_frame_generations(tmp_path):
         with pytest.raises(HistoryPending):
             router.disk_share(presentation, window_b)
         assert router.retained("totals", KEY, scope_b, window_b.end_mono_ns) == record
+        wait_local(router)
 
         # A record survives an ordinary preparation too; only adoption of a
         # changed scope retires it.
@@ -3784,8 +3852,9 @@ def test_exact_getters_reject_older_retained_window_without_hiding_record(tmp_pa
         # Apply a forward frame B, then adopt it; the exact B answer is still
         # missing, so the exact getter must raise rather than relabel A.
         router.prepare(window_b)
-        router._local_future.result(timeout=15)
+        wait_local(router)
         client.settle(client.only("ranking"), {
+
             "kind": "ranking", "result": [total(17, KEY)], "snapshot": DIGEST,
             "next_cursor": None,
         })
@@ -3858,11 +3927,17 @@ def test_retained_accessor_uses_applied_endpoint_and_is_pure(tmp_path):
             assert router._completed.qsize() == completed
 
             # Prepare cannot change eligibility; adoption owns the reset.
+            router.drain = original_drain
             router.prepare(forward)
-            router._local_future.result(timeout=15)
+            wait_local(router)
+            router.drain = forbidden
+
             assert router.retained("totals", KEY, scope, window.end_mono_ns) is record
+            router.drain = original_drain
             router.prepare(backward)
-            router._local_future.result(timeout=15)
+            wait_local(router)
+            router.drain = forbidden
+
             assert router.retained("totals", KEY, scope, window.end_mono_ns) is record
         finally:
             router.drain = original_drain
@@ -4131,8 +4206,9 @@ def test_authority_change_clears_details_without_conflating_cursor_advance(tmp_p
 
         # A new boot is authority too.
         router.prepare(window)
-        router._local_future.result(timeout=15)
+        wait_local(router)
         client.settle(client.only("ranking"), {
+
             "kind": "ranking", "result": [total(17, KEY)], "snapshot": DIGEST,
             "next_cursor": None,
         })
@@ -4149,8 +4225,9 @@ def test_authority_change_clears_details_without_conflating_cursor_advance(tmp_p
 
         # A new connection generation with the same boot/epoch is a change.
         router.prepare(window)
-        router._local_future.result(timeout=15)
+        wait_local(router)
         client.settle(client.only("ranking"), {
+
             "kind": "ranking", "result": [total(17, KEY)], "snapshot": DIGEST,
             "next_cursor": None,
         })
@@ -4240,7 +4317,7 @@ def _forged_frame_settlement(router, window, field, value):
     """One valid frame admission with exactly one routing field corrupted."""
 
     router.prepare(window)
-    outcome = router._local_future.result(timeout=20)
+    outcome = wait_worker(router)
     assert isinstance(outcome, LocalFrameOutcome)
     token = router._frame.local_token
     binding = router._worker_bindings[token.token_id]
@@ -4264,7 +4341,10 @@ def test_local_outcomes_share_settlement_for_frame_part_and_files(tmp_path):
 
     frames = _file_frames(tmp_path)
     client = _LocalCountingClient()
-    router = HistoryRouter(QueryService(frames.db), client, AppRegistry())
+    from live_overview_support import make_managed_router
+
+    router = make_managed_router(QueryService(frames.db), client, AppRegistry())
+
     window = FILE_WINDOW
     scope = retention_scope(FILE_APP, window)
     other_window = Window("range", FILE_BOOT, 200 * NS, 300 * NS)
@@ -4280,7 +4360,8 @@ def test_local_outcomes_share_settlement_for_frame_part_and_files(tmp_path):
     try:
         # -- positive frame arm: every evidence field publishes atomically ---
         router.prepare(window)
-        outcome = router._local_future.result(timeout=20)
+        outcome = wait_worker(router)
+
         assert isinstance(outcome, LocalFrameOutcome)
         expected_ranking = [replace(row, app_id=router.registry.id_for(row.app_key))
                             for row in outcome.ranking]
@@ -4325,10 +4406,12 @@ def test_local_outcomes_share_settlement_for_frame_part_and_files(tmp_path):
         assert client.queries == 0 and client.transports == 0
 
         # -- positive local Files arm: unchanged table/coverage/served gap ---
-        paths = (("local", frames.db.execute("PRAGMA database_list").fetchone()[2],
-                  "gui"),)
-        expected = HistoryRouter._read_local_files(
-            paths, window, FILE_APP, presentation, "bytes_total", "desc", None)
+        capture = router.sources.capture().result(timeout=15)
+        try:
+            expected = HistoryRouter._read_local_files(
+                capture, window, FILE_APP, presentation, "bytes_total", "desc", None)
+        finally:
+            router.sources.release_capture(capture.capture_id)
         future = router.request_file_view(presentation, window, "bytes_total", "desc", None)
         _drain_until(router, future.done)
         view = future.result(timeout=0)
@@ -4361,13 +4444,14 @@ def test_local_outcomes_share_settlement_for_frame_part_and_files(tmp_path):
             assert [entry for entry in settlements
                     if entry[0] == token.token_id] == [
                         (token.token_id, "frame", True)], label
-            with pytest.raises(ValueError):
+            with pytest.raises(RequestRejected) as caught:
                 router.ready(window)
+            assert caught.value.reason == "invalid_result"
 
         # A clean frame restores the supported readiness context the remaining
         # arms need; the malformed frames changed only their own owner.
         router.prepare(window)
-        assert router._local_future.result(timeout=20) is not None
+        assert wait_local(router) is not None
         assert router.ready(window) is True
 
         # -- malformed part arms: key, type, Window and digest ---------------
@@ -4442,12 +4526,14 @@ def test_local_outcomes_share_settlement_for_frame_part_and_files(tmp_path):
         # -- a stale drained success and error publish nothing --------------
         stale_token, stale_outcome, stale_settlement = None, None, None
         router.prepare(window)
-        stale_outcome = router._local_future.result(timeout=20)
+        stale_outcome = wait_worker(router)
+
         stale_token = router._frame.local_token
         assert router.ready(window) is True
         stale_settlement = router._local_settlement
         router.prepare(window)
-        assert router._local_future.result(timeout=20) is not None
+        assert wait_local(router) is not None
+
         before = (list(router._ranking), router.segments, router.boundaries,
                   router._not_retained, router.view_state)
         assert router._settle(stale_token, stale_settlement) is False
@@ -4493,9 +4579,13 @@ def test_ranking_readiness_excludes_all_detail_and_files_work(tmp_path):
                 local = _committed_store(
                     tmp_path / f"ready-{index}.db", ((ALPHA, 17, 20),))
                 store = local
-                router = HistoryRouter(QueryService(local), _IdleClient(), AppRegistry())
+                from live_overview_support import make_managed_router
+
+                router = make_managed_router(QueryService(local), _IdleClient(), AppRegistry())
+
                 router.prepare(window)
-                assert router._local_future.result(timeout=20) is not None
+                assert wait_local(router) is not None
+
                 assert router.ready(window) is True
                 assert router._worker_jobs == {} and router._unscheduled == {}
                 presentation = router.registry.id_for(ALPHA)
@@ -4510,7 +4600,8 @@ def test_ranking_readiness_excludes_all_detail_and_files_work(tmp_path):
                 router._read_local_part = held_part
                 router.select_detail(ALPHA, window)
                 assert router.request_detail("series", presentation, window).state == "pending"
-                assert entered.wait(10)
+                _drain_until(router, entered.is_set)
+                assert entered.is_set()
                 held = None
                 assert router.ready(window) is True
                 assert router._background_charge("detail") == 1
@@ -4583,7 +4674,10 @@ def test_local_worker_capacity_counts_retired_jobs_and_keeps_frame_independent(t
     """
 
     frames = _file_frames(tmp_path, "capacity.db")
-    router = HistoryRouter(QueryService(frames.db), _IdleClient(), AppRegistry())
+    from live_overview_support import make_managed_router
+
+    router = make_managed_router(QueryService(frames.db), _IdleClient(), AppRegistry())
+
     window = FILE_WINDOW
     release_detail = threading.Event()
     detail_entered = threading.Event()
@@ -4605,10 +4699,10 @@ def test_local_worker_capacity_counts_retired_jobs_and_keeps_frame_independent(t
         assert release_files.wait(20), "the Files worker was never released"
         return original_files(*args, **kwargs)
 
-    def held_frame(paths, window_arg):
+    def held_frame(paths, window_arg, **kwargs):
         frame_entered.set()
         assert frame_release.wait(20), "the frame worker was never released"
-        return original_read(paths, window_arg)
+        return original_read(paths, window_arg, **kwargs)
 
     router._read_local_part = held_part
     router._read_local_files = held_files
@@ -4622,7 +4716,8 @@ def test_local_worker_capacity_counts_retired_jobs_and_keeps_frame_independent(t
     router._background_executor.submit = counted_submit
     try:
         router.prepare(window)
-        assert router._local_future.result(timeout=20) is not None
+        assert wait_local(router) is not None
+
         assert router.ready(window) is True
         presentation = router.registry.id_for(FILE_APP)
         assert router._worker_jobs == {} and router._background_charge("detail") == 0
@@ -4632,9 +4727,16 @@ def test_local_worker_capacity_counts_retired_jobs_and_keeps_frame_independent(t
         router.select_detail(FILE_APP, window)
         assert router.request_detail("series", presentation, window).state == "pending"
         assert router.request_detail("totals", presentation, window).state == "pending"
-        assert detail_entered.wait(10)
+        from live_overview_support import wait_for_capture_admission
+        wait_for_capture_admission(router)
+        assert detail_entered.is_set()
         assert router._background_charge("detail") == 2
         assert len(submitted) == 2 and router._unscheduled == {}
+        router.prepare(window)
+        assert wait_local(router) is not None
+        assert router.ready(window) is True
+        assert not release_detail.is_set()
+        assert len(submitted) == 2
 
         # Eight Files workers fill the Files budget and the ten-job ceiling.
         # They queue behind the held detail worker; admission, not execution, is
@@ -4643,6 +4745,7 @@ def test_local_worker_capacity_counts_retired_jobs_and_keeps_frame_independent(t
             router.request_file_view(presentation, window, "bytes_total", "desc", None)
             for _ in range(8)
         ]
+        wait_for_capture_admission(router)
         assert router._background_charge("files") == 8
         assert len(router._worker_jobs) == 10
         assert len(submitted) == 10
@@ -4668,6 +4771,7 @@ def test_local_worker_capacity_counts_retired_jobs_and_keeps_frame_independent(t
         # on its own charge rather than running out of budget.
         release_detail.set()
         _drain_until(router, lambda: router._background_charge("detail") == 1)
+        wait_for_capture_admission(router)
         assert len(submitted) == 11, "exactly one waiting detail was admitted"
         assert router._background_charge("files") == 8
         assert len(router._worker_jobs) == 9
@@ -4679,6 +4783,7 @@ def test_local_worker_capacity_counts_retired_jobs_and_keeps_frame_independent(t
         router._read_local = held_frame
         frame_window = Window("range", FILE_BOOT, 0, FILE_HOUR_NS)
         router.prepare(frame_window)
+        wait_for_capture_admission(router)
         assert frame_entered.wait(10)
         running = router._local_future
         assert router.local_read_in_flight is True

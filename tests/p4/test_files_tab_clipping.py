@@ -25,7 +25,8 @@ def test_clipped_unproved_segment_requires_complete_known_gap_union(
     db.commit()
 
     if resume == 3*H and gaps == ((2*H,3*H,"collector_gap"),):
-        worker = HistoryRouter(QueryService(db), SimpleNamespace(state=None), AppRegistry())
+        worker = HistoryRouter._snapshot_planner(
+            (("local", QueryService(db), "gui"),), S)
         try:
             worker._plan(S)
             assert any((s.start_ns, s.end_ns, s.proven) == (3*H//2,3*H,False)
@@ -33,14 +34,15 @@ def test_clipped_unproved_segment_requires_complete_known_gap_union(
             assert any((s.start_ns, s.end_ns, s.proven) == (2*H,3*H,False)
                        for s in worker.segments)
         finally:
-            worker.close()
+            worker._close_views()
     if gaps[0][2] == "overlap_uncertain":
-        worker = HistoryRouter(QueryService(db), SimpleNamespace(state=None), AppRegistry())
+        worker = HistoryRouter._snapshot_planner(
+            (("local", QueryService(db), "gui"),), S)
         try:
             worker._plan(S)
             assert worker._known_gap_ranges == []
         finally:
-            worker.close()
+            worker._close_views()
 
     if accepted:
         result = read_files((("local",db,"gui"),))
@@ -56,14 +58,17 @@ def test_clipped_unproved_segment_requires_complete_known_gap_union(
 def test_unproved_segment_wholly_outside_served_interval_is_irrelevant(tab_store):
     db = tab_store(hours=(2,3), app_gaps={},
         gaps=((4*H,5*H,"collector_gap"),))
-    worker = HistoryRouter(QueryService(db), SimpleNamespace(state=None), AppRegistry())
+    worker = HistoryRouter._snapshot_planner(
+        (("local", QueryService(db), "gui"),), S)
+
     try:
         worker._plan(S)
         assert any((s.start_ns, s.end_ns, s.proven) == (4*H,5*H,False)
                    for s in worker._all_segments)
         assert all(s.proven for s in worker.segments)
     finally:
-        worker.close()
+        worker._close_views()
+
 
     result = read_files((("local",db,"gui"),))
     assert result.coverage.served_interval == S
