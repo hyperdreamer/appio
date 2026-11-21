@@ -3540,6 +3540,19 @@ def test_settlement_rejects_each_selector_shape_or_binding_violation(tmp_path):
         frame = router._frame
         serial = [0]
 
+        def publication_state():
+            return (
+                router._remote,
+                tuple(router._ranking),
+                router.daemon_answer_error,
+                router.view_state,
+                router.frame_provenance(window),
+                frame.remote_candidate,
+                frame.remote_applied,
+                frame.remote_settled,
+                frame.certificate,
+            )
+
         def coverage_arm(request, result, label, *, rejected):
             serial[0] += 1
             token = RequestToken(
@@ -3551,8 +3564,11 @@ def test_settlement_rejects_each_selector_shape_or_binding_violation(tmp_path):
                 "kind": "coverage", "result": result, "snapshot": DIGEST,
                 "next_cursor": None,
             })
-            settled = router._settle(token, RemoteSettlement(future, response=future.result()))
+            before = publication_state()
+            settled = router._settle(
+                token, RemoteSettlement(future, response=future.result()))
             assert settled is False, label
+            assert publication_state() == before, label
             if rejected:
                 assert client.rejected[-1] is future, label
             return future
@@ -3561,6 +3577,12 @@ def test_settlement_rejects_each_selector_shape_or_binding_violation(tmp_path):
         coverage_arm(process, _file_coverage(window), "file coverage in process slot",
                      rejected=True)
         coverage_arm(process, coverage(), "scalar in unscoped process slot", rejected=True)
+        coverage_arm(
+            process, {"unit:/alpha.service": coverage()},
+            "key-only unscoped process mapping", rejected=True)
+        coverage_arm(
+            process, {"unit:alpha.service": "not a Coverage"},
+            "value-only unscoped process mapping", rejected=True)
         control = coverage_arm(
             process, {"unit:alpha.service": coverage()},
             "valid unscoped process mapping", rejected=False)
