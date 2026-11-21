@@ -1938,6 +1938,60 @@ def test_capture_retirement_waits_for_admitted_capture(tmp_path, monkeypatch):
         stores.close()
 
 
+def test_capture_serializes_registration_lifecycle(tmp_path, monkeypatch):
+    """A source admitted during capture waits until the complete capture ends."""
+
+    import appio.history_source as history_source
+    from live_overview_support import LocalPositionStores
+    from appio.history_types import CapturedSourceSet
+
+    stores = LocalPositionStores(tmp_path)
+    registry = stores.new_managed_registry()
+    entered = threading.Event()
+    release = threading.Event()
+    original_backup = history_source._backup_image
+
+    def blocked_backup(connection):
+        entered.set()
+        if not release.wait(5):
+            raise TimeoutError("test did not release source backup")
+        return original_backup(connection)
+
+    monkeypatch.setattr(history_source, "_backup_image", blocked_backup)
+    original_start = history_source._SourceActor.start
+    start_calls = []
+
+    def record_start(actor):
+        start_calls.append(actor.spec.name)
+        return original_start(actor)
+
+    monkeypatch.setattr(history_source._SourceActor, "start", record_start)
+    try:
+        _register_fixture_sources(registry, stores, "local")
+        start_calls.clear()
+        capture = registry.capture()
+        assert entered.wait(5)
+
+        registration = registry.register(stores.managed_spec("export", owner="iod"))
+        assert start_calls == []
+        assert not registration.done()
+
+        release.set()
+        captured = capture.result(timeout=10)
+        assert isinstance(captured, CapturedSourceSet)
+        assert tuple(position.name for position in captured.opening.sources) == ("local",)
+        assert tuple(position.name for position in captured.closing.sources) == ("local",)
+        assert tuple(image.name for image in captured.images) == ("local",)
+        assert registration.result(timeout=10).name == "export"
+        assert start_calls == ["export"]
+        assert tuple(position.name for position in registry.observe().sources) == (
+            "export", "local")
+    finally:
+        release.set()
+        registry.close()
+        stores.close()
+
+
 def test_managed_source_forwards_cached_statements_option(tmp_path, monkeypatch):
     """Admission passes the validated statement-cache size to sqlite3.connect."""
 
@@ -1970,14 +2024,41 @@ def test_managed_source_forwards_cached_statements_option(tmp_path, monkeypatch)
         stores.close()
 
 
-def test_read_only_authorizer_denies_virtual_table_schema_actions():
-    """The authorizer independently rejects virtual-table schema mutations."""
+@pytest.mark.parametrize(
+    "action_name",
+    tuple(
+        name for name in (
+            "SQLITE_CREATE_INDEX",
+            "SQLITE_CREATE_TABLE",
+            "SQLITE_CREATE_TEMP_INDEX",
+            "SQLITE_CREATE_TEMP_TABLE",
+            "SQLITE_CREATE_TEMP_TRIGGER",
+            "SQLITE_CREATE_TEMP_VIEW",
+            "SQLITE_CREATE_TRIGGER",
+            "SQLITE_CREATE_VIEW",
+            "SQLITE_CREATE_VTABLE",
+            "SQLITE_DROP_INDEX",
+            "SQLITE_DROP_TABLE",
+            "SQLITE_DROP_VTABLE",
+            "SQLITE_DROP_TEMP_INDEX",
+            "SQLITE_DROP_TEMP_TABLE",
+            "SQLITE_DROP_TEMP_TRIGGER",
+            "SQLITE_DROP_TEMP_VIEW",
+            "SQLITE_DROP_TRIGGER",
+            "SQLITE_DROP_VIEW",
+            "SQLITE_ALTER_TABLE",
+        )
+        if hasattr(sqlite3, name)
+    ),
+)
+def test_read_only_authorizer_denies_virtual_table_schema_actions(action_name):
+    """The authorizer independently rejects every schema mutation action."""
 
     from appio.history_source import _read_only_authorizer
 
-    for action in (sqlite3.SQLITE_CREATE_VTABLE, sqlite3.SQLITE_DROP_VTABLE):
-        assert _read_only_authorizer(action, "table", None, "main", None) == (
-            sqlite3.SQLITE_DENY)
+    action = getattr(sqlite3, action_name)
+    assert _read_only_authorizer(action, "table", None, "main", None) == (
+        sqlite3.SQLITE_DENY)
 
 
 def test_local_vector_observes_each_registered_connection_without_hashing(

@@ -435,6 +435,8 @@ class ManagedSourceRegistry:
         self._retiring: dict[str, Future] = {}
         self._next_capture_id = 1
         self._capture_lock = threading.Lock()
+        self._capture_count = 0
+        self._deferred_admissions: list[Callable[[], None]] = []
         self._capture_executor = ThreadPoolExecutor(
             max_workers=4, thread_name_prefix="appio-source-capture")
         self._closed = False
@@ -534,17 +536,17 @@ class ManagedSourceRegistry:
                     lease.release()
                 return _failed_future(_safe_error(
                     registrations[0].spec, error, "capture admission"))
+            lease_tuple = tuple(leases)
+            self._capture_count += 1
         try:
             future = self._capture_executor.submit(
-                self._capture, capture_id, registrations, tuple(leases))
+                self._capture, capture_id, registrations, lease_tuple)
         except RuntimeError:
-            for lease in leases:
-                lease.release()
+            self._finish_capture(lease_tuple)
             return _failed_future(SourceAdmissionError(
                 "managed source registry is closed"))
         future.add_done_callback(
-            lambda _completed: self._release_capture_leases(leases))
-        future.add_done_callback(lambda _completed: self._notify())
+            lambda _completed: self._finish_capture(lease_tuple))
         return future
 
     def close(self) -> None:
@@ -570,6 +572,7 @@ class ManagedSourceRegistry:
             self._pending.clear()
             self._reserved.clear()
             self._retiring.clear()
+            self._deferred_admissions.clear()
             for actor in actors.values():
                 actor.close()
         self._capture_executor.shutdown(wait=False, cancel_futures=True)
@@ -579,8 +582,26 @@ class ManagedSourceRegistry:
         for lease in leases:
             lease.release()
 
+    def _finish_capture(self, leases: tuple[_CaptureLease, ...]) -> None:
+        self._release_capture_leases(leases)
+        with self._lock:
+            self._capture_count -= 1
+            if self._capture_count or self._closed:
+                deferred = ()
+            else:
+                deferred = tuple(self._deferred_admissions)
+                self._deferred_admissions.clear()
+        for admission in deferred:
+            admission()
+        self._notify()
+
     def _start_after_retirement(self, spec: ManagedSourceSpec, future: Future,
                                 retired: Future) -> None:
+        with self._lock:
+            if self._capture_count:
+                self._deferred_admissions.append(
+                    lambda: self._start_after_retirement(spec, future, retired))
+                return
         try:
             retired.result()
         except BaseException:
@@ -591,6 +612,10 @@ class ManagedSourceRegistry:
 
     def _start_registration(self, spec: ManagedSourceSpec, future: Future) -> None:
         with self._lock:
+            if self._capture_count:
+                self._deferred_admissions.append(
+                    lambda: self._start_registration(spec, future))
+                return
             if future.done():
                 if self._reserved.get(spec.name) is future:
                     self._reserved.pop(spec.name, None)
@@ -642,6 +667,10 @@ class ManagedSourceRegistry:
         receipt = _RegistrationReceipt(
             spec.name, spec.owner, pending.registration_epoch, "active")
         with self._lock:
+            if self._capture_count:
+                self._deferred_admissions.append(
+                    lambda: self._registration_ready(pending, ready))
+                return
             if (self._closed or self._pending.get(spec.name) is not pending
                     or pending.actor.status != "active"):
                 if self._pending.get(spec.name) is pending:
