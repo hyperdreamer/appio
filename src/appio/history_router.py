@@ -3067,9 +3067,6 @@ class HistoryRouter:
 
     def ranking_provenance(self, app_key: str, window: Window) -> AnswerProvenance | None:
         key = _canonical_app_key(app_key)
-        frame = self._frame
-        if frame is not None and frame.window == window and frame.certificate is not None:
-            return frame.ranking_provenance.get(key)
         applied = self._applied_ranking_provenance.get(key)
         lifetime = self._detail
         if (applied is not None and lifetime is not None
@@ -3077,6 +3074,9 @@ class HistoryRouter:
                 and self._applied_window == window
                 and applied.measured_window == window):
             return applied
+        frame = self._frame
+        if frame is not None and frame.window == window and frame.certificate is not None:
+            return frame.ranking_provenance.get(key)
         return None
 
     # -- the sole owner-side settlement writer (§3.4) ---------------------- #

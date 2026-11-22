@@ -3683,7 +3683,7 @@ def test_applied_ranking_provenance_survives_pending_replacement(tmp_path, qtbot
     client = _BoundClient()
     router, store = _empty_router(tmp_path, client, name="ranking-view.db")
     window_a = Window("since_boot", BOOT, end_mono_ns=140 * NS)
-    window_b = Window("since_boot", BOOT, end_mono_ns=150 * NS)
+    replacement_digest = "b" * 64
     view = None
     try:
         router.prepare(window_a)
@@ -3703,11 +3703,46 @@ def test_applied_ranking_provenance_survives_pending_replacement(tmp_path, qtbot
         assert oldest_answer_age(
             view.measurement_status().displayed_answers, client.clock()
         ) == "oldest answer 0 s ago"
-        router.prepare(window_b)
-        assert router.frame_provenance(window_b) is None
+
+        for kind in ("series", "totals"):
+            future = client.only(kind)
+            value = (
+                _totals_response(
+                    window=window_a, kind="series", value=series(17, window_a)
+                )
+                if kind == "series"
+                else _totals_response(window=window_a)
+            )
+            client.settle(future, value)
+            router.drain()
+        view.refresh_measurements()
+        assert view._overview_model.kpis[0].text == "22 B"
+
+        router.prepare(window_a)
+        wait_local(router)
+        client.settle(client.only("ranking"), {
+            "kind": "ranking",
+            "result": [total(17, KEY, peak=99)],
+            "snapshot": replacement_digest,
+            "next_cursor": None,
+        })
+        assert router.ready(window_a)
+        replacement = router._frame.ranking_provenance[KEY]
+        assert replacement.accepted_identity != original.accepted_identity
+        assert router.ranking_provenance(KEY, window_a) == original
+        assert view._overview_model.kpis[0].text == "22 B"
+
         view.refresh_measurements()
         current = view._overview_model.ranking_provenance
-        assert current == original, "pending replacement discarded applied ranking provenance"
+        assert current == original, (
+            "completed same-window replacement discarded applied ranking provenance"
+        )
+        assert view._overview_model.kpis[0].text == "22 B"
+
+        view.set_window(window_a)
+        applied = view._overview_model.ranking_provenance
+        assert applied == replacement
+        assert applied != original
     finally:
         if view is not None:
             view.close()
@@ -4982,7 +5017,14 @@ def test_failed_record_cannot_be_revived_by_pending_retry(tmp_path, qtbot):
         store.connection.close()
 
 
-def test_remote_detail_liveness_across_ten_second_commit(tmp_path, qtbot):
+@pytest.mark.parametrize(
+    "advance_before_detail_dispatch",
+    [False, True],
+    ids=["unchanged-cursor", "cursor-advances-before-detail-dispatch"],
+)
+def test_remote_detail_liveness_across_ten_second_commit(
+    tmp_path, qtbot, advance_before_detail_dispatch
+):
     from appio.ui.main_window import AppIoWindow
     from live_overview_transport import QueryTransportHarness
     from live_overview_support import make_managed_router
@@ -5008,14 +5050,28 @@ def test_remote_detail_liveness_across_ten_second_commit(tmp_path, qtbot):
         view.set_window(window_a)
         transport.pump()
         series_future = router._occupant[1]
+        totals_token = router._detail.live["totals"]
+        admission_source = totals_token.requested_source
+        assert admission_source == RemotePosition("boot-a", 7, 4)
         assert transport.client.query_transport(series_future).issued_at_ns == 200_000_000
+        if advance_before_detail_dispatch:
+            transport.stream(5)
+            assert transport.client.state.cursor == StreamCursor("boot-a", 7, 5)
         clock.ns = 5_150_000_000
         transport.reply(series_future, series(1, window_a), snapshot=DIGEST)
         router.drain()
         transport.pump()
         totals_future = router._occupant[1]
+        totals_state = transport.client.query_transport(totals_future)
         assert router._occupant[0].request.kind == "totals"
-        assert transport.client.query_transport(totals_future).issued_at_ns == 5_150_000_000
+        assert totals_state.issued_at_ns == 5_150_000_000
+        assert totals_state.issued_source == (
+            RemotePosition("boot-a", 7, 5)
+            if advance_before_detail_dispatch
+            else admission_source
+        )
+        if advance_before_detail_dispatch:
+            assert totals_state.issued_source != admission_source
         clock.ns = 10 * NS
         transport.stream(6)
         router.prepare(window_b)
@@ -5031,6 +5087,10 @@ def test_remote_detail_liveness_across_ten_second_commit(tmp_path, qtbot):
             router.part_state("totals", KEY, scope), router._detail,
             transport.client.query_transport(totals_future), router._retired_tokens)
         assert accepted.provenance.first_seen_at_ns == 10_100_000_000
+        if advance_before_detail_dispatch:
+            assert accepted.provenance.answered_source == RemotePosition("boot-a", 7, 5)
+        else:
+            assert accepted.provenance.answered_source == admission_source
         assert view._overview_model.share.task_total_bytes == 22
         assert not router.ready(window_b), "replacement must stay pending when totals appears"
         transport.pump()
