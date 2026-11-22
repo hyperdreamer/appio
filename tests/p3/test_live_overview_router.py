@@ -968,7 +968,7 @@ def test_live_records_validate_every_field_and_phase_combination() -> None:
             "worker_id", "request", "app_key", "table", "coverage", "served_gap_count", "snapshot",
         ),
         RemoteSettlement: ("future", "response", "error"),
-        LocalSettlement: ("worker_id", "outcome", "error", "local_bracket"),
+        LocalSettlement: ("worker_id", "capture", "outcome", "error"),
     }
     for record, names in private_inventory.items():
         assert tuple(field.name for field in fields(record)) == names, record.__name__
@@ -1375,9 +1375,10 @@ def test_live_records_validate_every_field_and_phase_combination() -> None:
             lambda kwargs=kwargs, base=base: RemoteSettlement(**{**base, **kwargs}),
         )
 
-    bracket = LocalBracket(local_vector, local_vector)
-    frame_settlement = LocalSettlement(2, outcome=frame, local_bracket=bracket)
+    capture = CapturedSourceSet(1, local_vector, local_vector, (image,), DIGEST)
+    frame_settlement = LocalSettlement(2, capture=capture, outcome=frame)
     assert frame_settlement.outcome is frame
+    assert frame_settlement.capture is capture
     assert LocalSettlement(3, error=RuntimeError("boom")).outcome is None
     _assert_frozen(frame_settlement, "worker_id")
     for label, kwargs in (
@@ -1388,9 +1389,9 @@ def test_live_records_validate_every_field_and_phase_combination() -> None:
         ("outcome.type", {"outcome": {"worker_id": 2}}),
         ("outcome.worker", {"outcome": part}),
         ("error.base", {"outcome": None, "error": KeyboardInterrupt()}),
-        ("bracket.type", {"local_bracket": [local_vector, local_vector]}),
+        ("capture.type", {"capture": [capture]}),
     ):
-        base = {"worker_id": 2, "outcome": frame, "error": None, "local_bracket": None}
+        base = {"worker_id": 2, "capture": capture, "outcome": frame, "error": None}
         _reject(
             f"local_settlement.{label}",
             lambda kwargs=kwargs, base=base: LocalSettlement(**{**base, **kwargs}),
@@ -3179,7 +3180,7 @@ def test_remote_frame_fallback_keeps_local_snapshot_evidence(tmp_path):
         router._ranking = list(outcome.ranking)
         router._ranking_stamps = {}
         router._clock_ns = time.monotonic_ns
-        router._local_settlement = LocalSettlement(1, outcome=outcome, local_bracket=bracket)
+        router._local_settlement = LocalSettlement(1, capture=captured, outcome=outcome)
         router._not_retained = outcome.not_retained
         router._gap_ranges = list(outcome.gaps)
         router._chronology_unproved = outcome.chronology_unproved
@@ -3254,10 +3255,10 @@ def test_detail_settlement_rejects_foreign_capture_before_publication(tmp_path):
         router._reject_token = lambda *args: rejected.append(args) or False
         forged = replace(outcome, snapshot=replace(outcome.snapshot, capture_id=outcome.snapshot.capture_id + 1))
         assert not router._settle_local(
-            token, LocalSettlement(7, outcome=forged, local_bracket=forged.snapshot.bracket))
+            token, LocalSettlement(7, capture=captured, outcome=forged))
         assert len(rejected) == 1 and published == []
         assert router._settle_local(
-            token, LocalSettlement(7, outcome=outcome, local_bracket=outcome.snapshot.bracket))
+            token, LocalSettlement(7, capture=captured, outcome=outcome))
         assert len(published) == 1
         assert published[0][1]["snapshot"] == outcome.snapshot
     finally:
@@ -4578,8 +4579,8 @@ def _forged_frame_settlement(router, window, field, value):
     assert isinstance(outcome, LocalFrameOutcome)
     token = router._frame.local_token
     binding = router._worker_bindings[token.token_id]
-    bracket = LocalBracket(binding.opening, router._closing_vector(binding))
-    settlement = LocalSettlement(token.token_id, outcome=outcome, local_bracket=bracket)
+    capture = router._worker_capture_sets[token.token_id]
+    settlement = LocalSettlement(token.token_id, capture=capture, outcome=outcome)
     forged = copy.copy(outcome)
     object.__setattr__(forged, field, value)
     object.__setattr__(settlement, "outcome", forged)
@@ -5009,7 +5010,7 @@ def test_local_outcomes_share_settlement_for_frame_part_and_files(tmp_path):
             token, settlement = _collect_settlement(router)
             assert token.owner == "detail"
             assert isinstance(settlement, LocalSettlement)
-            assert settlement.local_bracket is None
+            assert settlement.capture is not None
             binding = router._worker_bindings[token.token_id]
             settlement = router._close_local_settlement(settlement, binding=binding)
             forged = copy.copy(settlement.outcome)

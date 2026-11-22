@@ -2113,6 +2113,8 @@ def run_interactive(args) -> int:
             router = HistoryRouter(sources, client, registry, clock_ns=age_clock_ns)
 
             def local_factory() -> LiveCollector:
+                if coordinator is None:
+                    raise RuntimeError("collector coordinator is not initialized")
                 offer = coordinator.resume_handover
                 return LiveCollector(
                     proc_root=args.proc_root,

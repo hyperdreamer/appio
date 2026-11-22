@@ -30,7 +30,7 @@ import queue
 import sqlite3
 import tempfile
 import time
-from typing import Literal
+from typing import Literal, cast
 
 from .contracts import (
     AppTotal, Direction, DiskShare, FileCoverage, FileSort, FileTable, HistoryPending, Series, Window,
@@ -46,6 +46,8 @@ from .history_types import (
     LocalPosition,
     LocalPositionVector,
     ManagedSourceSpec,
+    PartKind,
+    PartPhase,
     PartState,
     RemotePosition,
     RetainedRecord,
@@ -118,7 +120,7 @@ _BACKGROUND_CHARGE = 10
 _TOKEN_ORIGINS = ("remote", "local")
 _TOKEN_OWNERS = ("frame", "detail", "files")
 _POSITION_OWNERS = ("gui", "iod")
-_DETAIL_KINDS = ("totals", "series")
+_DETAIL_KINDS: tuple[PartKind, ...] = ("totals", "series")
 
 #: Scheduler ranks (§5.1). Lower runs first; admission serial breaks ties and
 #: no issued request is ever preempted.
@@ -597,30 +599,36 @@ class LocalSettlement:
     """One terminal local worker outcome for its exact admitted worker."""
 
     worker_id: int
+    capture: CapturedSourceSet | None = None
     outcome: LocalFrameOutcome | LocalPartOutcome | LocalFilesOutcome | None = None
     error: Exception | None = None
-    local_bracket: LocalBracket | None = None
 
     def __post_init__(self) -> None:
         _private_int(self.worker_id, "local_settlement.worker_id", minimum=1)
+        capture = self.capture
+        if capture is not None:
+            if not isinstance(capture, CapturedSourceSet):
+                raise ValueError("a local settlement carries a CapturedSourceSet")
+            CapturedSourceSet.__post_init__(capture)
         outcome = self.outcome
         if (outcome is None) == (self.error is None):
             raise ValueError("a local settlement carries exactly one result or error")
         if outcome is not None:
             if not isinstance(outcome, (LocalFrameOutcome, LocalPartOutcome, LocalFilesOutcome)):
                 raise ValueError("a local settlement carries a typed local outcome")
-            # Re-enter the outcome's own validation; the shared recursive walk
-            # cannot descend through QueryRequest (it is a dataclass without
-            # __post_init__), and every nested value is already validated here.
-            type(outcome).__post_init__(outcome)
+            # Re-enter the outcome's own validation. QueryRequest is a
+            # dataclass without __post_init__, so the shared recursive walk
+            # would incorrectly descend into it.
+            if isinstance(outcome, LocalFrameOutcome):
+                LocalFrameOutcome.__post_init__(outcome)
+            elif isinstance(outcome, LocalPartOutcome):
+                LocalPartOutcome.__post_init__(outcome)
+            else:
+                LocalFilesOutcome.__post_init__(outcome)
             if outcome.worker_id != self.worker_id:
                 raise ValueError("a local settlement must carry its admitted worker id")
         if self.error is not None and not isinstance(self.error, Exception):
             raise ValueError("a local settlement error must be an Exception")
-        if self.local_bracket is not None:
-            if not isinstance(self.local_bracket, LocalBracket):
-                raise ValueError("a local settlement bracket must be a LocalBracket")
-            _revalidate_tree(self.local_bracket)
 
 
 SettlementInput = RemoteSettlement | LocalSettlement
@@ -744,6 +752,8 @@ class _FrameCopyPaths(tuple):
     foreign result with its own identity (§3.4, §4.3).
     """
 
+    binding: _LocalCopyBinding
+
     def __new__(cls, binding: _LocalCopyBinding) -> _FrameCopyPaths:
         self = super().__new__(cls, binding.paths)
         self.binding = binding
@@ -775,9 +785,9 @@ class _PartSlot:
     restamped merely because another value was accepted in between (§2.4).
     """
 
-    kind: str
+    kind: PartKind
     scope: RetentionScope
-    phase: str = "absent"
+    phase: PartPhase = "absent"
     token: RequestToken | None = None
     record: RetainedRecord | None = None
     reason: str | None = None
@@ -942,6 +952,7 @@ class HistoryRouter:
         self._capture_provider = sources
         self._capture_jobs: dict[int, tuple[RequestToken, Future]] = {}
         self._worker_captures: dict[int, int] = {}
+        self._worker_capture_sets: dict[int, CapturedSourceSet] = {}
         self._frame_jobs: dict[int, Future] = {}
         self._frame_metadata: dict[int, Future] = {}
         self.local = _LocalFileChoices()
@@ -957,11 +968,11 @@ class HistoryRouter:
         self._window = None
         self._generation = 0
         self._ready = False
-        self._views = []
-        self._ranking = []
-        self._remote = None
+        self._views: list[tuple[str, QueryService]] = []
+        self._ranking: list[AppTotal] = []
+        self._remote: list[AppTotal] | None = None
         self._remote_answered: SourcePosition | None = None
-        self._remote_snapshot = None
+        self._remote_snapshot: str | None = None
         #: Scope-owned detail (§3.1-3.2): one selected lifetime, never a
         #: cross-subject cache, plus the view's last adopted applied window.
         self._detail: _DetailLifetime | None = None
@@ -990,10 +1001,10 @@ class HistoryRouter:
         self._frame_error: Exception | None = None
         self._authority: tuple | None = None
         self._ranking_stamps: dict[AcceptedIdentity, int] = {}
-        self._deferred_admissions: list[str] = []
-        self._gap_ranges = []
-        self._known_gap_ranges = []
-        self._overlap_ranges = []
+        self._deferred_admissions: list[PartKind] = []
+        self._gap_ranges: list[tuple[str, int, int]] = []
+        self._known_gap_ranges: list[tuple[str, int, int]] = []
+        self._overlap_ranges: list[tuple[str, int, int]] = []
         self._has_local_history = False
         self._not_retained = False
         self._chronology_unproved = False
@@ -1018,8 +1029,7 @@ class HistoryRouter:
         self._legacy_files_workers: set[int] = set()
         self._next_token_id = 1
         self._local_paths: tuple[tuple[str, str, str], ...] | None = None
-        self._local_future = None
-        #: Immutable admission/closing evidence, keyed by the admitted worker id.
+        self._local_future: Future | None = None
         #: The frame owns one entry; detail copies own one until their settlement.
         self._worker_bindings: dict[int, _LocalCopyBinding] = {}
         #: Local Files worker associations (no opening vector, no bracket).
@@ -1027,9 +1037,9 @@ class HistoryRouter:
         self._local_worker_id: int | None = None
         self._local_settlement: LocalSettlement | None = None
         self._daemon_answer_error: DaemonAnswerError | None = None
-        self._local_generation = None
+        self._local_generation: int | None = None
         self._closed = False
-        self._file_jobs = set()
+        self._file_jobs: set[Future] = set()
         self._file_status = FileAvailability(True, False)
 
     def _allocate_token_id(self) -> int:
@@ -1044,162 +1054,6 @@ class HistoryRouter:
         self._next_token_id = token_id + 1
         return token_id
 
-    def _prove_file_binding(self, name: str, connection: sqlite3.Connection,
-                            path: str) -> None:
-        """Prove an unseen connection reads the file now at ``path`` (§4.2).
-
-        ``stat`` identifies the file at a pathname, not the file a connection
-        holds. A connection opened before an ``os.replace`` keeps reading the
-        unlinked original, so stamping it with the pathname's identity would let
-        its counters certify a copy of the replacement. The owner-side proof is
-        the connection's own committed database image: it must be exactly the
-        bytes of the file at the path, or - for a source whose journal keeps some
-        committed frames outside the main file - the image a read-only connection
-        to that path reads. Anything that cannot be proven that way - a missing
-        image, an unreadable or non-file source, or a source that reads another
-        database - is refused rather than guessed. This runs only when an existing
-        source is rebound to an unseen connection, never per observation.
-        """
-
-        if connection.in_transaction:
-            raise ValueError(
-                f"history source {name!r} has an uncommitted transaction")
-        if not path:
-            raise ValueError(f"history source {name!r} has no provable file binding")
-        try:
-            image = connection.serialize(name="main")
-        except (AttributeError, NotImplementedError, sqlite3.Error) as error:
-            raise ValueError(
-                f"history source {name!r} has no provable file binding") from error
-        try:
-            matched = self._image_matches_file(path, image)
-        except OSError as error:
-            raise ValueError(f"history source {name!r} is unavailable") from error
-        if not matched:
-            matched = self._image_matches_database(path, image)
-        if not matched:
-            raise ValueError(
-                f"history source {name!r} is no longer bound to its registered file")
-
-    def _install_registration(self, name: str, service: QueryService,
-                              owner: str) -> _SourceRegistration:
-        """Bind one source to a fresh, never-reused registration epoch.
-
-        A failed installation publishes nothing: the previous registration (if
-        any) stays in place and the caller raises before any vector is observed.
-        Only this method allocates epochs; commits, queries, frame generations
-        and unchanged observations never do (§4.2).
-        """
-
-        if not isinstance(service, QueryService):
-            raise ValueError("a history source is a QueryService")
-        connection = service.connection
-        try:
-            row = connection.execute("PRAGMA database_list").fetchone()
-        except sqlite3.Error as error:
-            raise ValueError(f"history source {name!r} is unavailable") from error
-        path = "" if row is None or row[2] is None else row[2]
-        if path:
-            path = os.path.abspath(path)
-        current = self._physical_identity(path)
-        # One connection keeps the physical file it was first registered for.
-        # An explicit add_source or a new QueryService around that same
-        # connection is not a rebinding: if the pathname now denotes another
-        # inode, the connection still reads the unlinked original and no copy
-        # of the replacement may be certified by its counters. Only a
-        # connection opened for the replacement file is a genuine rebinding.
-        known = self._connection_bindings.get(id(connection))
-        if known is not None and known[0] is connection:
-            physical = known[1]
-            if current != physical:
-                raise ValueError(
-                    f"history source {name!r} is no longer bound to its "
-                    "registered file")
-        else:
-            # The epoch is chosen here, not when the connection was opened, so
-            # an unseen connection cannot inherit the pathname's identity: it
-            # may predate the file now at that path. Replacing an existing
-            # source binding therefore requires proof, and a failed proof keeps
-            # the previous registration and allocates no epoch.
-            if self._rebinding(name, path):
-                self._prove_file_binding(name, connection, path)
-                if self._physical_identity(path) != current:
-                    raise ValueError(
-                        f"history source {name!r} is no longer bound to its "
-                        "registered file")
-            physical = current
-        epoch = self._next_registration_epoch
-        self._next_registration_epoch = epoch + 1
-        registration = _SourceRegistration(
-            name, owner, epoch, service, connection, path, physical)
-        self._registrations[name] = registration
-        self._source_paths[name] = path
-        self._connection_bindings[id(connection)] = (connection, physical)
-        if path:
-            self._path_bindings.add(path)
-        return registration
-
-    def _current_registration(self, name: str) -> _SourceRegistration:
-        """The live registration for ``name``, refreshed when its identity moved.
-
-        Service or connection replacement/reopening is a registration
-        replacement, so it allocates a new epoch even under the same name,
-        owner, path and raw counters. A changed filesystem identity under an
-        unchanged connection is refused instead: stat alone cannot prove that
-        connection addresses the replacement file.
-        """
-
-        try:
-            service, owner = self._sources[name]
-        except KeyError:
-            raise KeyError(name) from None
-        registration = self._registrations.get(name)
-        if (registration is None or registration.service is not service
-                or registration.connection is not service.connection
-                or registration.owner != owner):
-            registration = self._install_registration(name, service, owner)
-        return self._verify_registration(registration)
-
-    @staticmethod
-    def _verify_registration(registration: _SourceRegistration) -> _SourceRegistration:
-        if registration.physical is not None:
-            try:
-                info = os.stat(registration.path)
-            except OSError as error:
-                raise ValueError(
-                    f"history source {registration.name!r} is unavailable") from error
-            if (info.st_dev, info.st_ino) != registration.physical:
-                raise ValueError(
-                    f"history source {registration.name!r} is no longer bound "
-                    "to its registered file")
-        return registration
-
-    @staticmethod
-    def _observe_registration(registration: _SourceRegistration) -> LocalPosition:
-        """One O(1) committed position on the registered connection (§4.1).
-
-        The table/column hash inventory is empty: this reads exactly
-        ``PRAGMA main.data_version`` and the connection's own ``total_changes``
-        property. It never opens an observer connection, scans a table, reads a
-        rowid, or borrows ``QueryService._snapshot``.
-        """
-
-        if registration.physical is None:
-            raise ValueError("asynchronous history requires a file-backed SQLite source")
-        connection = registration.connection
-        if connection.in_transaction:
-            raise ValueError("history source has an uncommitted transaction")
-        cursor = connection.execute("PRAGMA main.data_version")
-        try:
-            row = cursor.fetchone()
-            data_version = None if row is None else row[0]
-            cursor.fetchall()
-        finally:
-            cursor.close()
-        return LocalPosition(registration.name, registration.owner,
-                             registration.registration_epoch, data_version,
-                             connection.total_changes)
-
     @staticmethod
     def _precheck(window: Window) -> None:
         validate_window(window)
@@ -1212,7 +1066,7 @@ class HistoryRouter:
     def _read_capture_metadata(capture: CapturedSourceSet, window: Window | None) -> _CaptureMetadata:
         with _captured_sources(capture) as (sources, snapshot):
             boot_id = None
-            applications = {}
+            applications: dict[str, tuple[str, int]] = {}
             choice_error = None
             successful_sources = 0
             for name, service, _owner in sources:
@@ -1266,9 +1120,10 @@ class HistoryRouter:
                 self._boot_future = self._frame_executor.submit(
                     self._read_capture_metadata, capture, None)
                 sources = self.sources
-                self._boot_future.add_done_callback(
-                    lambda completed, capture_id=capture.capture_id:
-                        sources.release_capture(capture_id))
+                def release_boot_capture(_completed: Future,
+                                         capture_id: int = capture.capture_id) -> None:
+                    sources.release_capture(capture_id)
+                self._boot_future.add_done_callback(release_boot_capture)
             except Exception as error:
                 self._boot_error = error
                 if capture is not None:
@@ -1353,6 +1208,7 @@ class HistoryRouter:
 
     def _release_worker_capture(self, worker_id: int) -> None:
         capture_id = self._worker_captures.pop(worker_id, None)
+        self._worker_capture_sets.pop(worker_id, None)
         if capture_id is not None:
             self._managed_sources().release_capture(capture_id)
 
@@ -1376,8 +1232,9 @@ class HistoryRouter:
             live = (not self._closed and worker_id not in self._retired_tokens
                     and token.authority == self._current_authority())
             if token.owner == "frame":
-                live = live and self._frame is not None and not self._frame.retired
-                live = live and self._frame.owner_id == token.owner_id
+                frame = self._frame
+                live = live and frame is not None and not frame.retired
+                live = live and frame is not None and frame.owner_id == token.owner_id
             elif token.owner == "detail":
                 live = live and self._detail_token_live(token)
             else:
@@ -1392,7 +1249,9 @@ class HistoryRouter:
                 continue
             try:
                 capture = future.result()
-                binding = self._capture_local_binding(
+                if not isinstance(capture, CapturedSourceSet):
+                    raise SourceAdmissionError("managed source returned an invalid capture")
+                local_binding = self._capture_local_binding(
                     worker_id=worker_id, token_id=worker_id,
                     request=token.request, capture=capture)
                 identities = tuple((item.name, item.owner, item.registration_epoch)
@@ -1403,51 +1262,86 @@ class HistoryRouter:
                 sources.retain_capture(capture.capture_id)
                 sources.release_capture(capture.capture_id)
                 self._worker_captures[worker_id] = capture.capture_id
+                self._worker_capture_sets[worker_id] = capture
                 if token.owner == "frame":
+                    frame = self._frame
+                    if frame is None or frame.retired:
+                        raise SourceAdmissionError("local frame owner is no longer active")
                     token = replace(token, requested_source=capture.opening)
-                    self._frame.local_token = token
-                    self._frame.local_binding = binding
-                    if self._frame.remote_token is None:
-                        self._frame.requested_source = capture.opening
-                    self._worker_bindings[worker_id] = binding
-                    reader = self._read_local
-                    metadata_future = Future()
+                    frame.local_token = token
+                    frame.local_binding = local_binding
+                    if frame.remote_token is None:
+                        frame.requested_source = capture.opening
+                    self._worker_bindings[worker_id] = local_binding
+                    frame_reader: Callable[..., LocalFrameOutcome] = self._read_local
+                    metadata_future: Future[_CaptureMetadata] = Future()
                     self._frame_metadata[worker_id] = metadata_future
-                    def read_frame(capture=capture, token=token, reader=reader,
-                                   metadata_future=metadata_future):
+
+                    def read_frame(
+                        capture: CapturedSourceSet = capture,
+                        token: RequestToken = token,
+                        reader: Callable[..., LocalFrameOutcome] = frame_reader,
+                        metadata_future: Future[_CaptureMetadata] = metadata_future,
+                    ) -> LocalFrameOutcome:
                         try:
-                            metadata = HistoryRouter._read_capture_metadata(capture, token.request.window)
+                            metadata = HistoryRouter._read_capture_metadata(
+                                capture, token.request.window)
                             metadata_future.set_result(metadata)
-                            return reader(capture, token.request.window,
-                                          worker_id=token.token_id, request=token.request)
+                            return reader(
+                                capture, token.request.window,
+                                worker_id=token.token_id, request=token.request)
                         except BaseException as error:
                             if not metadata_future.done():
                                 metadata_future.set_exception(error)
                             raise
+
                     self._local_future = self._frame_executor.submit(read_frame)
                     self._frame_jobs[worker_id] = self._local_future
                     self._file_status = FileAvailability(True, False)
-                else:
-                    if token.owner == "files":
-                        binding = _FilesBinding(
-                            worker_id, worker_id, token.request, binding.registrations,
-                            binding.paths, binding.snapshot)
-                        app_id = self._file_owners[token.owner_id].app_id
-                        reader = self._read_local_files
+                elif token.owner == "files":
+                    owner = self._file_owners.get(token.owner_id)
+                    if owner is None:
+                        raise SourceAdmissionError("Files owner is no longer active")
+                    file_binding = _FilesBinding(
+                        worker_id, worker_id, token.request,
+                        local_binding.registrations, local_binding.paths,
+                        local_binding.snapshot)
+                    app_id = owner.app_id
 
-                        def work(capture=capture, token=token, app_id=app_id, reader=reader):
-                            request = token.request
-                            return reader(capture, request.window, request.app_key, app_id,
-                                          request.sort, request.direction, request.search,
-                                          worker_id=token.token_id, request=request)
-                    else:
-                        reader = self._read_local_part
+                    files_reader: Callable[..., LocalFilesOutcome] = self._read_local_files
 
-                        def work(capture=capture, token=token, reader=reader):
-                            return reader(capture, token.request, worker_id=token.token_id,
-                                          app_key=token.request.app_key)
+                    def read_files(
+                        capture: CapturedSourceSet = capture,
+                        token: RequestToken = token,
+                        app_id: int = app_id,
+                        reader: Callable[..., LocalFilesOutcome] = files_reader,
+                    ) -> LocalFilesOutcome:
+                        request = token.request
+                        return reader(
+                            capture, request.window, request.app_key, app_id,
+                            request.sort, request.direction, request.search,
+                            worker_id=token.token_id, request=request)
+
                     self._worker_jobs[worker_id] = (token.owner, None)
-                    self._submit_background_worker(token, work, binding=binding, reserved=True)
+                    self._submit_background_worker(
+                        token, read_files, binding=file_binding,
+                        capture=capture, reserved=True)
+                else:
+                    part_reader: Callable[..., LocalPartOutcome] = self._read_local_part
+
+                    def read_part(
+                        capture: CapturedSourceSet = capture,
+                        token: RequestToken = token,
+                        reader: Callable[..., LocalPartOutcome] = part_reader,
+                    ) -> LocalPartOutcome:
+                        return reader(
+                            capture, token.request, worker_id=token.token_id,
+                            app_key=token.request.app_key)
+
+                    self._worker_jobs[worker_id] = (token.owner, None)
+                    self._submit_background_worker(
+                        token, read_part, binding=local_binding,
+                        capture=capture, reserved=True)
             except Exception as error:  # noqa: BLE001 - exact current capture/submission failure
                 changed |= self._settle(token, LocalSettlement(worker_id, error=error))
                 if worker_id in self._worker_captures:
@@ -1482,21 +1376,21 @@ class HistoryRouter:
     def _close_local_settlement(self, settlement: LocalSettlement, *,
                                 binding: _LocalCopyBinding | None = None
                                 ) -> LocalSettlement:
-        """Attach the actor-captured bracket to one admitted local settlement."""
+        """Validate the capture carried by one admitted local settlement."""
 
         if not isinstance(settlement, LocalSettlement):
-            raise ValueError("closing a local bracket needs a local settlement")
+            raise ValueError("a local settlement requires a local settlement record")
         if binding is None:
             binding = self._worker_bindings.get(settlement.worker_id)
         if binding is None:
             raise ValueError("a local settlement has no captured copy binding")
-        if settlement.outcome is None or binding.snapshot is None:
-            raise ValueError("a local settlement requires its admitted snapshot")
+        capture = settlement.capture
+        if settlement.outcome is None or capture is None or binding.snapshot is None:
+            raise ValueError("a local settlement requires its admitted capture")
         snapshot = _validate_worker_snapshot(settlement.outcome.snapshot)
-        if snapshot != binding.snapshot:
+        if snapshot != binding.snapshot or _capture_provenance(capture) != snapshot:
             raise ValueError("a local settlement answered another snapshot")
-        return LocalSettlement(settlement.worker_id, outcome=settlement.outcome,
-                               error=settlement.error, local_bracket=snapshot.bracket)
+        return settlement
 
     def _background_charge(self, owner: str) -> int:
         return sum(1 for charged_owner, _ in self._worker_jobs.values() if charged_owner == owner)
@@ -1514,6 +1408,7 @@ class HistoryRouter:
     def _submit_background_worker(
         self, token: RequestToken, work: Callable[[], LocalOutcome],
         *, binding: _LocalCopyBinding | _FilesBinding | None = None,
+        capture: CapturedSourceSet | None = None,
         reserved: bool = False,
     ) -> Future | None:
         """Charge one background slot and submit an immutable-outcome worker.
@@ -1528,6 +1423,7 @@ class HistoryRouter:
             raise ValueError("a background worker needs its admitted request token")
         if token.origin != "local" or token.owner not in ("detail", "files"):
             raise ValueError("only a local detail or Files token owns a background worker")
+        worker_id: int | None
         if reserved:
             if self._worker_jobs.get(token.token_id) != (token.owner, None):
                 raise ValueError("a capture requires its reserved background slot")
@@ -1560,13 +1456,16 @@ class HistoryRouter:
                 raise ValueError("a Files worker requires its Files binding")
             self._files_bindings[worker_id] = binding
         else:
+            if not isinstance(binding, _LocalCopyBinding):
+                raise ValueError("a detail worker requires its local binding")
             self._worker_bindings[worker_id] = binding
 
         def run() -> None:
             try:
-                settlement: SettlementInput = LocalSettlement(worker_id, outcome=work())
+                settlement: SettlementInput = LocalSettlement(
+                    worker_id, capture=capture, outcome=work())
             except Exception as error:  # noqa: BLE001 - the owner reports it once
-                settlement = LocalSettlement(worker_id, error=error)
+                settlement = LocalSettlement(worker_id, capture=capture, error=error)
             self._completed.put((token, settlement))
 
         try:
@@ -1914,7 +1813,8 @@ class HistoryRouter:
         validate_enum(sort, _FILE_SORT_NAMES, "sort")
         validate_enum(direction, ("asc", "desc"), "direction")
         validate_search(search)
-        future, generation = Future(), self._generation
+        future: Future[FileViewResult] = Future()
+        generation = self._generation
         if len(self._file_jobs) >= 8:
             future.set_exception(RequestRejected("query_busy", "File history queue is full."))
             return future
@@ -2090,7 +1990,7 @@ class HistoryRouter:
         if owner.generation != self._generation or self._closed:
             return self._files_failure(token, WindowUnavailableError(
                 "file_source_unavailable", "File history generation retired."))
-        if settlement.local_bracket is not None:
+        if settlement.capture is None:
             return self._files_failure(token, RequestRejected("invalid_result", "invalid_result"))
         try:
             LocalFilesOutcome.__post_init__(outcome)
@@ -2297,6 +2197,7 @@ class HistoryRouter:
             future.add_done_callback(
                 lambda completed, sources=sources, capture_id=capture_id:
                     sources.release_capture(capture_id))
+            self._worker_capture_sets.pop(worker_id, None)
             self._worker_captures.pop(worker_id)
         if self._boot_capture is not None:
             self._boot_capture.add_done_callback(
@@ -2639,22 +2540,7 @@ class HistoryRouter:
     def _local_authority(self) -> tuple:
         """The current local authority: every registered identity, name-ordered."""
 
-        if self._capture_provider is not None:
-            return ("local", self._capture_provider.registration_vector())
-        entries = []
-        for name in sorted(self._sources, key=lambda text: text.encode("utf-8")):
-            service, owner = self._sources[name]
-            registration = self._registrations.get(name)
-            if (registration is None or registration.service is not service
-                    or registration.connection is not service.connection
-                    or registration.owner != owner):
-                # A replacement is pending: its future epoch is not yet the
-                # installed identity of any connection. Never adopt it silently.
-                epoch = self._next_registration_epoch
-            else:
-                epoch = registration.registration_epoch
-            entries.append((name, owner, epoch))
-        return ("local", tuple(entries))
+        return ("local", self._capture_provider.registration_vector())
 
     def _remote_authority(self) -> tuple | None:
         """The verified remote connection identity, or None for local mode.
@@ -2715,12 +2601,11 @@ class HistoryRouter:
 
     @staticmethod
     def _scope_family(scope: RetentionScope) -> tuple:
-        tag = scope[1]
-        if tag == "range":
+        if len(scope) == 5:
             return (scope[0], "range", scope[2], scope[3])
-        if tag == "since_boot":
+        if len(scope) == 3:
             return (scope[0], "since_boot", scope[2])
-        return (scope[0], tag)
+        return (scope[0], scope[1])
 
     @staticmethod
     def _window_family(app_key: str, window: Window) -> tuple:
@@ -2824,10 +2709,10 @@ class HistoryRouter:
         successor = lifetime.successors.get(kind)
         return successor is not None and successor.token_id == token.token_id
 
-    def _admit_detail(self, lifetime: _DetailLifetime, kind: str, key: str,
+    def _admit_detail(self, lifetime: _DetailLifetime, kind: PartKind, key: str,
                       window: Window, scope: RetentionScope) -> RequestToken:
         token_id = self._allocate_token_id()
-        origin = "remote" if self._remote_mode() else "local"
+        origin: Literal["remote", "local"] = "remote" if self._remote_mode() else "local"
         authority = self._current_authority()
         requested_source = self.source_position() if origin == "remote" else self._local_vector()
         slot_id = self._allocate_token_id() if origin == "remote" else None
@@ -2906,7 +2791,7 @@ class HistoryRouter:
         self._admit_detail(lifetime, kind, key, window, scope)
         return self.part_state(kind, key, scope)
 
-    def _part_state_from_slot(self, key: str, kind: str,
+    def _part_state_from_slot(self, key: str, kind: PartKind,
                               scope: RetentionScope) -> PartState:
         lifetime = self._detail
         slot = None if lifetime is None else lifetime.slots.get((kind, scope))
@@ -2977,7 +2862,7 @@ class HistoryRouter:
                 best = slot.record
         return best
 
-    def _exact_part(self, app_id: int, window: Window, kind: str):
+    def _exact_part(self, app_id: int, window: Window, kind: PartKind):
         """The exact-window detail getter: its own Window or HistoryPending."""
 
         if isinstance(app_id, bool) or not isinstance(app_id, int) or app_id <= 0:
@@ -2993,11 +2878,14 @@ class HistoryRouter:
             # select_detail performs; it is never a cross-subject detail cache.
             self.select_detail(key, window)
             lifetime = self._detail
+        if lifetime is None:
+            raise HistoryPending("detail lifetime is still loading")
         scope = retention_scope(key, window)
         slot = lifetime.slots.get((kind, scope))
         if (slot is not None and slot.phase == "failed" and slot.token is not None
                 and slot.token.request.window == window):
-            raise slot.error
+            if slot.error is not None:
+                raise slot.error
         if (slot is not None and slot.phase == "ok" and slot.record is not None
                 and slot.record.provenance.measured_window == window):
             return slot.record.value
@@ -3359,7 +3247,9 @@ class HistoryRouter:
         lifetime = self._detail
         if lifetime is None or lifetime.lifetime_id != token.owner_id:
             return False
-        kind = token.request.kind
+        if token.scope is None:
+            return False
+        kind = cast(PartKind, token.request.kind)
         scope = token.scope
         slot = lifetime.slots.get((kind, scope))
         if slot is None:
@@ -3415,6 +3305,9 @@ class HistoryRouter:
             if settlement.error is not error and not cancelled:
                 return self._reject_token(
                     token, settlement, RequestRejected("invalid_result", "invalid_result"))
+            if settlement.error is None:
+                return self._reject_token(
+                    token, settlement, RequestRejected("invalid_result", "invalid_result"))
             return self._settle_failure(token, settlement.error)
         if settlement.response is None or settlement.response != actual:
             return self._reject_token(
@@ -3425,7 +3318,7 @@ class HistoryRouter:
             return self._reject_token(
                 token, settlement, RequestRejected("invalid_result", "invalid_result"))
         if token.owner == "detail":
-            kind = token.request.kind
+            kind = cast(PartKind, token.request.kind)
             value = actual["result"]
             if kind == "totals" and not isinstance(value, DiskShare):
                 return self._reject_token(
@@ -3441,6 +3334,9 @@ class HistoryRouter:
                 return self._reject_token(
                     token, settlement, RequestRejected("invalid_result", "invalid_result"))
             lifetime = self._detail
+            if lifetime is None or token.scope is None:
+                return self._reject_token(
+                    token, settlement, RequestRejected("invalid_result", "invalid_result"))
             if token.token_id in lifetime.local_tokens:
                 # The admitted ranking's source decision stays with this exact
                 # detail across preparation and later applied-frame adoption.
@@ -3461,6 +3357,9 @@ class HistoryRouter:
                 self._start_local_detail(local_token)
                 return True
             digest = actual.get("snapshot")
+            if not isinstance(digest, str):
+                return self._reject_token(
+                    token, settlement, RequestRejected("invalid_result", "invalid_result"))
             presentation = self.registry.id_for(token.request.app_key)
             return self._publish_detail(
                 token, replace(value, app_id=presentation), digest,
@@ -3513,11 +3412,23 @@ class HistoryRouter:
         if settlement.error is not None:
             return self._settle_failure(token, settlement.error)
         outcome = settlement.outcome
+        if outcome is None or settlement.capture is None:
+            return self._reject_token(
+                token, settlement, RequestRejected("invalid_result", "invalid_result"))
+        capture = settlement.capture
+        if token.owner == "files":
+            file_binding = cast(_FilesBinding, binding)
+            binding_snapshot = file_binding.snapshot
+        else:
+            local_binding = cast(_LocalCopyBinding, binding)
+            binding_snapshot = local_binding.snapshot
         try:
-            if outcome is None or outcome.worker_id != binding.worker_id:
+            if outcome.worker_id != binding.worker_id:
                 raise ValueError("a local outcome answered another worker")
             snapshot = _validate_worker_snapshot(outcome.snapshot)
-            if binding.snapshot is None or snapshot != binding.snapshot:
+            capture_snapshot = _capture_provenance(capture)
+            if (binding_snapshot is None or snapshot != binding_snapshot
+                    or capture_snapshot != snapshot):
                 raise ValueError("a local outcome answered another snapshot")
             sources = getattr(self, "_capture_provider", None)
             if sources is not None:
@@ -3525,8 +3436,6 @@ class HistoryRouter:
                                    for item in snapshot.bracket.opening.sources)
                 if identities != sources.registration_vector():
                     raise ValueError("a local outcome answered retired registrations")
-            if token.owner != "files" and settlement.local_bracket != snapshot.bracket:
-                raise ValueError("a local outcome answered another bracket")
         except Exception:  # noqa: BLE001 - malformed or foreign worker result
             return self._reject_token(
                 token, settlement, RequestRejected("invalid_result", "invalid_result"))
@@ -3545,8 +3454,9 @@ class HistoryRouter:
             if outcome.request != token.request or outcome.app_key != token.request.app_key:
                 return self._reject_token(
                     token, settlement, RequestRejected("invalid_result", "invalid_result"))
-            bracket = settlement.local_bracket
-            if bracket is None or bracket.opening != binding.opening:
+            local_binding = cast(_LocalCopyBinding, binding)
+            bracket = _capture_provenance(capture).bracket
+            if bracket.opening != local_binding.opening:
                 return self._reject_token(
                     token, settlement, RequestRejected("invalid_result", "invalid_result"))
             answered = bracket.opening if bracket.opening == bracket.closing else None
@@ -3566,12 +3476,13 @@ class HistoryRouter:
         if frame is None:
             return False
         try:
-            outcome = self._admitted_frame_outcome(outcome, binding)
+            outcome = self._admitted_frame_outcome(
+                outcome, cast(_LocalCopyBinding, binding))
         except Exception:  # noqa: BLE001 - malformed frame evidence
             return self._reject_token(
                 token, settlement, RequestRejected("invalid_result", "invalid_result"))
-        bracket = settlement.local_bracket
-        if bracket is None or bracket.opening != binding.opening:
+        bracket = _capture_provenance(capture).bracket
+        if bracket.opening != cast(_LocalCopyBinding, binding).opening:
             return self._reject_token(
                 token, settlement, RequestRejected("invalid_result", "invalid_result"))
         metadata_future = self._frame_metadata.get(token.token_id)
@@ -3627,8 +3538,10 @@ class HistoryRouter:
         lifetime = self._detail
         if lifetime is None or lifetime.lifetime_id != token.owner_id:
             return False
-        kind = token.request.kind
+        kind = cast(PartKind, token.request.kind)
         app_key = token.request.app_key
+        if app_key is None or token.scope is None:
+            return False
         scope = token.scope
         window = token.request.window
         identity = AcceptedIdentity(kind, app_key, window, digest)
@@ -3664,10 +3577,12 @@ class HistoryRouter:
                 or any(row.total_bytes or row.rchar or row.wchar for row in self._ranking)):
             raise ValueError("remote query cannot prove a mixed-store cutoff")
         snapshot = response.get("snapshot")
-        if snapshot is None:
+        if snapshot is None or not isinstance(snapshot, str):
             raise ValueError("remote history snapshot identity required")
         if response.get("next_cursor") is not None:
             raise ValueError("paginated remote ownership is not proved atomically")
+        if not isinstance(rows, (list, tuple)):
+            raise ValueError("remote ranking result must be a sequence")
         if not rows:
             raise ValueError("remote ownership evidence required")
         self._remote_snapshot = snapshot
@@ -3690,6 +3605,7 @@ class HistoryRouter:
                                    and entry.token.owner_id == frame.owner_id)]
         if isinstance(error, (WindowUnavailableError, CancelledError)):
             return
+        kind: Literal["remote_error", "unavailable", "rejected", "transport", "internal"]
         if isinstance(error, RemoteError):
             kind = "remote_error"
         elif isinstance(error, ClientUnavailable):
@@ -3720,6 +3636,8 @@ class HistoryRouter:
             answered = (bracket.opening
                         if bracket is not None and bracket.opening == bracket.closing
                         else None)
+        if frame.requested_source is None:
+            raise ValueError("a frame requires its requested source")
         certified = answered is not None and answered == frame.requested_source
         snapshot = None
         if bracket is not None:
@@ -3742,11 +3660,15 @@ class HistoryRouter:
         remote = self._remote is not None
         digest = self._remote_snapshot if remote else None
         rows = self._remote if remote else self._ranking
+        if rows is None:
+            return
         provenance: dict[str, AnswerProvenance] = {}
         for row in rows:
             key = row.app_key
             if remote:
                 row_digest = digest
+                if not isinstance(row_digest, str):
+                    raise ValueError("remote ranking snapshot identity is invalid")
                 row_answered: SourcePosition | None = answered
                 row_bracket = None
             else:
@@ -3816,21 +3738,25 @@ class HistoryRouter:
             state = self.client.query_transport(future)
         except Exception:
             state = None
-        release = state is None or state.phase in ("terminal", "not_sent", "lost")
-        if not release and state.phase == "expired" and state.issued_at_ns is not None:
-            deadline = state.issued_at_ns + REQUEST_LIFETIME_NS + NO_ANSWER_NS
-            if self._clock_ns() >= deadline:
-                try:
-                    retired = self.client.retire_query_connection(future)
-                except Exception:
-                    retired = False
-                if retired:
+        if state is None:
+            release = True
+        else:
+            release = state.phase in ("terminal", "not_sent", "lost")
+            issued_at_ns = state.issued_at_ns
+            if not release and state.phase == "expired" and issued_at_ns is not None:
+                deadline = issued_at_ns + REQUEST_LIFETIME_NS + NO_ANSWER_NS
+                if self._clock_ns() >= deadline:
                     try:
-                        state = self.client.query_transport(future)
+                        retired = self.client.retire_query_connection(future)
                     except Exception:
-                        state = None
-                    release = state is None or state.phase in (
-                        "terminal", "not_sent", "lost")
+                        retired = False
+                    if retired:
+                        try:
+                            state = self.client.query_transport(future)
+                        except Exception:
+                            state = None
+                        release = (state is None
+                                   or state.phase in ("terminal", "not_sent", "lost"))
         if release:
             self._occupant = None
         return changed
@@ -3848,16 +3774,23 @@ class HistoryRouter:
         if not self._local_future.done():
             return False
         worker_id = self._local_worker_id
-        binding = None if worker_id is None else self._worker_bindings.get(worker_id)
+        if worker_id is None:
+            self._frame_error = ValueError("a local frame has no worker binding")
+            self.view_state = "unavailable: local history evidence"
+            return False
+        binding = self._worker_bindings.get(worker_id)
+        capture = self._worker_capture_sets.get(worker_id)
         try:
             outcome = self._local_future.result()
         except Exception as error:  # noqa: BLE001 - the existing readiness seam
-            settlement: LocalSettlement = LocalSettlement(worker_id, error=error)
+            settlement: LocalSettlement = LocalSettlement(
+                worker_id, capture=capture, error=error)
         else:
             try:
-                settlement = LocalSettlement(worker_id, outcome=outcome)
+                settlement = LocalSettlement(
+                    worker_id, capture=capture, outcome=outcome)
             except Exception as error:  # noqa: BLE001 - a foreign/typed failure
-                settlement = LocalSettlement(worker_id, error=error)
+                settlement = LocalSettlement(worker_id, capture=capture, error=error)
         if binding is None:
             self._frame_error = ValueError("a local frame has no captured copy binding")
             self.view_state = "unavailable: local history evidence"
@@ -3865,12 +3798,13 @@ class HistoryRouter:
         if settlement.error is None:
             try:
                 outcome = self._admitted_frame_outcome(outcome, binding)
-            except Exception as caught:  # noqa: BLE001 - reported after the bracket
-                settlement = LocalSettlement(worker_id, error=caught)
+            except Exception as caught:  # noqa: BLE001 - reported after the capture
+                settlement = LocalSettlement(worker_id, capture=capture, error=caught)
             else:
                 try:
                     settlement = self._close_local_settlement(
-                        LocalSettlement(worker_id, outcome=outcome), binding=binding)
+                        LocalSettlement(worker_id, capture=capture, outcome=outcome),
+                        binding=binding)
                 except Exception as caught:  # noqa: BLE001 - retryable observation
                     self._frame_error = caught
                     self.view_state = "unavailable: local history evidence"
@@ -3965,21 +3899,6 @@ class HistoryRouter:
             if settlement.worker_id != token.token_id:
                 self._reap_background_worker(token.token_id)
                 continue
-            if (isinstance(settlement, LocalSettlement)
-                    and settlement.outcome is not None
-                    and not isinstance(settlement.outcome, LocalFilesOutcome)
-                    and settlement.local_bracket is None):
-                binding = self._worker_bindings.get(token.token_id)
-                if binding is None:
-                    settlement = LocalSettlement(
-                        token.token_id,
-                        error=ValueError("a local worker has no captured copy binding"))
-                else:
-                    try:
-                        settlement = self._close_local_settlement(
-                            settlement, binding=binding)
-                    except Exception as error:  # noqa: BLE001 - failed dependency
-                        settlement = LocalSettlement(token.token_id, error=error)
             changed |= self._settle(token, settlement)
             self._reap_background_worker(token.token_id)
         return changed
@@ -3999,6 +3918,9 @@ class HistoryRouter:
                 continue  # a newer live owner still owns the wire
             lifetime.successors.pop(kind, None)
             lifetime.live[kind] = token
+            if token.scope is None:
+                self._retired_tokens.add(token.token_id)
+                continue
             slot = lifetime.slots.get((kind, token.scope))
             if slot is None:
                 slot = _PartSlot(kind, token.scope)
@@ -4163,9 +4085,3 @@ class HistoryRouter:
             device_points=tuple(devices[key] for key in sorted(devices)),
             residual_points=tuple(residuals[key] for key in sorted(residuals)),
             coverage=coverage)
-
-    def disk_share(self, app_id: int, window: Window) -> DiskShare:
-        return self._exact_part(app_id, window, "totals")
-
-    def series(self, app_id: int, window: Window) -> Series:
-        return self._exact_part(app_id, window, "series")

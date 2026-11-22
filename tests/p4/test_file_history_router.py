@@ -220,9 +220,9 @@ def test_managed_files_settlement_rejects_foreign_capture(retained):
         router._accept_files_local = lambda *args: accepted.append(args) or True
         router._reject_token = lambda *args: rejected.append(args) or False
         forged = replace(outcome, snapshot=replace(outcome.snapshot, snapshot_digest="f" * 64))
-        assert not router._settle_local(token, LocalSettlement(3, outcome=forged))
+        assert not router._settle_local(token, LocalSettlement(3, capture=captured, outcome=forged))
         assert len(rejected) == 1 and accepted == []
-        assert router._settle_local(token, LocalSettlement(3, outcome=outcome))
+        assert router._settle_local(token, LocalSettlement(3, capture=captured, outcome=outcome))
         assert len(accepted) == 1
     finally:
         if captured is not None:
