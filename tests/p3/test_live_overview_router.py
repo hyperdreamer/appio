@@ -1457,6 +1457,72 @@ def _registered_paths(*sources):
     )
 
 
+@pytest.mark.parametrize("approved", [True, False], ids=["valid", "retired"])
+def test_background_settlement_revalidates_outcome_subtype(tmp_path, approved):
+    """An outcome's own validator runs again when the worker completes."""
+    from live_overview_support import make_managed_router
+
+    local = _committed_store(tmp_path / "local.db", ((ALPHA, 17, 20),))
+    router = make_managed_router(QueryService(local), _IdleClient(), AppRegistry())
+    capture = None
+    try:
+        capture = router.sources.capture().result(timeout=15)
+        scope = Window("range", BOOT, 100 * NS, 140 * NS)
+        request = QueryRequest("totals", scope, ALPHA)
+        vector = capture.opening
+        authority = ("local", tuple(
+            (position.name, position.owner, position.registration_epoch)
+            for position in vector.sources
+        ))
+        validation = {"approved": True, "calls": 0, "intercept": False}
+
+        class AttestedPart(LocalPartOutcome):
+            def __getattribute__(self, name):
+                if name == "__post_init__" and validation["intercept"]:
+                    return lambda: None
+                return super().__getattribute__(name)
+
+            def __post_init__(self):
+                super().__post_init__()
+                validation["calls"] += 1
+                if not validation["approved"]:
+                    raise ValueError("extended part attestation is retired")
+
+        worker_id = 51
+        part = HistoryRouter._read_local_part(
+            capture, request, worker_id=worker_id, app_key=ALPHA)
+        attested = AttestedPart(
+            part.worker_id, part.request, part.app_key, part.value,
+            part.data_digest, part.snapshot)
+        validation["approved"] = approved
+        validation["intercept"] = True
+        token = RequestToken(
+            worker_id, request, "local", retention_scope(ALPHA, scope),
+            "detail", worker_id, None, authority, vector)
+        future = router._submit_background_worker(
+            token, lambda: attested, capture=capture)
+        assert future is not None
+        future.result(timeout=15)
+        queued_token, settlement = router._completed.get(timeout=5)
+        assert queued_token is token
+        assert isinstance(settlement, LocalSettlement)
+        if approved:
+            assert settlement.outcome is attested
+            assert settlement.error is None
+        else:
+            assert settlement.outcome is None
+            assert isinstance(settlement.error, ValueError)
+            assert str(settlement.error) == "extended part attestation is retired"
+        assert validation["calls"] == 2
+        router._reap_background_worker(worker_id)
+    finally:
+        if capture is not None:
+            router.sources.release_capture(capture.capture_id)
+        router.close()
+        router.sources.close()
+        local.connection.close()
+
+
 def test_local_detail_is_lazy_selected_subject_only(tmp_path, monkeypatch):
     """A frame copy proves routing only; selection builds one kind and subject.
 
@@ -2631,6 +2697,7 @@ def test_local_vector_changes_for_every_existing_commit_path(tmp_path, monkeypat
             before = positions()
             operation()
             after = positions()
+            assert set(after) == {"local", "export"}
             assert after[name].registration_epoch == before[name].registration_epoch
             assert after[name].data_version > before[name].data_version
             other = "export" if name == "local" else "local"
@@ -3261,8 +3328,23 @@ def test_detail_settlement_rejects_foreign_capture_before_publication(tmp_path):
             token, LocalSettlement(7, capture=captured, outcome=outcome))
         assert len(published) == 1
         assert published[0][1]["snapshot"] == outcome.snapshot
+
+        # A completed worker can remain queued after its capture lease is
+        # released and the same source name is registered with a new epoch.
+        published.clear()
+        rejected.clear()
+        registry.release_capture(captured.capture_id)
+        capture_released = True
+        replacement = registry.replace(
+            "local", stores.managed_spec("local", owner="iod")).result(timeout=10)
+        assert replacement.registration_epoch > receipt.registration_epoch
+        router._capture_provider = registry
+        assert not router._settle_local(
+            token, LocalSettlement(7, capture=captured, outcome=outcome))
+        assert len(rejected) == 1
+        assert published == [], "retired source completion must not publish"
     finally:
-        if "captured" in locals():
+        if "captured" in locals() and not locals().get("capture_released", False):
             registry.release_capture(captured.capture_id)
         registry.close()
         stores.close()

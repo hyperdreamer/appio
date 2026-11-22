@@ -619,12 +619,8 @@ class LocalSettlement:
             # Re-enter the outcome's own validation. QueryRequest is a
             # dataclass without __post_init__, so the shared recursive walk
             # would incorrectly descend into it.
-            if isinstance(outcome, LocalFrameOutcome):
-                LocalFrameOutcome.__post_init__(outcome)
-            elif isinstance(outcome, LocalPartOutcome):
-                LocalPartOutcome.__post_init__(outcome)
-            else:
-                LocalFilesOutcome.__post_init__(outcome)
+            validator = cast(Callable[[LocalOutcome], None], type(outcome).__post_init__)
+            validator(outcome)
             if outcome.worker_id != self.worker_id:
                 raise ValueError("a local settlement must carry its admitted worker id")
         if self.error is not None and not isinstance(self.error, Exception):
