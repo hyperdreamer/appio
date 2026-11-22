@@ -1526,6 +1526,7 @@ class IodClient:
             self._stale_results += 1
             _settle(pending.future, error=ConnectionLost("stale_connection"))
             return
+        assert isinstance(request_id, str)
         if not self._association_intact(request_id, pending):
             # Pure selector validation proves the response shape for whatever
             # request the binding currently names; it cannot prove that binding

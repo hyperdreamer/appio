@@ -5250,6 +5250,28 @@ def test_age_uses_oldest_displayed_dependency_and_unknown_contributor(
         created.close()
 
 
+def test_lowered_tail_peak_is_recomputed(qtbot):
+    """Replacing a tail with smaller peaks discards the earlier maxima."""
+    from tests.test_charts import TEN_NS, WIDE, dense_points, make_chart, task_point
+    from appio.ui.charts import DualSeriesChart
+
+    points = list(dense_points(31))
+    points[-1] = task_point(
+        30 * TEN_NS, read_bytes=10, write_bytes=5,
+        peak_read_bps=7000, peak_write_bps=9000)
+    chart = make_chart(DualSeriesChart, qtbot, width=WIDE, height=180)
+    chart.set_task_points(tuple(points), identity=("task", "a"))
+    assert (chart._groups[-1].peak_read_bps, chart._groups[-1].peak_write_bps) == (7000, 9000)
+
+    points[-1] = task_point(
+        30 * TEN_NS, bucket_secs=20, read_bytes=3, write_bytes=4,
+        peak_read_bps=700, peak_write_bps=900, spans_suspend=True)
+    chart.append_task_points(tuple(points), identity=("task", "a"))
+    tail = chart._groups[-1]
+    assert tail.duration_ns == 40 * 10**9
+    assert (tail.peak_read_bps, tail.peak_write_bps) == (700, 900)
+
+
 def test_main_window_uses_data_identity_for_task_and_device_appends(qtbot, monkeypatch) -> None:
     """Chart identities follow typed series data, even when points do not change."""
     from live_overview_support import series as fixture_series, share as fixture_share
@@ -5304,10 +5326,11 @@ def test_main_window_uses_data_identity_for_task_and_device_appends(qtbot, monke
     scope = retention_scope(key, requested)
     task_identity = ("task", key, scope, 0, "rollup_60s")
     device_identity = ("device", key, scope, 0, "rollup_60s", "8:0")
+    assert task_calls[-1][2] == task_identity
+    assert first.series_metadata is not None
     assert first.series_metadata.tier == "rollup_60s"
     assert first.share.coverage.tier == "raw"
     assert task_calls[-1][0] == "append_task_points"
-    assert task_calls[-1][2] == task_identity
     assert device_calls[-1][0] == "append_device_points"
     assert device_calls[-1][2] == device_identity
     assert all(isinstance(point, DeviceSeriesPoint) for point in device_calls[-1][1])

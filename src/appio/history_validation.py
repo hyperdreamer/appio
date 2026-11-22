@@ -177,7 +177,9 @@ def _revalidate_tree(value: object) -> None:
         raise ValueError("history records carry tuples, not mutable collections")
     if isinstance(value, type) or not is_dataclass(value):
         raise ValueError(f"unsupported history value {type(value).__name__}")
-    type(value).__post_init__(value)  # type: ignore[attr-defined]
+    post_init = getattr(type(value), "__post_init__", None)
+    if post_init is not None:
+        post_init(value)
     for field in fields(value):  # type: ignore[arg-type]
         _revalidate_tree(getattr(value, field.name))
 

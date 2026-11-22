@@ -20,7 +20,7 @@ import tempfile
 import threading
 import time
 from urllib.parse import parse_qsl, unquote, urlencode, urlsplit, urlunsplit
-from typing import Callable, Literal
+from typing import Callable, Literal, TypeVar, cast
 
 from .contracts import SQLITE_INT_MAX, validate_enum, validate_sqlite_integer
 from .iodclient import GapNotice
@@ -156,8 +156,11 @@ def _allocate_registration_epoch() -> int:
         return epoch
 
 
-def _failed_future(error: BaseException) -> Future:
-    future = Future()
+_T = TypeVar("_T")
+
+
+def _failed_future(error: BaseException) -> Future[_T]:
+    future: Future[_T] = Future()
     future.set_exception(error)
     return future
 
@@ -184,8 +187,8 @@ def _validate_file_uri(database_uri: str) -> None:
         raise SourceAdmissionError("managed source URI has an invalid cache mode")
 
 
-def _connection_options(spec: ManagedSourceSpec) -> dict[str, object]:
-    options: dict[str, object] = {}
+def _connection_options(spec: ManagedSourceSpec) -> dict[str, float | int | str]:
+    options: dict[str, float | int | str] = {}
     for key, value in spec.connect_options:
         if key in options:
             raise SourceAdmissionError("managed source has duplicate connect options")
@@ -233,10 +236,13 @@ def _open_read_only_connection(
     _validate_file_uri(spec.database_uri)
     options = _connection_options(spec)
     isolation_level = options.pop("isolation_level", None)
-    connection = sqlite3.connect(
+    connection = cast(Callable[..., sqlite3.Connection], sqlite3.connect)(
         spec.database_uri,
         uri=True,
-        isolation_level=isolation_level,
+        isolation_level=cast(
+            Literal["DEFERRED", "EXCLUSIVE", "IMMEDIATE"] | None,
+            isolation_level,
+        ),
         check_same_thread=True,
         **options,
     )
@@ -476,10 +482,13 @@ class _SourceActor:
             self._status = status
 
     def _observe(self) -> LocalPosition:
+        connection = self._connection
+        if connection is None:
+            raise SourceAdmissionError("managed source observer is not active")
         deadline_ns = self._clock_ns() + self._busy_timeout_ns
         while True:
             try:
-                return _position(self._connection, self.spec, self.registration_epoch)
+                return _position(connection, self.spec, self.registration_epoch)
             except sqlite3.OperationalError as error:
                 code = getattr(error, "sqlite_errorcode", 0) & 0xff
                 if code not in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED):
@@ -494,14 +503,17 @@ class _SourceActor:
             return sqlite3.SQLITE_OK
         return _read_only_authorizer(action, first, second, database, source)
 
-    def _retry_writer(self, operation: Callable):
+    def _retry_writer(self, operation: Callable[[], _T]) -> _T:
+        writer = self._writer
+        if writer is None:
+            raise SourceAdmissionError("managed source has no primary gap writer")
         deadline = self._clock_ns() + _GAP_RETRY_NS
         for attempt in range(_GAP_ATTEMPTS):
             try:
                 return operation()
             except BaseException as error:
-                if self._writer.in_transaction:
-                    _query(self._writer, "ROLLBACK")
+                if writer.in_transaction:
+                    _query(writer, "ROLLBACK")
                 code = getattr(error, "sqlite_errorcode", 0) & 0xff
                 if (code not in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED)
                         or attempt + 1 == _GAP_ATTEMPTS
@@ -513,6 +525,7 @@ class _SourceActor:
                 self._retry_wait(min(_GAP_RETRY_SECONDS, remaining))
                 if self._clock_ns() >= deadline:
                     raise
+        raise SourceAdmissionError("managed source writer retry budget exhausted")
 
     def _open_primary(self) -> None:
         """Create and challenge the only writer/observer pair for this epoch."""
@@ -530,27 +543,33 @@ class _SourceActor:
             self._writer = sqlite3.connect(
                 self.spec.database_uri, uri=True, isolation_level=None,
                 check_same_thread=True, timeout=0, cached_statements=0)
-            _query(self._writer, "PRAGMA busy_timeout=0")
-            _query(self._writer, "PRAGMA foreign_keys=ON")
-            _query(self._writer, "PRAGMA synchronous=FULL")
-            if (_query(self._writer, "PRAGMA foreign_keys") != [(1,)]
-                    or _query(self._writer, "PRAGMA synchronous") != [(2,)]
-                    or self._writer.in_transaction):
+            writer = self._writer
+            if writer is None:
+                raise SourceAdmissionError("primary writer is not active")
+            _query(writer, "PRAGMA busy_timeout=0")
+            _query(writer, "PRAGMA foreign_keys=ON")
+            _query(writer, "PRAGMA synchronous=FULL")
+            if (_query(writer, "PRAGMA foreign_keys") != [(1,)]
+                    or _query(writer, "PRAGMA synchronous") != [(2,)]
+                    or writer.in_transaction):
                 raise SourceAdmissionError("primary writer controls are unavailable")
-            validate_schema(self._writer)
+            validate_schema(writer)
             observer_uri = urlunsplit(parsed._replace(
                 query=urlencode({"mode": "ro", "cache": "shared"})))
             observer_spec = replace(self.spec, database_uri=observer_uri,
                                     connect_options=(("cached_statements", "0"), ("timeout", "0")))
             self._connection = _open_read_only_connection(
                 observer_spec, authorizer=self._observer_authorizer)
+            observer = self._connection
+            if observer is None:
+                raise SourceAdmissionError("primary observer is not active")
             self._retry_writer(self._challenge_pair)
-            if _query(self._connection, "PRAGMA query_only") != [(1,)]:
+            if _query(observer, "PRAGMA query_only") != [(1,)]:
                 raise SourceAdmissionError("primary observer is not query-only")
             for statement in ("PRAGMA query_only=OFF", "PRAGMA read_uncommitted=ON",
                               "UPDATE boot SET source=source WHERE 0"):
                 try:
-                    _query(self._connection, statement)
+                    _query(observer, statement)
                 except sqlite3.DatabaseError as error:
                     if getattr(error, "sqlite_errorcode", 0) != sqlite3.SQLITE_AUTH:
                         raise
@@ -560,7 +579,10 @@ class _SourceActor:
             raise SourceAdmissionError("gap writer binding is unprovable") from error
 
     def _challenge_pair(self) -> None:
-        writer, observer = self._writer, self._connection
+        writer = self._writer
+        observer = self._connection
+        if writer is None or observer is None:
+            raise SourceAdmissionError("managed source pair is not active")
         if writer.in_transaction or observer.in_transaction:
             raise SourceAdmissionError("pairing requires committed connections")
         _query(writer, "BEGIN IMMEDIATE")
@@ -599,14 +621,20 @@ class _SourceActor:
 
     def _write_gap(self, notice: GapNotice) -> GapWriteResult:
         _validate_gap_notice(notice)
-        if self._writer is None:
-            raise SourceAdmissionError("managed source has no primary gap writer")
+        from_mono_ns = notice.from_mono_ns
+        to_mono_ns = notice.to_mono_ns
+        if (isinstance(from_mono_ns, bool) or not isinstance(from_mono_ns, int)
+                or isinstance(to_mono_ns, bool) or not isinstance(to_mono_ns, int)):
+            raise SourceAdmissionError("gap writer requires integer bounds")
 
         def transaction() -> GapWriteResult:
-            writer, observer = self._writer, self._connection
+            writer = self._writer
+            observer = self._connection
+            if writer is None or observer is None:
+                raise SourceAdmissionError("managed source pair is not active")
             if writer.in_transaction or observer.in_transaction:
                 raise SourceAdmissionError("gap write requires committed connections")
-            bounds = (notice.boot_id, notice.from_mono_ns, notice.to_mono_ns)
+            bounds: tuple[str, int, int] = (notice.boot_id, from_mono_ns, to_mono_ns)
             _query(writer, "BEGIN IMMEDIATE")
             disposition: Literal["inserted", "duplicate", "unknown_boot"]
             if not _query(writer, "SELECT 1 FROM boot WHERE boot_id=?", (notice.boot_id,)):
@@ -620,7 +648,7 @@ class _SourceActor:
                 _query(writer, "INSERT INTO gap(boot_id,source,epoch,seq,from_mono_ns,to_mono_ns,reason) "
                        "VALUES(?,'gui',?,0,?,?,'gui_absent')",
                        (notice.boot_id, epoch[0][0] if epoch else 1,
-                        notice.from_mono_ns, notice.to_mono_ns))
+                        from_mono_ns, to_mono_ns))
                 _query(writer, "COMMIT")
                 disposition = "inserted"
             if writer.in_transaction or observer.in_transaction:
@@ -672,10 +700,13 @@ class _SourceActor:
                     continue
                 try:
                     if operation == "observe":
-                        result = self._observe()
+                        result: object = self._observe()
                     elif operation == "capture":
+                        connection = self._connection
+                        if connection is None:
+                            raise SourceAdmissionError("managed source observer is not active")
                         result = _backup_image(
-                            self._connection, clock_ns=self._clock_ns,
+                            connection, clock_ns=self._clock_ns,
                             deadline_ns=self._clock_ns() + self._busy_timeout_ns)
                     elif isinstance(operation, _GapWrite):
                         result = self._write_gap(operation.notice)
@@ -978,7 +1009,7 @@ class ManagedSourceRegistry:
                 self._release_capture_leases(leases)
             self._capture_count -= 1
             if self._capture_count or self._closed:
-                deferred = ()
+                deferred: tuple[Callable[[], None], ...] = ()
             else:
                 deferred = tuple(self._deferred_admissions)
                 self._deferred_admissions.clear()

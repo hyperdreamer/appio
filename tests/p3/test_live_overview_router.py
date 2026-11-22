@@ -968,7 +968,7 @@ def test_live_records_validate_every_field_and_phase_combination() -> None:
             "worker_id", "request", "app_key", "table", "coverage", "served_gap_count", "snapshot",
         ),
         RemoteSettlement: ("future", "response", "error"),
-        LocalSettlement: ("worker_id", "outcome", "error", "local_bracket"),
+        LocalSettlement: ("worker_id", "capture", "outcome", "error"),
     }
     for record, names in private_inventory.items():
         assert tuple(field.name for field in fields(record)) == names, record.__name__
@@ -1375,9 +1375,10 @@ def test_live_records_validate_every_field_and_phase_combination() -> None:
             lambda kwargs=kwargs, base=base: RemoteSettlement(**{**base, **kwargs}),
         )
 
-    bracket = LocalBracket(local_vector, local_vector)
-    frame_settlement = LocalSettlement(2, outcome=frame, local_bracket=bracket)
+    capture = CapturedSourceSet(1, local_vector, local_vector, (image,), DIGEST)
+    frame_settlement = LocalSettlement(2, capture=capture, outcome=frame)
     assert frame_settlement.outcome is frame
+    assert frame_settlement.capture is capture
     assert LocalSettlement(3, error=RuntimeError("boom")).outcome is None
     _assert_frozen(frame_settlement, "worker_id")
     for label, kwargs in (
@@ -1388,9 +1389,9 @@ def test_live_records_validate_every_field_and_phase_combination() -> None:
         ("outcome.type", {"outcome": {"worker_id": 2}}),
         ("outcome.worker", {"outcome": part}),
         ("error.base", {"outcome": None, "error": KeyboardInterrupt()}),
-        ("bracket.type", {"local_bracket": [local_vector, local_vector]}),
+        ("capture.type", {"capture": [capture]}),
     ):
-        base = {"worker_id": 2, "outcome": frame, "error": None, "local_bracket": None}
+        base = {"worker_id": 2, "capture": capture, "outcome": frame, "error": None}
         _reject(
             f"local_settlement.{label}",
             lambda kwargs=kwargs, base=base: LocalSettlement(**{**base, **kwargs}),
@@ -1454,6 +1455,72 @@ def _registered_paths(*sources):
         (name, store.connection.execute("PRAGMA database_list").fetchone()[2], owner)
         for name, store, owner in sources
     )
+
+
+@pytest.mark.parametrize("approved", [True, False], ids=["valid", "retired"])
+def test_background_settlement_revalidates_outcome_subtype(tmp_path, approved):
+    """An outcome's own validator runs again when the worker completes."""
+    from live_overview_support import make_managed_router
+
+    local = _committed_store(tmp_path / "local.db", ((ALPHA, 17, 20),))
+    router = make_managed_router(QueryService(local), _IdleClient(), AppRegistry())
+    capture = None
+    try:
+        capture = router.sources.capture().result(timeout=15)
+        scope = Window("range", BOOT, 100 * NS, 140 * NS)
+        request = QueryRequest("totals", scope, ALPHA)
+        vector = capture.opening
+        authority = ("local", tuple(
+            (position.name, position.owner, position.registration_epoch)
+            for position in vector.sources
+        ))
+        validation = {"approved": True, "calls": 0, "intercept": False}
+
+        class AttestedPart(LocalPartOutcome):
+            def __getattribute__(self, name):
+                if name == "__post_init__" and validation["intercept"]:
+                    return lambda: None
+                return super().__getattribute__(name)
+
+            def __post_init__(self):
+                super().__post_init__()
+                validation["calls"] += 1
+                if not validation["approved"]:
+                    raise ValueError("extended part attestation is retired")
+
+        worker_id = 51
+        part = HistoryRouter._read_local_part(
+            capture, request, worker_id=worker_id, app_key=ALPHA)
+        attested = AttestedPart(
+            part.worker_id, part.request, part.app_key, part.value,
+            part.data_digest, part.snapshot)
+        validation["approved"] = approved
+        validation["intercept"] = True
+        token = RequestToken(
+            worker_id, request, "local", retention_scope(ALPHA, scope),
+            "detail", worker_id, None, authority, vector)
+        future = router._submit_background_worker(
+            token, lambda: attested, capture=capture)
+        assert future is not None
+        future.result(timeout=15)
+        queued_token, settlement = router._completed.get(timeout=5)
+        assert queued_token is token
+        assert isinstance(settlement, LocalSettlement)
+        if approved:
+            assert settlement.outcome is attested
+            assert settlement.error is None
+        else:
+            assert settlement.outcome is None
+            assert isinstance(settlement.error, ValueError)
+            assert str(settlement.error) == "extended part attestation is retired"
+        assert validation["calls"] == 2
+        router._reap_background_worker(worker_id)
+    finally:
+        if capture is not None:
+            router.sources.release_capture(capture.capture_id)
+        router.close()
+        router.sources.close()
+        local.connection.close()
 
 
 def test_local_detail_is_lazy_selected_subject_only(tmp_path, monkeypatch):
@@ -2630,6 +2697,7 @@ def test_local_vector_changes_for_every_existing_commit_path(tmp_path, monkeypat
             before = positions()
             operation()
             after = positions()
+            assert set(after) == {"local", "export"}
             assert after[name].registration_epoch == before[name].registration_epoch
             assert after[name].data_version > before[name].data_version
             other = "export" if name == "local" else "local"
@@ -3179,7 +3247,7 @@ def test_remote_frame_fallback_keeps_local_snapshot_evidence(tmp_path):
         router._ranking = list(outcome.ranking)
         router._ranking_stamps = {}
         router._clock_ns = time.monotonic_ns
-        router._local_settlement = LocalSettlement(1, outcome=outcome, local_bracket=bracket)
+        router._local_settlement = LocalSettlement(1, capture=captured, outcome=outcome)
         router._not_retained = outcome.not_retained
         router._gap_ranges = list(outcome.gaps)
         router._chronology_unproved = outcome.chronology_unproved
@@ -3254,14 +3322,29 @@ def test_detail_settlement_rejects_foreign_capture_before_publication(tmp_path):
         router._reject_token = lambda *args: rejected.append(args) or False
         forged = replace(outcome, snapshot=replace(outcome.snapshot, capture_id=outcome.snapshot.capture_id + 1))
         assert not router._settle_local(
-            token, LocalSettlement(7, outcome=forged, local_bracket=forged.snapshot.bracket))
+            token, LocalSettlement(7, capture=captured, outcome=forged))
         assert len(rejected) == 1 and published == []
         assert router._settle_local(
-            token, LocalSettlement(7, outcome=outcome, local_bracket=outcome.snapshot.bracket))
+            token, LocalSettlement(7, capture=captured, outcome=outcome))
         assert len(published) == 1
         assert published[0][1]["snapshot"] == outcome.snapshot
+
+        # A completed worker can remain queued after its capture lease is
+        # released and the same source name is registered with a new epoch.
+        published.clear()
+        rejected.clear()
+        registry.release_capture(captured.capture_id)
+        capture_released = True
+        replacement = registry.replace(
+            "local", stores.managed_spec("local", owner="iod")).result(timeout=10)
+        assert replacement.registration_epoch > receipt.registration_epoch
+        router._capture_provider = registry
+        assert not router._settle_local(
+            token, LocalSettlement(7, capture=captured, outcome=outcome))
+        assert len(rejected) == 1
+        assert published == [], "retired source completion must not publish"
     finally:
-        if "captured" in locals():
+        if "captured" in locals() and not locals().get("capture_released", False):
             registry.release_capture(captured.capture_id)
         registry.close()
         stores.close()
@@ -4578,8 +4661,8 @@ def _forged_frame_settlement(router, window, field, value):
     assert isinstance(outcome, LocalFrameOutcome)
     token = router._frame.local_token
     binding = router._worker_bindings[token.token_id]
-    bracket = LocalBracket(binding.opening, router._closing_vector(binding))
-    settlement = LocalSettlement(token.token_id, outcome=outcome, local_bracket=bracket)
+    capture = router._worker_capture_sets[token.token_id]
+    settlement = LocalSettlement(token.token_id, capture=capture, outcome=outcome)
     forged = copy.copy(outcome)
     object.__setattr__(forged, field, value)
     object.__setattr__(settlement, "outcome", forged)
@@ -5009,7 +5092,7 @@ def test_local_outcomes_share_settlement_for_frame_part_and_files(tmp_path):
             token, settlement = _collect_settlement(router)
             assert token.owner == "detail"
             assert isinstance(settlement, LocalSettlement)
-            assert settlement.local_bracket is None
+            assert settlement.capture is not None
             binding = router._worker_bindings[token.token_id]
             settlement = router._close_local_settlement(settlement, binding=binding)
             forged = copy.copy(settlement.outcome)
@@ -5448,7 +5531,8 @@ def test_transport_gap_writer_registration_retirement_and_close(
     from appio.history_source import GapWriteResult, ManagedSourceRegistry, SourceAdmissionError
     from appio.history_types import ManagedSourceSpec
     from appio.iodclient import GapNotice
-    from live_overview_support import GapSqlHarness, LocalPositionStores
+    from live_overview_support import (GapSqlHarness, LocalPositionStores,
+                                       drain_transport_gaps, make_managed_router)
 
     assert tuple(field.name for field in fields(GapWriteResult)) == (
         "registration_epoch", "disposition", "boot_id", "from_mono_ns", "to_mono_ns")
@@ -5546,6 +5630,32 @@ def test_transport_gap_writer_registration_retirement_and_close(
                 assert probe.close_thread == probe.thread
         finally:
             sources.close()
+
+        # Drain an old writer completion after replacement through the router.
+        # The new incarnation must not be invalidated by that completion.
+        router = make_managed_router(stores.services["local"], _IdleClient(), AppRegistry())
+        sources = router._capture_provider
+        primary_spec = sources._active["local"].spec
+        invalidations = []
+        invalidate = router.invalidate
+
+        def observe_invalidation(**options):
+            invalidations.append(options)
+            invalidate(**options)
+
+        monkeypatch.setattr(router, "invalidate", observe_invalidation)
+        try:
+            with sql.hold("COMMIT") as barrier:
+                router.record_transport_gap(replace(notice, from_mono_ns=30 * NS,
+                                                     to_mono_ns=31 * NS))
+                barrier.wait()
+                replacement = sources.replace("local", primary_spec)
+                barrier.release()
+                replacement.result(timeout=10)
+                drain_transport_gaps(router)
+            assert invalidations == [], "retired gap invalidated the replacement epoch"
+        finally:
+            router.close()
 
 
 @pytest.mark.parametrize("mode", ["local", "remote"])

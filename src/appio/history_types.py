@@ -19,7 +19,7 @@ import hashlib
 import json
 import math
 from dataclasses import dataclass, fields
-from typing import Literal
+from typing import Literal, TypeVar, cast
 
 from .contracts import (
     AppTotal,
@@ -176,11 +176,14 @@ def _revalidate_tree(value: object) -> None:
         _revalidate_tree(getattr(value, field.name))
 
 
-def _record(record: object, expected: type, field: str) -> object:
+_T = TypeVar("_T")
+
+
+def _record(record: object, expected: type[_T], field: str) -> _T:
     if not isinstance(record, expected):
         raise ValueError(f"{field} must be a {expected.__name__}")
     _revalidate_tree(record)
-    return record
+    return cast(_T, record)
 
 
 def _source_position(value: object, field: str) -> "RemotePosition | LocalPositionVector":
@@ -645,14 +648,15 @@ class FrameProvenance:
         if len(args) == 2:
             if snapshot is not None or certified is not None:
                 raise TypeError("snapshot or certified supplied twice")
-            snapshot, certified = args
+            snapshot = cast(SnapshotProvenance | None, args[0])
+            certified = cast(bool | None, args[1])
         elif args:
             if isinstance(args[0], bool) and certified is None:
                 certified = args[0]
             else:
                 if snapshot is not None:
                     raise TypeError("snapshot supplied twice")
-                snapshot = args[0]
+                snapshot = cast(SnapshotProvenance | None, args[0])
         object.__setattr__(self, "generation", generation)
         object.__setattr__(self, "window", window)
         object.__setattr__(self, "requested_source", requested_source)

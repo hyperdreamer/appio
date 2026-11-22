@@ -29,7 +29,7 @@ from __future__ import annotations
 import math
 import time
 from collections import deque
-from typing import Callable, Protocol, Sequence
+from typing import Callable, Protocol, Sequence, cast
 
 from PyQt6 import sip
 from PyQt6.QtCore import QModelIndex, QObject, QRect, QRectF, QSize, Qt, pyqtSignal
@@ -205,12 +205,11 @@ def _window_family(app_key: str, window: Window) -> tuple:
 def _scope_family(scope: RetentionScope) -> tuple:
     """The same lifetime identity derived from a retention-scope tuple."""
 
-    tag = scope[1]
-    if tag == "range":
+    if len(scope) == 5:
         return (scope[0], "range", scope[2], scope[3])
-    if tag == "since_boot":
+    if len(scope) == 3:
         return (scope[0], "since_boot", scope[2])
-    return (scope[0], tag)
+    return (scope[0], scope[1])
 
 
 def _is_retained_service(service: object) -> bool:
@@ -435,7 +434,7 @@ class _ExactDetailAdapter:
         self._request_serial += 1
         return self._request_serial
 
-    def _slot_for(self, kind: str, scope: RetentionScope) -> _DetailSlot:
+    def _slot_for(self, kind: PartKind, scope: RetentionScope) -> _DetailSlot:
         slot = self._slots.get((kind, scope))
         if slot is None:
             slot = _DetailSlot()
@@ -444,7 +443,7 @@ class _ExactDetailAdapter:
 
     def _check_part(
         self, kind: object, app_key: object, scope: object
-    ) -> tuple[str, str, RetentionScope]:
+    ) -> tuple[PartKind, str, RetentionScope]:
         if kind not in _DETAIL_KINDS:
             raise ValueError(
                 f"detail.kind must be one of totals, series, got {kind!r}"
@@ -453,7 +452,7 @@ class _ExactDetailAdapter:
         checked = validate_scope(scope)
         if checked[0] != key:
             raise ValueError("a part scope must name its subject")
-        return kind, key, checked  # type: ignore[return-value]
+        return cast(PartKind, kind), key, checked
 
     def request_detail(
         self, kind: PartKind, app_id: int, window: Window
@@ -522,7 +521,7 @@ class _ExactDetailAdapter:
 
     def _admit(
         self,
-        kind: str,
+        kind: PartKind,
         app_id: int,
         key: str,
         scope: RetentionScope,
@@ -542,7 +541,7 @@ class _ExactDetailAdapter:
 
     def _observe(
         self,
-        kind: str,
+        kind: PartKind,
         app_id: int,
         key: str,
         scope: RetentionScope,
@@ -578,7 +577,7 @@ class _ExactDetailAdapter:
             self._fail(slot, kind, invalid)
 
     def _fail(
-        self, slot: _DetailSlot, kind: str, error: BaseException
+        self, slot: _DetailSlot, kind: PartKind, error: BaseException
     ) -> None:
         """Clear the record before any notification and keep the exact failure."""
 
@@ -670,7 +669,7 @@ class _ExactDetailAdapter:
 
     def _accept(
         self,
-        kind: str,
+        kind: PartKind,
         key: str,
         scope: RetentionScope,
         window: Window,
@@ -852,7 +851,8 @@ def _coverage_diagnostic(service: object) -> str | None:
         "transport": "connection lost before the answer",
         "internal": "history query failed",
     }
-    clause = clauses.get(getattr(error, "kind", None))
+    clause_key = getattr(error, "kind", None)
+    clause = clauses.get(clause_key if isinstance(clause_key, str) else "")
     reason = getattr(error, "reason", None)
     if clause is None or not isinstance(reason, str) or not reason:
         return None
@@ -1124,7 +1124,7 @@ class AppIoWindow(QMainWindow):
         #: The one selected structural detail capability (router or adapter).
         self._exact_adapter: _ExactDetailAdapter | None = None
         if _is_retained_service(query_service):
-            self._detail_service: RetainedQueryService = query_service
+            self._detail_service = cast(RetainedQueryService, query_service)
         else:
             adapter = _ExactDetailAdapter(
                 query_service,
@@ -1947,10 +1947,14 @@ class AppIoWindow(QMainWindow):
                 coverage_diagnostic=diagnostic,
                 ranking_provenance=ranking_provenance,
                 series_provenance=(
-                    series_record.provenance if series_value is not None else None
+                    series_record.provenance
+                    if series_value is not None and series_record is not None
+                    else None
                 ),
                 share_provenance=(
-                    share_record.provenance if share_value is not None else None
+                    share_record.provenance
+                    if share_value is not None and share_record is not None
+                    else None
                 ),
             )
 
