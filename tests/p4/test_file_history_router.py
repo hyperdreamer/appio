@@ -8,6 +8,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import replace
 import json
 import threading
+import time
 
 import pytest
 
@@ -31,15 +32,24 @@ from appio.iodclient import (
     ClientState,
     ClientUnavailable,
     ConnectionLost,
+    QueryTransportState,
     RemoteError,
     RequestRejected,
 )
-from appio.ipc_models import Capabilities, QueryRequest, validate_request
+from appio.ipc_models import Capabilities, QueryRequest, StreamCursor, validate_request
 from appio.query import QueryService
 from appio.store import AppIoStore
 from appio.ui.files_view import FilesView
 from tests.p3.test_iodclient import Harness, snapshot_frame
 from tests.p4.test_file_runtime import APP, ZERO, Frames, event
+from live_overview_support import (
+    add_managed_source, managed_router, wait_for_capture_admission, wait_for_local_frame,
+)
+
+
+@pytest.fixture(autouse=True)
+def managed_sources():
+    yield
 
 SORTS = ("bytes_total", "bytes_r", "bytes_w", "reads", "writes", "basename", "dev", "last_seen")
 WINDOW = Window("since_boot", "boot-A", end_mono_ns=H)
@@ -90,16 +100,43 @@ def inject_requested_gap_evidence(db, app_id=1, gaps=1):
     assert not db.in_transaction
 
 
+def managed_router(store, client, registry=None, **options):
+    from live_overview_support import make_managed_router
+
+    return make_managed_router(
+        QueryService(store), client, registry or AppRegistry(), **options)
+
+
 def local_router(retained):
-    router = HistoryRouter(QueryService(retained.db), Client(), AppRegistry())
+    router = managed_router(retained.db, Client())
     router.prepare(WINDOW)
-    router._local_future.result(timeout=10)
+    wait_for_local_frame(router)
     assert router.ready(WINDOW)
     return router
 
 
 def id_for(router, key=APP):
     return router.registry.id_for(key)
+
+
+def drive(router, future, *, timeout=15.0):
+    """Owner-thread drain loop for one outward Files Future.
+
+    Files settlement is lazy by design (spec §§3.3-3.4): a worker only enqueues
+    an immutable outcome, and the owner's ``drain`` performs the closing reads
+    and publishes. A fixture that blocks on the outward Future therefore has to
+    act as the owner thread. Every assertion still observes the same published
+    result or failure; only the delivery driver changed.
+    """
+
+    deadline = time.monotonic() + timeout
+    while not future.done():
+        router.drain()
+        if future.done():
+            break
+        assert time.monotonic() < deadline, "the outward Files future never settled"
+        time.sleep(0.001)
+    return future.result(timeout=0)
 
 
 @pytest.mark.parametrize("sort", SORTS)
@@ -109,13 +146,88 @@ def test_local_file_futures_delegate_every_sort_and_NFC_casefold_search(retained
     try:
         expected = QueryService(retained.db).file_table(1, WINDOW, sort, direction, "CAFÉ")
         expected_cov = QueryService(retained.db).file_coverage(1, WINDOW)
-        view = router.request_file_view(id_for(router), WINDOW, sort, direction, "CAFÉ").result(timeout=10)
+        view = drive(router, router.request_file_view(
+            id_for(router), WINDOW, sort, direction, "CAFÉ"))
         assert isinstance(view, FileViewResult)
         assert view.table == replace(expected, app_id=id_for(router))
         assert view.coverage == replace(expected_cov, app_id=id_for(router))
         assert len(view.table.rows) == 2
     finally:
         router.close()
+
+
+@pytest.mark.parametrize("sort", [
+    "bytes_total", "bytes_r", "bytes_w", "reads", "writes", "basename", "dev", "last_seen",
+])
+@pytest.mark.parametrize("direction", ["asc", "desc"])
+def test_managed_files_worker_preserves_served_evidence(retained, sort, direction):
+    """A Files worker uses the immutable image and keeps served-gap evidence."""
+
+    from appio.history_source import ManagedSourceRegistry
+    from appio.history_types import ManagedSourceSpec
+
+    path = retained.db.execute("PRAGMA database_list").fetchone()[2]
+    from pathlib import Path
+    registry = ManagedSourceRegistry(wake=lambda: None)
+    captured = None
+    try:
+        registry.register(ManagedSourceSpec(
+            "local", "iod", Path(path).as_uri() + "?mode=ro", ())).result(timeout=10)
+        captured = registry.capture().result(timeout=15)
+        result = HistoryRouter._read_local_files(
+            captured, WINDOW, APP, 1, sort, direction, None,
+            worker_id=3, request=QueryRequest("files", WINDOW, APP, sort=sort, direction=direction))
+        direct = QueryService(retained.db)
+        assert result.table == direct.file_table(1, WINDOW, sort, direction, None)
+        assert result.coverage == direct.file_coverage(1, WINDOW)
+        assert result.served_gap_count == direct.file_serve_facts(1, WINDOW).gaps_in_served_interval
+        assert result.snapshot.capture_id == captured.capture_id
+        assert result.snapshot.snapshot_digest == captured.snapshot_digest
+    finally:
+        if captured is not None:
+            registry.release_capture(captured.capture_id)
+        registry.close()
+
+
+def test_managed_files_settlement_rejects_foreign_capture(retained):
+    from pathlib import Path
+    from types import SimpleNamespace
+    from appio.history_router import LocalSettlement, RequestToken
+    from appio.history_source import ManagedSourceRegistry
+    from appio.history_types import ManagedSourceSpec
+
+    path = retained.db.execute("PRAGMA database_list").fetchone()[2]
+    registry = ManagedSourceRegistry(wake=lambda: None)
+    captured = None
+    try:
+        receipt = registry.register(ManagedSourceSpec(
+            "local", "iod", Path(path).as_uri() + "?mode=ro", ())).result(timeout=10)
+        captured = registry.capture().result(timeout=15)
+        request = QueryRequest("files", WINDOW, APP)
+        outcome = HistoryRouter._read_local_files(
+            captured, WINDOW, APP, 1, "bytes_total", "desc", None,
+            worker_id=3, request=request)
+        token = RequestToken(
+            3, request, "local", None, "files", 1, None,
+            ("local", (("local", "iod", receipt.registration_epoch),)), captured.opening)
+        binding = SimpleNamespace(token_id=3, worker_id=3, request=request,
+                                  snapshot=outcome.snapshot)
+        router = object.__new__(HistoryRouter)
+        router._worker_bindings = {}
+        router._files_bindings = {3: binding}
+        accepted = []
+        rejected = []
+        router._accept_files_local = lambda *args: accepted.append(args) or True
+        router._reject_token = lambda *args: rejected.append(args) or False
+        forged = replace(outcome, snapshot=replace(outcome.snapshot, snapshot_digest="f" * 64))
+        assert not router._settle_local(token, LocalSettlement(3, capture=captured, outcome=forged))
+        assert len(rejected) == 1 and accepted == []
+        assert router._settle_local(token, LocalSettlement(3, capture=captured, outcome=outcome))
+        assert len(accepted) == 1
+    finally:
+        if captured is not None:
+            registry.release_capture(captured.capture_id)
+        registry.close()
 
 
 def test_local_query_runs_on_bounded_executor_and_invalidated_future_cannot_publish(retained, monkeypatch):
@@ -135,8 +247,16 @@ def test_local_query_runs_on_bounded_executor_and_invalidated_future_cannot_publ
     monkeypatch.setattr(QueryService, "file_table", blocked)
     try:
         future = router.request_file_view(id_for(router), WINDOW, "bytes_total", "desc", None)
+        wait_for_capture_admission(router)
         assert entered.wait(5)
-        assert ui_sql == [], "a Files request must not execute even metadata SQL on the UI connection"
+        # Admission captures one O(1) owner-thread position PRAGMA for its token;
+        # no Files query (table/coverage/facts) may touch the UI connection.
+        assert all(statement.startswith("PRAGMA main.data_version") for statement in ui_sql), ui_sql
+        assert not any(
+            keyword in statement.upper()
+            for statement in ui_sql
+            for keyword in ("SELECT", "FROM", "ROWID")
+        ), ui_sql
         router.invalidate()
         release.set()
         with pytest.raises((WindowUnavailableError, RemoteError)) as caught:
@@ -156,7 +276,8 @@ def test_local_SQL_failure_settles_as_explicit_unavailable_not_an_empty_table(re
     monkeypatch.setattr(QueryService, "file_table", broken)
     try:
         with pytest.raises(WindowUnavailableError) as caught:
-            router.request_file_view(id_for(router), WINDOW, "bytes_total", "desc", None).result(timeout=10)
+            drive(router, router.request_file_view(
+                id_for(router), WINDOW, "bytes_total", "desc", None))
         assert caught.value.reason == "file_source_unavailable"
         assert not router.file_source_status().available
     finally:
@@ -170,7 +291,8 @@ def test_zero_F_is_complete_only_with_authoritative_hour_and_missing_or_pruned_i
         retained.db.execute("DELETE FROM sample_dev")
         retained.db.commit()
         # F remains representable when 24-hour raw process observations are gone.
-        zero = router.request_file_view(id_for(router, ZERO), WINDOW, "bytes_total", "desc", None).result(timeout=10)
+        zero = drive(router, router.request_file_view(
+            id_for(router, ZERO), WINDOW, "bytes_total", "desc", None))
         assert zero.table.rows == () and zero.coverage.observed_bytes_r == 0
         assert zero.table.coverage.complete and zero.coverage.coverage.complete
         retained.db.execute("DELETE FROM file_coverage WHERE app_id=2")
@@ -179,10 +301,11 @@ def test_zero_F_is_complete_only_with_authoritative_hour_and_missing_or_pruned_i
         # A bounded range uses hourly units, not the since-boot retained total.
         scoped = Window("range", "boot-A", 0, H)
         router.prepare(scoped)
-        router._local_future.result(timeout=10)
+        wait_for_local_frame(router)
         assert router.ready(scoped)
         with pytest.raises(WindowUnavailableError) as caught:
-            router.request_file_view(id_for(router, ZERO), scoped, "bytes_total", "desc", None).result(timeout=10)
+            drive(router, router.request_file_view(
+                id_for(router, ZERO), scoped, "bytes_total", "desc", None))
         assert caught.value.reason == "not_retained"
     finally:
         router.close()
@@ -195,7 +318,8 @@ def test_missing_F_capability_is_not_a_zero_table_and_A22_precedes_bad_app_id(tm
     router = local_router(f)
     try:
         with pytest.raises(WindowUnavailableError) as caught:
-            router.request_file_view(id_for(router), WINDOW, "bytes_total", "desc", None).result(timeout=10)
+            drive(router, router.request_file_view(
+                id_for(router), WINDOW, "bytes_total", "desc", None))
         assert caught.value.reason == "file_source_unavailable"
         assert not router.file_source_status().available
         with pytest.raises(WindowUnavailableError) as disabled:
@@ -210,17 +334,19 @@ def test_mixed_or_excluded_ownership_never_merges_database_local_paths(retained,
     other = Frames(tmp_path / "other.db")
     other.tick(0)
     other.tick(H)
-    router = HistoryRouter(QueryService(retained.db), Client(), AppRegistry())
-    router.add_source(QueryService(other.db), collector_id="other", owner="gui")
+    router = managed_router(retained.db, Client())
+    add_managed_source(router, other.db, name="other", owner="gui")
+
     # Distinct epochs constitute unproved concurrent ownership even for matching AppKey.
     other.db.execute("UPDATE collector_interval SET source='gui',epoch=7")
     other.db.commit()
     try:
         router.prepare(WINDOW)
-        router._local_future.result(timeout=10)
+        wait_for_local_frame(router)
         assert router.ready(WINDOW)
         with pytest.raises(WindowUnavailableError) as caught:
-            router.request_file_view(id_for(router), WINDOW, "basename", "asc", None).result(timeout=10)
+            drive(router, router.request_file_view(
+                id_for(router), WINDOW, "basename", "asc", None))
         assert caught.value.reason == "file_source_unavailable"
     finally:
         router.close()
@@ -233,7 +359,14 @@ def test_retained_local_file_history_is_queried_without_answering_daemon(retaine
     qtbot.addWidget(view)
     try:
         view.set_window(WINDOW)
-        qtbot.waitUntil(lambda: view.state != "loading", timeout=10_000)
+
+        def settled():
+            # The Files view has no poll of its own: the owner thread (here the
+            # test) must drain the lazy settlement that publishes its Future.
+            router.drain()
+            return view.state != "loading"
+
+        qtbot.waitUntil(settled, timeout=10_000)
         assert view.state == "ready", (
             f"screen_state={view.state}; request_count={len(view.requests)}"
         )
@@ -259,11 +392,12 @@ class Remote:
         self.h.client.pump()
         self.rpc = HistoryRpc(retained.db)
         self.store = AppIoStore(tmp_path / "local-empty.db")
-        self.router = HistoryRouter(QueryService(self.store), self.h.client, AppRegistry())
+        self.router = managed_router(self.store, self.h.client)
+
         self.requests = []
         self.replies = []
         self.router.prepare(window)
-        self.router._local_future.result(timeout=10)
+        wait_for_local_frame(self.router)
         for _ in range(15):
             self.respond()
             if self.router.ready(window):
@@ -285,6 +419,9 @@ class Remote:
             self.replies.append(reply)
             self.h.send(reply)
         self.h.client.pump()
+        # Files settlement is lazy: the owner drain admits the next page and
+        # publishes the outward Future. Drive it in the same turn as the reply.
+        self.router.drain()
 
     def finish(self, future):
         for _ in range(20):
@@ -370,14 +507,26 @@ def test_remote_scope_snapshot_stale_cursor_and_invalidate_fail_closed(retained,
             remote.respond(corrupt)
             if future.done():
                 break
-        with pytest.raises((WindowUnavailableError, RemoteError)) as caught:
+        # Fail-closed is the invariant. A malformed answer the client's own
+        # pre-cache validator now rightly refuses surfaces as the typed
+        # invalid_result refusal; faults that only the router's Files owner
+        # predicates can see stay WindowUnavailableError; a forged server HMAC
+        # stays the daemon's stale_cursor RemoteError. No arm may publish a
+        # partial or zero-filled table.
+        with pytest.raises((WindowUnavailableError, RemoteError, RequestRejected)) as caught:
             future.result(timeout=5)
-        assert caught.value.reason in ("file_source_unavailable", "stale_cursor")
+        client_refused = ("snapshot", "coverage_snapshot", "scope", "app",
+                          "coverage_app", "page_requested_window")
         if fault == "cursor":
             assert caught.value.reason == "stale_cursor"
+        elif fault in client_refused:
+            assert isinstance(caught.value, RequestRejected), fault
+            assert caught.value.reason == "invalid_result"
+        else:
+            assert caught.value.reason == "file_source_unavailable", fault
+        assert future.exception() is caught.value
         if fault in ("page_served_scope", "page_requested_window"):
             assert files_seen > 1, "the later-page fault must have been delivered"
-            assert caught.value.reason == "file_source_unavailable"
     finally:
         remote.close()
 
@@ -423,24 +572,29 @@ def test_local_cancellation_cannot_turn_bounded_executor_into_unbounded_queue(re
     entered, release = threading.Event(), threading.Event()
     original = router._read_local_files
     calls = []
-    def held(*args):
+    def held(*args, **kwargs):
         calls.append(1)
         entered.set()
         assert release.wait(5)
-        return original(*args)
+        return original(*args, **kwargs)
     monkeypatch.setattr(router, "_read_local_files", held)
     futures = []
     try:
         # Hold the router's single worker at a barrier before cancellation;
         # otherwise canceled-work skipping could make admission pass vacuously.
         futures.append(router.request_file_view(id_for(router), WINDOW, "bytes_total", "desc", None))
+        wait_for_capture_admission(router)
         assert entered.wait(5)
         futures[0].cancel()
         for _ in range(23):
             future = router.request_file_view(id_for(router), WINDOW, "bytes_total", "desc", None)
             futures.append(future)
             future.cancel()
+        # One bounded ledger is shared by the frame lane and the background
+        # Files lane: canceled outward jobs never admit an unbounded queue.
         assert router._executor._work_queue.qsize() <= 8
+        assert router._background_charge("files") <= 8
+        assert len(router._worker_jobs) <= 10
     finally:
         release.set()
         router.close()
@@ -458,23 +612,33 @@ def test_remote_query_errors_are_typed_without_rewriting_data_reason(tmp_path):
     )
 
     class FailedQueryClient:
-        state = ClientState(verified=True, answering=True)
+        generation = 0
+        state = ClientState(
+            verified=True, answering=True, cursor=StreamCursor("boot-A", 1, 1))
 
         def __init__(self, error):
             self.error = error
+            self.bound = {}
 
-        def query(self, _request):
+        def query(self, request):
             future = Future()
+            self.bound[future] = request
             future.set_exception(self.error)
             return future
 
+        def query_transport(self, future):
+            # A terminal issue-time failure owns no wire slot and no source.
+            return QueryTransportState(
+                self.bound[future], 0, None, "terminal", None, None, None)
+
     for index, (error, kind, reason) in enumerate(cases):
         store, _ = source(tmp_path / f"remote-{index}.db")
-        router = HistoryRouter(QueryService(store), FailedQueryClient(error), AppRegistry())
+        router = managed_router(store, FailedQueryClient(error))
+
         scope = process_window(100, 110)
         try:
             router.prepare(scope)
-            router._local_future.result(timeout=10)
+            wait_for_local_frame(router)
             assert router._not_retained is False
             assert router.ready(scope)
             rows = router.ranking(scope, "total_bytes")
@@ -489,11 +653,12 @@ def test_remote_query_errors_are_typed_without_rewriting_data_reason(tmp_path):
     pruned, _ = source(tmp_path / "pruned.db")
     pruned.connection.execute("DELETE FROM collector_interval")
     pruned.connection.commit()
-    router = HistoryRouter(QueryService(pruned), Client(), AppRegistry())
+    router = managed_router(pruned, Client())
+
     scope = Window("lifetime")
     try:
         router.prepare(scope)
-        router._local_future.result(timeout=10)
+        wait_for_local_frame(router)
         assert router.ready(scope)
         rows = router.ranking(scope, "total_bytes")
         assert rows[0].coverage.unavailable_reason == "not_retained"
@@ -503,7 +668,8 @@ def test_remote_query_errors_are_typed_without_rewriting_data_reason(tmp_path):
 
 
 def test_retirement_and_cancellation_do_not_set_history_failure_flags(retained):
-    router = HistoryRouter(QueryService(retained.db), Client(), AppRegistry())
+    router = managed_router(retained.db, Client())
+
     try:
         with pytest.raises(WindowUnavailableError):
             router.prepare(Window("launch", "boot-A", launch_id=1))
@@ -533,20 +699,29 @@ def test_retirement_and_cancellation_do_not_set_history_failure_flags(retained):
     )
 
     class UnavailableQueryClient:
-        state = ClientState(verified=True, answering=True)
+        generation = 0
+        state = ClientState(
+            verified=True, answering=True, cursor=StreamCursor("boot-A", 1, 1))
 
         def __init__(self):
             self.calls = 0
+            self.bound = {}
 
-        def query(self, _request):
+        def query(self, request):
             self.calls += 1
+            self.bound[unavailable] = request
             return unavailable
 
+        def query_transport(self, future):
+            return QueryTransportState(
+                self.bound[future], 0, None, "terminal", None, None, None)
+
     unavailable_client = UnavailableQueryClient()
-    router = HistoryRouter(QueryService(retained.db), unavailable_client, AppRegistry())
+    router = managed_router(retained.db, unavailable_client)
+
     try:
         router.prepare(WINDOW)
-        router._local_future.result(timeout=10)
+        wait_for_local_frame(router)
         assert router.ready(WINDOW)
         assert unavailable_client.calls == 1
         assert router._pending is None
@@ -559,20 +734,29 @@ def test_retirement_and_cancellation_do_not_set_history_failure_flags(retained):
     cancelled.cancel()
 
     class CancelledQueryClient:
-        state = ClientState(verified=True, answering=True)
+        generation = 0
+        state = ClientState(
+            verified=True, answering=True, cursor=StreamCursor("boot-A", 1, 1))
 
         def __init__(self):
             self.calls = 0
+            self.bound = {}
 
-        def query(self, _request):
+        def query(self, request):
             self.calls += 1
+            self.bound[cancelled] = request
             return cancelled
 
+        def query_transport(self, future):
+            return QueryTransportState(
+                self.bound[future], 0, None, "terminal", None, None, None)
+
     cancelled_client = CancelledQueryClient()
-    router = HistoryRouter(QueryService(retained.db), cancelled_client, AppRegistry())
+    router = managed_router(retained.db, cancelled_client)
+
     try:
         router.prepare(WINDOW)
-        router._local_future.result(timeout=10)
+        wait_for_local_frame(router)
         assert router.ready(WINDOW)
         assert cancelled_client.calls == 1
         assert router._pending is None
@@ -638,7 +822,8 @@ def test_queued_local_read_blocks_every_replacement_submission(retained, qtbot, 
 
     from appio.ui.collector_window import CollectorWindow
 
-    history = HistoryRouter(QueryService(retained.db), Client(), AppRegistry())
+    history = managed_router(retained.db, Client())
+
     current = Window("since_boot", "boot-A", end_mono_ns=H)
     explicit = Window("range", "boot-A", 0, H)
     blocker_started = threading.Event()
@@ -669,6 +854,7 @@ def test_queued_local_read_blocks_every_replacement_submission(retained, qtbot, 
     try:
         # Seed a genuine router preparation behind the occupied single worker.
         history.prepare(current)
+        wait_for_capture_admission(history)
         queued = history._local_future
         assert queued is not None and queued.running() is False and not queued.done()
         assert history.local_read_in_flight is True

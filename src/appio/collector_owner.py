@@ -9,6 +9,7 @@ No GUI checkpoint is uploaded to the daemon.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from concurrent.futures import Future
 import errno
 import fcntl
 import os
@@ -21,10 +22,10 @@ from typing import Callable, Literal
 from .handover import HandoverOffer, IncompleteHandoverError, capture_handover
 from .history_export import ExportResult
 from .history_router import HistoryRouter
+from .history_types import ManagedSourceSpec
 from .iodclient import IodClient
 from .live import LiveCollector
 from .migrations import validate_schema
-from .query import QueryService
 from .store import AppIoStore
 
 
@@ -155,6 +156,7 @@ class CollectorCoordinator:
         self._facts = None
         self._history_key: HistoryKey | None = None
         self._exports = []
+        self._export_registrations: dict[str, Future] = {}
         self.resume_handover: HandoverOffer | None = None
         self.outgoing_handover: HandoverOffer | None = None
         self.boundary_issues: list[str] = []
@@ -278,10 +280,12 @@ class CollectorCoordinator:
                 except (ValueError, IncompleteHandoverError) as error:
                     self.boundary_issues.append(f"export has no complete ownership chain: {error}")
                     offer = None
-            self.history.add_source(QueryService(connection),
-                collector_id=f"export:{state.boot_id}:{state.epoch}:{state.last_seq}", owner="iod")
-            self._exports.append(connection)
-            connection = None
+            source_name = f"export:{state.boot_id}:{state.epoch}:{state.last_seq}"
+            spec = ManagedSourceSpec(
+                source_name, "iod", Path(result.path).absolute().as_uri() + "?mode=ro", ())
+            registration = self.history.add_managed_source(spec)
+            self._export_registrations[source_name] = registration
+            self._exports.append(source_name)
             if self._facts is not None and self._facts.active in ("absent", "inactive"):
                 if self._local is not None and self._local.last_frame is not None:
                     self.resume_handover = None
@@ -313,6 +317,6 @@ class CollectorCoordinator:
             try:
                 self.client.close()
             finally:
-                for connection in self._exports:
-                    connection.close()
+                for name in self._exports:
+                    self.history.retire_managed_source(name, "coordinator closed")
                 self._closed = True

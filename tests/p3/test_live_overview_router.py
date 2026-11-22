@@ -1,0 +1,6080 @@
+"""Neutral retained-answer and source records: exact fields, phases and digests.
+
+The single required test on this module validates every §2 record field, the
+PartState truth table, the canonical local-answer digest, and that importing the
+neutral module stays free of the client, router, query service and Qt.
+"""
+
+from __future__ import annotations
+
+from concurrent.futures import Future
+import copy
+from dataclasses import FrozenInstanceError, fields, replace
+import os
+import sqlite3
+import subprocess
+import sys
+import threading
+import time
+
+import pytest
+
+from appio.bpf_fileio import BpfFileSource, VectorLoader
+from appio.contracts import (
+    FILE_HOUR_NS,
+    DeviceShareRow,
+    FileCoverage,
+    FileRow,
+    FileTable,
+    HistoryPending,
+    HookHits,
+    UnknownOwnerOverflow,
+    Window,
+    WindowUnavailableError,
+)
+from appio.file_runtime import FileRuntime
+from appio.files import FileIdentityResolver
+from appio.history_router import (
+    FileViewResult,
+    HistoryRouter,
+    HistorySegment,
+    LocalFilesOutcome,
+    LocalFrameOutcome,
+    LocalPartOutcome,
+    LocalSettlement,
+    RemoteSettlement,
+    RequestToken,
+)
+from appio.history_types import (
+    AcceptedIdentity,
+    AnswerProvenance,
+    FrameProvenance,
+    LocalBracket,
+    LocalPosition,
+    LocalPositionVector,
+    PartState,
+    RemotePosition,
+    RetainedRecord,
+    SeriesMetadata,
+    SnapshotProvenance,
+    applied_endpoint,
+    local_answer_digest,
+    retention_scope,
+)
+from appio.handover import baseline_seed
+from appio.history_validation import _normalize_request
+from appio.iodclient import (
+    AppRegistry,
+    ClientState,
+    ConnectionLost,
+    QueryTransportState,
+    RemoteError,
+    RequestRejected,
+)
+from appio.ipc_models import Capabilities, QueryRequest, StreamCursor
+from appio.procs import AppKeyInputs, IoReadOutcome, ProcessIdentity, StableProcRecord
+from appio.query import QueryService
+from appio.sampler import TickInput, aggregate_tick
+from appio.store import AppIoStore
+from live_overview_support import Clock, coverage, series, share, total
+from tests.p4.test_file_runtime import Frames as FileFrames
+from tests.p4.test_file_runtime import event as file_event
+
+KEY = "unit:alpha.service"
+OTHER_KEY = "unit:beta.service"
+DIGEST = "a" * 64
+NS = 1_000_000_000
+BOOT = "boot-a"
+ALPHA = "exe:/usr/bin/alpha"
+BETA = "exe:/usr/bin/beta"
+
+
+def _reject(label: str, call) -> None:
+    """Assert ``call`` raises ValueError (not another exception) for ``label``."""
+
+    try:
+        call()
+    except ValueError:
+        return
+    except Exception as error:  # noqa: BLE001 - a wrong exception type is a failure
+        raise AssertionError(f"{label}: raised {type(error).__name__}, not ValueError") from error
+    raise AssertionError(f"{label}: invalid record was accepted")
+
+
+def _assert_frozen(record: object, name: str) -> None:
+    with pytest.raises(FrozenInstanceError):
+        setattr(record, name, getattr(record, name))
+
+
+def test_revision_8_inventory_has_one_definition_at_prescribed_file():
+    import ast
+    from collections import defaultdict
+    from pathlib import Path
+    import re
+
+    root = Path(__file__).resolve().parents[2]
+    spec = (root / "docs/superpowers/specs/2026-11-15-live-overview-totals-spec.md").read_text()
+    inventory = spec.split("## 12. Test inventory", 1)[1].split("### 12.10", 1)[0]
+    required = {}
+    for section in re.split(r"(?=^### 12\.)", inventory, flags=re.MULTILINE):
+        heading = section.splitlines()[0] if section.splitlines() else ""
+        paths = re.findall(r"`(tests/[^`]+\.py)`", heading)
+        for name in re.findall(r"^\| `(test_\w+)` \|", section, flags=re.MULTILINE):
+            assert paths, f"required test has no specified file: {name}"
+            assert name not in required, f"duplicate specification row: {name}"
+            required[name] = paths
+    definitions = defaultdict(list)
+    for path in (root / "tests").rglob("test_*.py"):
+        for node in ast.parse(path.read_text()).body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                definitions[node.name].append(path.relative_to(root).as_posix())
+    assert len(required) == 91
+    for name, allowed in required.items():
+        assert len(definitions[name]) == 1, (name, definitions[name])
+        assert definitions[name][0] in allowed, (name, allowed, definitions[name])
+
+
+def test_disposable_mutation_runner_rejects_missing_target_and_cleans(monkeypatch):
+    from pathlib import Path
+    import tempfile
+    import live_overview_support as support
+
+    roots = []
+    temporary = tempfile.TemporaryDirectory
+
+    def tracked(*args, **kwargs):
+        result = temporary(*args, **kwargs)
+        roots.append(Path(result.name))
+        return result
+
+    monkeypatch.setattr(tempfile, "TemporaryDirectory", tracked)
+    with pytest.raises(AssertionError, match="mutation target must occur exactly once"):
+        support.run_isolated_mutation("src/appio/history_source.py", "missing-target-marker",
+                                     "replacement", (), "never reached")
+    assert roots and all(not root.exists() for root in roots)
+
+
+def test_remote_registration_change_retires_frame_detail_and_files(tmp_path):
+    from test_live_overview_client import _scheduler_router, _ready_remote_frame, _answer_next
+    from live_overview_support import managed_spec
+
+    window = Window("since_boot", BOOT, end_mono_ns=140 * NS)
+    router, transport, store = _scheduler_router(tmp_path)
+    imported = AppIoStore(tmp_path / "imported-authority.db")
+    try:
+        presentation = _ready_remote_frame(router, transport, window)
+        router.select_detail(KEY, window)
+        router.request_detail("totals", presentation, window)
+        _answer_next(router, transport, share(1, window))
+        scope = retention_scope(KEY, window)
+        assert router.retained("totals", KEY, scope, window.end_mono_ns) is not None
+        files = router.request_file_view(presentation, window, "bytes_total", "desc", None)
+        frame = router._frame
+        current = router._current_authority()
+        router.add_managed_source(managed_spec(imported, "imported", "iod")).result(timeout=10)
+        assert router._current_authority() == current
+        assert router.drain() is True
+        assert frame.retired
+        assert router._detail is None
+        assert router.retained("totals", KEY, scope, window.end_mono_ns) is None
+        assert files.done()
+        assert files.exception() is not None
+        assert router.frame_provenance(window) is None
+    finally:
+        router.close()
+        store.connection.close()
+        imported.connection.close()
+
+
+def test_managed_source_rejects_empty_option_value() -> None:
+    from appio.history_types import ManagedSourceSpec
+
+    with pytest.raises(ValueError):
+        ManagedSourceSpec("local", "gui", "file:/tmp/a.db", (("x", ""),))
+
+
+def test_captured_image_rejects_digest_mismatch() -> None:
+    from appio.history_types import CapturedSourceImage
+
+    with pytest.raises(ValueError):
+        CapturedSourceImage("local", 1, b"abc", "a" * 64)
+
+
+def test_frame_provenance_accepts_legacy_six_arguments() -> None:
+    window = Window("lifetime")
+    remote = RemotePosition("boot-a", 1, 0)
+    frame = FrameProvenance(3, window, remote, remote, None, True)
+    assert frame.snapshot is None
+    assert frame.certified is True
+
+    vector = LocalPositionVector((LocalPosition("local", "gui", 1, 1, 0),))
+    bracket = LocalBracket(vector, vector)
+    local_frame = FrameProvenance(3, window, vector, vector, bracket, True)
+    assert local_frame.snapshot is None
+    assert local_frame.certified is True
+    with pytest.raises(ValueError):
+        FrameProvenance(3, window, remote, remote, None, snapshot=True)
+
+
+def test_live_records_validate_every_field_and_phase_combination() -> None:
+    clock = Clock(5)
+    assert clock() == 5
+    clock.advance_ns(7)
+    assert clock.ns == 12
+    _reject("clock.negative", lambda: Clock(-1))
+    _reject("clock.bool", lambda: Clock(True))
+    _reject("clock.advance-negative", lambda: clock.advance_ns(-1))
+
+    since_boot = Window("since_boot", "boot-a", end_mono_ns=20_000_000_000)
+    lived = Window("lifetime")
+    range_w = Window("range", "boot-a", 1_000_000_000, 20_000_000_000)
+    launch = Window("launch", "boot-a", launch_id=7)
+    scope = retention_scope(KEY, since_boot)
+    assert scope == (KEY, "since_boot", "boot-a")
+    assert retention_scope(KEY, lived) == (KEY, "lifetime")
+    assert retention_scope(KEY, range_w) == (
+        KEY,
+        "range",
+        "boot-a",
+        1_000_000_000,
+        20_000_000_000,
+    )
+    assert retention_scope(KEY, launch) == (KEY, "launch")
+    assert applied_endpoint(since_boot) == 20_000_000_000
+    assert applied_endpoint(range_w) == 20_000_000_000
+    assert applied_endpoint(Window("lifetime")) is None
+    assert applied_endpoint(lived) is None
+    assert applied_endpoint(launch) is None
+
+    _reject("scope.empty-subject", lambda: retention_scope("", since_boot))
+    _reject("scope.bool-subject", lambda: retention_scope(True, since_boot))
+    _reject("scope.not-window", lambda: retention_scope(KEY, {"kind": "lifetime"}))
+    forged_window = Window("since_boot", "boot-a", end_mono_ns=20_000_000_000)
+    object.__setattr__(forged_window, "end_mono_ns", True)
+    _reject("scope.forged-window", lambda: retention_scope(KEY, forged_window))
+    _reject("endpoint.forged-window", lambda: applied_endpoint(forged_window))
+
+    remote = RemotePosition("boot-a", 1, 0)
+    assert remote == RemotePosition("boot-a", 1, 0)
+    assert RemotePosition("boot-a", 2**70, 2**70) == RemotePosition("boot-a", 2**70, 2**70)
+    assert RemotePosition("é" * 128, 1, 0).boot_id == "é" * 128
+    _reject("remote.bool-epoch", lambda: RemotePosition("boot-a", True, 0))
+    _reject("remote.zero-epoch", lambda: RemotePosition("boot-a", 0, 0))
+    _reject("remote.negative-seq", lambda: RemotePosition("boot-a", 1, -1))
+
+    a = share(7, since_boot)
+    assert local_answer_digest("totals", KEY, since_boot, a) == local_answer_digest(
+        "totals", KEY, since_boot, replace(a, app_id=91)
+    )
+    assert local_answer_digest("totals", KEY, since_boot, a) != local_answer_digest(
+        "totals", KEY, since_boot, replace(a, task_read_bytes=18, task_total_bytes=23)
+    )
+
+    # -- revision-8 managed-source and capture record availability --------- #
+    import appio.history_types as history_types
+
+    for name in (
+        "ManagedSourceSpec", "CapturedSourceImage", "CapturedSourceSet", "SnapshotProvenance",
+    ):
+        assert hasattr(history_types, name), f"missing revision-8 record {name}"
+        assert name in history_types.__all__
+    from appio.history_types import (
+        CapturedSourceImage,
+        CapturedSourceSet,
+        ManagedSourceSpec,
+        SnapshotProvenance,
+    )
+
+    # -- immutable field inventory ----------------------------------------- #
+    inventory = {
+        AcceptedIdentity: ("kind", "app_key", "window", "data_digest"),
+        RemotePosition: ("boot_id", "iod_epoch", "seq"),
+        LocalPosition: ("name", "owner", "registration_epoch", "data_version", "total_changes"),
+        LocalPositionVector: ("sources",),
+        LocalBracket: ("opening", "closing"),
+        ManagedSourceSpec: ("name", "owner", "database_uri", "connect_options"),
+        CapturedSourceImage: ("name", "registration_epoch", "image", "image_digest"),
+        CapturedSourceSet: (
+            "capture_id", "opening", "closing", "images", "snapshot_digest",
+        ),
+        SnapshotProvenance: ("capture_id", "snapshot_digest", "bracket"),
+        AnswerProvenance: (
+            "kind",
+            "app_key",
+            "scope",
+            "measured_window",
+            "accepted_identity",
+            "first_seen_at_ns",
+            "answered_source",
+            "local_bracket",
+            "snapshot",
+        ),
+        RetainedRecord: ("value", "provenance"),
+        PartState: (
+            "kind",
+            "app_key",
+            "scope",
+            "state",
+            "request_id",
+            "requested_window",
+            "record",
+            "reason",
+        ),
+        FrameProvenance: (
+            "generation",
+            "window",
+            "requested_source",
+            "answered_source",
+            "local_bracket",
+            "snapshot",
+            "certified",
+        ),
+        SeriesMetadata: ("app_id", "app_key", "measured_window", "tier", "coverage"),
+    }
+    for record, names in inventory.items():
+        assert tuple(field.name for field in fields(record)) == names, record.__name__
+        assert record.__dataclass_params__.frozen is True, record.__name__
+    _assert_frozen(remote, "seq")
+    _assert_frozen(since_boot, "kind")
+
+    # -- AcceptedIdentity --------------------------------------------------- #
+    identity = AcceptedIdentity("totals", KEY, since_boot, DIGEST)
+    assert identity.window == since_boot
+    for label, bad in (
+        ("kind", "dashboard"),
+        ("kind", True),
+        ("kind", 3),
+        ("app_key", ""),
+        ("app_key", 7),
+        ("app_key", "\ud800"),
+        ("window", {"kind": "since_boot"}),
+        ("window", forged_window),
+        ("data_digest", "A" * 64),
+        ("data_digest", "a" * 63),
+        ("data_digest", "a" * 65),
+        ("data_digest", "g" * 64),
+        ("data_digest", 5),
+    ):
+        _reject(
+            f"accepted_identity.{label}.{bad!r}",
+            lambda label=label, bad=bad: AcceptedIdentity(
+                **{**{f.name: getattr(identity, f.name) for f in fields(identity)}, label: bad}
+            ),
+        )
+
+    # -- RemotePosition / LocalPosition / LocalPositionVector / LocalBracket  #
+    for label, bad in (
+        ("boot_id.empty", ""),
+        ("boot_id.nul", "boot\x00a"),
+        ("boot_id.long", "x" * 257),
+        ("boot_id.long-utf8", "é" * 129),
+        ("boot_id.unencodable", "\ud800"),
+        ("boot_id.int", 5),
+        ("iod_epoch.zero", 0),
+        ("iod_epoch.bool", True),
+        ("iod_epoch.float", 1.5),
+        ("seq.negative", -1),
+        ("seq.bool", True),
+        ("seq.float", 1.0),
+    ):
+        field_name, _ = label.split(".")
+        _reject(
+            f"remote_position.{label}",
+            lambda field_name=field_name, bad=bad: RemotePosition(
+                **{**{"boot_id": "boot-a", "iod_epoch": 1, "seq": 0}, field_name: bad}
+            ),
+        )
+
+    position = LocalPosition("local", "gui", 1, 1, 0)
+    assert LocalPosition("local", "gui", 1, 2**70, 2**80) == LocalPosition(
+        "local", "gui", 1, 2**70, 2**80
+    )
+    for label, bad in (
+        ("name.empty", ""),
+        ("name.int", 5),
+        ("name.unencodable", "\ud800"),
+        ("owner.enum", "root"),
+        ("owner.bool", True),
+        ("owner.case", "GUI"),
+        ("registration_epoch.zero", 0),
+        ("registration_epoch.bool", True),
+        ("registration_epoch.negative", -1),
+        ("data_version.zero", 0),
+        ("data_version.bool", False),
+        ("total_changes.negative", -1),
+        ("total_changes.bool", True),
+    ):
+        field_name, _ = label.split(".")
+        defaults = {
+            "name": "local",
+            "owner": "gui",
+            "registration_epoch": 1,
+            "data_version": 1,
+            "total_changes": 0,
+        }
+        _reject(
+            f"local_position.{label}",
+            lambda field_name=field_name, bad=bad, defaults=defaults: LocalPosition(
+                **{**defaults, field_name: bad}
+            ),
+        )
+    forged_position = LocalPosition("local", "gui", 1, 1, 0)
+    object.__setattr__(forged_position, "data_version", 0)
+    _reject("local_position.forged", lambda: LocalPositionVector((forged_position,)))
+
+    vector = LocalPositionVector((position,))
+    assert vector == LocalPositionVector((position,))
+    assert LocalPositionVector((LocalPosition("z", "gui", 1, 1, 0), LocalPosition("é", "iod", 2, 1, 0))).sources[0].name == "z"
+    _reject("vector.empty", lambda: LocalPositionVector(()))
+    _reject("vector.list", lambda: LocalPositionVector([position]))  # type: ignore[arg-type]
+    _reject(
+        "vector.duplicate",
+        lambda: LocalPositionVector((position, LocalPosition("local", "iod", 2, 1, 0))),
+    )
+    _reject(
+        "vector.unsorted",
+        lambda: LocalPositionVector(
+            (LocalPosition("b", "gui", 1, 1, 0), LocalPosition("a", "iod", 2, 1, 0))
+        ),
+    )
+    _reject(
+        "vector.unsorted-bytes",
+        lambda: LocalPositionVector(
+            (LocalPosition("é", "iod", 2, 1, 0), LocalPosition("z", "gui", 1, 1, 0))
+        ),
+    )
+    _reject("vector.non-position", lambda: LocalPositionVector((remote,)))  # type: ignore[arg-type]
+    _reject("vector.forged", lambda: LocalPositionVector((forged_position,)))
+
+    tolerant = LocalPositionVector((position,))
+    changed = LocalPositionVector((LocalPosition("local", "gui", 1, 1, 1),))
+    bracket = LocalBracket(tolerant, tolerant)
+    assert LocalBracket(tolerant, changed).opening != LocalBracket(tolerant, changed).closing
+    _reject("bracket.opening", lambda: LocalBracket(remote, tolerant))  # type: ignore[arg-type]
+    _reject("bracket.closing", lambda: LocalBracket(tolerant, [position]))  # type: ignore[arg-type]
+
+    # -- ManagedSourceSpec ------------------------------------------------- #
+    spec = ManagedSourceSpec(
+        "local", "gui", "file:/tmp/local.db?mode=rw", (("timeout", "5"), ("isolation_level", "DEFERRED"))
+    )
+    assert spec.database_uri == "file:/tmp/local.db?mode=rw"
+    assert spec.connect_options == (("timeout", "5"), ("isolation_level", "DEFERRED"))
+    assert replace(spec, owner="iod", connect_options=()).owner == "iod"
+    for label, bad in (
+        ("name", ""),
+        ("name", True),
+        ("name", "\ud800"),
+        ("owner", "root"),
+        ("owner", True),
+        ("owner", "GUI"),
+        ("database_uri", ""),
+        ("database_uri", 5),
+        ("database_uri", "file:a\x00b"),
+        ("database_uri", "file:\ud800"),
+        ("connect_options", []),
+        ("connect_options", {"timeout": "5"}),
+        ("connect_options", lambda: {}),
+        ("connect_options", (["timeout", "5"],)),
+        ("connect_options", (("timeout",),)),
+        ("connect_options", (("timeout", "5", "extra"),)),
+        ("connect_options", ((True, "5"),)),
+        ("connect_options", (("timeout", 5),)),
+        ("connect_options", (("factory", lambda: {}),)),
+        ("connect_options", (("timeout", {}),)),
+        ("connect_options", (("\ud800", "5"),)),
+        ("connect_options", (("timeout", "\ud800"),)),
+    ):
+        _reject(
+            f"managed_source.{label}.{bad!r}",
+            lambda label=label, bad=bad: replace(spec, **{label: bad}),
+        )
+
+    # -- CapturedSourceImage / CapturedSourceSet / SnapshotProvenance ------- #
+    image = CapturedSourceImage(
+        "local", 1, b"abc", "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+    )
+    captured = CapturedSourceSet(1, tolerant, tolerant, (image,), DIGEST)
+    snapshot = SnapshotProvenance(1, DIGEST, bracket)
+    raced_bracket = LocalBracket(tolerant, changed)
+    raced_capture = replace(captured, closing=changed)
+    raced_snapshot = replace(snapshot, bracket=raced_bracket)
+    assert captured.images[0].image == b"abc"
+    assert raced_capture.opening != raced_capture.closing
+    assert raced_snapshot.bracket == raced_bracket
+    assert replace(image, registration_epoch=2**70).registration_epoch == 2**70
+    assert replace(captured, capture_id=2**70).capture_id == 2**70
+    assert replace(snapshot, capture_id=2**70).capture_id == 2**70
+    for label, bad in (
+        ("name", ""),
+        ("name", 5),
+        ("name", "\ud800"),
+        ("registration_epoch", 0),
+        ("registration_epoch", -1),
+        ("registration_epoch", True),
+        ("registration_epoch", 1.0),
+        ("image", "abc"),
+        ("image", bytearray(b"abc")),
+        ("image", memoryview(b"abc")),
+        ("image", (b"abc",)),
+        ("image", True),
+        ("image_digest", "A" * 64),
+        ("image_digest", "a" * 63),
+        ("image_digest", "a" * 65),
+        ("image_digest", "g" * 64),
+        ("image_digest", 5),
+    ):
+        _reject(
+            f"captured_image.{label}.{bad!r}",
+            lambda label=label, bad=bad: replace(image, **{label: bad}),
+        )
+    for record in (captured, snapshot):
+        for capture_id in (0, -1, True, 1.0, "1"):
+            _reject(
+                f"{type(record).__name__}.capture_id.{capture_id!r}",
+                lambda record=record, capture_id=capture_id: replace(record, capture_id=capture_id),
+            )
+        for digest in ("A" * 64, "a" * 63, "a" * 65, "g" * 64, True):
+            _reject(
+                f"{type(record).__name__}.snapshot_digest.{digest!r}",
+                lambda record=record, digest=digest: replace(record, snapshot_digest=digest),
+            )
+
+    second_position = LocalPosition("é", "iod", 2, 1, 0)
+    complete_vector = LocalPositionVector((position, second_position))
+    second_image = replace(image, name="é", registration_epoch=2)
+    complete_capture = replace(
+        captured, opening=complete_vector, closing=complete_vector, images=(image, second_image)
+    )
+    assert tuple(item.name for item in complete_capture.images) == ("local", "é")
+    for label, kwargs in (
+        ("opening.type", {"opening": remote}),
+        ("closing.type", {"closing": (position,)}),
+        ("images.list", {"images": [image, second_image]}),
+        ("images.type", {"images": (image, second_position)}),
+        ("images.empty", {"images": ()}),
+        ("images.duplicate", {"images": (image, image, second_image)}),
+        ("images.unsorted", {"images": (second_image, image)}),
+        ("images.missing", {"images": (image,)}),
+        ("images.extra", {"images": (image, replace(image, name="other"), second_image)}),
+        ("opening.missing", {"opening": tolerant}),
+        ("closing.missing", {"closing": tolerant}),
+        ("opening.incarnation", {
+            "opening": LocalPositionVector((replace(position, registration_epoch=3), second_position)),
+        }),
+        ("closing.incarnation", {
+            "closing": LocalPositionVector((replace(position, registration_epoch=3), second_position)),
+        }),
+        ("images.incarnation", {"images": (replace(image, registration_epoch=3), second_image)}),
+    ):
+        _reject(
+            f"captured_set.{label}",
+            lambda kwargs=kwargs: replace(complete_capture, **kwargs),
+        )
+    _reject("snapshot.bracket-type", lambda: replace(snapshot, bracket=(tolerant, tolerant)))
+    forged_image = copy.copy(image)
+    object.__setattr__(forged_image, "image", bytearray(b"abc"))
+    _reject("captured_set.forged-image", lambda: replace(captured, images=(forged_image,)))
+    forged_capture_vector = copy.copy(tolerant)
+    object.__setattr__(forged_capture_vector, "sources", ())
+    _reject("captured_set.forged-opening", lambda: replace(captured, opening=forged_capture_vector))
+    _reject("captured_set.forged-closing", lambda: replace(captured, closing=forged_capture_vector))
+    forged_bracket = copy.copy(bracket)
+    object.__setattr__(forged_bracket, "closing", forged_capture_vector)
+    _reject("snapshot.forged-bracket", lambda: replace(snapshot, bracket=forged_bracket))
+    for record, name in (
+        (spec, "connect_options"), (image, "image"), (captured, "images"), (snapshot, "bracket"),
+    ):
+        _assert_frozen(record, name)
+
+    # -- AnswerProvenance --------------------------------------------------- #
+    provenance = AnswerProvenance("totals", KEY, scope, since_boot, identity, 1_000_000_000, None, None)
+    assert provenance.accepted_identity == identity
+    local_provenance = AnswerProvenance(
+        "totals", KEY, scope, since_boot, identity, 0, tolerant, bracket, snapshot
+    )
+    assert local_provenance.answered_source == tolerant
+    assert local_provenance.snapshot == snapshot
+    raced_provenance = AnswerProvenance(
+        "totals", KEY, scope, since_boot, identity, 0, None, raced_bracket, raced_snapshot
+    )
+    assert raced_provenance.answered_source is None
+    remote_provenance = replace(provenance, answered_source=remote)
+    assert remote_provenance.snapshot is None
+    assert replace(local_provenance, accepted_identity=None, first_seen_at_ns=None).snapshot == snapshot
+    for label, kwargs in (
+        ("snapshot.missing-local", {"snapshot": None}),
+        ("snapshot.type", {"snapshot": {"capture_id": 1}}),
+        ("snapshot.bracket", {"snapshot": raced_snapshot}),
+        ("snapshot.without-bracket", {"answered_source": None, "local_bracket": None}),
+    ):
+        _reject(
+            f"answer_provenance.{label}",
+            lambda kwargs=kwargs: replace(local_provenance, **kwargs),
+        )
+    _reject("answer_provenance.raced-without-snapshot", lambda: replace(raced_provenance, snapshot=None))
+    _reject("answer_provenance.remote-snapshot", lambda: replace(remote_provenance, snapshot=snapshot))
+    forged_snapshot = copy.copy(snapshot)
+    object.__setattr__(forged_snapshot, "capture_id", True)
+    _reject("answer_provenance.forged-snapshot", lambda: replace(local_provenance, snapshot=forged_snapshot))
+    _assert_frozen(local_provenance, "snapshot")
+    assert (
+        AnswerProvenance("totals", KEY, scope, since_boot, None, None, None, None).accepted_identity
+        is None
+    )
+    for label, kwargs in (
+        ("kind", {"kind": "dashboard"}),
+        ("app_key.empty", {"app_key": ""}),
+        ("app_key.mismatch", {"app_key": OTHER_KEY}),
+        ("scope.tag", {"scope": (KEY, "dashboard", "boot-a")}),
+        ("scope.length", {"scope": (KEY, "since_boot", "boot-a", 1)}),
+        ("scope.bounds", {"scope": (KEY, "range", "boot-a", 20, 10)}),
+        ("scope.subject", {"scope": (OTHER_KEY, "since_boot", "boot-a")}),
+        ("scope.not-tuple", {"scope": [KEY, "since_boot", "boot-a"]}),
+        ("window.mapping", {"measured_window": {"kind": "since_boot"}}),
+        ("window.forged", {"measured_window": forged_window}),
+        ("identity.kind", {"accepted_identity": AcceptedIdentity("series", KEY, since_boot, DIGEST)}),
+        ("identity.key", {"accepted_identity": AcceptedIdentity("totals", OTHER_KEY, since_boot, DIGEST)}),
+        ("identity.window", {"accepted_identity": AcceptedIdentity("totals", KEY, range_w, DIGEST)}),
+        ("stamp.negative", {"first_seen_at_ns": -1}),
+        ("stamp.bool", {"first_seen_at_ns": True}),
+        ("stamp.with-identity-absent", {"accepted_identity": None}),
+        ("identity.with-stamp-absent", {"first_seen_at_ns": None}),
+        ("source.mapping", {"answered_source": {"boot_id": "boot-a"}}),
+        ("source.bool", {"answered_source": True}),
+        ("source.local-without-bracket", {"answered_source": tolerant}),
+        ("source.remote-with-bracket", {"answered_source": remote, "local_bracket": bracket}),
+        ("bracket.equal-without-source", {"answered_source": None, "local_bracket": bracket}),
+        ("bracket.unequal-with-source", {"answered_source": changed, "local_bracket": LocalBracket(tolerant, changed)}),
+        ("bracket.type", {"local_bracket": [tolerant, tolerant]}),
+    ):
+        base = {
+            "kind": "totals",
+            "app_key": KEY,
+            "scope": scope,
+            "measured_window": since_boot,
+            "accepted_identity": identity,
+            "first_seen_at_ns": 1_000_000_000,
+            "answered_source": None,
+            "local_bracket": None,
+        }
+        _reject(
+            f"answer_provenance.{label}",
+            lambda kwargs=kwargs, base=base: AnswerProvenance(**{**base, **kwargs}),
+        )
+
+    # A forged nested identity/window/source must be revalidated, not trusted.
+    forged_identity = AcceptedIdentity("totals", KEY, since_boot, DIGEST)
+    object.__setattr__(forged_identity, "data_digest", "A" * 64)
+    _reject(
+        "answer_provenance.forged-identity",
+        lambda: AnswerProvenance(
+            "totals", KEY, scope, since_boot, forged_identity, 1_000_000_000, None, None
+        ),
+    )
+    forged_vector = LocalPositionVector((position,))
+    object.__setattr__(forged_vector, "sources", ())
+    _reject(
+        "answer_provenance.forged-bracket",
+        lambda: AnswerProvenance(
+            "totals", KEY, scope, since_boot, identity, 0, None, LocalBracket(forged_vector, forged_vector)
+        ),
+    )
+
+    # -- RetainedRecord ----------------------------------------------------- #
+    totals_record = RetainedRecord(share(7, since_boot), provenance)
+    series_value = series(7, since_boot)
+    series_identity = AcceptedIdentity("series", KEY, since_boot, DIGEST)
+    series_provenance = AnswerProvenance(
+        "series", KEY, scope, since_boot, series_identity, 1_000_000_000, None, None
+    )
+    series_record = RetainedRecord(series_value, series_provenance)
+    assert totals_record.value.app_id == 7
+    assert series_record.value.tier == "raw"
+    _reject("record.totals-with-series", lambda: RetainedRecord(series_value, provenance))
+    _reject("record.series-with-share", lambda: RetainedRecord(a, series_provenance))
+    # The ranking negative first builds a *valid* ranking provenance: combining
+    # kind ranking with a totals identity fails in AnswerProvenance instead.
+    ranking_provenance = AnswerProvenance(
+        "ranking",
+        KEY,
+        scope,
+        since_boot,
+        AcceptedIdentity("ranking", KEY, since_boot, DIGEST),
+        1_000_000_000,
+        None,
+        None,
+    )
+    assert ranking_provenance.kind == "ranking"
+    _reject("record.ranking", lambda: RetainedRecord(a, ranking_provenance))
+    _reject(
+        "record.window-mismatch",
+        lambda: RetainedRecord(share(7, range_w), provenance),
+    )
+    _reject(
+        "record.provenance-type",
+        lambda: RetainedRecord(a, {"kind": "totals"}),  # type: ignore[arg-type]
+    )
+
+    # A forged grandchild inside an otherwise valid value is not trusted:
+    # contracts validate their children's *types* only. Each control changes
+    # exactly one nested field, so only the recursive walk can reject it.
+    forged_row = DeviceShareRow("boot-a", "8:0", 9, 5, 14)
+    object.__setattr__(forged_row, "rbytes", True)
+    _reject(
+        "record.forged-device-row",
+        lambda: RetainedRecord(replace(a, devices=(forged_row,)), provenance),
+    )
+    forged_grandchild = coverage()
+    object.__setattr__(forged_grandchild.hook_hits, "vfs_read", -1)
+    _reject(
+        "record.forged-hook-hits",
+        lambda: RetainedRecord(replace(a, coverage=forged_grandchild), provenance),
+    )
+
+    # -- PartState truth table --------------------------------------------- #
+    absent = PartState("totals", KEY, scope, "absent", None, None, None, None)
+    pending = PartState("totals", KEY, scope, "pending", 1, since_boot, None, None)
+    ok = PartState("totals", KEY, scope, "ok", 1, since_boot, totals_record, None)
+    failed = PartState("totals", KEY, scope, "failed", 1, since_boot, None, "query_timeout")
+    for state in (absent, pending, ok, failed):
+        assert state.scope == scope
+    _reject("part.absent-request", lambda: PartState("totals", KEY, scope, "absent", 1, None, None, None))
+    _reject("part.absent-window", lambda: PartState("totals", KEY, scope, "absent", None, since_boot, None, None))
+    _reject("part.absent-reason", lambda: PartState("totals", KEY, scope, "absent", None, None, None, "why"))
+    _reject("part.pending-no-request", lambda: PartState("totals", KEY, scope, "pending", None, since_boot, None, None))
+    _reject("part.pending-no-window", lambda: PartState("totals", KEY, scope, "pending", 1, None, None, None))
+    _reject("part.pending-record", lambda: PartState("totals", KEY, scope, "pending", 1, since_boot, totals_record, None))
+    _reject("part.pending-reason", lambda: PartState("totals", KEY, scope, "pending", 1, since_boot, None, "why"))
+    _reject("part.ok-no-record", lambda: PartState("totals", KEY, scope, "ok", 1, since_boot, None, None))
+    _reject("part.ok-reason", lambda: PartState("totals", KEY, scope, "ok", 1, since_boot, totals_record, "why"))
+    _reject("part.ok-key", lambda: PartState("totals", OTHER_KEY, retention_scope(OTHER_KEY, since_boot), "ok", 1, since_boot, totals_record, None))
+    _reject("part.ok-kind", lambda: PartState("series", KEY, scope, "ok", 1, since_boot, totals_record, None))
+    # Same scope, different since-boot endpoint: only the exact record/token
+    # Window comparison can reject this, because the scope tuple is equal.
+    newer_endpoint = Window("since_boot", "boot-a", end_mono_ns=30_000_000_000)
+    assert retention_scope(KEY, newer_endpoint) == scope
+    _reject(
+        "part.ok-endpoint",
+        lambda: PartState("totals", KEY, scope, "ok", 1, newer_endpoint, totals_record, None),
+    )
+    _reject("part.ok-window", lambda: PartState("totals", KEY, scope, "ok", 1, range_w, totals_record, None))
+    _reject("part.failed-no-reason", lambda: PartState("totals", KEY, scope, "failed", 1, since_boot, None, None))
+    _reject("part.failed-empty-reason", lambda: PartState("totals", KEY, scope, "failed", 1, since_boot, None, ""))
+    _reject("part.failed-int-reason", lambda: PartState("totals", KEY, scope, "failed", 1, since_boot, None, 5))
+    _reject("part.failed-record", lambda: PartState("totals", KEY, scope, "failed", 1, since_boot, totals_record, "why"))
+    _reject("part.request-zero", lambda: PartState("totals", KEY, scope, "pending", 0, since_boot, None, None))
+    _reject("part.request-bool", lambda: PartState("totals", KEY, scope, "pending", True, since_boot, None, None))
+    _reject("part.request-negative", lambda: PartState("totals", KEY, scope, "pending", -1, since_boot, None, None))
+    _reject("part.kind", lambda: PartState("ranking", KEY, scope, "pending", 1, since_boot, None, None))
+    _reject("part.state", lambda: PartState("totals", KEY, scope, "done", 1, since_boot, None, None))
+    _reject("part.scope", lambda: PartState("totals", KEY, (OTHER_KEY, "since_boot", "boot-a"), "pending", 1, since_boot, None, None))
+    _reject("part.window-type", lambda: PartState("totals", KEY, scope, "pending", 1, {"kind": "since_boot"}, None, None))
+    _reject("part.window-scope", lambda: PartState("totals", KEY, scope, "pending", 1, range_w, None, None))
+    _reject("part.record-type", lambda: PartState("totals", KEY, scope, "ok", 1, since_boot, a, None))
+
+    # -- FrameProvenance ---------------------------------------------------- #
+    assert FrameProvenance(3, since_boot, remote, remote, None, None, True).certified is True
+    local_frame = FrameProvenance(3, since_boot, tolerant, tolerant, bracket, snapshot, True)
+    assert local_frame.certified is True
+    fallback = FrameProvenance(3, since_boot, remote, tolerant, bracket, snapshot, False)
+    assert fallback.answered_source == tolerant
+    uncertified = FrameProvenance(3, since_boot, tolerant, None, raced_bracket, raced_snapshot, False)
+    assert uncertified.certified is False
+    # Failed local work may have bracket evidence without a captured image.
+    assert replace(uncertified, snapshot=None).certified is False
+    _assert_frozen(local_frame, "snapshot")
+    assert replace(local_frame, snapshot=None).certified is True
+    for label, kwargs in (
+        ("snapshot.type", {"snapshot": (1, DIGEST, bracket)}),
+        ("snapshot.forged", {"snapshot": forged_snapshot}),
+        ("snapshot.bracket", {"snapshot": raced_snapshot}),
+        ("bracket.equal-without-source", {"answered_source": None, "certified": False}),
+        ("bracket.unequal-with-source", {"local_bracket": raced_bracket, "snapshot": raced_snapshot, "certified": False}),
+    ):
+        _reject(
+            f"frame_provenance.{label}",
+            lambda kwargs=kwargs: replace(local_frame, **kwargs),
+        )
+    remote_frame = FrameProvenance(3, since_boot, remote, remote, None, None, False)
+    _reject("frame_provenance.remote-snapshot", lambda: replace(remote_frame, snapshot=snapshot))
+    _reject(
+        "frame_provenance.unanswered-snapshot-without-bracket",
+        lambda: replace(remote_frame, answered_source=None, snapshot=snapshot),
+    )
+    for label, kwargs in (
+        ("generation.negative", {"generation": -1}),
+        ("generation.bool", {"generation": True}),
+        ("window.forged", {"window": forged_window}),
+        ("requested.type", {"requested_source": {"boot_id": "boot-a"}}),
+        # Isolated from certification: no answered source and certified=False,
+        # so only the missing local-request bracket can reject this shape.
+        (
+            "requested.local-without-bracket",
+            {"requested_source": tolerant, "answered_source": None, "certified": False},
+        ),
+        # Remote-to-local fallback: only the missing local bracket can reject it.
+        (
+            "answered.local-fallback-without-bracket",
+            {"requested_source": remote, "answered_source": tolerant, "certified": False},
+        ),
+        ("answered.remote-with-bracket", {"answered_source": remote, "local_bracket": bracket}),
+        ("certified.not-bool", {"certified": 1}),
+        ("certified.empty", {"answered_source": None}),
+        ("certified.mismatched", {"answered_source": RemotePosition("boot-a", 1, 1)}),
+        ("certified.unequal-bracket", {"answered_source": changed, "local_bracket": LocalBracket(tolerant, changed)}),
+    ):
+        base = {
+            "generation": 3,
+            "window": since_boot,
+            "requested_source": remote,
+            "answered_source": remote,
+            "local_bracket": None,
+            "snapshot": None,
+            "certified": True,
+        }
+        _reject(
+            f"frame_provenance.{label}",
+            lambda kwargs=kwargs, base=base: FrameProvenance(**{**base, **kwargs}),
+        )
+
+    # -- SeriesMetadata ----------------------------------------------------- #
+    metadata = SeriesMetadata(7, KEY, since_boot, "raw", coverage(tier="raw"))
+    assert metadata.coverage.tier == metadata.tier
+    for label, kwargs in (
+        ("app_id.zero", {"app_id": 0}),
+        ("app_id.bool", {"app_id": True}),
+        ("app_key.empty", {"app_key": ""}),
+        ("window.forged", {"measured_window": forged_window}),
+        ("tier.enum", {"tier": "minute"}),
+        ("coverage.type", {"coverage": {"tier": "raw"}}),
+        ("tier.mismatch", {"tier": "rollup_60s"}),
+    ):
+        base = {
+            "app_id": 7,
+            "app_key": KEY,
+            "measured_window": since_boot,
+            "tier": "raw",
+            "coverage": coverage(tier="raw"),
+        }
+        _reject(
+            f"series_metadata.{label}",
+            lambda kwargs=kwargs, base=base: SeriesMetadata(**{**base, **kwargs}),
+        )
+    forged_coverage = coverage()
+    object.__setattr__(forged_coverage, "complete", 1)
+    _reject(
+        "series_metadata.forged-coverage",
+        lambda: SeriesMetadata(7, KEY, since_boot, "raw", forged_coverage),
+    )
+    forged_hook_hits = coverage()
+    object.__setattr__(forged_hook_hits.hook_hits, "vfs_read", -1)
+    _reject(
+        "series_metadata.forged-hook-hits",
+        lambda: SeriesMetadata(7, KEY, since_boot, "raw", forged_hook_hits),
+    )
+
+    # -- canonical local-answer digest ------------------------------------- #
+    base_digest = local_answer_digest("totals", KEY, since_boot, a)
+    assert len(base_digest) == 64
+    assert set(base_digest) <= set("0123456789abcdef")
+    # Independently encoded canonical vector: this literal was derived from a
+    # hand-built §2.1 payload (domain tag, every Window and contract field,
+    # app_id omitted), so it pins the tag and encoding, not just determinism.
+    assert base_digest == "70c6320069cb9128073ef4915deefd5056a58ae2ddced05fb718156e7c9fc5af"
+    assert base_digest == local_answer_digest("totals", KEY, since_boot, a)
+    assert base_digest != local_answer_digest("totals", KEY, range_w, share(7, range_w))
+    assert base_digest != local_answer_digest("totals", KEY, since_boot, replace(a, device_read_bytes=None, device_write_bytes=None, device_total_bytes=None, residual_read=None, residual_write=None, residual_total=None))
+    assert base_digest != local_answer_digest("totals", KEY, since_boot, replace(a, coverage=coverage(resets=1)))
+    assert base_digest != local_answer_digest("totals", KEY, since_boot, replace(a, devices=(DeviceShareRow("boot-a", "8:2", 9, 5, 14),)))
+    assert base_digest != local_answer_digest("totals", KEY, since_boot, replace(a, devices=()))
+    assert base_digest != local_answer_digest("totals", KEY, since_boot, replace(a, residual_total=0))
+    assert base_digest != local_answer_digest("totals", KEY, since_boot, replace(a, residual_total=None))
+    assert base_digest != local_answer_digest("totals", KEY, since_boot, replace(a, task_write_bytes=6, task_total_bytes=23))
+    _reject("digest.kind-enum", lambda: local_answer_digest("files", KEY, since_boot, a))
+    _reject("digest.kind-value", lambda: local_answer_digest("series", KEY, since_boot, a))
+    _reject("digest.totals-with-series", lambda: local_answer_digest("totals", KEY, since_boot, series_value))
+    _reject("digest.series-with-share", lambda: local_answer_digest("series", KEY, since_boot, a))
+    _reject("digest.custom-window", lambda: local_answer_digest("totals", KEY, since_boot, share(7, range_w)))
+    _reject("digest.empty-key", lambda: local_answer_digest("totals", "", since_boot, a))
+
+    ranking_value = total(7, KEY)
+    ranking_digest = local_answer_digest("ranking", KEY, since_boot, ranking_value)
+    assert ranking_digest == local_answer_digest("ranking", KEY, since_boot, replace(ranking_value, app_id=91))
+    assert ranking_digest != local_answer_digest("ranking", KEY, since_boot, total(7, KEY, peak=5))
+    # Presentation identity is not external: app_id stays omitted, but every
+    # Window field (including launch_id) enters the encoded payload.
+    launch_a = Window("launch", "boot-a", launch_id=7)
+    launch_b = Window("launch", "boot-a", launch_id=8)
+    assert local_answer_digest("totals", KEY, launch_a, share(7, launch_a)) != local_answer_digest(
+        "totals", KEY, launch_b, share(7, launch_b)
+    )
+    _reject("digest.ranking-key", lambda: local_answer_digest("ranking", KEY, since_boot, total(7, OTHER_KEY)))
+    _reject("digest.ranking-share", lambda: local_answer_digest("ranking", KEY, since_boot, a))
+
+    series_digest = local_answer_digest("series", KEY, since_boot, series_value)
+    assert series_digest == local_answer_digest("series", KEY, since_boot, replace(series_value, app_id=91))
+    assert series_digest != local_answer_digest("series", KEY, since_boot, replace(series_value, coverage=coverage(tier="raw", resets=1)))
+    suspended = replace(
+        series_value,
+        points=(
+            replace(series_value.points[0], spans_suspend=True),
+            series_value.points[1],
+        ),
+    )
+    assert series_digest != local_answer_digest("series", KEY, since_boot, suspended)
+    reordered = replace(
+        series_value,
+        points=tuple(reversed(series_value.points)),
+        device_points=tuple(reversed(series_value.device_points)),
+        residual_points=tuple(reversed(series_value.residual_points)),
+    )
+    assert series_digest != local_answer_digest("series", KEY, since_boot, reordered)
+    _reject("digest.series-window", lambda: local_answer_digest("series", KEY, since_boot, series(7, range_w)))
+    nan_wall = replace(
+        series_value,
+        points=(replace(series_value.points[0], wall_start_seconds=float("nan")), series_value.points[1]),
+    )
+    _reject("digest.series-nan", lambda: local_answer_digest("series", KEY, since_boot, nan_wall))
+    infinite_wall = replace(
+        series_value,
+        points=(replace(series_value.points[0], wall_start_seconds=float("inf")), series_value.points[1]),
+    )
+    _reject("digest.series-infinite", lambda: local_answer_digest("series", KEY, since_boot, infinite_wall))
+    _reject("digest.forged-coverage", lambda: local_answer_digest("totals", KEY, since_boot, replace(a, coverage=forged_coverage)))
+
+    # -- private router worker records (§3.4) ------------------------------- #
+    ranking_request = QueryRequest("ranking", since_boot)
+    detail_request = QueryRequest("totals", since_boot, KEY)
+    files_request = QueryRequest("files", since_boot, KEY)
+    registrations = (("local", "gui", 1),)
+    local_authority = ("local", registrations)
+    remote_authority = ("remote", 2, "boot-a", 1)
+    local_vector = LocalPositionVector((LocalPosition("local", "gui", 1, 1, 0),))
+    remote_position = RemotePosition("boot-a", 1, 0)
+    snapshot = SnapshotProvenance(1, DIGEST, LocalBracket(local_vector, local_vector))
+
+    private_inventory = {
+        RequestToken: (
+            "token_id", "request", "origin", "scope", "owner", "owner_id", "slot_id",
+            "authority", "requested_source",
+        ),
+        LocalFrameOutcome: (
+            "worker_id", "request", "ranking", "segments", "boundaries", "gaps",
+            "known_gaps", "overlaps", "has_local_history", "not_retained",
+            "chronology_unproved", "file_available", "snapshot",
+        ),
+        LocalPartOutcome: ("worker_id", "request", "app_key", "value", "data_digest", "snapshot"),
+        LocalFilesOutcome: (
+            "worker_id", "request", "app_key", "table", "coverage", "served_gap_count", "snapshot",
+        ),
+        RemoteSettlement: ("future", "response", "error"),
+        LocalSettlement: ("worker_id", "capture", "outcome", "error"),
+    }
+    for record, names in private_inventory.items():
+        assert tuple(field.name for field in fields(record)) == names, record.__name__
+        assert record.__dataclass_params__.frozen is True, record.__name__
+
+    detail_token = RequestToken(1, detail_request, "local", scope, "detail", 1, None,
+                                local_authority, local_vector)
+    assert detail_token.scope == scope
+    remote_token = RequestToken(2, ranking_request, "remote", None, "frame", 3, 9,
+                                remote_authority, remote_position)
+    local_frame_token = RequestToken(3, ranking_request, "local", None, "frame", 4, None,
+                                     local_authority, local_vector)
+    assert local_frame_token.origin == "local"
+    _assert_frozen(remote_token, "slot_id")
+    for label, kwargs in (
+        ("token_id.zero", {"token_id": 0}),
+        ("token_id.bool", {"token_id": True}),
+        ("token_id.negative", {"token_id": -1}),
+        ("request.not-query", {"request": {"kind": "ranking", "window": since_boot}}),
+        ("request.invalid-selector", {"request": QueryRequest("series", since_boot)}),
+        ("request.a22", {"request": QueryRequest("ranking", Window("launch", "boot-a", launch_id=1))}),
+        ("origin.enum", {"origin": "peer"}),
+        ("owner.enum", {"owner": "worker"}),
+        ("owner_id.zero", {"owner_id": 0}),
+        ("owner_id.bool", {"owner_id": False}),
+        ("detail.no-scope", {"request": detail_request, "owner": "detail", "scope": None}),
+        ("detail.no-subject", {"request": ranking_request, "owner": "detail", "scope": scope}),
+        ("detail.scope-subject", {"scope": retention_scope(OTHER_KEY, since_boot)}),
+        ("detail.scope-window", {"scope": retention_scope(KEY, range_w)}),
+        ("frame.scope", {"owner": "frame", "scope": scope}),
+        ("local.slot", {"slot_id": 1}),
+        ("remote.no-slot", {"origin": "remote", "slot_id": None,
+                            "requested_source": remote_position, "authority": remote_authority}),
+        ("authority.tag", {"authority": ("bogus", 1)}),
+        ("authority.remote-length", {"authority": ("remote", 1, "boot-a")}),
+        ("authority.remote-bool-generation", {"authority": ("remote", True, "boot-a", 1)}),
+        ("authority.remote-epoch", {"authority": ("remote", 1, "boot-a", 0)}),
+        ("authority.local-length", {"authority": ("local", registrations, 1)}),
+        ("authority.local-duplicate", {"authority": ("local", (("local", "gui", 1), ("local", "iod", 2)))}),
+        ("authority.local-unsorted", {"authority": ("local", (("z", "gui", 1), ("a", "iod", 2)))}),
+        ("authority.local-empty-name", {"authority": ("local", (("", "gui", 1),))}),
+        ("authority.local-epoch", {"authority": ("local", (("local", "gui", 0),))}),
+        ("source.remote-with-vector", {"origin": "remote", "slot_id": 1,
+                                      "requested_source": local_vector,
+                                      "authority": remote_authority}),
+        ("source.local-with-remote", {"requested_source": remote_position}),
+        ("source.mapping", {"requested_source": {"boot_id": "boot-a"}}),
+    ):
+        base = {
+            "token_id": 2,
+            "request": ranking_request,
+            "origin": "local",
+            "scope": None,
+            "owner": "frame",
+            "owner_id": 4,
+            "slot_id": None,
+            "authority": local_authority,
+            "requested_source": local_vector,
+        }
+        _reject(
+            f"request_token.{label}",
+            lambda kwargs=kwargs, base=base: RequestToken(**{**base, **kwargs}),
+        )
+    forged_vector = LocalPositionVector((LocalPosition("local", "gui", 1, 1, 0),))
+    object.__setattr__(forged_vector, "sources", ())
+    _reject(
+        "request_token.forged-source",
+        lambda: RequestToken(1, ranking_request, "local", None, "frame", 1, None,
+                             local_authority, forged_vector),
+    )
+    # A detail token is already valid before one field is varied. The former
+    # cases used a frame base, so they failed the "frame carries no scope" guard
+    # instead of the subject/Window scope equality their labels claimed.
+    detail_base = {
+        "token_id": 1,
+        "request": detail_request,
+        "origin": "local",
+        "scope": scope,
+        "owner": "detail",
+        "owner_id": 1,
+        "slot_id": None,
+        "authority": local_authority,
+        "requested_source": local_vector,
+    }
+    assert RequestToken(**detail_base) == detail_token
+    for label, kwargs in (
+        ("detail.scope-other-subject", {"scope": retention_scope(OTHER_KEY, since_boot)}),
+        ("detail.scope-other-window", {"scope": retention_scope(KEY, range_w)}),
+    ):
+        _reject(
+            f"request_token.{label}",
+            lambda kwargs=kwargs, base=detail_base: RequestToken(**{**base, **kwargs}),
+        )
+
+    # LocalFrameOutcome: all copied routing evidence, no eager detail handle.
+    frame_segments = (
+        HistorySegment("local", "gui", "boot-a", 0, 4 * NS, True),
+        HistorySegment("export", "iod", "boot-a", 4 * NS, 8 * NS, True),
+        HistorySegment("unproved", "unknown", "boot-a", 8 * NS, 10 * NS, False),
+    )
+    frame_boundaries = (("boot-a", 4 * NS, "gui", "iod"),)
+    frame_gaps = (("boot-a", 8 * NS, 10 * NS),)
+    # Known-gap evidence may overlap across sources; there is no global rule.
+    frame_known_gaps = (("boot-a", 8 * NS, 9 * NS + NS // 2), ("boot-a", 9 * NS, 10 * NS))
+    frame = LocalFrameOutcome(
+        2, ranking_request, (total(7, KEY), total(8, OTHER_KEY)), frame_segments,
+        frame_boundaries, frame_gaps, frame_known_gaps, (), False, False, False, True, snapshot,
+    )
+    # Boundaries are a chronology: valid ordered evidence is the control, and a
+    # permutation or repeat of that same evidence is not another valid plan.
+    chrono_segments = (
+        HistorySegment("local", "gui", "boot-a", 0, 4 * NS, True),
+        HistorySegment("export", "iod", "boot-a", 4 * NS, 8 * NS, True),
+        HistorySegment("local", "gui", "boot-a", 8 * NS, 12 * NS, True),
+    )
+    chrono_boundaries = (("boot-a", 4 * NS, "gui", "iod"), ("boot-a", 8 * NS, "iod", "gui"))
+    chrono_frame = LocalFrameOutcome(
+        2, ranking_request, (total(7, KEY),), chrono_segments,
+        chrono_boundaries, (), (), (), False, False, False, True, snapshot,
+    )
+    assert chrono_frame.boundaries == chrono_boundaries
+    assert frame.ranking[0].app_key == KEY
+    assert frame.known_gaps[0][2] > frame.known_gaps[1][1]
+    _assert_frozen(frame, "ranking")
+    for label, kwargs in (
+        ("worker_id.zero", {"worker_id": 0}),
+        ("worker_id.bool", {"worker_id": True}),
+        ("request.totals", {"request": QueryRequest("totals", since_boot, KEY)}),
+        ("request.subject", {"request": QueryRequest("ranking", since_boot, KEY)}),
+        ("ranking.list", {"ranking": [total(7, KEY)]}),
+        ("ranking.mutable-row", {"ranking": ([total(7, KEY)],)}),
+        ("ranking.duplicate", {"ranking": (total(7, KEY), total(8, KEY))}),
+        ("ranking.not-row", {"ranking": ({"app_key": KEY},)}),
+        ("segments.list", {"segments": list(frame_segments)}),
+        ("segments.not-segment", {"segments": (("local", "gui", "boot-a", 0, NS),)}),
+        ("segments.order", {"segments": (frame_segments[1], frame_segments[0])}),
+        # Nested segments promise real UTF-8 boot text; the pre-existing segment
+        # validator only checks identity truthiness, so these cross this boundary.
+        ("segments.boot-int", {
+            "segments": (HistorySegment("local", "gui", 123, 0, 4 * NS, True),),
+            "boundaries": (),
+        }),
+        ("segments.boot-tuple", {
+            "segments": (HistorySegment("local", "gui", ("x",), 0, 4 * NS, True),),
+            "boundaries": (),
+        }),
+        ("segments.boot-nul", {
+            "segments": (HistorySegment("local", "gui", "a\x00b", 0, 4 * NS, True),),
+            "boundaries": (),
+        }),
+        ("segments.boot-encoding", {
+            "segments": (HistorySegment("local", "gui", "a\ud800", 0, 4 * NS, True),),
+            "boundaries": (),
+        }),
+        ("boundaries.list", {"boundaries": list(frame_boundaries)}),
+        ("boundaries.length", {"boundaries": (("boot-a", 4 * NS, "gui"),)}),
+        ("boundaries.boot", {"boundaries": (("", 4 * NS, "gui", "iod"),)}),
+        ("boundaries.negative", {"boundaries": (("boot-a", -1, "gui", "iod"),)}),
+        ("boundaries.bool", {"boundaries": (("boot-a", True, "gui", "iod"),)}),
+        ("boundaries.owner-enum", {"boundaries": (("boot-a", 4 * NS, "gui", "root"),)}),
+        ("boundaries.same-owner", {"boundaries": (("boot-a", 4 * NS, "gui", "gui"),)}),
+        ("boundaries.unsupported", {"boundaries": (("boot-a", 2 * NS, "gui", "iod"),)}),
+        ("boundaries.other-boot", {"boundaries": (("other", 4 * NS, "gui", "iod"),)}),
+        ("boundaries.reversed", {
+            "segments": chrono_segments,
+            "boundaries": tuple(reversed(chrono_boundaries)),
+        }),
+        ("boundaries.duplicate", {
+            "segments": chrono_segments,
+            "boundaries": chrono_boundaries + (chrono_boundaries[-1],),
+        }),
+        ("boundaries.boot-order", {
+            "segments": (
+                HistorySegment("local", "gui", "boot-a", 0, 4 * NS, True),
+                HistorySegment("export", "iod", "boot-a", 4 * NS, 8 * NS, True),
+                HistorySegment("local", "gui", "boot-b", 8 * NS, 12 * NS, True),
+                HistorySegment("export", "iod", "boot-b", 12 * NS, 16 * NS, True),
+            ),
+            "boundaries": (("boot-b", 12 * NS, "gui", "iod"),
+                           ("boot-a", 4 * NS, "gui", "iod")),
+        }),
+        ("gaps.list", {"gaps": [("boot-a", 8 * NS, 10 * NS)]}),
+        ("gaps.length", {"gaps": (("boot-a", 8 * NS),)}),
+        ("gaps.boot", {"gaps": (("", 8 * NS, 10 * NS),)}),
+        ("gaps.reversed", {"gaps": (("boot-a", 10 * NS, 8 * NS),)}),
+        ("gaps.empty", {"gaps": (("boot-a", 8 * NS, 8 * NS),)}),
+        ("gaps.bool", {"gaps": (("boot-a", True, 10 * NS),)}),
+        ("known_gaps.list", {"known_gaps": [("boot-a", 8 * NS, 10 * NS)]}),
+        ("known_gaps.empty", {"known_gaps": (("boot-a", 8 * NS, 8 * NS),)}),
+        ("overlaps.list", {"overlaps": [("boot-a", 8 * NS, 10 * NS)]}),
+        ("overlaps.reversed", {"overlaps": (("boot-a", 10 * NS, 8 * NS),)}),
+        ("flag.int", {"has_local_history": 1}),
+        ("flag.str", {"not_retained": "no"}),
+        ("flag.bool-as-int", {"chronology_unproved": 0}),
+        ("flag.none", {"file_available": None}),
+    ):
+        base = {
+            "worker_id": 2,
+            "request": ranking_request,
+            "ranking": (total(7, KEY),),
+            "segments": frame_segments,
+            "boundaries": frame_boundaries,
+            "gaps": frame_gaps,
+            "known_gaps": frame_known_gaps,
+            "overlaps": (),
+            "has_local_history": False,
+            "not_retained": False,
+            "chronology_unproved": False,
+            "file_available": True,
+            "snapshot": snapshot,
+        }
+        _reject(
+            f"local_frame.{label}",
+            lambda kwargs=kwargs, base=base: LocalFrameOutcome(**{**base, **kwargs}),
+        )
+    forged_segment = HistorySegment("local", "gui", "boot-a", 0, 4 * NS, True)
+    object.__setattr__(forged_segment, "end_ns", 0)
+    _reject(
+        "local_frame.forged-segment",
+        lambda: LocalFrameOutcome(2, ranking_request, (total(7, KEY),), (forged_segment,),
+                                  (), (), (), (), False, False, False, True, snapshot),
+    )
+    # A boundary needs both adjacent *proven* segments. Keep the intended gui/iod
+    # owners and vary only `proven`, so the proven-status requirement is the sole
+    # reason these values become admissible when it is removed.
+    for label, segments in (
+        ("boundary-unproven-outgoing", (
+            HistorySegment("local", "gui", "boot-a", 0, 4 * NS, False),
+            HistorySegment("export", "iod", "boot-a", 4 * NS, 8 * NS, True))),
+        ("boundary-unproven-incoming", (
+            HistorySegment("local", "gui", "boot-a", 0, 4 * NS, True),
+            HistorySegment("unproved", "iod", "boot-a", 4 * NS, 8 * NS, False))),
+    ):
+        _reject(
+            f"local_frame.{label}",
+            lambda segments=segments: LocalFrameOutcome(
+                2, ranking_request, (total(7, KEY),), segments,
+                (("boot-a", 4 * NS, "gui", "iod"),), (), (), (), False, False, False, True, snapshot),
+        )
+
+    # LocalPartOutcome: one kind, one external subject, one canonical digest.
+    totals_value = share(7, since_boot)
+    part = LocalPartOutcome(
+        3, detail_request, KEY, totals_value,
+        local_answer_digest("totals", KEY, since_boot, totals_value), snapshot,
+    )
+    assert part.value.window == since_boot
+    _assert_frozen(part, "data_digest")
+    series_value = series(7, since_boot)
+    for label, kwargs in (
+        ("worker_id.zero", {"worker_id": 0}),
+        ("request.ranking", {"request": ranking_request}),
+        ("request.files", {"request": files_request}),
+        ("request.missing-subject", {"request": QueryRequest("totals", since_boot)}),
+        ("key.mismatch", {"app_key": OTHER_KEY}),
+        # Recompute the digest for the deliberately mismatched external key, so
+        # the request association is the sole fault rather than a digest mismatch.
+        ("key.mismatch-valid-digest", {
+            "app_key": OTHER_KEY,
+            "data_digest": local_answer_digest("totals", OTHER_KEY, since_boot, totals_value),
+        }),
+        ("key.invalid", {"app_key": "exe:relative/path"}),
+        ("value.series", {"value": series_value}),
+        ("value.window", {"value": share(7, range_w)}),
+        ("digest.uppercase", {"data_digest": "A" * 64}),
+        ("digest.length", {"data_digest": "a" * 63}),
+        ("digest.nonhex", {"data_digest": "g" * 64}),
+        ("digest.wrong", {"data_digest": "b" * 64}),
+        ("digest.int", {"data_digest": 5}),
+    ):
+        base = {
+            "worker_id": 3,
+            "request": detail_request,
+            "app_key": KEY,
+            "value": totals_value,
+            "data_digest": local_answer_digest("totals", KEY, since_boot, totals_value),
+            "snapshot": snapshot,
+        }
+        _reject(
+            f"local_part.{label}",
+            lambda kwargs=kwargs, base=base: LocalPartOutcome(**{**base, **kwargs}),
+        )
+    series_request = QueryRequest("series", since_boot, KEY)
+    series_part = LocalPartOutcome(
+        4, series_request, KEY, series_value,
+        local_answer_digest("series", KEY, since_boot, series_value), snapshot,
+    )
+    assert series_part.value.tier == "raw"
+    _reject(
+        "local_part.series-key-mismatch-valid-digest",
+        lambda: LocalPartOutcome(
+            4, series_request, OTHER_KEY, series_value,
+            local_answer_digest("series", OTHER_KEY, since_boot, series_value), snapshot),
+    )
+    forged_value_coverage = coverage()
+    object.__setattr__(forged_value_coverage.hook_hits, "vfs_read", -1)
+    _reject(
+        "local_part.forged-value",
+        lambda: LocalPartOutcome(3, detail_request, KEY,
+                                 replace(totals_value, coverage=forged_value_coverage),
+                                 "a" * 64, snapshot),
+    )
+
+    # LocalFilesOutcome: typed table/coverage/served evidence, first page only.
+    overflow = UnknownOwnerOverflow(since_boot, "overflow_owner_unknown", 0, 0, 0, coverage())
+    file_table = FileTable(7, since_boot, (), "bytes_total", "desc", None, overflow, coverage())
+    file_coverage = FileCoverage(
+        7, since_boot, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        HookHits(0, 0, 0, 0, 0, 0), 0, 0, overflow, coverage(),
+    )
+    files_outcome = LocalFilesOutcome(4, files_request, KEY, file_table, file_coverage, 0, snapshot)
+    assert files_outcome.coverage.served_interval == since_boot
+    assert LocalFilesOutcome(4, files_request, KEY, file_table, file_coverage, None, snapshot).served_gap_count is None
+    _assert_frozen(files_outcome, "table")
+    unavailable_overflow = UnknownOwnerOverflow(
+        since_boot, "overflow_owner_unknown", 0, 0, 0, coverage(unavailable_reason="not_retained"))
+    unavailable_table = FileTable(
+        7, since_boot, (), "bytes_total", "desc", None, unavailable_overflow,
+        coverage(unavailable_reason="not_retained"))
+    unavailable_coverage = FileCoverage(
+        7, since_boot, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        HookHits(0, 0, 0, 0, 0, 0), 0, 0, unavailable_overflow,
+        coverage(unavailable_reason="not_retained"),
+    )
+    for label, kwargs in (
+        ("worker_id.zero", {"worker_id": 0}),
+        ("request.totals", {"request": detail_request}),
+        ("request.continuation", {"request": QueryRequest("files", since_boot, KEY, cursor="opaque")}),
+        ("key.mismatch", {"app_key": OTHER_KEY}),
+        ("table.type", {"table": {"app_id": 7}}),
+        ("table.window", {"table": replace(file_table, window=range_w)}),
+        ("table.sort", {"table": replace(file_table, sort="basename")}),
+        ("coverage.type", {"coverage": coverage()}),
+        ("coverage.window", {"coverage": replace(file_coverage, window=range_w)}),
+        ("coverage.app-id", {"coverage": replace(file_coverage, app_id=8)}),
+        ("coverage.tier", {"coverage": replace(file_coverage, coverage=coverage(tier="rollup_60s"))}),
+        ("coverage.gap", {"coverage": replace(file_coverage, coverage=coverage(gap_intervals=1))}),
+        ("coverage.unavailable", {"table": unavailable_table, "coverage": unavailable_coverage}),
+        ("served.negative", {"served_gap_count": -1}),
+        ("served.bool", {"served_gap_count": True}),
+    ):
+        base = {
+            "worker_id": 4,
+            "request": files_request,
+            "app_key": KEY,
+            "table": file_table,
+            "coverage": file_coverage,
+            "served_gap_count": 0,
+            "snapshot": snapshot,
+        }
+        _reject(
+            f"local_files.{label}",
+            lambda kwargs=kwargs, base=base: LocalFilesOutcome(**{**base, **kwargs}),
+        )
+    # Served evidence must lie inside the exact request. The positive control is
+    # an in-bounds subrange; the negative varies only its served end endpoint, so
+    # removing the served-bounds check is the sole reason it becomes admissible.
+    inside_served = Window("range", BOOT, 1_000_000_000, 15_000_000_000)
+    inside_overflow = UnknownOwnerOverflow(
+        inside_served, "overflow_owner_unknown", 0, 0, 0, coverage())
+    inside_table = FileTable(
+        7, since_boot, (), "bytes_total", "desc", None, inside_overflow, coverage())
+    inside_coverage = FileCoverage(
+        7, since_boot, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        HookHits(0, 0, 0, 0, 0, 0), 0, 0, inside_overflow, coverage(),
+    )
+    inside = LocalFilesOutcome(4, files_request, KEY, inside_table, inside_coverage, 0, snapshot)
+    assert inside.coverage.served_interval == inside_served
+
+    wide_served = Window("range", BOOT, 1_000_000_000, 30_000_000_000)
+    wide_overflow = UnknownOwnerOverflow(
+        wide_served, "overflow_owner_unknown", 0, 0, 0, coverage())
+    wide_table = FileTable(
+        7, since_boot, (), "bytes_total", "desc", None, wide_overflow, coverage())
+    wide_coverage = FileCoverage(
+        7, since_boot, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        HookHits(0, 0, 0, 0, 0, 0), 0, 0, wide_overflow, coverage(),
+    )
+    assert wide_coverage.served_interval == wide_served
+    _reject(
+        "local_files.served-outside-request",
+        lambda: LocalFilesOutcome(4, files_request, KEY, wide_table, wide_coverage, 0, snapshot),
+    )
+
+    # Settlement inputs carry exactly one terminal result or error.
+    finished = Future()
+    finished.set_result({"kind": "totals"})
+    remote_settlement = RemoteSettlement(finished, {"kind": "totals"})
+    assert remote_settlement.response is not None
+    failed_settlement = RemoteSettlement(finished, error=WindowUnavailableError(
+        "not_retained", "remote history is not retained"))
+    assert failed_settlement.response is None
+    _assert_frozen(remote_settlement, "response")
+    for label, kwargs in (
+        ("future.type", {"future": {"done": True}}),
+        ("both", {"response": {}, "error": RuntimeError("x")}),
+        ("neither", {"response": None, "error": None}),
+        ("response.list", {"response": []}),
+        ("error.base", {"response": None, "error": KeyboardInterrupt()}),
+    ):
+        base = {"future": finished, "response": {"kind": "totals"}, "error": None}
+        _reject(
+            f"remote_settlement.{label}",
+            lambda kwargs=kwargs, base=base: RemoteSettlement(**{**base, **kwargs}),
+        )
+
+    capture = CapturedSourceSet(1, local_vector, local_vector, (image,), DIGEST)
+    frame_settlement = LocalSettlement(2, capture=capture, outcome=frame)
+    assert frame_settlement.outcome is frame
+    assert frame_settlement.capture is capture
+    assert LocalSettlement(3, error=RuntimeError("boom")).outcome is None
+    _assert_frozen(frame_settlement, "worker_id")
+    for label, kwargs in (
+        ("worker_id.zero", {"worker_id": 0}),
+        ("worker_id.bool", {"worker_id": True}),
+        ("both", {"outcome": frame, "error": RuntimeError("x")}),
+        ("neither", {"outcome": None, "error": None}),
+        ("outcome.type", {"outcome": {"worker_id": 2}}),
+        ("outcome.worker", {"outcome": part}),
+        ("error.base", {"outcome": None, "error": KeyboardInterrupt()}),
+        ("capture.type", {"capture": [capture]}),
+    ):
+        base = {"worker_id": 2, "capture": capture, "outcome": frame, "error": None}
+        _reject(
+            f"local_settlement.{label}",
+            lambda kwargs=kwargs, base=base: LocalSettlement(**{**base, **kwargs}),
+        )
+
+    # -- the neutral module stays free of client/router/query/Qt ----------- #
+    probe = (
+        "import sys\n"
+        "import appio.history_types\n"
+        "banned = ('appio.iodclient', 'appio.history_router', 'appio.query',\n"
+        "          'appio.iod_history', 'appio.store', 'appio.ipc_models',\n"
+        "          'appio.identity', 'sqlite3', 'PyQt6')\n"
+        "loaded = [name for name in banned if name in sys.modules]\n"
+        "assert not loaded, loaded\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", probe], capture_output=True, text=True, timeout=120
+    )
+    assert result.returncode == 0, result.stderr
+
+
+class _IdleClient:
+    """A verified-not-answering stub: a local frame must issue no query."""
+
+    state = ClientState()
+
+    def query(self, request):  # pragma: no cover - a local frame never asks
+        raise AssertionError(f"unexpected daemon query: {request.kind}")
+
+
+def _committed_store(path, apps, *, owner="gui", start=100, end=110):
+    """One committed synthetic store with a per-app delta across one tick pair."""
+
+    store = AppIoStore(path)
+    store.start_boot(BOOT, 1, 0, 1000.0, owner)
+    for key, app_id, _amount in apps:
+        store.connection.execute(
+            "INSERT INTO app VALUES (?,?,?,NULL,0,0,'user')",
+            (app_id, key, key.partition(":")[2]),
+        )
+    store.connection.commit()
+    store.start_collector(owner, BOOT, start * NS)
+    state = None
+    for seq, at in ((0, start), (1, end)):
+        processes = tuple(
+            StableProcRecord(
+                ProcessIdentity(BOOT, 410 + index, 100), 1, 1000, key, "/fixture",
+                AppKeyInputs("/fixture", key.partition(":")[2]),
+                IoReadOutcome("readable", (100 + seq * amount,) * 4, None, None),
+            )
+            for index, (key, _app_id, amount) in enumerate(apps)
+        )
+        observation = TickInput(BOOT, owner, 1, seq, at * NS, (1000 + at) * NS, processes, ())
+        frame, state = baseline_seed(observation) if seq == 0 else aggregate_tick(state, observation)
+        store.record_tick(frame, state)
+    return store
+
+
+def _registered_paths(*sources):
+    return tuple(
+        (name, store.connection.execute("PRAGMA database_list").fetchone()[2], owner)
+        for name, store, owner in sources
+    )
+
+
+@pytest.mark.parametrize("approved", [True, False], ids=["valid", "retired"])
+def test_background_settlement_revalidates_outcome_subtype(tmp_path, approved):
+    """An outcome's own validator runs again when the worker completes."""
+    from live_overview_support import make_managed_router
+
+    local = _committed_store(tmp_path / "local.db", ((ALPHA, 17, 20),))
+    router = make_managed_router(QueryService(local), _IdleClient(), AppRegistry())
+    capture = None
+    try:
+        capture = router.sources.capture().result(timeout=15)
+        scope = Window("range", BOOT, 100 * NS, 140 * NS)
+        request = QueryRequest("totals", scope, ALPHA)
+        vector = capture.opening
+        authority = ("local", tuple(
+            (position.name, position.owner, position.registration_epoch)
+            for position in vector.sources
+        ))
+        validation = {"approved": True, "calls": 0, "intercept": False}
+
+        class AttestedPart(LocalPartOutcome):
+            def __getattribute__(self, name):
+                if name == "__post_init__" and validation["intercept"]:
+                    return lambda: None
+                return super().__getattribute__(name)
+
+            def __post_init__(self):
+                super().__post_init__()
+                validation["calls"] += 1
+                if not validation["approved"]:
+                    raise ValueError("extended part attestation is retired")
+
+        worker_id = 51
+        part = HistoryRouter._read_local_part(
+            capture, request, worker_id=worker_id, app_key=ALPHA)
+        attested = AttestedPart(
+            part.worker_id, part.request, part.app_key, part.value,
+            part.data_digest, part.snapshot)
+        validation["approved"] = approved
+        validation["intercept"] = True
+        token = RequestToken(
+            worker_id, request, "local", retention_scope(ALPHA, scope),
+            "detail", worker_id, None, authority, vector)
+        future = router._submit_background_worker(
+            token, lambda: attested, capture=capture)
+        assert future is not None
+        future.result(timeout=15)
+        queued_token, settlement = router._completed.get(timeout=5)
+        assert queued_token is token
+        assert isinstance(settlement, LocalSettlement)
+        if approved:
+            assert settlement.outcome is attested
+            assert settlement.error is None
+        else:
+            assert settlement.outcome is None
+            assert isinstance(settlement.error, ValueError)
+            assert str(settlement.error) == "extended part attestation is retired"
+        assert validation["calls"] == 2
+        router._reap_background_worker(worker_id)
+    finally:
+        if capture is not None:
+            router.sources.release_capture(capture.capture_id)
+        router.close()
+        router.sources.close()
+        local.connection.close()
+
+
+def test_local_detail_is_lazy_selected_subject_only(tmp_path, monkeypatch):
+    """A frame copy proves routing only; selection builds one kind and subject.
+
+    `_read_local` returns no part map and calls neither reducer sequence. A
+    selected detail resolves the external AppKey inside each private snapshot,
+    so store-local numeric IDs never come from the presentation registry. A real
+    computation barrier on the background lane also proves the frame lane keeps
+    executing while detail work is held inside its worker.
+    """
+
+    from pathlib import Path
+    from appio.history_source import ManagedSourceRegistry
+    from appio.history_types import ManagedSourceSpec
+    from live_overview_support import wait_for_capture_admission, wait_for_local_frame
+
+    alpha_id, beta_id, export_alpha_id = 17, 18, 3
+    local = _committed_store(
+        tmp_path / "local.db", ((ALPHA, alpha_id, 20), (BETA, beta_id, 7)))
+    root = None
+    router = None
+    source_registry = ManagedSourceRegistry(wake=lambda: None)
+    captures = []
+    release = threading.Event()
+    try:
+        local_path = local.connection.execute("PRAGMA database_list").fetchone()[2]
+        source_registry.register(ManagedSourceSpec(
+            "local", "iod", Path(local_path).as_uri() + "?mode=ro", ())).result(timeout=10)
+        captured = source_registry.capture().result(timeout=15)
+        captures.append(captured)
+        scope = Window("range", BOOT, 100 * NS, 140 * NS)
+
+        computations: list[tuple[str, str | None, Window]] = []
+        local_ids: list[tuple[str, int]] = []
+        originals = {"totals": QueryService.disk_share, "series": QueryService.series}
+
+        def observe(kind, service, app_id, window):
+            row = service.connection.execute(
+                "SELECT key FROM app WHERE app_id=?", (app_id,)).fetchone()
+            computations.append((kind, row[0] if row is not None else None, window))
+            local_ids.append((kind, app_id))
+            return originals[kind](service, app_id, window)
+
+        monkeypatch.setattr(
+            QueryService, "disk_share",
+            lambda service, app_id, window: observe("totals", service, app_id, window))
+        monkeypatch.setattr(
+            QueryService, "series",
+            lambda service, app_id, window: observe("series", service, app_id, window))
+
+        frame = HistoryRouter._read_local(
+            captured, scope, worker_id=1, request=QueryRequest("ranking", scope))
+        assert isinstance(frame, LocalFrameOutcome)
+        assert not hasattr(frame, "parts")
+        assert computations == []
+        assert {row.app_key for row in frame.ranking} == {ALPHA, BETA}
+        assert all(row.app_id > 0 for row in frame.ranking)
+        assert [segment.collector_id for segment in frame.segments] == ["local", "unproved"]
+        assert frame.gaps == ((BOOT, 110 * NS, 140 * NS),)
+        assert frame.segments[0].proven is True
+        assert frame.segments[1].proven is False
+        assert frame.known_gaps == ()
+        assert frame.file_available is False
+
+        part = HistoryRouter._read_local_part(
+            captured, QueryRequest("totals", scope, ALPHA), worker_id=2, app_key=ALPHA)
+        assert isinstance(part, LocalPartOutcome)
+        assert part.worker_id == 2 and part.value.window == scope
+        assert (part.value.task_read_bytes, part.value.task_write_bytes) == (20, 20)
+        assert part.value.coverage.gap_intervals == 1
+        assert not part.value.coverage.complete
+        assert part.data_digest == local_answer_digest(
+            "totals", part.app_key, scope, part.value)
+        assert computations == [("totals", ALPHA, scope)]
+        assert local_ids == [("totals", alpha_id)]  # the private store's own id
+
+        series_part = HistoryRouter._read_local_part(
+            captured, QueryRequest("series", scope, ALPHA), worker_id=3, app_key=ALPHA)
+        assert isinstance(series_part, LocalPartOutcome)
+        assert series_part.value.tier == "raw"
+        assert sum(point.read_bytes for point in series_part.value.points) == 20
+        assert [kind for kind, _key, _window in computations] == ["totals", "series"]
+        assert all(key == ALPHA for _kind, key, _window in computations)
+
+        # Each private snapshot resolves the same AppKey to its own numeric id:
+        # the second store holds alpha as id 3, not the first store's 17.
+        root = _committed_store(
+            tmp_path / "root.db", ((ALPHA, export_alpha_id, 30),),
+            owner="iod", start=110, end=120)
+        root_path = root.connection.execute("PRAGMA database_list").fetchone()[2]
+        source_registry.register(ManagedSourceSpec(
+            "export", "iod", Path(root_path).as_uri() + "?mode=ro", ())).result(timeout=10)
+        merged_capture = source_registry.capture().result(timeout=15)
+        captures.append(merged_capture)
+        computations.clear()
+        local_ids.clear()
+        merged = HistoryRouter._read_local_part(
+            merged_capture, QueryRequest("totals", scope, ALPHA), worker_id=4, app_key=ALPHA)
+        assert isinstance(merged, LocalPartOutcome)
+        assert merged.value.task_read_bytes == 50
+        assert merged.value.coverage.gap_intervals == 1
+        assert set(local_ids) == {("totals", alpha_id), ("totals", export_alpha_id)}
+        assert computations == [("totals", ALPHA, scope), ("totals", ALPHA, scope)]
+
+        # D03: a held detail computation must not serialize the frame lane.
+        computations.clear()
+        local_ids.clear()
+        router = HistoryRouter(source_registry, _IdleClient(), AppRegistry())
+
+        authority = ("local", (("local", "gui", 1),))
+        vector = LocalPositionVector((LocalPosition("local", "gui", 1, 1, 0),))
+        entered = threading.Event()
+        token = RequestToken(
+            11, QueryRequest("totals", scope, ALPHA), "local",
+            retention_scope(ALPHA, scope), "detail", 1, None, authority, vector,
+        )
+
+        def held_detail():
+            entered.set()
+            # A longer bound than the frame wait: if both lanes shared one
+            # worker this hold would outlive the frame assertion below.
+            assert release.wait(15), "the detail worker was never released"
+            return HistoryRouter._read_local_part(
+                merged_capture, QueryRequest("totals", scope, ALPHA),
+                worker_id=token.token_id, app_key=ALPHA)
+
+        assert router._frame_executor is not router._background_executor
+        assert router._submit_background_worker(token, held_detail) is not None
+        assert entered.wait(5)
+        router.prepare(scope)
+        outcome = wait_for_local_frame(router)
+        assert isinstance(outcome, LocalFrameOutcome)
+        assert release.is_set() is False, "the frame waited for the held detail"
+        assert router.ready(scope)
+        assert router.pending_work
+        assert router._background_charge("detail") == 1
+
+        # Two charged detail Futures is the hard lane bound: with both live, a
+        # third admission must refuse rather than submit unbounded stale work.
+        second = RequestToken(
+            12, QueryRequest("totals", scope, ALPHA), "local",
+            retention_scope(ALPHA, scope), "detail", 2, None, authority, vector,
+        )
+
+        def held_second():
+            assert release.wait(15), "the second detail worker was never released"
+            return HistoryRouter._read_local_part(
+                merged_capture, QueryRequest("totals", scope, ALPHA), worker_id=12, app_key=ALPHA)
+
+        assert router._submit_background_worker(second, held_second) is not None
+        third = RequestToken(
+            13, QueryRequest("totals", scope, ALPHA), "local",
+            retention_scope(ALPHA, scope), "detail", 3, None, authority, vector,
+        )
+        assert router._submit_background_worker(third, held_second) is None
+        assert router._background_charge("detail") == 2
+
+        release.set()
+        settled = [router._completed.get(timeout=10) for _ in range(2)]
+        assert {item[0].token_id for item in settled} == {token.token_id, second.token_id}
+        for settled_token, settlement in settled:
+            assert isinstance(settlement, LocalSettlement)
+            assert settlement.worker_id == settled_token.token_id
+            assert isinstance(settlement.outcome, LocalPartOutcome)
+            assert settlement.outcome.value.window == scope
+        # A done callback never releases charged capacity; only an owner drain does.
+        assert router._background_charge("detail") == 2
+        router._reap_background_worker(token.token_id)
+        router._reap_background_worker(second.token_id)
+        assert router._background_charge("detail") == 0
+
+        # One authoritative background ledger: the legacy local Files path and
+        # helper submissions reserve against the same Files/total charges. Eight
+        # Files charges include the helper, so a ninth Files request and another
+        # helper Files job must both refuse instead of running a second budget.
+        files_release = threading.Event()
+        files_started = threading.Event()
+        original_files = router._read_local_files
+
+        def held_files(*args, **kwargs):
+            files_started.set()
+            assert files_release.wait(15), "the Files worker was never released"
+            return original_files(*args, **kwargs)
+
+        monkeypatch.setattr(router, "_read_local_files", held_files)
+        presentation = router.registry.id_for(ALPHA)
+        files_futures = [
+            router.request_file_view(presentation, scope, "bytes_total", "desc", None)
+            for _ in range(4)
+        ]
+        from live_overview_support import wait_for_capture_admission
+        wait_for_capture_admission(router)
+        assert files_started.wait(5)
+        helper_files = RequestToken(
+            21, QueryRequest("files", scope, ALPHA), "local", None, "files", 6, None,
+            authority, vector,
+        )
+
+        def held_helper_files():
+            assert files_release.wait(15), "the helper Files worker was never released"
+            raise WindowUnavailableError("file_source_unavailable", "held Files worker")
+
+        assert router._submit_background_worker(helper_files, held_helper_files) is not None
+        assert router._background_charge("files") == 5
+        for _ in range(3):
+            files_futures.append(
+                router.request_file_view(presentation, scope, "bytes_total", "desc", None))
+        assert router._background_charge("files") == 8
+        rejected = router.request_file_view(presentation, scope, "bytes_total", "desc", None)
+        with pytest.raises(RequestRejected) as refused:
+            rejected.result(timeout=5)
+        assert refused.value.reason == "query_busy"
+        # A fresh explicit helper id stays outside the implicit allocator's
+        # current range; the refusal below must come from capacity, not a
+        # colliding binding.
+        extra_files = RequestToken(
+            30, QueryRequest("files", scope, ALPHA), "local", None, "files", 7, None,
+            authority, vector,
+        )
+        assert router._submit_background_worker(extra_files, held_helper_files) is None
+
+        wait_for_capture_admission(router)
+        files_release.set()
+        # Worker threads only enqueue immutable settlements; the outward Files
+        # Futures publish solely on the owner drain. A terminal worker therefore
+        # keeps its charge until that owner path reaps it.
+        for _owner, job in list(router._worker_jobs.values()):
+            if job is not None:
+                job.result(timeout=15)
+        assert router._background_charge("files") == 8
+        assert all(not future.done() for future in files_futures)
+        queued = []
+        while not router._completed.empty():
+            queued.append(router._completed.get_nowait())
+        helper_token, helper_settlement = next(
+            item for item in queued if item[0] is helper_files)
+        assert isinstance(helper_settlement, LocalSettlement)
+        assert isinstance(helper_settlement.error, WindowUnavailableError)
+        for item in queued:
+            router._completed.put(item)
+        while not all(future.done() for future in files_futures):
+            router.drain()
+        for future in files_futures:
+            future.exception(timeout=0)
+        # The same ledger that admitted every worker releases it on the owner
+        # drain; the ignored helper charge is reaped through that path too.
+        assert router._background_charge("files") == 0
+        assert not router._worker_jobs
+
+        # Close retires publication, never resource accounting. A running worker
+        # keeps its binding until it terminates and is reaped through this same
+        # owner path; its late outcome is dropped instead of published.
+        close_release = threading.Event()
+        close_started = threading.Event()
+
+        def held_close(worker_id):
+            def work():
+                close_started.set()
+                assert close_release.wait(15), "the close worker was never released"
+                return HistoryRouter._read_local_part(
+                    merged_capture, QueryRequest("totals", scope, ALPHA),
+                    worker_id=worker_id, app_key=ALPHA)
+            return work
+
+        closing = RequestToken(
+            31, QueryRequest("totals", scope, ALPHA), "local",
+            retention_scope(ALPHA, scope), "detail", 9, None, authority, vector,
+        )
+        close_job = router._submit_background_worker(closing, held_close(closing.token_id))
+        assert close_job is not None
+        assert close_started.wait(5)
+        router.close()
+        assert close_job.running() is True
+        assert closing.token_id in router._worker_jobs
+        assert router._background_charge("detail") == 1
+        assert router.pending_work
+        close_release.set()
+        assert close_job.result(timeout=15) is None
+        assert router._background_charge("detail") == 1
+        assert router.pending_work
+        router._reap_background_worker(closing.token_id)
+        assert router._background_charge("detail") == 0
+        assert router._completed.empty()
+        assert router.pending_work is False
+    finally:
+        release.set()
+        if router is not None:
+            router.close()
+        for image in captures:
+            if image.capture_id in source_registry._capture_leases:
+                source_registry.release_capture(image.capture_id)
+        source_registry.close()
+        if root is not None:
+            root.connection.close()
+        local.connection.close()
+
+
+def test_worker_ids_are_never_reused_across_helper_and_files_admission(tmp_path, monkeypatch):
+    """One collision-safe worker-id authority for helper and public Files work.
+
+    The implicit Files allocator must never hand out an id that an admitted
+    helper already owns. Each submitted Future then keeps exactly one charge,
+    the shared ceiling refuses the eleventh submission instead of silently
+    rebinding a running worker, and close() retains that worker's charge.
+    """
+
+    local = _committed_store(tmp_path / "local.db", ((ALPHA, 17, 20),))
+    router = None
+    release = threading.Event()
+    entered = threading.Event()
+    submitted: list[Future] = []
+    capture = None
+    try:
+        scope = Window("range", BOOT, 100 * NS, 140 * NS)
+        from live_overview_support import make_managed_router
+
+        router = make_managed_router(QueryService(local), _IdleClient(), AppRegistry())
+
+        authority = ("local", (("local", "gui", 1),))
+        vector = LocalPositionVector((LocalPosition("local", "gui", 1, 1, 0),))
+        router.prepare(scope)
+        assert isinstance(wait_local(router), LocalFrameOutcome)
+
+        assert router.ready(scope)
+        assert router.pending_work is False
+        capture = router.sources.capture().result(timeout=15)
+
+        actual_submit = router._background_executor.submit
+
+        def counted_submit(work, /, *args, **kwargs):
+            future = actual_submit(work, *args, **kwargs)
+            submitted.append(future)
+            return future
+
+        monkeypatch.setattr(router._background_executor, "submit", counted_submit)
+
+        # The helper takes exactly the id the implicit Files allocator would
+        # otherwise return for the first legacy Files request.
+        helper_id = router._next_token_id
+        helper = RequestToken(
+            helper_id, QueryRequest("totals", scope, ALPHA), "local",
+            retention_scope(ALPHA, scope), "detail", 1, None, authority, vector,
+        )
+
+        def held_detail():
+            entered.set()
+            assert release.wait(15), "the helper worker was never released"
+            return HistoryRouter._read_local_part(
+                capture, QueryRequest("totals", scope, ALPHA),
+                worker_id=helper_id, app_key=ALPHA)
+
+        helper_job = router._submit_background_worker(helper, held_detail)
+        assert helper_job is not None and entered.wait(5)
+        assert router._worker_jobs[helper_id][0] == "detail"
+        assert router._background_charge("detail") == 1
+
+        presentation = router.registry.id_for(ALPHA)
+        router.request_file_view(presentation, scope, "bytes_total", "desc", None)
+        from live_overview_support import wait_for_capture_admission
+        wait_for_capture_admission(router)
+
+        def held_helper_worker():
+            assert False, "a queued helper worker must never run in this control"
+
+        for worker_id in range(102, 109):
+            helper_files = RequestToken(
+                worker_id, QueryRequest("files", scope, ALPHA), "local", None,
+                "files", worker_id, None, authority, vector,
+            )
+            assert router._submit_background_worker(
+                helper_files, held_helper_worker) is not None
+
+        second = RequestToken(
+            100, QueryRequest("totals", scope, ALPHA), "local",
+            retention_scope(ALPHA, scope), "detail", 2, None, authority, vector,
+        )
+        assert router._submit_background_worker(second, held_detail) is not None
+
+        # The eleventh submission attempt must meet the ten-job ceiling. If an
+        # implicit id overwrote the first helper's binding, this token is
+        # admitted against a ledger that has already lost one real charge.
+        third = RequestToken(
+            101, QueryRequest("totals", scope, ALPHA), "local",
+            retention_scope(ALPHA, scope), "detail", 3, None, authority, vector,
+        )
+        eleventh = router._submit_background_worker(third, held_detail)
+
+        # Every actual executor submission owns one distinct live charge.
+        assert len(submitted) == len(router._worker_jobs) == 10, (
+            f"{len(submitted)} submitted Futures against "
+            f"{len(router._worker_jobs)} recorded charges")
+        assert eleventh is None
+        assert router._worker_jobs[helper_id][0] == "detail"
+        assert router._background_charge("detail") == 2
+        assert router._background_charge("files") == 8
+
+        # Close retires publication, never a running worker's resource. With an
+        # overwritten binding this ledger emptied while the worker still ran.
+        router.close()
+        assert helper_job.running() is True
+        assert router._worker_jobs[helper_id][0] == "detail"
+        assert len(router._worker_jobs) == 1
+        assert router._background_charge("detail") == 1
+        assert router.pending_work
+        release.set()
+        assert helper_job.result(timeout=15) is None
+        assert router._background_charge("detail") == 1
+        assert router.pending_work
+        router._reap_background_worker(helper_id)
+        assert router._background_charge("detail") == 0
+        assert router._completed.empty()
+        assert router.pending_work is False
+    finally:
+        release.set()
+        if router is not None:
+            router.close()
+            if capture is not None and capture.capture_id in router.sources._capture_leases:
+                router.sources.release_capture(capture.capture_id)
+        local.connection.close()
+
+
+# ---------------------------------------------------------------------------
+# Local positions and copy brackets (§§2.2, 4.1–4.3)
+# ---------------------------------------------------------------------------
+
+
+class _StateClient:
+    """A client whose only observable fact is the state under test."""
+
+    def __init__(self, state):
+        self.state = state
+
+
+def _db_path(store) -> str:
+    return store.connection.execute("PRAGMA database_list").fetchone()[2]
+
+
+def _source_stores(tmp_path):
+    """Two file-backed stores with their own connections and separate writers."""
+
+    local = _committed_store(tmp_path / "local.db", ((ALPHA, 17, 20), (BETA, 18, 7)))
+    imported = _committed_store(
+        tmp_path / "imported.db", ((ALPHA, 3, 30),), owner="iod", start=110, end=120)
+    return local, imported
+
+
+def _source_router(tmp_path):
+    local, imported = _source_stores(tmp_path)
+    from live_overview_support import add_managed_source, make_managed_router
+
+    history = make_managed_router(QueryService(local), _IdleClient(), AppRegistry())
+    add_managed_source(history, imported, name="imported", owner="iod")
+    return history, local, imported
+
+
+class _SourceConnectionProbe:
+    """Observe source-connection calls while preserving real SQLite behavior."""
+
+    def __init__(self, connection, *, attempt_write=False):
+        self._connection = connection
+        self.attempt_write = attempt_write
+        self.begin_transaction_on_next_check = False
+        self.transaction_opened = False
+        self.sql = []
+        self.connect_thread = threading.get_ident()
+        self.authorizer_thread = None
+        self.execute_threads = []
+        self.backup_threads = []
+        self.close_thread = None
+        self.write_error = None
+        self._authorizer = None
+        self.block_authorizer = False
+        self.authorizer_entered = threading.Event()
+        self.authorizer_release = threading.Event()
+        self.closed = threading.Event()
+        self.close_entered = threading.Event()
+        self.close_release = None
+
+    @property
+    def in_transaction(self):
+        if self.begin_transaction_on_next_check:
+            self.begin_transaction_on_next_check = False
+            self._connection.set_authorizer(None)
+            self._connection.execute("BEGIN")
+            self.transaction_opened = self._connection.in_transaction
+            self._connection.set_authorizer(self._authorizer)
+        return self._connection.in_transaction
+
+    @property
+    def total_changes(self):
+        return self._connection.total_changes
+
+    def execute(self, statement, parameters=()):
+        self.sql.append(statement)
+        self.execute_threads.append(threading.get_ident())
+        return self._connection.execute(statement, parameters)
+
+    def set_authorizer(self, callback):
+        self.authorizer_thread = threading.get_ident()
+        self._authorizer = callback
+        self._connection.set_authorizer(callback)
+        if self.block_authorizer:
+            self.authorizer_entered.set()
+            if not self.authorizer_release.wait(10):
+                raise TimeoutError("test did not release source admission")
+        if self.attempt_write:
+            try:
+                self._connection.execute("UPDATE app SET name=name WHERE app_id=1")
+            except sqlite3.DatabaseError as error:
+                self.write_error = str(error)
+
+    def backup(self, target, **options):
+        self.backup_threads.append(threading.get_ident())
+        return self._connection.backup(target, **options)
+
+    def close(self):
+        self.close_thread = threading.get_ident()
+        self.close_entered.set()
+        if self.close_release is not None:
+            self.close_release.wait(10)
+        try:
+            self._connection.close()
+        finally:
+            self.closed.set()
+
+    def __getattr__(self, name):
+        return getattr(self._connection, name)
+
+
+def _track_source_connections(monkeypatch, *, attempt_write=False,
+                             block_first_authorizer=False, connection_entered=None):
+    import appio.history_source as history_source
+
+    original_connect = history_source.sqlite3.connect
+    probes = []
+
+    def connect(database, *args, **options):
+        connection = original_connect(database, *args, **options)
+        if isinstance(database, str) and database.startswith("file:"):
+            probe = _SourceConnectionProbe(connection, attempt_write=attempt_write)
+            probe.block_authorizer = block_first_authorizer and not probes
+            probes.append(probe)
+            if connection_entered is not None:
+                connection_entered.set()
+            return probe
+        return connection
+
+    monkeypatch.setattr(history_source.sqlite3, "connect", connect)
+    return probes
+
+
+def _register_fixture_sources(registry, stores, *names):
+    from concurrent.futures import Future
+
+    receipts = {}
+    for name in names:
+        pending = registry.register(stores.managed_spec(name, owner="iod"))
+        assert isinstance(pending, Future)
+        receipts[name] = pending.result(timeout=10)
+    return receipts
+
+
+@pytest.mark.parametrize("journal_mode", ["DELETE", "WAL"])
+def test_capture_validates_ordered_images_and_removes_private_destinations(
+        tmp_path, monkeypatch, journal_mode):
+    """Each actor backs up and deletes its own complete temporary image."""
+
+    import hashlib
+    import tempfile
+    from live_overview_support import LocalPositionStores
+
+    stores = LocalPositionStores(
+        tmp_path, journal_modes={"local": journal_mode, "export": journal_mode})
+    registry = stores.new_managed_registry()
+    probes = _track_source_connections(monkeypatch)
+    temporary_files = []
+    real_mkstemp = tempfile.mkstemp
+
+    def record_mkstemp(*args, **kwargs):
+        descriptor, path = real_mkstemp(*args, **kwargs)
+        temporary_files.append((path, threading.get_ident()))
+        return descriptor, path
+
+    monkeypatch.setattr(tempfile, "mkstemp", record_mkstemp)
+    captures = []
+    try:
+        receipts = _register_fixture_sources(registry, stores, "local", "export")
+        captures.append(registry.capture().result(timeout=15))
+        captures.append(registry.capture().result(timeout=15))
+        first, second = captures
+        assert first.capture_id > 0 and second.capture_id > first.capture_id
+        assert [image.name for image in first.images] == ["export", "local"]
+        assert [image.registration_epoch for image in first.images] == [
+            receipts["export"].registration_epoch, receipts["local"].registration_epoch]
+        assert first.opening == first.closing
+        for image in first.images:
+            assert image.image_digest == hashlib.sha256(image.image).hexdigest()
+        assert len(temporary_files) == 4
+        assert all(not os.path.exists(path) for path, _thread in temporary_files)
+        assert {thread for _path, thread in temporary_files} == {
+            probe.connect_thread for probe in probes}
+        assert all(probe.backup_threads == [probe.connect_thread] * 2 for probe in probes)
+    finally:
+        for captured in captures:
+            registry.release_capture(captured.capture_id)
+        registry.close()
+        stores.close()
+
+
+def test_managed_router_submits_bound_captures_through_normal_entry_points(tmp_path):
+    """Frame and selected detail use actor captures with their admitted identity."""
+
+    from live_overview_support import LocalPositionStores, make_managed_router, wait_for_local_frame
+
+    with LocalPositionStores(tmp_path) as stores:
+        router = make_managed_router(stores.services["local"], _IdleClient(), AppRegistry())
+        try:
+            window = Window("range", BOOT, 10 * NS, 20 * NS)
+            router.prepare(window)
+            outcome = wait_for_local_frame(router)
+            assert isinstance(outcome, LocalFrameOutcome)
+            assert outcome.worker_id == router._frame.local_token.token_id
+            assert outcome.request == router._frame.local_token.request
+            assert router.ready(window)
+            assert router.frame_provenance(window).snapshot == outcome.snapshot
+            row, = router.ranking(window, "total_bytes")
+            router.select_detail(row.app_key, window)
+            for kind in ("totals", "series"):
+                router.request_detail(kind, row.app_id, window)
+                scope = retention_scope(row.app_key, window)
+                _drain_until(router, lambda: router.part_state(kind, row.app_key, scope).state == "ok")
+                record = router.retained(kind, row.app_key, scope, window.end_mono_ns)
+                assert record.provenance.snapshot is not None
+                assert record.provenance.snapshot.capture_id > outcome.snapshot.capture_id
+                assert record.value.window == window
+            assert router._capture_provider._capture_leases == {}
+        finally:
+            router.close()
+
+
+def test_reprepare_reaps_completed_capture_before_admitting_new_frame(tmp_path, monkeypatch):
+    """Replacing a completed capture submits only the new frame's worker."""
+
+    from live_overview_support import LocalPositionStores, make_managed_router, wait_for_local_frame
+
+    with LocalPositionStores(tmp_path) as stores:
+        router = make_managed_router(stores.services["local"], _IdleClient(), AppRegistry())
+        window = Window("range", BOOT, 10 * NS, 20 * NS)
+        release = threading.Event()
+        reader = router._read_local
+
+        def held_reader(capture, *args, **options):
+            assert release.wait(10)
+            return reader(capture, *args, **options)
+
+        monkeypatch.setattr(router, "_read_local", held_reader)
+        try:
+            router.prepare(window)
+            first = router._local_future.result(timeout=10)
+            first_worker = router._local_worker_id
+            router.prepare(window)
+            assert router._frame_jobs == {}, "reprepare submitted the obsolete captured frame"
+            assert first_worker not in router._capture_jobs
+            assert first.capture_id not in router._capture_provider._capture_leases
+            release.set()
+            outcome = wait_for_local_frame(router)
+            assert router.ready(window)
+            assert outcome.worker_id != first_worker
+            assert outcome.snapshot.capture_id > first.capture_id
+        finally:
+            release.set()
+            router.close()
+
+
+@pytest.mark.parametrize("owner", ["frame", "detail"])
+def test_managed_capture_failure_preserves_current_owner_error(tmp_path, monkeypatch, owner):
+    """Capture failure retains its original exception at the owner boundary."""
+
+    import appio.history_source as history_source
+    from live_overview_support import LocalPositionStores, make_managed_router, wait_for_local_frame
+
+    with LocalPositionStores(tmp_path) as stores:
+        router = make_managed_router(stores.services["local"], _IdleClient(), AppRegistry())
+        window = Window("range", BOOT, 10 * NS, 20 * NS)
+        error = sqlite3.OperationalError("snapshot validation cannot read schema")
+        try:
+            if owner == "detail":
+                router.prepare(window)
+                wait_for_local_frame(router)
+                assert router.ready(window)
+                row, = router.ranking(window, "total_bytes")
+                router.select_detail(row.app_key, window)
+
+            def invalid_image(connection):
+                raise error
+
+            monkeypatch.setattr(history_source, "validate_schema", invalid_image)
+            if owner == "frame":
+                router.prepare(window)
+                _drain_until(router, lambda: router._frame.error is not None)
+                with pytest.raises(Exception) as caught:
+                    router.ready(window)
+            else:
+                router.request_detail("totals", row.app_id, window)
+                scope = retention_scope(row.app_key, window)
+                _drain_until(router, lambda: router.part_state("totals", row.app_key, scope).state == "failed")
+                assert router.part_state("totals", row.app_key, scope).reason == str(error)
+                with pytest.raises(Exception) as caught:
+                    router.disk_share(row.app_id, window)
+            assert caught.value is error, "owner replaced the source operation failure"
+            assert router._capture_provider._capture_leases == {}
+        finally:
+            router.close()
+
+
+def test_observe_returns_without_waiting_for_held_capture(tmp_path, monkeypatch):
+    """A source-driven owner poll stays responsive while backup is held."""
+
+    import appio.history_source as history_source
+    from live_overview_support import LocalPositionStores
+
+    stores = LocalPositionStores(tmp_path)
+    registry = stores.new_managed_registry()
+    router = HistoryRouter(registry, _IdleClient(), AppRegistry())
+
+    entered, release, returned = threading.Event(), threading.Event(), threading.Event()
+    original_backup = history_source._backup_image
+    observations = []
+
+    def held_backup(connection, **options):
+        entered.set()
+        assert release.wait(5)
+        return original_backup(connection, **options)
+
+    def owner_poll():
+        try:
+            observations.append(router.source_position())
+        finally:
+            returned.set()
+
+    monkeypatch.setattr(history_source, "_backup_image", held_backup)
+    owner = None
+    try:
+        _register_fixture_sources(registry, stores, "local")
+        router.prepare(Window("range", BOOT, 10 * NS, 20 * NS))
+        capture = router._local_future
+        assert entered.wait(5)
+        owner = threading.Thread(target=owner_poll)
+        owner.start()
+        assert returned.wait(0.5), "owner observation waited behind the held backup"
+        assert observations[0].sources[0].name == "local"
+    finally:
+        release.set()
+        if owner is not None:
+            owner.join(timeout=5)
+        if "capture" in locals():
+            capture.result(timeout=10)
+        router.close()
+        registry.close()
+        stores.close()
+
+
+def test_capture_completed_after_close_reaps_unclaimed_lease(tmp_path, monkeypatch):
+    """Closing during backup leaves no consumer that can claim the result."""
+
+    import appio.history_source as history_source
+    from live_overview_support import LocalPositionStores
+
+    stores = LocalPositionStores(tmp_path)
+    registry = stores.new_managed_registry()
+    entered, release = threading.Event(), threading.Event()
+    original_backup = history_source._backup_image
+
+    def held_backup(connection, **options):
+        entered.set()
+        assert release.wait(5)
+        return original_backup(connection, **options)
+
+    monkeypatch.setattr(history_source, "_backup_image", held_backup)
+    captured = None
+    try:
+        _register_fixture_sources(registry, stores, "local")
+        actor = registry._active["local"].actor
+        capture = registry.capture()
+        assert entered.wait(5)
+        registry.close()
+        assert not actor.closed.done()
+        release.set()
+        captured = capture.result(timeout=10)
+        closed = threading.Event()
+        actor.closed.add_done_callback(lambda completed: closed.set())
+        assert closed.wait(1), "late capture kept its actor alive after registry close"
+        assert registry._capture_leases == {}
+    finally:
+        release.set()
+        if captured is not None and captured.capture_id in registry._capture_leases:
+            registry.release_capture(captured.capture_id)
+        registry.close()
+        stores.close()
+
+
+@pytest.mark.parametrize("owner", ["frame", "detail"])
+def test_managed_router_close_keeps_worker_lease_until_terminal_cleanup(tmp_path, monkeypatch, owner):
+    """A claimed capture survives close until its real worker terminates."""
+
+    from live_overview_support import (
+        LocalPositionStores, make_managed_router, wait_for_capture_admission, wait_for_local_frame,
+    )
+
+    with LocalPositionStores(tmp_path) as stores:
+        router = make_managed_router(stores.services["local"], _IdleClient(), AppRegistry())
+        sources = router._capture_provider
+        actor = sources._active["local"].actor
+        window = Window("range", BOOT, 10 * NS, 20 * NS)
+        entered, release = threading.Event(), threading.Event()
+        try:
+            if owner == "detail":
+                router.prepare(window)
+                wait_for_local_frame(router)
+                assert router.ready(window)
+                row, = router.ranking(window, "total_bytes")
+                router.select_detail(row.app_key, window)
+            method = "_read_local" if owner == "frame" else "_read_local_part"
+            reader = getattr(router, method)
+
+            def held_reader(capture, *args, **options):
+                entered.set()
+                assert release.wait(10)
+                return reader(capture, *args, **options)
+
+            monkeypatch.setattr(router, method, held_reader)
+            if owner == "frame":
+                router.prepare(window)
+            else:
+                router.request_detail("totals", row.app_id, window)
+            wait_for_capture_admission(router)
+            assert entered.wait(5)
+            future = (router._local_future if owner == "frame"
+                      else next(iter(router._worker_jobs.values()))[1])
+            router.close()
+            assert sources._capture_leases
+            assert not actor.closed.done()
+            release.set()
+            future.result(timeout=10)
+            actor.closed.result(timeout=5)
+            router.drain()
+            assert sources._capture_leases == {}
+            assert router._worker_jobs == {}
+            assert not router._ready
+        finally:
+            release.set()
+            router.close()
+
+
+def test_capture_preserves_original_sqlite_validation_failure(tmp_path, monkeypatch):
+    """An actor's exact SQLite diagnostic survives the capture Future."""
+
+    import appio.history_source as history_source
+    from live_overview_support import LocalPositionStores
+
+    stores = LocalPositionStores(tmp_path)
+    registry = stores.new_managed_registry()
+    error = sqlite3.OperationalError("private image schema read failed")
+    try:
+        _register_fixture_sources(registry, stores, "local")
+
+        def invalid_image(connection):
+            raise error
+
+        monkeypatch.setattr(history_source, "validate_schema", invalid_image)
+        with pytest.raises(Exception) as caught:
+            registry.capture().result(timeout=10)
+        assert caught.value is error, "capture replaced the underlying SQLite failure"
+        assert str(caught.value) == "private image schema read failed"
+        assert registry._capture_leases == {}
+    finally:
+        registry.close()
+        stores.close()
+
+
+def test_capture_busy_source_obeys_injected_deadline(tmp_path):
+    """A locked observer fails within the registry's finite capture deadline."""
+
+    from appio.history_source import ManagedSourceRegistry
+    from live_overview_support import LocalPositionStores
+
+    stores = LocalPositionStores(tmp_path, journal_modes={"local": "DELETE"})
+    clock_reads = []
+
+    def injected_clock():
+        value = time.monotonic_ns()
+        clock_reads.append(value)
+        return value
+
+    registry = ManagedSourceRegistry(
+        wake=lambda: None, clock_ns=injected_clock, busy_timeout_ns=50_000_000)
+    writer = stores.writers["local"]
+    try:
+        _register_fixture_sources(registry, stores, "local")
+        clock_count = len(clock_reads)
+        writer.execute("BEGIN EXCLUSIVE")
+        started = time.monotonic()
+        with pytest.raises(Exception) as caught:
+            registry.capture().result(timeout=2)
+        assert isinstance(caught.value, sqlite3.OperationalError)
+        assert str(caught.value) == "database is locked"
+        assert time.monotonic() - started < 1.0
+        assert len(clock_reads) > clock_count + 1
+    finally:
+        writer.rollback()
+        registry.close()
+        stores.close()
+
+
+def test_capture_lease_retains_retired_source_until_dependents_drain(tmp_path, monkeypatch):
+    """Retirement ends authority while admitted workers still hold the actor."""
+
+    from live_overview_support import LocalPositionStores
+    from appio.history_source import SourceAdmissionError
+
+    stores = LocalPositionStores(tmp_path)
+    registry = stores.new_managed_registry()
+    probes = _track_source_connections(monkeypatch)
+    try:
+        _register_fixture_sources(registry, stores, "local")
+        capture = registry.capture().result(timeout=10)
+        registry.retain_capture(capture.capture_id)
+        registry.retire("local", "dependent work remains")
+        with pytest.raises(SourceAdmissionError):
+            registry.observe()
+        replacement = registry.register(stores.managed_spec("local", owner="iod"))
+        assert not probes[0].closed.wait(0.1)
+        assert not replacement.done()
+        registry.release_capture(capture.capture_id)
+        assert not probes[0].closed.wait(0.1)
+        assert not replacement.done()
+        registry.release_capture(capture.capture_id)
+        assert probes[0].closed.wait(5)
+        assert replacement.result(timeout=10).registration_epoch > capture.images[0].registration_epoch
+    finally:
+        registry.close()
+        stores.close()
+
+
+def test_capture_retirement_waits_for_admitted_capture(tmp_path, monkeypatch):
+    """An admitted capture completes before retirement closes its actor."""
+
+    import appio.history_source as history_source
+    from live_overview_support import LocalPositionStores
+    from appio.history_source import SourceAdmissionError
+    from appio.history_types import CapturedSourceSet
+
+    stores = LocalPositionStores(tmp_path)
+    registry = stores.new_managed_registry()
+    entered = threading.Event()
+    release = threading.Event()
+    original_backup = history_source._backup_image
+
+    def blocked_backup(connection, **options):
+        entered.set()
+        if not release.wait(5):
+            raise TimeoutError("test did not release source backup")
+        return original_backup(connection, **options)
+
+    monkeypatch.setattr(history_source, "_backup_image", blocked_backup)
+    try:
+        _register_fixture_sources(registry, stores, "local")
+        capture = registry.capture()
+        assert entered.wait(5)
+
+        registry.retire("local", "capture lease test")
+        release.set()
+
+        captured = capture.result(timeout=10)
+        assert isinstance(captured, CapturedSourceSet)
+        assert captured.images[0].name == "local"
+        with pytest.raises(SourceAdmissionError):
+            registry.observe()
+        registry.release_capture(captured.capture_id)
+    finally:
+        release.set()
+        registry.close()
+        stores.close()
+
+
+def test_capture_serializes_registration_lifecycle(tmp_path, monkeypatch):
+    """A source admitted during capture waits until the complete capture ends."""
+
+    import appio.history_source as history_source
+    from live_overview_support import LocalPositionStores
+    from appio.history_types import CapturedSourceSet
+
+    stores = LocalPositionStores(tmp_path)
+    registry = stores.new_managed_registry()
+    entered = threading.Event()
+    release = threading.Event()
+    original_backup = history_source._backup_image
+
+    def blocked_backup(connection, **options):
+        entered.set()
+        if not release.wait(5):
+            raise TimeoutError("test did not release source backup")
+        return original_backup(connection, **options)
+
+    monkeypatch.setattr(history_source, "_backup_image", blocked_backup)
+    original_start = history_source._SourceActor.start
+    start_calls = []
+
+    def record_start(actor):
+        start_calls.append(actor.spec.name)
+        return original_start(actor)
+
+    monkeypatch.setattr(history_source._SourceActor, "start", record_start)
+    try:
+        _register_fixture_sources(registry, stores, "local")
+        start_calls.clear()
+        capture = registry.capture()
+        assert entered.wait(5)
+
+        registration = registry.register(stores.managed_spec("export", owner="iod"))
+        assert start_calls == []
+        assert not registration.done()
+
+        release.set()
+        captured = capture.result(timeout=10)
+        assert isinstance(captured, CapturedSourceSet)
+        assert tuple(position.name for position in captured.opening.sources) == ("local",)
+        assert tuple(position.name for position in captured.closing.sources) == ("local",)
+        assert tuple(image.name for image in captured.images) == ("local",)
+        assert registration.result(timeout=10).name == "export"
+        assert start_calls == ["export"]
+        assert tuple(position.name for position in registry.observe().sources) == (
+            "export", "local")
+        registry.release_capture(captured.capture_id)
+    finally:
+        release.set()
+        registry.close()
+        stores.close()
+
+
+def test_managed_source_forwards_cached_statements_option(tmp_path, monkeypatch):
+    """Admission passes the validated statement-cache size to sqlite3.connect."""
+
+    import appio.history_source as history_source
+    from live_overview_support import LocalPositionStores
+
+    stores = LocalPositionStores(tmp_path)
+    registry = stores.new_managed_registry()
+    original_connect = history_source.sqlite3.connect
+    captured_options = []
+
+    def connect(database, *args, **options):
+        if isinstance(database, str) and database.startswith("file:"):
+            captured_options.append(dict(options))
+        return original_connect(database, *args, **options)
+
+    monkeypatch.setattr(history_source.sqlite3, "connect", connect)
+    spec = stores.managed_spec("local", owner="iod")
+    spec = replace(spec, connect_options=(("cached_statements", "0"),))
+    try:
+        registry.register(spec).result(timeout=10)
+        assert captured_options == [{
+            "uri": True,
+            "isolation_level": None,
+            "check_same_thread": True,
+            "cached_statements": 0,
+        }]
+    finally:
+        registry.close()
+        stores.close()
+
+
+@pytest.mark.parametrize(
+    "action_name",
+    tuple(
+        name for name in (
+            "SQLITE_CREATE_INDEX",
+            "SQLITE_CREATE_TABLE",
+            "SQLITE_CREATE_TEMP_INDEX",
+            "SQLITE_CREATE_TEMP_TABLE",
+            "SQLITE_CREATE_TEMP_TRIGGER",
+            "SQLITE_CREATE_TEMP_VIEW",
+            "SQLITE_CREATE_TRIGGER",
+            "SQLITE_CREATE_VIEW",
+            "SQLITE_CREATE_VTABLE",
+            "SQLITE_DROP_INDEX",
+            "SQLITE_DROP_TABLE",
+            "SQLITE_DROP_VTABLE",
+            "SQLITE_DROP_TEMP_INDEX",
+            "SQLITE_DROP_TEMP_TABLE",
+            "SQLITE_DROP_TEMP_TRIGGER",
+            "SQLITE_DROP_TEMP_VIEW",
+            "SQLITE_DROP_TRIGGER",
+            "SQLITE_DROP_VIEW",
+            "SQLITE_ALTER_TABLE",
+        )
+        if hasattr(sqlite3, name)
+    ),
+)
+def test_read_only_authorizer_denies_virtual_table_schema_actions(action_name):
+    """The authorizer independently rejects every schema mutation action."""
+
+    from appio.history_source import _read_only_authorizer
+
+    action = getattr(sqlite3, action_name)
+    assert _read_only_authorizer(action, "table", None, "main", None) == (
+        sqlite3.SQLITE_DENY)
+
+
+def test_local_vector_observes_each_registered_connection_without_hashing(
+        tmp_path, monkeypatch):
+    """Observe every persistent actor connection with one constant SQL read."""
+
+    from live_overview_support import LocalPositionStores
+    from appio.history_types import LocalPositionVector
+
+    stores = LocalPositionStores(tmp_path)
+    registry = stores.new_managed_registry()
+    probes = _track_source_connections(monkeypatch)
+    try:
+        receipts = _register_fixture_sources(registry, stores, "local", "export")
+        assert tuple(receipts) == ("local", "export")
+        assert len(probes) == 2
+        assert all(receipt.status == "active" for receipt in receipts.values())
+
+        for probe in probes:
+            probe.sql.clear()
+            probe.execute_threads.clear()
+
+        first = registry.observe_async().result(timeout=10)
+        second = registry.observe_async().result(timeout=10)
+        assert isinstance(first, LocalPositionVector)
+        assert tuple(position.name for position in first.sources) == ("export", "local")
+        assert second == first
+        assert {position.owner for position in first.sources} == {"iod"}
+        assert len({position.registration_epoch for position in first.sources}) == 2
+        assert all(position.data_version >= 1 for position in first.sources)
+        assert all(position.total_changes == 0 for position in first.sources)
+
+        for probe in probes:
+            assert probe.sql == ["PRAGMA main.data_version"] * 2
+            assert len(set(probe.execute_threads)) == 1
+            assert probe.execute_threads[0] == probe.connect_thread
+            assert probe.authorizer_thread == probe.connect_thread
+        assert len({probe.connect_thread for probe in probes}) == 2
+
+        registry.close()
+        for probe in probes:
+            assert probe.closed.wait(5)
+            assert probe.close_thread == probe.connect_thread
+    finally:
+        registry.close()
+        stores.close()
+
+
+def test_local_vector_changes_for_every_existing_commit_path(tmp_path, monkeypatch):
+    """Committed changes move only the source token for the changed database."""
+
+    from live_overview_support import LocalPositionStores
+
+    stores = LocalPositionStores(
+        tmp_path, journal_modes={"local": "DELETE", "export": "WAL"})
+    registry = stores.new_managed_registry()
+    probes = _track_source_connections(monkeypatch)
+    try:
+        _register_fixture_sources(registry, stores, "local", "export")
+
+        def positions():
+            vector = registry.observe_async().result(timeout=10)
+            return {position.name: position for position in vector.sources}
+
+        def committed_change(name, operation):
+            before = positions()
+            operation()
+            after = positions()
+            assert set(after) == {"local", "export"}
+            assert after[name].registration_epoch == before[name].registration_epoch
+            assert after[name].data_version > before[name].data_version
+            other = "export" if name == "local" else "local"
+            assert after[other] == before[other]
+            return after
+
+        local = stores.stores["local"].connection
+        old_sample = local.execute(
+            "SELECT boot_id, source, epoch, seq, app_id, launch_id, ts_mono_ns "
+            "FROM sample ORDER BY observed_mono_ns, ts_mono_ns LIMIT 1").fetchone()
+        assert old_sample is not None
+
+        def delete_old_sample():
+            local.execute(
+                "DELETE FROM sample WHERE boot_id=? AND source=? AND epoch=? AND seq=? "
+                "AND app_id=? AND launch_id=? AND ts_mono_ns=?", old_sample)
+            local.commit()
+
+        deleted = committed_change("local", delete_old_sample)
+
+        def update_external_export():
+            writer = stores.writers["export"]
+            writer.execute(
+                "UPDATE boot SET started_wall=started_wall+1 WHERE boot_id='boot-a'")
+            writer.commit()
+
+        updated = committed_change("export", update_external_export)
+        assert updated["local"] == deleted["local"]
+
+        def update_local_in_place():
+            local.execute(
+                "UPDATE collector_epoch SET epoch=epoch+1 WHERE source='gui'")
+            local.commit()
+
+        changed_local = committed_change("local", update_local_in_place)
+        assert changed_local["export"] == updated["export"]
+
+        writer = stores.writers["export"]
+        before_rollback = positions()
+        writer.execute(
+            "UPDATE boot SET started_wall=started_wall+1 WHERE boot_id='boot-a'")
+        assert writer.in_transaction
+        while_uncommitted = positions()
+        assert while_uncommitted == before_rollback
+        writer.rollback()
+        assert not writer.in_transaction
+        assert positions() == before_rollback
+    finally:
+        registry.close()
+        for probe in probes:
+            assert probe.closed.wait(5)
+        stores.close()
+
+
+def test_local_registration_add_remove_replace_and_reopen_never_repeat_token(
+        tmp_path, monkeypatch):
+    """Every registration incarnation receives a globally fresh epoch."""
+
+    from concurrent.futures import Future
+    from dataclasses import fields
+    from live_overview_support import LocalPositionStores
+    from appio.history_source import ManagedSourceRegistry, SourceAdmissionError
+    from appio.history_types import ManagedSourceSpec
+
+    stores = LocalPositionStores(tmp_path)
+    registry = stores.new_managed_registry()
+    probes = _track_source_connections(monkeypatch)
+    spec = stores.managed_spec("local", owner="iod")
+    bad_path = tmp_path / "invalid-source.db"
+    sqlite3.connect(bad_path).close()
+    invalid = ManagedSourceSpec(
+        "local", "iod", bad_path.as_uri() + "?mode=ro", ())
+    epochs = []
+    try:
+        first_future = registry.register(spec)
+        assert isinstance(first_future, Future)
+        first = first_future.result(timeout=10)
+        epochs.append(first.registration_epoch)
+        assert tuple(field.name for field in fields(first)) == (
+            "name", "owner", "registration_epoch", "status")
+        assert first.status == "active"
+        assert not any(hasattr(first, name) for name in (
+            "connection", "database_uri", "path", "actor"))
+
+        initial = registry.observe().sources[0]
+        replaced = registry.replace("local", spec).result(timeout=10)
+        epochs.append(replaced.registration_epoch)
+        replacement_position = registry.observe().sources[0]
+        assert replaced.registration_epoch > first.registration_epoch
+        assert replacement_position.registration_epoch == replaced.registration_epoch
+        assert (replacement_position.data_version, replacement_position.total_changes) == (
+            initial.data_version, initial.total_changes)
+
+        failed = registry.replace("local", invalid)
+        with pytest.raises(ValueError, match="schema validation requires user_version"):
+            failed.result(timeout=10)
+        with pytest.raises(SourceAdmissionError):
+            registry.observe()
+
+        recovered = registry.register(spec).result(timeout=10)
+        epochs.append(recovered.registration_epoch)
+        assert recovered.registration_epoch > replaced.registration_epoch
+        registry.retire("local", "test retirement")
+        with pytest.raises(SourceAdmissionError):
+            registry.observe()
+
+        reopened = registry.register(spec).result(timeout=10)
+        epochs.append(reopened.registration_epoch)
+        assert reopened.registration_epoch > recovered.registration_epoch
+        replaced_again = registry.replace("local", spec).result(timeout=10)
+        epochs.append(replaced_again.registration_epoch)
+        assert replaced_again.registration_epoch > reopened.registration_epoch
+
+        closing_probe = probes[-1]
+        close_release = threading.Event()
+        closing_probe.close_release = close_release
+        cancelled = registry.replace("local", spec)
+        assert closing_probe.close_entered.wait(5)
+        registry.retire("local", "cancel queued replacement")
+        close_release.set()
+        with pytest.raises(SourceAdmissionError):
+            cancelled.result(timeout=10)
+        with pytest.raises(SourceAdmissionError):
+            registry.observe()
+
+        after_cancel = registry.register(spec).result(timeout=10)
+        epochs.append(after_cancel.registration_epoch)
+        assert after_cancel.registration_epoch > replaced_again.registration_epoch
+        assert len(epochs) == len(set(epochs))
+        assert all(later > earlier for earlier, later in zip(epochs, epochs[1:]))
+
+        registry.close()
+        for probe in probes:
+            assert probe.closed.wait(5)
+        reopened_registry = ManagedSourceRegistry(wake=lambda: None)
+        reopened_again = reopened_registry.register(spec).result(timeout=10)
+        assert reopened_again.registration_epoch > after_cancel.registration_epoch
+        reopened_registry.close()
+        assert probes[-1].closed.wait(5)
+    finally:
+        for probe in probes:
+            if probe.close_release is not None:
+                probe.close_release.set()
+        registry.close()
+        stores.close()
+
+
+def test_retire_during_pending_registration_waits_for_actor_close(tmp_path, monkeypatch):
+    """A reentrant retry cannot open while the retired actor is still starting."""
+
+    from live_overview_support import LocalPositionStores
+    from appio.history_source import _SourceActor
+
+    stores = LocalPositionStores(tmp_path)
+    registry = stores.new_managed_registry()
+    connection_entered = threading.Event()
+    probes = _track_source_connections(
+        monkeypatch, block_first_authorizer=True, connection_entered=connection_entered)
+    started_epochs = []
+    closed_before_start = []
+    original_start = _SourceActor.start
+
+    def record_start(actor):
+        if started_epochs:
+            closed_before_start.append(probes[0].closed.is_set())
+        started_epochs.append(actor.registration_epoch)
+        original_start(actor)
+
+    monkeypatch.setattr(_SourceActor, "start", record_start)
+    spec = stores.managed_spec("local", owner="iod")
+    retry_futures = []
+    try:
+        pending = registry.register(spec)
+        assert connection_entered.wait(5)
+        assert probes[0].authorizer_entered.wait(5)
+        pending.add_done_callback(
+            lambda _completed: retry_futures.append(registry.register(spec)))
+
+        registry.retire("local", "retired during admission")
+        assert pending.done()
+        assert len(started_epochs) == 1
+
+        probes[0].authorizer_release.set()
+        receipt = retry_futures[0].result(timeout=10)
+        assert receipt.registration_epoch == started_epochs[1]
+        assert closed_before_start == [True]
+        assert probes[0].closed.wait(5)
+    finally:
+        for probe in probes:
+            probe.authorizer_release.set()
+        registry.close()
+        for probe in probes:
+            probe.closed.wait(5)
+        stores.close()
+
+
+def test_local_observations_require_committed_registered_connections(tmp_path, monkeypatch):
+    """Actors refuse transactional observations and enforce read-only capture."""
+
+    import hashlib
+    from live_overview_support import LocalPositionStores
+    from appio.history_source import SourceAdmissionError
+    from appio.history_types import CapturedSourceSet, ManagedSourceSpec
+
+    stores = LocalPositionStores(
+        tmp_path, journal_modes={"local": "DELETE", "export": "WAL"})
+    registry = stores.new_managed_registry()
+    probes = _track_source_connections(monkeypatch, attempt_write=True)
+    try:
+        _register_fixture_sources(registry, stores, "local")
+        assert len(probes) == 1
+        probe = probes[0]
+        assert probe.write_error is not None
+        assert "not authorized" in probe.write_error.lower()
+
+        before = registry.observe_async().result(timeout=10)
+
+        writer = stores.writers["local"]
+        writer.execute("UPDATE app SET name='pending' WHERE app_id=1")
+        while_writer_transaction = registry.observe_async().result(timeout=10)
+        assert writer.in_transaction
+        assert while_writer_transaction == before
+        assert writer.execute("SELECT name FROM app WHERE app_id=1").fetchone()[0] == "pending"
+        writer.rollback()
+        assert not writer.in_transaction
+        assert registry.observe_async().result(timeout=10) == before
+
+        writer.execute("UPDATE app SET name='committed' WHERE app_id=1")
+        writer.commit()
+        committed = registry.observe_async().result(timeout=10)
+        assert committed.sources[0].data_version > before.sources[0].data_version
+
+        captured = registry.capture().result(timeout=15)
+        assert isinstance(captured, CapturedSourceSet)
+        assert captured.opening.sources[0].name == "local"
+        assert captured.closing.sources[0].name == "local"
+        assert captured.images[0].image_digest == hashlib.sha256(
+            captured.images[0].image).hexdigest()
+        assert probes[0].backup_threads == [probes[0].connect_thread]
+        assert len(captured.snapshot_digest) == 64
+        assert all(character in "0123456789abcdef"
+                   for character in captured.snapshot_digest)
+
+        image_path = tmp_path / "captured.sqlite"
+        image_path.write_bytes(captured.images[0].image)
+        image_connection = sqlite3.connect(image_path)
+        try:
+            assert image_connection.execute(
+                "SELECT name FROM app WHERE app_id=1").fetchone()[0] == "committed"
+        finally:
+            image_connection.close()
+            image_path.unlink()
+        registry.release_capture(captured.capture_id)
+
+        gui_spec = ManagedSourceSpec(
+            "primary", "gui", stores.paths["local"].as_uri() + "?mode=ro", ())
+        receipt = registry.register(gui_spec).result(timeout=5)
+        assert receipt.owner == "gui"
+        assert registry._active["primary"].actor._writer is None
+
+        memory_spec = ManagedSourceSpec(
+            "memory", "iod", "file::memory:?mode=memory&cache=shared", ())
+        with pytest.raises(SourceAdmissionError):
+            registry.register(memory_spec).result(timeout=5)
+        supported_option = ManagedSourceSpec(
+            "option", "iod", stores.paths["local"].as_uri() + "?mode=ro",
+            (("isolation_level", "DEFERRED"),))
+        option_receipt = registry.register(supported_option).result(timeout=5)
+        assert option_receipt.name == "option"
+        registry.retire("option", "option test")
+
+        probe.begin_transaction_on_next_check = True
+        prior_sql = len(probe.sql)
+        with pytest.raises(SourceAdmissionError, match="uncommitted transaction"):
+            registry.observe_async().result(timeout=10)
+        assert len(probe.sql) == prior_sql
+        assert probe.transaction_opened
+        registry.close()
+        assert probe.closed.wait(5)
+    finally:
+        registry.close()
+        for probe in probes:
+            probe.closed.wait(5)
+        stores.close()
+
+
+def test_managed_frame_worker_uses_private_verified_snapshot(tmp_path, monkeypatch):
+    """A frame worker receives immutable capture bytes and removes its file."""
+
+    from concurrent.futures import ThreadPoolExecutor
+    import hashlib
+    import tempfile
+    from live_overview_support import LocalPositionStores
+    from appio.history_types import LocalBracket, SnapshotProvenance
+
+    stores = LocalPositionStores(tmp_path)
+    registry = stores.new_managed_registry()
+    files = []
+    actual_mkstemp = tempfile.mkstemp
+    actual_ranking = QueryService.ranking
+    worker_threads = []
+    detail_calls = []
+    try:
+        _register_fixture_sources(registry, stores, "local")
+        captured = registry.capture().result(timeout=15)
+
+        def tracked_file(*args, **kwargs):
+            descriptor, path = actual_mkstemp(*args, **kwargs)
+            files.append((path, threading.get_ident()))
+            return descriptor, path
+
+        def tracked_ranking(service, *args, **kwargs):
+            worker_threads.append(threading.get_ident())
+            return actual_ranking(service, *args, **kwargs)
+
+        monkeypatch.setattr(tempfile, "mkstemp", tracked_file)
+        monkeypatch.setattr(QueryService, "ranking", tracked_ranking)
+        monkeypatch.setattr(QueryService, "disk_share", lambda *args: detail_calls.append("totals"))
+        monkeypatch.setattr(QueryService, "series", lambda *args: detail_calls.append("series"))
+        window = Window("range", BOOT, 10 * NS, 20 * NS)
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            result = executor.submit(
+                HistoryRouter._read_local, captured, window,
+                worker_id=17, request=QueryRequest("ranking", window)).result(timeout=15)
+        assert result.worker_id == 17
+        assert result.request == QueryRequest("ranking", window)
+        assert result.snapshot == SnapshotProvenance(
+            captured.capture_id, captured.snapshot_digest,
+            LocalBracket(captured.opening, captured.closing))
+        assert {row.app_key for row in result.ranking} == {"scope:/session/unknown"}
+        assert detail_calls == []
+        assert worker_threads and all(thread != threading.get_ident() for thread in worker_threads)
+        assert files and {thread for _path, thread in files} == set(worker_threads)
+        assert all(not os.path.exists(path) for path, _thread in files)
+        assert hashlib.sha256(captured.images[0].image).hexdigest() == captured.images[0].image_digest
+    finally:
+        if "captured" in locals():
+            registry.release_capture(captured.capture_id)
+        registry.close()
+        stores.close()
+
+
+@pytest.mark.parametrize("kind", ["totals", "series"])
+def test_managed_detail_worker_uses_capture_provenance(tmp_path, monkeypatch, kind):
+    from live_overview_support import LocalPositionStores
+    from appio.history_types import LocalBracket, SnapshotProvenance
+
+    stores = LocalPositionStores(tmp_path)
+    registry = stores.new_managed_registry()
+    try:
+        _register_fixture_sources(registry, stores, "local")
+        captured = registry.capture().result(timeout=15)
+        key = "scope:/session/unknown"
+        window = Window("range", BOOT, 10 * NS, 20 * NS)
+        request = QueryRequest(kind, window, key)
+        calls = []
+        for method in ("disk_share", "series"):
+            original = getattr(QueryService, method)
+
+            def tracked(service, app_id, requested_window, *, name=method, call=original):
+                row = service.connection.execute(
+                    "SELECT key FROM app WHERE app_id=?", (app_id,)).fetchone()
+                calls.append((name, row[0], requested_window))
+                return call(service, app_id, requested_window)
+
+            monkeypatch.setattr(QueryService, method, tracked)
+        outcome = HistoryRouter._read_local_part(
+            captured, request, worker_id=9, app_key=key)
+        assert calls == [("disk_share" if kind == "totals" else "series", key, window)]
+        assert outcome.worker_id == 9
+        assert outcome.request == request
+        assert outcome.app_key == key
+        assert outcome.data_digest == local_answer_digest(kind, key, window, outcome.value)
+        assert outcome.snapshot == SnapshotProvenance(
+            captured.capture_id, captured.snapshot_digest,
+            LocalBracket(captured.opening, captured.closing))
+    finally:
+        if "captured" in locals():
+            registry.release_capture(captured.capture_id)
+        registry.close()
+        stores.close()
+
+
+def _assert_one_managed_replacement(harness, captured):
+    """Hold a real replacement worker and observe the shell's coalescing gate."""
+
+    from live_overview_support import wait_for_capture_admission, wait_for_local_frame
+
+    router = harness.router
+    window = router._frame.window
+    replacement_started = threading.Event()
+    replacement_release = threading.Event()
+    reader = router._read_local
+    replacements = []
+
+    def held_replacement(capture, window, **binding):
+        replacements.append(capture)
+        replacement_started.set()
+        assert replacement_release.wait(10), "replacement worker barrier timed out"
+        return reader(capture, window, **binding)
+
+    router._read_local = held_replacement
+    try:
+        harness.ordinary_refresh()
+        wait_for_capture_admission(router)
+        assert replacement_started.wait(5)
+        for _ in range(3):
+            harness.ordinary_refresh()
+            harness.poll()
+        assert sum(event[0] == "prepare" for event in harness.events) == 2
+        assert len(replacements) == 1
+        replacement_release.set()
+        outcome = wait_for_local_frame(router)
+        harness.poll()
+        certificate = router.frame_provenance(window)
+        assert certificate.certified
+        assert certificate.snapshot == outcome.snapshot
+        assert certificate.snapshot.capture_id == replacements[0].capture_id
+        assert certificate.snapshot.capture_id > captured.capture_id
+        harness.ordinary_refresh()
+        assert sum(event[0] == "prepare" for event in harness.events) == 2
+        assert not any(event[0] in ("query", "send") for event in harness.events)
+    finally:
+        replacement_release.set()
+        router._read_local = reader
+
+
+def _capture_commit_schedule(tmp_path, monkeypatch, journal_mode, stage):
+    """Drive production preparation and actor backup around an external commit."""
+
+    from live_overview_support import LiveOverviewHarness, wait_for_local_frame
+    import appio.history_source as history_source
+
+    _track_source_connections(monkeypatch)
+    harness = LiveOverviewHarness(tmp_path, journal_modes={"local": journal_mode})
+    router = harness.router
+    router.client = _IdleClient()
+    registry = router._capture_provider
+    primary_observer = registry._active["local"].actor._connection
+    entered = threading.Event()
+    release = threading.Event()
+    try:
+        if stage == "during":
+            original_backup = _SourceConnectionProbe.backup
+
+            def backup(probe, target, **options):
+                original_progress = options["progress"]
+
+                def progress(status, remaining, total):
+                    if probe is primary_observer and status == sqlite3.SQLITE_OK and not entered.is_set():
+                        entered.set()
+                        assert release.wait(10), "backup barrier timed out"
+                    original_progress(status, remaining, total)
+
+                options["pages"] = 1
+                options["progress"] = progress
+                return original_backup(probe, target, **options)
+
+            monkeypatch.setattr(_SourceConnectionProbe, "backup", backup)
+        elif stage == "after_backup":
+            original_backup = history_source._backup_image
+
+            def backup(connection, **options):
+                image = original_backup(connection, **options)
+                if connection is primary_observer and not entered.is_set():
+                    entered.set()
+                    assert release.wait(10), "closing-read barrier timed out"
+                return image
+
+            monkeypatch.setattr(history_source, "_backup_image", backup)
+        window = Window("since_boot", BOOT, end_mono_ns=110 * NS)
+        harness.request(window)
+        capture_future = router._local_future
+        if stage != "after_closing":
+            assert entered.wait(10)
+            harness.stores.commit("local", "UPDATE app SET name=? WHERE app_id=1", ("changed",))
+            release.set()
+        captured = capture_future.result(timeout=15)
+        if stage == "after_closing":
+            harness.stores.commit("local", "UPDATE app SET name=? WHERE app_id=1", ("changed",))
+        next_position = registry.observe_async().result(timeout=10)
+        outcome = wait_for_local_frame(router)
+        assert outcome.snapshot.capture_id == captured.capture_id
+        assert outcome.worker_id == router._frame.local_token.token_id
+        harness.poll()
+        certificate = router.frame_provenance(window)
+        assert certificate.snapshot == outcome.snapshot
+        assert sum(event[0] == "apply" for event in harness.events) == 1
+        assert primary_observer.backup_threads[0] == primary_observer.connect_thread
+        if stage != "after_closing":
+            _assert_one_managed_replacement(harness, captured)
+        return captured, certificate, next_position
+    finally:
+        release.set()
+        harness.close()
+
+
+@pytest.mark.parametrize("journal_mode", ["DELETE", "WAL"])
+def test_commit_during_backup_is_uncertified_with_one_replacement(tmp_path, monkeypatch, journal_mode):
+    captured, certificate, observed = _capture_commit_schedule(
+        tmp_path, monkeypatch, journal_mode, "during")
+    assert captured.opening != captured.closing
+    assert certificate.snapshot.bracket == LocalBracket(captured.opening, captured.closing)
+    assert certificate.answered_source is None and not certificate.certified
+    assert observed == captured.closing
+
+
+@pytest.mark.parametrize("journal_mode", ["DELETE", "WAL"])
+def test_commit_after_backup_before_closing_read_is_uncertified(tmp_path, monkeypatch, journal_mode):
+    captured, certificate, observed = _capture_commit_schedule(
+        tmp_path, monkeypatch, journal_mode, "after_backup")
+    assert captured.opening != captured.closing
+    assert certificate.answered_source is None and not certificate.certified
+    assert observed == captured.closing
+
+
+@pytest.mark.parametrize("journal_mode", ["DELETE", "WAL"])
+def test_commit_after_closing_read_is_caught_by_next_comparison(tmp_path, monkeypatch, journal_mode):
+    captured, certificate, observed = _capture_commit_schedule(
+        tmp_path, monkeypatch, journal_mode, "after_closing")
+    assert captured.opening == captured.closing
+    assert certificate.answered_source == captured.opening and certificate.certified
+    assert observed != certificate.answered_source
+
+
+def test_remote_frame_fallback_keeps_local_snapshot_evidence(tmp_path):
+    from types import SimpleNamespace
+    from live_overview_support import LocalPositionStores
+
+    stores = LocalPositionStores(tmp_path)
+    registry = stores.new_managed_registry()
+    try:
+        _register_fixture_sources(registry, stores, "local")
+        captured = registry.capture().result(timeout=15)
+        window = Window("range", BOOT, 10 * NS, 20 * NS)
+        outcome = HistoryRouter._read_local(
+            captured, window, worker_id=1, request=QueryRequest("ranking", window))
+        bracket = outcome.snapshot.bracket
+        router = object.__new__(HistoryRouter)
+        router._frame = SimpleNamespace(
+            owner_id=1, window=window, requested_source=RemotePosition(BOOT, 1, 5),
+            local_bracket=bracket, local_settled=True, remote_token=None,
+            retired=False, certificate=None, answered_source=None,
+            ranking_provenance={})
+        router._ready = False
+        router._remote = None
+        router._ranking = list(outcome.ranking)
+        router._ranking_stamps = {}
+        router._clock_ns = time.monotonic_ns
+        router._local_settlement = LocalSettlement(1, capture=captured, outcome=outcome)
+        router._not_retained = outcome.not_retained
+        router._gap_ranges = list(outcome.gaps)
+        router._chronology_unproved = outcome.chronology_unproved
+        assert router._finish_frame_if_terminal()
+        certificate = router._frame.certificate
+        assert certificate.answered_source == captured.opening
+        assert certificate.snapshot == outcome.snapshot
+        assert not certificate.certified
+        assert all(item.snapshot == outcome.snapshot
+                   for item in router._frame.ranking_provenance.values())
+    finally:
+        if "captured" in locals():
+            registry.release_capture(captured.capture_id)
+        registry.close()
+        stores.close()
+
+
+def test_frame_outcome_rejects_foreign_capture_binding(tmp_path):
+    from types import SimpleNamespace
+    from live_overview_support import LocalPositionStores
+
+    stores = LocalPositionStores(tmp_path)
+    registry = stores.new_managed_registry()
+    try:
+        _register_fixture_sources(registry, stores, "local")
+        captured = registry.capture().result(timeout=15)
+        window = Window("range", BOOT, 10 * NS, 20 * NS)
+        request = QueryRequest("ranking", window)
+        outcome = HistoryRouter._read_local(captured, window, worker_id=7, request=request)
+        binding = SimpleNamespace(worker_id=7, request=request, snapshot=outcome.snapshot)
+        assert HistoryRouter._admitted_frame_outcome(None, outcome, binding) is outcome
+        for forged_snapshot in (
+            replace(outcome.snapshot, capture_id=captured.capture_id + 1),
+            replace(outcome.snapshot, snapshot_digest="f" * 64),
+        ):
+            with pytest.raises(ValueError, match="snapshot"):
+                HistoryRouter._admitted_frame_outcome(
+                    None, replace(outcome, snapshot=forged_snapshot), binding)
+    finally:
+        if "captured" in locals():
+            registry.release_capture(captured.capture_id)
+        registry.close()
+        stores.close()
+
+
+def test_detail_settlement_rejects_foreign_capture_before_publication(tmp_path):
+    from types import SimpleNamespace
+    from live_overview_support import LocalPositionStores
+
+    stores = LocalPositionStores(tmp_path)
+    registry = stores.new_managed_registry()
+    try:
+        receipt = _register_fixture_sources(registry, stores, "local")["local"]
+        captured = registry.capture().result(timeout=15)
+        key = "scope:/session/unknown"
+        window = Window("range", BOOT, 10 * NS, 20 * NS)
+        request = QueryRequest("totals", window, key)
+        outcome = HistoryRouter._read_local_part(captured, request, worker_id=7, app_key=key)
+        token = RequestToken(
+            7, request, "local", retention_scope(key, window), "detail", 1, None,
+            ("local", (("local", "iod", receipt.registration_epoch),)), captured.opening)
+        binding = SimpleNamespace(
+            token_id=7, worker_id=7, request=request, opening=captured.opening,
+            snapshot=outcome.snapshot)
+        router = object.__new__(HistoryRouter)
+        router._worker_bindings = {7: binding}
+        router._files_bindings = {}
+        router.registry = AppRegistry()
+        published = []
+        rejected = []
+        router._publish_detail = lambda *args, **kwargs: published.append((args, kwargs)) or True
+        router._reject_token = lambda *args: rejected.append(args) or False
+        forged = replace(outcome, snapshot=replace(outcome.snapshot, capture_id=outcome.snapshot.capture_id + 1))
+        assert not router._settle_local(
+            token, LocalSettlement(7, capture=captured, outcome=forged))
+        assert len(rejected) == 1 and published == []
+        assert router._settle_local(
+            token, LocalSettlement(7, capture=captured, outcome=outcome))
+        assert len(published) == 1
+        assert published[0][1]["snapshot"] == outcome.snapshot
+
+        # A completed worker can remain queued after its capture lease is
+        # released and the same source name is registered with a new epoch.
+        published.clear()
+        rejected.clear()
+        registry.release_capture(captured.capture_id)
+        capture_released = True
+        replacement = registry.replace(
+            "local", stores.managed_spec("local", owner="iod")).result(timeout=10)
+        assert replacement.registration_epoch > receipt.registration_epoch
+        router._capture_provider = registry
+        assert not router._settle_local(
+            token, LocalSettlement(7, capture=captured, outcome=outcome))
+        assert len(rejected) == 1
+        assert published == [], "retired source completion must not publish"
+    finally:
+        if "captured" in locals() and not locals().get("capture_released", False):
+            registry.release_capture(captured.capture_id)
+        registry.close()
+        stores.close()
+
+
+def test_managed_frame_worker_refuses_forged_capture_image(tmp_path):
+    from live_overview_support import LocalPositionStores
+
+    stores = LocalPositionStores(tmp_path)
+    registry = stores.new_managed_registry()
+    try:
+        _register_fixture_sources(registry, stores, "local")
+        captured = registry.capture().result(timeout=15)
+        forged = copy.copy(captured.images[0])
+        object.__setattr__(forged, "image", forged.image + b"corrupt")
+        altered = copy.copy(captured)
+        object.__setattr__(altered, "images", (forged,))
+        with pytest.raises(ValueError, match="digest"):
+            HistoryRouter._read_local(
+                altered, Window("lifetime"), worker_id=1,
+                request=QueryRequest("ranking", Window("lifetime")))
+    finally:
+        if "captured" in locals():
+            registry.release_capture(captured.capture_id)
+        registry.close()
+        stores.close()
+
+
+def test_local_frame_rejects_a_foreign_worker_binding(tmp_path):
+    """A frame result publishes only under its exact admitted worker binding.
+
+    The copy worker receives the admitted worker id and request with its paths,
+    so its outcome already carries them; consumption never relabels a foreign
+    result. A mismatched worker identity and a mismatched request each fail
+    before the owner publishes any routing fact or closing bracket for that
+    result, and a later clean frame still publishes normally (§3.4, §4.3).
+    """
+
+    history, local, imported = _source_router(tmp_path)
+    scope = Window("range", BOOT, 100 * NS, 140 * NS)
+    try:
+        for corrupt, expected in (("worker", "worker"), ("request", "request")):
+            history.prepare(scope)
+            admitted = history._local_worker_id
+            outcome = wait_worker(history)
+            assert isinstance(outcome, LocalFrameOutcome)
+            # The submitted worker answers under its own admission; a matching
+            # default id would only be a consumer rewrite of a foreign result.
+            assert outcome.worker_id == admitted
+            assert outcome.request == QueryRequest("ranking", scope)
+            forged = replace(
+                outcome,
+                worker_id=admitted + 900 if corrupt == "worker" else admitted,
+                request=(outcome.request if corrupt == "worker"
+                         else QueryRequest("ranking", Window("lifetime"))),
+            )
+            future = Future()
+            future.set_result(forged)
+            history._local_future = future
+            with pytest.raises(ValueError, match=expected):
+                history.ready(scope)
+            assert history._ranking == []
+            assert history.view_state == "unavailable: local history evidence"
+            assert isinstance(history._local_settlement.error, ValueError)
+
+        # The rejection does not strand the lane: the next frame publishes under
+        # its own admitted binding.
+        history.prepare(scope)
+        admitted = history._local_worker_id
+        assert isinstance(wait_local(history), LocalFrameOutcome)
+        assert history.ready(scope) is True
+        assert history._local_settlement.outcome.worker_id == admitted
+        assert history.local_position("local").name == "local"
+    finally:
+        history.close()
+        local.connection.close()
+        imported.connection.close()
+
+
+# ---------------------------------------------------------------------------
+# Authority retirement, scope-owned detail and the sole settlement writer
+# (§§2.4, 3.1–3.4, 5.1, 12.2)
+# ---------------------------------------------------------------------------
+
+
+class _BoundClient:
+    """A verified answering client whose Futures carry real transport states.
+
+    Every Future is bound to its normalized request before it can settle, as
+    the production client's observation seam does, so a settlement arm fails
+    only for the single fault a test names.
+    """
+
+    def __init__(self, *, boot=BOOT, epoch=3, seq=7, clock=None):
+        self.clock = Clock(50) if clock is None else clock
+        self.cursor = StreamCursor(boot, epoch, seq)
+        self.state = ClientState(
+            verified=True, answering=True, cursor=self.cursor,
+            capabilities=Capabilities(proc_all=True, dev_stat=True,
+                                      file_io=True, bpf_loaded=True))
+        self._generation = 0
+        self._serial = 0
+        self.requests = []
+        self.rejected = []
+        self.retired = []
+        self._records = {}
+
+    @property
+    def generation(self):
+        return self._generation
+
+    def source(self):
+        return RemotePosition(self.cursor.boot_id, self.cursor.iod_epoch, self.cursor.seq)
+
+    def query(self, request):
+        normalized = _normalize_request(request)
+        future = Future()
+        self._serial += 1
+        self._records[future] = {
+            "request": normalized,
+            "connection_generation": self._generation,
+            "request_id": f"q{self._generation}-{self._serial}",
+            "phase": "active",
+            "issued_at_ns": self.clock(),
+            "issued_source": self.source(),
+            "answered_source": None,
+        }
+        self.requests.append((normalized, future))
+        return future
+
+    def query_transport(self, future):
+        try:
+            record = self._records[future]
+        except KeyError:
+            raise ValueError("this Future is not bound to a client query") from None
+        return QueryTransportState(**record)
+
+    def retire_query_connection(self, future):
+        record = self._records[future]
+        if record["phase"] not in ("active", "expired") or record["request_id"] is None:
+            return False
+        record["phase"] = "lost"
+        self._generation += 1
+        self.retired.append(future)
+        return True
+
+    def reject_query_result(self, future):
+        if future not in self._records:
+            raise ValueError("this Future is not bound to a client query")
+        self.rejected.append(future)
+
+    def settle(self, future, value):
+        record = self._records[future]
+        record["phase"] = "terminal"
+        record["answered_source"] = record["issued_source"]
+        future.set_result(value)
+
+    def fail(self, future, error):
+        record = self._records[future]
+        record["phase"] = "terminal"
+        record["answered_source"] = None
+        future.set_exception(error)
+
+    def corrupt(self, future, **changes):
+        self._records[future].update(changes)
+
+    def expire(self, future):
+        self._records[future]["phase"] = "expired"
+
+    def held(self, kind):
+        return [
+            future for request, future in self.requests
+            if request.kind == kind and not future.done()
+        ]
+
+    def only(self, kind):
+        futures = self.held(kind)
+        assert len(futures) == 1, f"expected exactly one held {kind} query, saw {len(futures)}"
+        return futures[0]
+
+
+def _empty_router(tmp_path, client, *, name):
+    store = AppIoStore(tmp_path / name)
+    store.connection.commit()
+    from live_overview_support import make_managed_router
+
+    router = make_managed_router(QueryService(store), client, AppRegistry(), clock_ns=client.clock)
+
+    return router, store
+
+
+def wait_local(router):
+    from live_overview_support import wait_for_local_frame
+
+    return wait_for_local_frame(router)
+
+
+def wait_worker(router):
+    import time
+
+    deadline = time.monotonic() + 20
+    while router._capture_jobs:
+        router.drain()
+        assert time.monotonic() < deadline
+        time.sleep(0.001)
+    future = router._local_future
+    assert future is not None
+    return future.result(timeout=20)
+
+
+def _remote_frame(router, client, window, *, key=KEY, app_id=17):
+    """Prepare one remote-ranking frame and settle its local ownership evidence."""
+
+    router.prepare(window)
+    assert router._local_future is not None
+    wait_local(router)
+    future = client.only("ranking")
+    client.settle(future, {
+        "kind": "ranking",
+        "result": [total(app_id, key)],
+        "snapshot": DIGEST,
+        "next_cursor": None,
+    })
+    assert router.ready(window) is True
+    return router.registry.id_for(key)
+
+
+def _totals_response(key=KEY, *, window, value=None, snapshot=DIGEST, kind="totals"):
+    response = {
+        "kind": kind,
+        "result": share(1, window) if value is None else value,
+        "snapshot": snapshot,
+        "next_cursor": None,
+    }
+    if key is not None:
+        response["app_key"] = key
+    return response
+
+
+def test_range_end_change_retires_router_and_exact_adapter_lifetimes(tmp_path):
+    from appio.ui.main_window import _ExactDetailAdapter
+    from live_overview_support import ExactOnlyQuery
+
+    client = _BoundClient()
+    router, store = _empty_router(tmp_path, client, name="range-end.db")
+    window_a = Window("range", BOOT, 0, 140 * NS)
+    window_b = Window("range", BOOT, 0, 180 * NS)
+    try:
+        app_id = _remote_frame(router, client, window_a)
+        router.select_detail(KEY, window_a)
+        router.request_detail("totals", app_id, window_a)
+        client.settle(client.only("totals"), _totals_response(window=window_a))
+        router.drain()
+        assert router.retained(
+            "totals", KEY, retention_scope(KEY, window_a), window_a.end_mono_ns
+        ) is not None
+        lifetime_id = router._detail.lifetime_id
+        router.select_detail(KEY, window_b)
+        assert router._detail.lifetime_id != lifetime_id, (
+            "same-start range end change reused the router lifetime"
+        )
+        assert router.retained(
+            "totals", KEY, retention_scope(KEY, window_b), window_b.end_mono_ns
+        ) is None, "router retained range A under range B"
+    finally:
+        router.close()
+        store.connection.close()
+
+    service = ExactOnlyQuery([total(1, KEY)])
+    service.set_share(window_a, share(1, window_a))
+    service.set_pending("totals", 1, window_b)
+    adapter = _ExactDetailAdapter(service, clock_ns=Clock(), authority_epoch=1)
+    adapter.capture_ranking(service.ranking(window_a, "total_bytes"), window_a)
+    adapter.select_detail(KEY, window_a)
+    assert adapter.request_detail("totals", 1, window_a).state == "ok"
+    adapter.capture_ranking(service.ranking(window_b, "total_bytes"), window_b)
+    adapter.select_detail(KEY, window_b)
+    assert adapter.request_detail("totals", 1, window_b).state == "pending"
+    adapter_record = adapter.retained(
+        "totals", KEY, retention_scope(KEY, window_b), window_b.end_mono_ns
+    )
+    assert adapter_record is None, "exact-only adapter retained range A under range B"
+
+
+def test_reaccepted_router_ranking_identity_preserves_stamp(tmp_path):
+    client = _BoundClient(clock=Clock(NS))
+    router, store = _empty_router(tmp_path, client, name="ranking-stamp.db")
+    window = Window("since_boot", BOOT, end_mono_ns=140 * NS)
+    try:
+        _remote_frame(router, client, window)
+        router.select_detail(KEY, window)
+        first = router.ranking_provenance(KEY, window)
+        assert first is not None
+        client.clock.advance_ns(2 * NS)
+        _remote_frame(router, client, window)
+        second = router.ranking_provenance(KEY, window)
+        assert second is not None
+        assert second.accepted_identity == first.accepted_identity
+        assert second.first_seen_at_ns == first.first_seen_at_ns, (
+            "identical accepted ranking identity was restamped"
+        )
+    finally:
+        router.close()
+        store.connection.close()
+
+
+def test_remote_settlement_requires_original_bound_future(tmp_path):
+    client = _BoundClient()
+    router, store = _empty_router(tmp_path, client, name="foreign-future.db")
+    window = Window("since_boot", BOOT, end_mono_ns=140 * NS)
+    try:
+        app_id = _remote_frame(router, client, window)
+        router.select_detail(KEY, window)
+        router.request_detail("totals", app_id, window)
+        token, bound_future = router._occupant
+        foreign = client.query(token.request)
+        response = _totals_response(window=window)
+        client.settle(foreign, response)
+        assert not bound_future.done()
+        assert router._settle(
+            token, RemoteSettlement(foreign, response=foreign.result())
+        ) is True
+        state = router.part_state("totals", KEY, retention_scope(KEY, window))
+        assert state.state == "failed" and state.reason == "invalid_result", (
+            "a same-selector foreign Future published for the current token"
+        )
+    finally:
+        router.close()
+        store.connection.close()
+
+
+def test_applied_ranking_provenance_survives_pending_replacement(tmp_path, qtbot):
+    from appio.ui.main_window import AppIoWindow
+    from appio.ui.render_model import oldest_answer_age
+
+    client = _BoundClient()
+    router, store = _empty_router(tmp_path, client, name="ranking-view.db")
+    window_a = Window("since_boot", BOOT, end_mono_ns=140 * NS)
+    replacement_digest = "b" * 64
+    view = None
+    try:
+        router.prepare(window_a)
+        wait_local(router)
+        client.settle(client.only("ranking"), {
+            "kind": "ranking",
+            "result": [total(17, KEY, peak=12)],
+            "snapshot": DIGEST,
+            "next_cursor": None,
+        })
+        assert router.ready(window_a)
+        view = AppIoWindow(router, clock_ns=client.clock)
+        qtbot.addWidget(view)
+        view.set_window(window_a)
+        original = view._overview_model.ranking_provenance
+        assert original is not None and original.accepted_identity is not None
+        assert oldest_answer_age(
+            view.measurement_status().displayed_answers, client.clock()
+        ) == "oldest answer 0 s ago"
+
+        for kind in ("series", "totals"):
+            future = client.only(kind)
+            value = (
+                _totals_response(
+                    window=window_a, kind="series", value=series(17, window_a)
+                )
+                if kind == "series"
+                else _totals_response(window=window_a)
+            )
+            client.settle(future, value)
+            router.drain()
+        view.refresh_measurements()
+        assert view._overview_model.kpis[0].text == "22 B"
+
+        router.prepare(window_a)
+        wait_local(router)
+        client.settle(client.only("ranking"), {
+            "kind": "ranking",
+            "result": [total(17, KEY, peak=99)],
+            "snapshot": replacement_digest,
+            "next_cursor": None,
+        })
+        assert router.ready(window_a)
+        replacement = router._frame.ranking_provenance[KEY]
+        assert replacement.accepted_identity != original.accepted_identity
+        assert router.ranking_provenance(KEY, window_a) == original
+        assert view._overview_model.kpis[0].text == "22 B"
+
+        view.refresh_measurements()
+        current = view._overview_model.ranking_provenance
+        assert current == original, (
+            "completed same-window replacement discarded applied ranking provenance"
+        )
+        assert view._overview_model.kpis[0].text == "22 B"
+
+        view.set_window(window_a)
+        applied = view._overview_model.ranking_provenance
+        assert applied == replacement
+        assert applied != original
+    finally:
+        if view is not None:
+            view.close()
+        router.close()
+        store.connection.close()
+
+
+def test_background_future_stays_charged_until_terminal_drain(tmp_path, monkeypatch):
+    import queue
+    from live_overview_support import (
+        LocalPositionStores,
+        make_managed_router,
+        wait_for_capture_admission,
+    )
+
+    with LocalPositionStores(tmp_path) as stores:
+        router = make_managed_router(
+            stores.services["local"], _IdleClient(), AppRegistry()
+        )
+        window = Window("range", "boot-a", 10 * NS, 20 * NS)
+        entered = threading.Event()
+        release_compute = threading.Event()
+        queued = threading.Event()
+        release_put = threading.Event()
+        inner = queue.SimpleQueue()
+        original = router._read_local_part
+        held_future = None
+        token_id = None
+
+        class CompletionQueue:
+            def put(self, item):
+                inner.put(item)
+                queued.set()
+                assert release_put.wait(10), "completion publication was not released"
+
+            def get_nowait(self):
+                return inner.get_nowait()
+
+            def empty(self):
+                return inner.empty()
+
+        def held_computation(*args, **kwargs):
+            entered.set()
+            assert release_compute.wait(10), "detail computation was not released"
+            return original(*args, **kwargs)
+
+        try:
+            router.prepare(window)
+            wait_local(router)
+            assert router.ready(window)
+            row = router.ranking(window, "total_bytes")[0]
+            router.select_detail(row.app_key, window)
+            monkeypatch.setattr(router, "_completed", CompletionQueue())
+            monkeypatch.setattr(router, "_read_local_part", held_computation)
+            router.request_detail("totals", row.app_id, window)
+            wait_for_capture_admission(router)
+            assert entered.wait(5)
+            token_id, (_, held_future) = next(iter(router._worker_jobs.items()))
+            release_compute.set()
+            assert queued.wait(5)
+            router.drain()
+            assert router.retained(
+                "totals", row.app_key,
+                retention_scope(row.app_key, window), window.end_mono_ns
+            ) is not None
+            assert token_id in router._worker_jobs
+            router.request_detail("totals", row.app_id, window)
+            router.request_detail("series", row.app_id, window)
+            wait_for_capture_admission(router)
+            actual_futures = [held_future] + [
+                future for _, future in router._worker_jobs.values() if future is not None
+            ]
+            assert sum(not future.done() for future in actual_futures) <= 2, (
+                "the detail lane exceeded its two-Future bound"
+            )
+        finally:
+            release_compute.set()
+            release_put.set()
+            if held_future is not None:
+                held_future.result(timeout=5)
+            router.drain()
+            if token_id is not None:
+                assert token_id not in router._worker_jobs
+            router.close()
+
+
+def _file_coverage(window):
+    """One complete file-coverage envelope, for a wrong-variant coverage arm."""
+
+    overflow = UnknownOwnerOverflow(window, "overflow_owner_unknown", 0, 0, 0, coverage())
+    return FileCoverage(
+        1, window,
+        0, 0, 0, 0, 0, 0,
+        0, 0, 0,
+        HookHits(0, 0, 0, 0, 0, 0),
+        0, 0,
+        overflow, coverage(),
+    )
+
+
+def test_settlement_rejects_each_selector_shape_or_binding_violation(tmp_path):
+    """Each single selector/binding fault is a current invalid_result, never absent.
+
+    The malformed process-coverage arms are the two separate mappings from
+    §12.3 plus their passing control; every arm settles through its real
+    associated Future, so no arm can pass by fabricating a router record.
+    """
+
+    client = _BoundClient()
+    router, store = _empty_router(tmp_path, client, name="settlement.db")
+    window = Window("since_boot", BOOT, end_mono_ns=140 * NS)
+    other = Window("since_boot", BOOT, end_mono_ns=150 * NS)
+    try:
+        presentation = _remote_frame(router, client, window)
+        router.select_detail(KEY, window)
+        scope = retention_scope(KEY, window)
+
+        def admit(kind="totals"):
+            state = router.request_detail(kind, presentation, window)
+            assert state.state == "pending"
+            return client.only(kind)
+
+        def assert_failed(future, label):
+            assert router.part_state("totals", KEY, scope).state == "failed", label
+            assert router.part_state("totals", KEY, scope).reason == "invalid_result", label
+            assert router.retained("totals", KEY, scope, window.end_mono_ns) is None, label
+            assert client.rejected and client.rejected[-1] is future, label
+
+        arms = (
+            ("wrong kind", _totals_response(KEY, window=window, kind="series",
+                                            value=series(1, window))),
+            ("wrong external key", _totals_response(OTHER_KEY, window=window)),
+            ("wrong window", _totals_response(KEY, window=window, value=share(1, other))),
+            ("coverage for totals", _totals_response(KEY, window=window, value=coverage())),
+        )
+        for label, response in arms:
+            future = admit()
+            client.settle(future, response)
+            assert router.drain() is True, label
+            assert_failed(future, label)
+
+        # The bound transport must carry this exact normalized request.
+        future = admit()
+        client.corrupt(future, request=_normalize_request(
+            QueryRequest("series", window, KEY)))
+        client.settle(future, _totals_response(KEY, window=window))
+        assert router.drain() is True
+        assert_failed(future, "wrong request association")
+
+        # A duplicate ranking identity is a frame-ranking rejection, and the
+        # rejected candidate is evicted before any notification.
+        router.prepare(window)
+        wait_local(router)
+        duplicate = client.only("ranking")
+
+        client.settle(duplicate, {
+            "kind": "ranking",
+            "result": [total(17, KEY), total(18, KEY)],
+            "snapshot": DIGEST,
+            "next_cursor": None,
+        })
+        assert router.ready(window) is True
+        assert router._remote is None
+        assert router.daemon_answer_error is not None
+        assert router.daemon_answer_error.kind == "rejected"
+        assert router.daemon_answer_error.reason == "invalid_result"
+        assert client.rejected[-1] is duplicate
+
+        # Coverage selectors are validated at the same settlement boundary. A
+        # frame owns at most one remote token per owner/generation context.
+        frame = router._frame
+        serial = [0]
+
+        def publication_state():
+            return (
+                router._remote,
+                tuple(router._ranking),
+                router.daemon_answer_error,
+                router.view_state,
+                router.frame_provenance(window),
+                frame.remote_candidate,
+                frame.remote_applied,
+                frame.remote_settled,
+                frame.certificate,
+            )
+
+        def coverage_arm(request, result, label, *, rejected):
+            serial[0] += 1
+            token = RequestToken(
+                900 + serial[0], request, "remote", None, "frame",
+                frame.owner_id, 500 + serial[0], frame.authority,
+                frame.requested_source)
+            future = client.query(request)
+            transport = client.query_transport(future)
+            router._remote_futures[token.token_id] = future
+            router._remote_issue_sources[token.token_id] = transport.issued_source
+            client.settle(future, {
+                "kind": "coverage", "result": result, "snapshot": DIGEST,
+                "next_cursor": None,
+            })
+            before = publication_state()
+            settled = router._settle(
+                token, RemoteSettlement(future, response=future.result()))
+            assert settled is False, label
+            assert publication_state() == before, label
+            if rejected:
+                assert client.rejected[-1] is future, label
+            return future
+
+        process = QueryRequest("coverage", window, None, coverage_kind="process")
+        coverage_arm(process, _file_coverage(window), "file coverage in process slot",
+                     rejected=True)
+        coverage_arm(process, coverage(), "scalar in unscoped process slot", rejected=True)
+        coverage_arm(
+            process, {"unit:/alpha.service": coverage()},
+            "key-only unscoped process mapping", rejected=True)
+        coverage_arm(
+            process, {"unit:alpha.service": "not a Coverage"},
+            "value-only unscoped process mapping", rejected=True)
+        control = coverage_arm(
+            process, {"unit:alpha.service": coverage()},
+            "valid unscoped process mapping", rejected=False)
+        assert control not in client.rejected
+
+        unknown = QueryRequest("coverage", window, None, coverage_kind="unknown_owner")
+        coverage_arm(unknown, coverage(), "invalid UnknownOwnerOverflow", rejected=True)
+    finally:
+        router.close()
+        store.connection.close()
+
+
+def test_settlement_superseded_or_duplicate_has_no_publication_effect(tmp_path):
+    """Stale or duplicate outcomes never mutate a record, stamp or marker.
+
+    Covers a superseded frame generation, a dead detail lifetime under changed
+    connection authority, subject/scope/boot retirement, and a second
+    settlement after success and after failure; only the matching terminal wire
+    slot is released.
+    """
+
+    client = _BoundClient()
+    router, store = _empty_router(tmp_path, client, name="superseded.db")
+    window = Window("since_boot", BOOT, end_mono_ns=140 * NS)
+    scope = retention_scope(KEY, window)
+    try:
+        presentation = _remote_frame(router, client, window)
+
+        # A superseded frame generation cannot publish its delayed ranking.
+        router.prepare(window)
+        stale_ranking = client.only("ranking")
+        wait_local(router)
+        router.prepare(window)
+        client.settle(stale_ranking, {
+            "kind": "ranking", "result": [total(17, KEY)], "snapshot": DIGEST,
+            "next_cursor": None,
+        })
+        assert router.drain() is False
+        assert router._remote is None
+        assert router.frame_provenance(window) is None
+        # Complete the replacement frame so the wire is free for the detail arm.
+        wait_local(router)
+        client.settle(client.only("ranking"), {
+            "kind": "ranking", "result": [total(17, KEY)], "snapshot": DIGEST,
+            "next_cursor": None,
+        })
+        assert router.ready(window) is True
+
+        # A dead detail lifetime cannot publish a delayed success.
+        router.select_detail(KEY, window)
+        state = router.request_detail("totals", presentation, window)
+        stale_token = router._detail.live["totals"]
+        stale_future = client.only("totals")
+        router.select_detail(None, None)
+        client.settle(stale_future, _totals_response(KEY, window=window))
+        router.drain()
+        assert router.retained("totals", KEY, scope, window.end_mono_ns) is None
+        assert router.part_state("totals", KEY, scope).state == "absent"
+        assert router._occupant is None  # the terminal wire slot was released
+
+        # A connection-authority change retires the lifetime before the old
+        # answer can publish.
+        router.select_detail(KEY, window)
+        router.request_detail("totals", presentation, window)
+        old_future = client.only("totals")
+        client._generation += 1
+        client.settle(old_future, _totals_response(KEY, window=window))
+        router.drain()
+        assert router.retained("totals", KEY, scope, window.end_mono_ns) is None
+        assert router.part_state("totals", KEY, scope).state == "absent"
+        assert router._occupant is None
+
+        # Subject and scope retirement behave the same way.
+        for retire in (
+            lambda: router.select_detail(OTHER_KEY, window),
+            lambda: router.select_detail(KEY, Window("range", BOOT, 0, 140 * NS)),
+            lambda: router.select_detail(KEY, Window("since_boot", "boot-b",
+                                                     end_mono_ns=140 * NS)),
+        ):
+            router.select_detail(KEY, window)
+            router.request_detail("totals", presentation, window)
+            future = client.only("totals")
+            retire()
+            client.settle(future, _totals_response(KEY, window=window))
+            router.drain()
+            assert router.retained("totals", KEY, scope, window.end_mono_ns) is None
+            assert router._occupant is None
+
+        # Duplicate settlement after success: same record, same stamp, no change.
+        router.select_detail(KEY, window)
+        router.request_detail("totals", presentation, window)
+        accepted = router._detail.live["totals"]
+        future = client.only("totals")
+        client.settle(future, _totals_response(KEY, window=window))
+        assert router.drain() is True
+        record = router.retained("totals", KEY, scope, window.end_mono_ns)
+        assert record is not None
+        stamp = record.provenance.first_seen_at_ns
+        assert router._settle(accepted, RemoteSettlement(future, response=future.result())) is False
+        assert router.retained("totals", KEY, scope, window.end_mono_ns) is record
+        assert record.provenance.first_seen_at_ns == stamp
+
+        # Duplicate settlement after failure: the failed slot is unchanged.
+        router.request_detail("totals", presentation, window)
+        failed_token = router._detail.live["totals"]
+        failed_future = client.only("totals")
+        error = RemoteError("daemon_error", "collector exploded")
+        client.fail(failed_future, error)
+        assert router.drain() is True
+        failed = router.part_state("totals", KEY, scope)
+        assert failed.state == "failed" and failed.reason == "collector exploded"
+        assert router._settle(
+            failed_token, RemoteSettlement(failed_future, error=error)) is False
+        assert router.part_state("totals", KEY, scope) == failed
+        assert stale_token.token_id != accepted.token_id
+        assert router.pending_work is False
+    finally:
+        router.close()
+        store.connection.close()
+
+
+def test_held_local_detail_accepts_once_after_forward_frames(tmp_path, qtbot, monkeypatch):
+    """A held local detail keeps its lifetime while forward frames settle."""
+
+    from live_overview_support import LocalPositionStores, _DeliveryQueue, make_managed_router
+
+    with LocalPositionStores(tmp_path) as stores:
+        router = make_managed_router(
+            stores.services["local"], _LocalCountingClient(), AppRegistry())
+        stores.attach(router)
+        delivery = _DeliveryQueue(router._completed)
+        router._completed = delivery
+        with delivery.lock:
+            delivery.held.add("totals")
+        window_a = Window("since_boot", BOOT, end_mono_ns=140 * NS)
+        window_b = Window("since_boot", BOOT, end_mono_ns=180 * NS)
+        window_c = Window("since_boot", BOOT, end_mono_ns=220 * NS)
+        scope = retention_scope(KEY, window_a)
+        settlements = []
+        settle_impl = router._settle
+
+        def settle_spy(token, outcome=None, *, retiring=False):
+            changed = settle_impl(token, outcome, retiring=retiring)
+            if token.owner == "detail":
+                settlements.append((token.token_id, retiring, changed))
+            return changed
+
+        router._settle = settle_spy
+        try:
+            router.prepare(window_a)
+            assert isinstance(wait_local(router), LocalFrameOutcome)
+            assert router.ready(window_a) is True
+            presentation = router.registry.id_for(KEY)
+            router.select_detail(KEY, window_a)
+
+            state = router.request_detail("totals", presentation, window_a)
+            token_id = state.request_id
+            _drain_until(router, delivery.entered.is_set)
+            assert state.state == "pending"
+            assert router._detail.live["totals"].token_id == token_id
+
+            for forward in (window_b, window_c):
+                router.prepare(forward)
+                assert isinstance(wait_local(router), LocalFrameOutcome)
+                assert router.ready(forward) is True
+                assert router._detail.live["totals"].token_id == token_id
+                assert router.part_state("totals", KEY, scope).state == "pending"
+
+            delivery.release("totals")
+            _drain_until(
+                router,
+                lambda: router.part_state("totals", KEY, scope).state != "pending",
+            )
+            state = router.part_state("totals", KEY, scope)
+            record = router.retained("totals", KEY, scope, window_c.end_mono_ns)
+            assert state.state == "ok"
+            assert state.request_id == token_id
+            assert record is not None
+            assert record.value.window == window_a
+            assert [entry for entry in settlements if entry[0] == token_id] == [
+                (token_id, False, True)
+            ]
+        finally:
+            delivery.release("totals")
+            del router._settle
+            router.close()
+
+    from appio.ui.collector_window import CollectorWindow
+    from test_collector_window import ControlledCoordinator, ControlledSetup
+    from live_overview_support import wait_for_capture_admission
+
+    with LocalPositionStores(tmp_path) as stores:
+        router = make_managed_router(stores.services["local"], _LocalCountingClient(), AppRegistry())
+        entered, release = threading.Event(), threading.Event()
+        successor_release = threading.Event()
+        original = router._read_local_part
+        completed = []
+
+        def held_computation(capture, request, **options):
+            if request.kind == "totals":
+                if request.window == window_a:
+                    entered.set()
+                    assert release.wait(20), "held detail computation was not released"
+                else:
+                    assert successor_release.wait(20), "successor computation was not released"
+            result = original(capture, request, **options)
+            completed.append((request.kind, request.window, result.data_digest))
+            return result
+
+        monkeypatch.setattr(router, "_read_local_part", held_computation)
+        shell = CollectorWindow(ControlledCoordinator(), router, ControlledSetup(),
+                                clock_ns=lambda: 100 * NS)
+        qtbot.addWidget(shell)
+        shell._timer.stop()
+        shell._poll_timer.stop()
+        window_a = Window("since_boot", "boot-a", end_mono_ns=20 * NS)
+        window_b = Window("since_boot", "boot-a", end_mono_ns=30 * NS)
+        scope = retention_scope(KEY, window_a)
+        try:
+            shell.show_window(window_a)
+            wait_local(router)
+            assert shell.apply_ready_frame()
+            wait_for_capture_admission(router)
+            _drain_until(router, entered.is_set)
+            original_token = router._detail.live["totals"]
+            selected_key = original_token.request.app_key
+            scope = retention_scope(selected_key, window_a)
+            assert not release.is_set()
+            shell.show_window(window_b)
+            wait_local(router)
+            assert router.ready(window_b)
+            assert shell.apply_ready_frame()
+            assert shell._displayed == window_b, "frame did not apply while detail computation was held"
+            assert not release.is_set()
+            assert router._detail.live["totals"] is original_token
+            release.set()
+            _drain_until(router, lambda: router.retained(
+                "totals", selected_key, scope, window_b.end_mono_ns) is not None)
+            record = router.retained("totals", selected_key, scope, window_b.end_mono_ns)
+            assert record is not None
+            assert record.value.window == window_a
+            assert record.provenance.accepted_identity.data_digest == local_answer_digest(
+                "totals", selected_key, window_a, record.value)
+            assert len([item for item in completed if item[:2] == ("totals", window_a)]) == 1
+        finally:
+            release.set()
+            successor_release.set()
+            shell.shutdown()
+
+
+def test_scope_owned_detail_survives_forward_frame_generations(tmp_path):
+    """Detail belongs to its selected scope, not to one preparing frame.
+
+    An ordinary forward preparation neither cancels the pending owner nor
+    relabels its delayed answer; the exact A window remains readable through
+    the retained accessor while B is applied/pending.
+    """
+
+    client = _BoundClient()
+    router, store = _empty_router(tmp_path, client, name="scope-owned.db")
+    window_a = Window("since_boot", BOOT, end_mono_ns=140 * NS)
+    window_b = Window("since_boot", BOOT, end_mono_ns=180 * NS)
+    scope_a = retention_scope(KEY, window_a)
+    scope_b = retention_scope(KEY, window_b)
+    try:
+        presentation = _remote_frame(router, client, window_a)
+        router.select_detail(KEY, window_a)
+        state_a = router.request_detail("totals", presentation, window_a)
+        assert state_a.state == "pending"
+        owner = state_a.request_id
+        pending_future = client.only("totals")
+
+        router.prepare(window_b)
+        assert router._detail.live["totals"].request.window == window_a
+        assert router.part_state("totals", KEY, scope_a).request_id == owner
+        assert router.part_state("totals", KEY, scope_a).state == "pending"
+        # A since-boot retention scope carries its boot, not a moving endpoint:
+        # both applied windows share one slot and one owner.
+        assert scope_a == scope_b
+        assert router.part_state("totals", KEY, scope_b).requested_window == window_a
+
+        client.settle(pending_future, _totals_response(KEY, window=window_a, value=share(1, window_a, read=91)))
+        assert router.drain() is True
+
+        record = router.retained("totals", KEY, scope_b, window_b.end_mono_ns)
+        assert record is not None
+        assert record.value.window == window_a
+        assert record.value.task_read_bytes == 91
+        assert record.provenance.measured_window == window_a
+        assert record.provenance.accepted_identity.window == window_a
+        assert router.part_state("totals", KEY, scope_a).state == "ok"
+        assert router.part_state("totals", KEY, scope_a).request_id == owner
+
+        with pytest.raises(HistoryPending):
+            router.disk_share(presentation, window_b)
+        assert router.retained("totals", KEY, scope_b, window_b.end_mono_ns) == record
+        wait_local(router)
+
+        # A record survives an ordinary preparation too; only adoption of a
+        # changed scope retires it.
+        router.prepare(window_b)
+        assert router.retained("totals", KEY, scope_b, window_b.end_mono_ns) == record
+        router.select_detail(KEY, window_b)
+        assert router.retained("totals", KEY, scope_b, window_b.end_mono_ns) == record
+        assert router.part_state("totals", KEY, scope_b).state == "ok"
+        with pytest.raises(HistoryPending):
+            router.disk_share(presentation, window_b)
+        assert router.retained("totals", KEY, scope_b, window_b.end_mono_ns) == record
+    finally:
+        router.close()
+        store.connection.close()
+
+
+@pytest.mark.parametrize(
+    "fault",
+    ["remote_error", "window_unavailable", "connection_lost", "query_timeout",
+     "invalid_result"],
+)
+def test_current_detail_failure_clears_record_before_view_notification(tmp_path, fault):
+    """A current failure clears the record before the drain batch notifies.
+
+    RemoteError, WindowUnavailableError, an authority-current injected
+    ConnectionLost, query_timeout and invalid_result each preserve their own
+    exception/reason; a pending retry cannot restore the record.
+    """
+
+    client = _BoundClient()
+    router, store = _empty_router(tmp_path, client, name=f"failure-{fault}.db")
+    window = Window("since_boot", BOOT, end_mono_ns=140 * NS)
+    scope = retention_scope(KEY, window)
+    try:
+        presentation = _remote_frame(router, client, window)
+        router.select_detail(KEY, window)
+        router.request_detail("totals", presentation, window)
+        first = client.only("totals")
+        client.settle(first, _totals_response(KEY, window=window))
+        assert router.drain() is True
+        assert router.retained("totals", KEY, scope, window.end_mono_ns) is not None
+
+        observed = []
+        original_notify = router._notify
+
+        def notify():
+            observed.append((
+                router.retained("totals", KEY, scope, window.end_mono_ns),
+                router.part_state("totals", KEY, scope),
+            ))
+            original_notify()
+
+        router._notify = notify
+        state = router.request_detail("totals", presentation, window)
+        assert state.state == "pending"
+        second = client.only("totals")
+        if fault == "remote_error":
+            error = RemoteError("daemon_error", "collector exploded")
+            client.fail(second, error)
+        elif fault == "window_unavailable":
+            error = WindowUnavailableError("file_source_unavailable", "file history unavailable")
+            client.fail(second, error)
+        elif fault == "connection_lost":
+            error = ConnectionLost("daemon_not_answering", "connection ended")
+            client.fail(second, error)
+        elif fault == "query_timeout":
+            error = RequestRejected("query_timeout", "the daemon did not answer within five seconds")
+            client.fail(second, error)
+        else:
+            error = RequestRejected("invalid_result", "invalid_result")
+            client.settle(second, _totals_response(KEY, window=window, value=coverage()))
+        assert router.drain() is True
+
+        assert observed, "the view notification observer never ran"
+        inside_record, inside_state = observed[-1]
+        assert inside_record is None
+        assert inside_state.state == "failed"
+        assert inside_state.reason == str(error) or inside_state.reason == error.reason
+        failed = router.part_state("totals", KEY, scope)
+        assert failed.state == "failed"
+        assert failed.reason == (str(error) if str(error) else type(error).__name__)
+        assert router.retained("totals", KEY, scope, window.end_mono_ns) is None
+        with pytest.raises(type(error)) as raised:
+            router.disk_share(presentation, window)
+        assert str(raised.value) == str(error)
+
+        # A pending retry cannot restore the cleared record.
+        retry = router.request_detail("totals", presentation, window)
+        assert retry.state == "pending"
+        assert router.retained("totals", KEY, scope, window.end_mono_ns) is None
+        assert router.drain() is False
+        assert router.part_state("totals", KEY, scope).state == "pending"
+        assert router.retained("totals", KEY, scope, window.end_mono_ns) is None
+    finally:
+        router.close()
+        store.connection.close()
+
+
+def test_exact_getters_reject_older_retained_window_without_hiding_record(tmp_path):
+    """An exact getter never repairs an older record into the requested window.
+
+    The applied B scope raises HistoryPending for its own exact answer while
+    the accepted A record stays readable and unmodified through retained.
+    """
+
+    client = _BoundClient()
+    router, store = _empty_router(tmp_path, client, name="exact-getters.db")
+    window_a = Window("since_boot", BOOT, end_mono_ns=140 * NS)
+    window_b = Window("since_boot", BOOT, end_mono_ns=180 * NS)
+    scope_b = retention_scope(KEY, window_b)
+    try:
+        presentation = _remote_frame(router, client, window_a)
+        router.select_detail(KEY, window_a)
+        router.request_detail("totals", presentation, window_a)
+        client.settle(client.only("totals"),
+                      _totals_response(KEY, window=window_a, value=share(1, window_a, read=89)))
+        assert router.drain() is True
+        record = router.retained("totals", KEY, scope_b, window_b.end_mono_ns)
+        assert record is not None and record.value.window == window_a
+
+        # Apply a forward frame B, then adopt it; the exact B answer is still
+        # missing, so the exact getter must raise rather than relabel A.
+        router.prepare(window_b)
+        wait_local(router)
+        client.settle(client.only("ranking"), {
+
+            "kind": "ranking", "result": [total(17, KEY)], "snapshot": DIGEST,
+            "next_cursor": None,
+        })
+        assert router.ready(window_b) is True
+        router.select_detail(KEY, window_b)
+        assert router.retained("totals", KEY, scope_b, window_b.end_mono_ns) == record
+        with pytest.raises(HistoryPending):
+            router.disk_share(presentation, window_b)
+        assert router.retained("totals", KEY, scope_b, window_b.end_mono_ns) == record
+        pending = router.part_state("totals", KEY, retention_scope(KEY, window_b))
+        assert pending.state == "pending"
+        assert pending.requested_window == window_b
+        # The admitted exact B request still never rewrites the A measurement.
+        assert record.value.window == window_a
+        assert record.provenance.measured_window == window_a
+        assert record.value.app_id == presentation
+        assert router.registry.key_for(record.value.app_id) == KEY
+
+        # A wrong presentation id is a lookup failure, not a repaired subject.
+        with pytest.raises((KeyError, TypeError)):
+            router.disk_share(presentation + 1000, window_b)
+        assert router.retained("totals", KEY, scope_b, window_b.end_mono_ns) == record
+    finally:
+        router.close()
+        store.connection.close()
+
+
+def test_retained_accessor_uses_applied_endpoint_and_is_pure(tmp_path):
+    """Retained eligibility follows the caller's applied endpoint, never prepare.
+
+    The accessor sends, drains, restamps nothing, rejects malformed arguments,
+    withholds a future-end record, and keeps that answer through a forward and
+    a backward preparation until adoption resets it.
+    """
+
+    client = _BoundClient()
+    router, store = _empty_router(tmp_path, client, name="retained-pure.db")
+    window = Window("since_boot", BOOT, end_mono_ns=140 * NS)
+    forward = Window("since_boot", BOOT, end_mono_ns=180 * NS)
+    backward = Window("since_boot", BOOT, end_mono_ns=120 * NS)
+    scope = retention_scope(KEY, window)
+    try:
+        presentation = _remote_frame(router, client, window)
+        router.select_detail(KEY, window)
+        router.request_detail("totals", presentation, window)
+        client.settle(client.only("totals"),
+                      _totals_response(KEY, window=window, value=share(1, window, read=73)))
+        assert router.drain() is True
+        record = router.retained("totals", KEY, scope, window.end_mono_ns)
+        assert record is not None
+        stamp = record.provenance.first_seen_at_ns
+        sends = len(client.requests)
+        completed = router._completed.qsize()
+
+        original_drain = router.drain
+
+        def forbidden():
+            raise AssertionError("retained must not drain")
+
+        router.drain = forbidden
+        try:
+            for _ in range(3):
+                client.clock.advance_ns(10 * NS)
+                assert router.retained("totals", KEY, scope, window.end_mono_ns) is record
+                assert record.provenance.first_seen_at_ns == stamp
+            # A future measured endpoint is ineligible, not restamped.
+            assert router.retained("totals", KEY, scope, window.end_mono_ns - 1) is None
+            assert record.provenance.first_seen_at_ns == stamp
+            assert len(client.requests) == sends
+            assert router._completed.qsize() == completed
+
+            # Prepare cannot change eligibility; adoption owns the reset.
+            router.drain = original_drain
+            router.prepare(forward)
+            wait_local(router)
+            router.drain = forbidden
+
+            assert router.retained("totals", KEY, scope, window.end_mono_ns) is record
+            router.drain = original_drain
+            router.prepare(backward)
+            wait_local(router)
+            router.drain = forbidden
+
+            assert router.retained("totals", KEY, scope, window.end_mono_ns) is record
+        finally:
+            router.drain = original_drain
+
+        # Malformed arguments are rejected, never relabelled.
+        with pytest.raises(ValueError):
+            router.retained("totals", KEY, (OTHER_KEY, "lifetime"), None)
+        with pytest.raises(ValueError):
+            router.retained("totals", KEY, retention_scope(KEY, Window("lifetime")), 5)
+        with pytest.raises(ValueError):
+            router.retained("totals", KEY, (KEY, "range", BOOT, 0), 5)
+        with pytest.raises(ValueError):
+            router.retained("totals", KEY, scope, -1)
+
+        router.select_detail(KEY, backward)
+        assert router.retained("totals", KEY, scope, window.end_mono_ns) is None
+    finally:
+        router.close()
+        store.connection.close()
+
+
+def test_superseded_failure_does_not_clear_newer_accepted_record(tmp_path):
+    """An old token's delayed error cannot clear a newer accepted measurement.
+
+    A newer acceptance replaces the record and its first-seen stamp; the old
+    token's error and a later pending retry leave both exactly as accepted.
+    """
+
+    client = _BoundClient()
+    router, store = _empty_router(tmp_path, client, name="superseded-failure.db")
+    window = Window("since_boot", BOOT, end_mono_ns=140 * NS)
+    scope = retention_scope(KEY, window)
+    try:
+        presentation = _remote_frame(router, client, window)
+        router.select_detail(KEY, window)
+
+        router.request_detail("totals", presentation, window)
+        old_token = router._detail.live["totals"]
+        old_future = client.only("totals")
+        client.settle(old_future, _totals_response(KEY, window=window))
+        assert router.drain() is True
+        assert router.retained("totals", KEY, scope, window.end_mono_ns) is not None
+
+        router.request_detail("totals", presentation, window)
+        new_token = router._detail.live["totals"]
+        new_future = client.only("totals")
+        client.settle(new_future, _totals_response(KEY, window=window, value=share(1, window, read=64)))
+        assert router.drain() is True
+        newer = router.retained("totals", KEY, scope, window.end_mono_ns)
+        assert newer is not None and newer.value.task_read_bytes == 64
+        stamp = newer.provenance.first_seen_at_ns
+
+        # Deliver the superseded token's error after the newer acceptance.
+        error = RemoteError("daemon_error", "late failure")
+        assert router._settle(old_token, RemoteSettlement(old_future, error=error)) is False
+        assert router.retained("totals", KEY, scope, window.end_mono_ns) is newer
+        assert router.retained("totals", KEY, scope, window.end_mono_ns).provenance \
+            .first_seen_at_ns == stamp
+        assert router.part_state("totals", KEY, scope).state == "ok"
+        assert router.part_state("totals", KEY, scope).request_id == new_token.token_id
+
+        # A later pending retry neither restores nor clears the newer record.
+        router.request_detail("totals", presentation, window)
+        pending = router.part_state("totals", KEY, scope)
+        assert pending.state == "pending"
+        assert router.retained("totals", KEY, scope, window.end_mono_ns) is newer
+        assert newer.provenance.first_seen_at_ns == stamp
+        assert old_token.token_id != new_token.token_id
+    finally:
+        router.close()
+        store.connection.close()
+
+
+def test_retention_resets_before_subject_scope_boot_or_backward_display(tmp_path):
+    """Scope transitions clear old detail synchronously, before any render.
+
+    Subject, tag, range bounds, boot and a backward endpoint each retire the
+    live lifetime immediately through the same owner settlement seam; a
+    backward-then-forward return and a second distinct range never resurrect
+    the old record.
+    """
+
+    client = _BoundClient()
+    router, store = _empty_router(tmp_path, client, name="retention-resets.db")
+    window = Window("since_boot", BOOT, end_mono_ns=140 * NS)
+    big = Window("since_boot", BOOT, end_mono_ns=180 * NS)
+    small = Window("since_boot", BOOT, end_mono_ns=110 * NS)
+    range_one = Window("range", BOOT, 0, 140 * NS)
+    range_two = Window("range", BOOT, 200 * NS, 240 * NS)
+    scope = retention_scope(KEY, window)
+    try:
+        presentation = _remote_frame(router, client, window)
+        router.select_detail(KEY, window)
+        router.request_detail("totals", presentation, window)
+        client.settle(client.only("totals"), _totals_response(KEY, window=window))
+        assert router.drain() is True
+        assert router.retained("totals", KEY, scope, window.end_mono_ns) is not None
+        sends = len(client.requests)
+        owner = router._detail.lifetime_id
+
+        transitions = (
+            ("subject", lambda: router.select_detail(OTHER_KEY, window)),
+            ("tag", lambda: router.select_detail(KEY, range_one)),
+            ("range bounds", lambda: router.select_detail(KEY, range_two)),
+            ("boot", lambda: router.select_detail(KEY, Window("since_boot", "boot-b",
+                                                              end_mono_ns=140 * NS))),
+        )
+        detail_calls = []
+        detail_impl = router._retire_detail_token
+
+        def detail_spy(token):
+            detail_calls.append(token.token_id)
+            return detail_impl(token)
+
+        router._retire_detail_token = detail_spy
+        try:
+            for label, retire in transitions:
+                router.select_detail(KEY, window)
+                router.request_detail("totals", presentation, window)
+                client.settle(client.only("totals"), _totals_response(KEY, window=window))
+                assert router.drain() is True
+                assert router.retained("totals", KEY, scope, window.end_mono_ns) is not None, label
+                settled_token = router._detail.slots[("totals", scope)].token.token_id
+                detail_calls.clear()
+                retire()
+                # Synchronous: no drain, ready, render or query participates,
+                # and the reset enters the one owner retirement seam once.
+                assert detail_calls == [settled_token], label
+                assert router.retained("totals", KEY, scope, window.end_mono_ns) is None, label
+                assert router.part_state("totals", KEY, scope).state == "absent", label
+                assert len(client.requests) == sends + 1, label
+                sends = len(client.requests)
+        finally:
+            del router._retire_detail_token
+
+        # A backward endpoint retires; returning forward does not resurrect.
+        router.select_detail(KEY, window)
+        seen = router._detail.lifetime_id
+        router.select_detail(KEY, big)
+        assert router._detail.lifetime_id == seen  # forward preserves the lifetime
+        router.select_detail(KEY, small)
+        assert router._detail.lifetime_id != seen
+        assert router.retained("totals", KEY, scope, window.end_mono_ns) is None
+        router.select_detail(KEY, big)
+        assert router.retained("totals", KEY, scope, window.end_mono_ns) is None
+        assert router._detail.lifetime_id != seen
+        assert router._detail.lifetime_id != owner
+
+        # Two distinct ranges are distinct lifetimes too.
+        router.select_detail(KEY, range_one)
+        lifetime_one = router._detail.lifetime_id
+        router.select_detail(KEY, range_two)
+        assert router._detail.lifetime_id != lifetime_one
+        assert router.retained("totals", KEY, retention_scope(KEY, range_one),
+                               range_one.end_mono_ns) is None
+        assert router.retained("totals", KEY, retention_scope(KEY, range_two),
+                               range_two.end_mono_ns) is None
+    finally:
+        router.close()
+        store.connection.close()
+
+
+def test_authority_change_clears_details_without_conflating_cursor_advance(tmp_path):
+    """Only authority identities retire owners; sequence and counters do not.
+
+    Remote connection/boot/epoch and local registration changes clear the
+    selected lifetime and its records, while same-authority cursor sequence
+    advancement and local counter movement preserve them unchanged. One
+    authority transition invokes each owner-level retirement arm exactly once
+    through ``_settle``, clearing the accepted record and the pending owner.
+    """
+
+    client = _BoundClient()
+    router, store = _empty_router(tmp_path, client, name="authority.db")
+    window = Window("since_boot", BOOT, end_mono_ns=140 * NS)
+    scope = retention_scope(KEY, window)
+    try:
+        presentation = _remote_frame(router, client, window)
+        router.select_detail(KEY, window)
+        router.request_detail("totals", presentation, window)
+        client.settle(client.only("totals"),
+                      _totals_response(KEY, window=window, value=share(1, window, read=52)))
+        assert router.drain() is True
+        record = router.retained("totals", KEY, scope, window.end_mono_ns)
+        assert record is not None
+        stamp = record.provenance.first_seen_at_ns
+
+        # Same authority: a sequence advance is not a connection change.
+        client.cursor = StreamCursor(BOOT, 3, 8)
+        client.state = ClientState(verified=True, answering=True, cursor=client.cursor)
+        client.clock.advance_ns(NS)
+        assert router.drain() is False
+        assert router.retained("totals", KEY, scope, window.end_mono_ns) is record
+        assert record.provenance.first_seen_at_ns == stamp
+
+        # One lifetime holds an accepted record and one pending detail. An
+        # authority change retires both through the sole settlement writer,
+        # invoking each owner-level retirement arm exactly once.
+        router.request_detail("series", presentation, window)
+        pending = router._detail.live["series"]
+        held_series = client.only("series")
+        accepted_slot = router._detail.slots[("totals", scope)]
+        assert accepted_slot.record is record
+        frame = router._frame
+        frame_sides = tuple(side.token_id for side in
+                            (frame.local_token, frame.remote_token) if side is not None)
+        assert len(frame_sides) == 2, "the frame owns its local and remote tokens"
+        frame_calls, detail_calls, retirements_seen = [], [], []
+        settle_impl = router._settle
+        frame_impl = router._retire_frame_owner
+        detail_impl = router._retire_detail_token
+
+        def settle_spy(token, outcome=None, *, retiring=False):
+            retirements_seen.append((token.owner, token.token_id, retiring))
+            return settle_impl(token, outcome, retiring=retiring)
+
+        def frame_spy(token):
+            frame_calls.append(token.token_id)
+            return frame_impl(token)
+
+        def detail_spy(token):
+            detail_calls.append(token.token_id)
+            return detail_impl(token)
+
+        router._settle = settle_spy
+        router._retire_frame_owner = frame_spy
+        router._retire_detail_token = detail_spy
+        try:
+            # A stored epoch is authority; a new epoch retires the lifetime once.
+            before = router._generation
+            client.cursor = StreamCursor(BOOT, 4, 8)
+            client.state = ClientState(verified=True, answering=True, cursor=client.cursor)
+            assert router.drain() is True
+        finally:
+            del router._settle, router._retire_frame_owner, router._retire_detail_token
+
+        # Frame owner: one retirement for both side tokens, one generation bump.
+        assert frame_calls == [frame_sides[0]], "one frame-owner retirement"
+        assert router._generation == before + 1, "one generation advance per frame owner"
+        assert set(frame_sides) <= router._retired_tokens
+        # Detail owner: one retirement clears the whole selected lifetime.
+        assert detail_calls == [pending.token_id], "one detail-lifetime retirement"
+        assert [entry for entry in retirements_seen
+                if entry[0] == "detail" and entry[2]] == [
+                    ("detail", pending.token_id, True)], "detail enters the settlement seam"
+        assert accepted_slot.record is None, "the retirement arm cleared the accepted record"
+        assert accepted_slot.stamps == {}, "the retirement arm cleared the stamp lookup"
+        assert router._detail is None
+        assert router.retained("totals", KEY, scope, window.end_mono_ns) is None
+        assert router.part_state("totals", KEY, scope).state == "absent"
+        assert router.part_state("series", KEY, scope).state == "absent"
+        assert router.view_state.startswith("unavailable")
+
+        # A publication-retired completion is drained and ignored; its real
+        # transport occupant is released only now that it is terminal.
+        client.settle(held_series, _totals_response(
+            KEY, window=window, kind="series", value=series(1, window)))
+        assert router.drain() is False
+        assert router.retained("totals", KEY, scope, window.end_mono_ns) is None
+        assert router._occupant is None
+
+        retirements = router._generation
+        assert retirements == before + 1
+        assert router.drain() is False
+        assert router._generation == retirements, "an already retired frame is not retired again"
+
+        # A new boot is authority too.
+        router.prepare(window)
+        wait_local(router)
+        client.settle(client.only("ranking"), {
+
+            "kind": "ranking", "result": [total(17, KEY)], "snapshot": DIGEST,
+            "next_cursor": None,
+        })
+        assert router.ready(window) is True
+        router.select_detail(KEY, window)
+        router.request_detail("totals", presentation, window)
+        client.settle(client.only("totals"), _totals_response(KEY, window=window))
+        assert router.drain() is True
+        assert router.retained("totals", KEY, scope, window.end_mono_ns) is not None
+        client.cursor = StreamCursor("boot-b", 4, 8)
+        client.state = ClientState(verified=True, answering=True, cursor=client.cursor)
+        assert router.drain() is True
+        assert router.retained("totals", KEY, scope, window.end_mono_ns) is None
+
+        # A new connection generation with the same boot/epoch is a change.
+        router.prepare(window)
+        wait_local(router)
+        client.settle(client.only("ranking"), {
+
+            "kind": "ranking", "result": [total(17, KEY)], "snapshot": DIGEST,
+            "next_cursor": None,
+        })
+        assert router.ready(window) is True
+        router.select_detail(KEY, window)
+        router.request_detail("totals", presentation, window)
+        client.settle(client.only("totals"), _totals_response(KEY, window=window))
+        assert router.drain() is True
+        assert router.retained("totals", KEY, scope, window.end_mono_ns) is not None
+        client._generation += 1
+        assert router.drain() is True
+        assert router.retained("totals", KEY, scope, window.end_mono_ns) is None
+    finally:
+        router.close()
+        store.connection.close()
+
+
+def test_authority_change_retires_pending_frame_once_and_replacement_applies(tmp_path):
+    """A connection-authority change retires one frame owner before replacement."""
+
+    client = _BoundClient()
+    router, store = _empty_router(tmp_path, client, name="frame-authority.db")
+    window = Window("since_boot", BOOT, end_mono_ns=140 * NS)
+    try:
+        _remote_frame(router, client, window)
+        router.prepare(window)
+        assert wait_local(router) is not None
+        stale_frame = router._frame
+        stale_future = client.only("ranking")
+        retirements = []
+        retire_impl = router._retire_frame_owner
+
+        def retire_spy(token):
+            retirements.append(token.token_id)
+            return retire_impl(token)
+
+        router._retire_frame_owner = retire_spy
+        before_generation = router._generation
+        client._generation += 1
+        assert router.drain() is True
+        assert retirements == [stale_frame.local_token.token_id]
+        assert stale_frame.retired is True
+        assert router._generation == before_generation + 1
+        assert router.frame_provenance(window) is None
+
+        client.settle(stale_future, {
+            "kind": "ranking",
+            "result": [total(17, KEY)],
+            "snapshot": DIGEST,
+            "next_cursor": None,
+        })
+        assert router.drain() is False
+        assert retirements == [stale_frame.local_token.token_id]
+        assert router.frame_provenance(window) is None
+
+        router.prepare(window)
+        assert wait_local(router) is not None
+        replacement = client.only("ranking")
+        client.settle(replacement, {
+            "kind": "ranking",
+            "result": [total(17, KEY)],
+            "snapshot": DIGEST,
+            "next_cursor": None,
+        })
+        assert router.ready(window) is True
+        assert router._frame is not stale_frame
+        assert router.frame_provenance(window) is not None
+        assert retirements == [stale_frame.local_token.token_id]
+    finally:
+        if "retire_spy" in locals():
+            del router._retire_frame_owner
+        router.close()
+        store.connection.close()
+
+
+# ---------------------------------------------------------------------------
+# Files settlement integration (§§3.3-3.4, 5.1, 5.4, 12.2)
+# ---------------------------------------------------------------------------
+
+FILE_APP = "exe:/demo"
+FILE_ZERO = "exe:/zero"
+FILE_BOOT = "boot-A"
+FILE_WINDOW = Window("since_boot", FILE_BOOT, end_mono_ns=FILE_HOUR_NS)
+
+
+def _file_frames(tmp_path, name="files-settlement.db"):
+    """One committed file-capable store: T/D receipts plus hourly F rows."""
+
+    frames = FileFrames(tmp_path / name)
+    loader = VectorLoader()
+    runtime = FileRuntime(
+        frames.db,
+        source_factory=lambda: BpfFileSource(loader),
+        identity_resolver=FileIdentityResolver(lambda dev: "fs"),
+    )
+    runtime.start()
+    loader.queue(0, events=[
+        replace(file_event(inode=index, amount=10 + index), basename=basename,
+                name_len=len(basename), reads=index, writes=8 - index)
+        for index, basename in enumerate(
+            [b"Cafe\xcc\x81", b"Caf\xc3\xa9", b"alpha", b"zeta"])])
+    runtime.consume(*frames.tick(0))
+    runtime.consume(*frames.tick(FILE_HOUR_NS, amount=200))
+    return frames
+
+
+class _LocalCountingClient:
+    """A verified-not-answering client: a local outcome must issue no query."""
+
+    state = ClientState()
+
+    def __init__(self):
+        self.queries = 0
+        self.transports = 0
+
+    def query(self, request):  # pragma: no cover - local work never asks
+        self.queries += 1
+        raise AssertionError(f"a local outcome must not query: {request}")
+
+    def query_transport(self, future):  # pragma: no cover - local has no transport
+        self.transports += 1
+        raise AssertionError("a local outcome has no remote transport")
+
+
+def _drain_until(router, predicate, timeout=20.0):
+    """Owner-thread drain loop with a fixed bound; never a worker-thread wait."""
+
+    deadline = time.monotonic() + timeout
+    while not predicate():
+        router.drain()
+        if predicate():
+            break
+        assert time.monotonic() < deadline, "drain never satisfied the predicate"
+        time.sleep(0.001)
+
+
+def _collect_settlement(router):
+    """Read one queued local settlement on the owner thread."""
+
+    _drain_until(router, lambda: not router._completed.empty())
+    return router._completed.get_nowait()
+
+
+def _forged_frame_settlement(router, window, field, value):
+    """One valid frame admission with exactly one routing field corrupted."""
+
+    router.prepare(window)
+    outcome = wait_worker(router)
+    assert isinstance(outcome, LocalFrameOutcome)
+    token = router._frame.local_token
+    binding = router._worker_bindings[token.token_id]
+    capture = router._worker_capture_sets[token.token_id]
+    settlement = LocalSettlement(token.token_id, capture=capture, outcome=outcome)
+    forged = copy.copy(outcome)
+    object.__setattr__(forged, field, value)
+    object.__setattr__(settlement, "outcome", forged)
+    return token, settlement
+
+
+@pytest.mark.parametrize("kind", ["detail", "files"], ids=["detail", "files"])
+def test_local_settlement_rejects_self_consistent_foreign_capture(tmp_path, kind):
+    from appio.history_router import _capture_provenance
+    from live_overview_support import make_managed_router
+
+    frames = _file_frames(tmp_path, f"foreign-capture-{kind}.db")
+    router = make_managed_router(
+        QueryService(frames.db), _LocalCountingClient(), AppRegistry()
+    )
+    other = None
+    outward = None
+    try:
+        window = FILE_WINDOW
+        router.prepare(window)
+        wait_local(router)
+        assert router.ready(window)
+        app_id = router.registry.id_for(FILE_APP)
+        if kind == "detail":
+            router.select_detail(FILE_APP, window)
+            router.request_detail("totals", app_id, window)
+        else:
+            outward = router.request_file_view(
+                app_id, window, "bytes_total", "desc", None
+            )
+        token, original = _collect_settlement(router)
+        assert original.error is None and original.capture is not None
+        other = router.sources.capture().result(timeout=15)
+        assert other.capture_id != original.capture.capture_id
+        assert other.opening == original.capture.opening
+        assert other.snapshot_digest == original.capture.snapshot_digest
+        outcome = replace(
+            original.outcome, snapshot=_capture_provenance(other)
+        )
+        supplied = LocalSettlement(token.token_id, capture=other, outcome=outcome)
+        assert router._settle(token, supplied) is True
+        if kind == "detail":
+            state = router.part_state(
+                "totals", FILE_APP, retention_scope(FILE_APP, window)
+            )
+            assert state.state == "failed" and state.reason == "invalid_result", (
+                "foreign internally consistent capture published under original worker binding"
+            )
+        else:
+            assert outward is not None
+            with pytest.raises(RequestRejected) as caught:
+                outward.result(timeout=0)
+            assert caught.value.reason == "invalid_result"
+    finally:
+        if other is not None:
+            router.sources.release_capture(other.capture_id)
+        router.close()
+        frames.db.close()
+
+
+def test_failed_record_cannot_be_revived_by_pending_retry(tmp_path, qtbot):
+    from appio.ui.main_window import AppIoWindow
+
+    client = _BoundClient()
+    router, store = _empty_router(tmp_path, client, name="failed-view.db")
+    window = Window("since_boot", BOOT, end_mono_ns=140 * NS)
+    scope = retention_scope(KEY, window)
+    view = None
+    try:
+        presentation = _remote_frame(router, client, window)
+        view = AppIoWindow(router, clock_ns=client.clock)
+        qtbot.addWidget(view)
+        view.set_window(window)
+        client.settle(client.only("series"), {
+            "kind": "series", "app_key": KEY, "result": series(1, window),
+            "snapshot": DIGEST, "next_cursor": None})
+        router.drain()
+        client.settle(client.only("totals"), _totals_response(window=window))
+        router.drain()
+        view.refresh_measurements()
+        original_series = view._overview_model.series_provenance
+        assert view._overview_model.share is not None
+        router.request_detail("totals", presentation, window)
+        client.fail(client.only("totals"), RemoteError("unavailable", "share_bad"))
+        router.drain()
+        view.refresh_measurements()
+        assert router.retained("totals", KEY, scope, window.end_mono_ns) is None
+        assert view._overview_model.share is None
+        router.request_detail("totals", presentation, window)
+        view.refresh_measurements()
+        assert router.part_state("totals", KEY, scope).state == "pending"
+        assert router.retained("totals", KEY, scope, window.end_mono_ns) is None
+        assert all(item.text == "unavailable" for item in view._overview_model.kpis)
+        assert view._overview_model.series_provenance == original_series
+        assert view._overview_model.task_points == series(1, window).points
+        client.settle(client.only("totals"), _totals_response(window=window))
+        router.drain()
+        view.refresh_measurements()
+        assert view._overview_model.share.task_total_bytes == 22
+    finally:
+        if view is not None:
+            view.close()
+        router.close()
+        store.connection.close()
+
+
+@pytest.mark.parametrize(
+    "advance_before_detail_dispatch",
+    [False, True],
+    ids=["unchanged-cursor", "cursor-advances-before-detail-dispatch"],
+)
+def test_remote_detail_liveness_across_ten_second_commit(
+    tmp_path, qtbot, advance_before_detail_dispatch
+):
+    from appio.ui.main_window import AppIoWindow
+    from live_overview_transport import QueryTransportHarness
+    from live_overview_support import make_managed_router
+
+    clock = Clock(0)
+    transport = QueryTransportHarness(clock=clock)
+    transport.stream(4)
+    store = AppIoStore(tmp_path / "slow-detail.db")
+    router = make_managed_router(QueryService(store), transport.client, AppRegistry(), clock_ns=clock)
+    window_a = Window("since_boot", "boot-a", end_mono_ns=20 * NS)
+    window_b = Window("since_boot", "boot-a", end_mono_ns=30 * NS)
+    scope = retention_scope(KEY, window_a)
+    view = None
+    try:
+        router.prepare(window_a)
+        wait_local(router)
+        clock.ns = 200_000_000
+        transport.pump()
+        transport.reply(router._occupant[1], [total(17, KEY)], snapshot=DIGEST)
+        assert router.ready(window_a)
+        view = AppIoWindow(router, clock_ns=clock)
+        qtbot.addWidget(view)
+        view.set_window(window_a)
+        transport.pump()
+        series_future = router._occupant[1]
+        totals_token = router._detail.live["totals"]
+        admission_source = totals_token.requested_source
+        assert admission_source == RemotePosition("boot-a", 7, 4)
+        assert transport.client.query_transport(series_future).issued_at_ns == 200_000_000
+        if advance_before_detail_dispatch:
+            transport.stream(5)
+            assert transport.client.state.cursor == StreamCursor("boot-a", 7, 5)
+        clock.ns = 5_150_000_000
+        transport.reply(series_future, series(1, window_a), snapshot=DIGEST)
+        router.drain()
+        transport.pump()
+        totals_future = router._occupant[1]
+        totals_state = transport.client.query_transport(totals_future)
+        assert router._occupant[0].request.kind == "totals"
+        assert totals_state.issued_at_ns == 5_150_000_000
+        assert totals_state.issued_source == (
+            RemotePosition("boot-a", 7, 5)
+            if advance_before_detail_dispatch
+            else admission_source
+        )
+        if advance_before_detail_dispatch:
+            assert totals_state.issued_source != admission_source
+        clock.ns = 10 * NS
+        transport.stream(6)
+        router.prepare(window_b)
+        wait_local(router)
+        assert not router.ready(window_b)
+        assert router._occupant[1] is totals_future
+        clock.ns = 10_100_000_000
+        transport.reply(totals_future, share(1, window_a), snapshot=DIGEST)
+        router.drain()
+        view.refresh_measurements()
+        accepted = router.retained("totals", KEY, scope, window_b.end_mono_ns)
+        assert accepted is not None and accepted.value.window == window_a, (
+            router.part_state("totals", KEY, scope), router._detail,
+            transport.client.query_transport(totals_future), router._retired_tokens)
+        assert accepted.provenance.first_seen_at_ns == 10_100_000_000
+        if advance_before_detail_dispatch:
+            assert accepted.provenance.answered_source == RemotePosition("boot-a", 7, 5)
+        else:
+            assert accepted.provenance.answered_source == admission_source
+        assert view._overview_model.share.task_total_bytes == 22
+        assert not router.ready(window_b), "replacement must stay pending when totals appears"
+        transport.pump()
+        transport.reply(router._occupant[1], [total(17, KEY)], snapshot=DIGEST)
+        assert router.ready(window_b)
+        view.set_window(window_b)
+        assert view._overview_model.share.window == window_a
+        assert view._overview_model.share_provenance == accepted.provenance
+        assert router.part_state("totals", KEY, scope).state == "pending"
+        assert "share measured: since_boot boot-a through 20000000000 ns" in view._overview_model.detail_line
+        assert max(transport.observed_historical_occupants) == 1
+    finally:
+        if view is not None:
+            view.close()
+        router.close()
+        transport.client.close()
+        for server in transport.servers:
+            server.close()
+        store.connection.close()
+
+
+@pytest.mark.parametrize("kind", ["totals", "series"])
+@pytest.mark.parametrize("schedule", [
+    "settled", "forward_frame_held", "replacement_local_completed",
+    "subject_change_local_held", "subject_change_local_completed",
+])
+def test_remote_detail_after_mixed_store_refusal_uses_local_ownership(tmp_path, kind, schedule, monkeypatch):
+    from test_history_router import BOOT as fixture_boot, source
+    from live_overview_support import add_managed_source, make_managed_router
+
+    local, _ = source(tmp_path / "overlap-local.db", start=100, end=122)
+    local.connection.execute(
+        "INSERT INTO app VALUES(18,'exe:/usr/bin/second','second',NULL,0,0,'user')")
+    local.connection.execute(
+        "INSERT INTO app_boot_total SELECT boot_id,18,0,0,0,0,NULL,NULL,NULL,coverage_json "
+        "FROM app_boot_total WHERE app_id=17")
+    local.connection.commit()
+    imported, _ = source(tmp_path / "overlap-export.db", "iod", start=100, end=120)
+    second, _ = source(tmp_path / "second-export.db", "iod", app_id=18,
+                       key="/usr/bin/second", start=100, end=120)
+    client = _BoundClient(boot=fixture_boot)
+    router = make_managed_router(QueryService(local), client, AppRegistry(), clock_ns=client.clock)
+    add_managed_source(router, imported, name="export", owner="iod")
+    add_managed_source(router, second, name="second", owner="iod")
+    window = Window("since_boot", fixture_boot, end_mono_ns=130 * NS)
+    release_frame = threading.Event()
+    subject_change = schedule.startswith("subject_change_")
+    try:
+        router.prepare(window)
+        wait_local(router)
+        remote_rows = (QueryService(imported).ranking(window, "total_bytes")
+                       + QueryService(second).ranking(window, "total_bytes"))
+        client.settle(client.only("ranking"), {
+            "kind": "ranking", "result": remote_rows, "snapshot": DIGEST,
+            "next_cursor": None,
+        })
+        assert router.ready(window)
+        rows = {row.app_key: row for row in router.ranking(window, "total_bytes")}
+        assert set(rows) == {"exe:/usr/bin/shared", "exe:/usr/bin/second"}
+        for row in rows.values():
+            assert row.total_bytes == 0
+            assert row.coverage.overlap_uncertain_intervals == 1
+        row = rows["exe:/usr/bin/shared"]
+        assert router._remote is None
+        assert "mixed-store" in router.daemon_answer_error.reason
+        router.select_detail(row.app_key, window)
+        if not subject_change:
+            router.request_detail(kind, row.app_id, window)
+        if schedule in ("forward_frame_held", "subject_change_local_held"):
+            entered = threading.Event()
+            read = router._read_local
+
+            def held_frame(*args, **kwargs):
+                entered.set()
+                assert release_frame.wait(20), "forward frame was not released"
+                return read(*args, **kwargs)
+
+            monkeypatch.setattr(router, "_read_local", held_frame)
+            desired = (Window("range", fixture_boot, 130 * NS, 140 * NS) if subject_change
+                       else replace(window, end_mono_ns=140 * NS))
+            router.prepare(desired)
+            _drain_until(router, entered.is_set)
+            assert not router._has_local_history and router._overlap_ranges == []
+        elif schedule in ("replacement_local_completed", "subject_change_local_completed"):
+            desired = Window("range", fixture_boot, 130 * NS, 140 * NS)
+            router.prepare(desired)
+            wait_local(router)
+            assert not router.ready(desired)
+            assert router._applied_window == window
+            assert router._local_settlement.outcome.request.window == desired
+            assert not router._has_local_history and router._overlap_ranges == []
+        if subject_change:
+            row = rows["exe:/usr/bin/second"]
+            # Public provenance still describes only the current generation.
+            assert router.ranking_provenance(row.app_key, window) is None
+            router.select_detail(row.app_key, window)
+            router.request_detail(kind, row.app_id, window)
+            assert router._applied_window == window
+            # Release the wire slot while the replacement stays unapplied.
+            client.settle(client.only("ranking"), {
+                "kind": "ranking", "result": [], "snapshot": DIGEST,
+                "next_cursor": None,
+            })
+            router.drain()
+        scope = retention_scope(row.app_key, window)
+        service = QueryService(second if subject_change else imported)
+        remote_id = next(item.app_id for item in remote_rows if item.app_key == row.app_key)
+        remote_value = (service.disk_share(remote_id, window) if kind == "totals"
+                        else service.series(remote_id, window))
+        remote_amount = (remote_value.task_total_bytes if kind == "totals" else
+                         sum(point.read_bytes + point.write_bytes for point in remote_value.points))
+        assert remote_amount == 40
+        future = client.only(kind)
+        client.settle(future, {
+            "kind": kind, "result": remote_value, "app_key": row.app_key,
+            "snapshot": DIGEST, "next_cursor": None,
+        })
+        router.drain()
+        _drain_until(router, lambda: router.part_state(kind, row.app_key, scope).state == "ok")
+        record = router.retained(kind, row.app_key, scope, window.end_mono_ns)
+        assert record is not None
+        measured = record.value
+        amount = (measured.task_total_bytes if kind == "totals" else
+                  sum(point.read_bytes + point.write_bytes for point in measured.points))
+        assert amount == 0, "remote detail resurrected excluded overlap bytes"
+        assert measured.coverage.overlap_uncertain_intervals == 1
+        assert record.provenance.snapshot is not None
+        assert record.provenance.local_bracket is not None
+        assert future in client.rejected
+        if schedule == "settled":
+            assert router._overlap_ranges == [(fixture_boot, 100 * NS, 120 * NS)]
+    finally:
+        release_frame.set()
+        router.close()
+        local.connection.close()
+        imported.connection.close()
+        second.connection.close()
+
+
+@pytest.mark.parametrize("kind", ["totals", "series"])
+def test_remote_detail_keeps_imported_only_ranking_ownership(tmp_path, kind):
+    from test_history_router import BOOT as fixture_boot, source
+    from live_overview_support import add_managed_source, make_managed_router
+
+    local = AppIoStore(tmp_path / "empty-primary.db")
+    imported, _ = source(tmp_path / "export-only.db", "iod", start=100, end=120, amount=20)
+    daemon, _ = source(tmp_path / "daemon-private.db", "iod", start=100, end=120, amount=30)
+    client = _BoundClient(boot=fixture_boot)
+    router = make_managed_router(QueryService(local), client, AppRegistry(), clock_ns=client.clock)
+    add_managed_source(router, imported, name="export", owner="iod")
+    window = Window("since_boot", fixture_boot, end_mono_ns=130 * NS)
+    try:
+        router.prepare(window)
+        wait_local(router)
+        service = QueryService(daemon)
+        remote_rows = service.ranking(window, "total_bytes")
+        client.settle(client.only("ranking"), {
+            "kind": "ranking", "result": remote_rows, "snapshot": DIGEST,
+            "next_cursor": None,
+        })
+        assert router.ready(window)
+        row, = router.ranking(window, "total_bytes")
+        assert row.total_bytes == 40
+        assert router._remote is None
+        assert "mixed-store" in router.daemon_answer_error.reason
+        assert not router._has_local_history and router._overlap_ranges == []
+        router.select_detail(row.app_key, window)
+        scope = retention_scope(row.app_key, window)
+        router.request_detail(kind, row.app_id, window)
+        future = client.only(kind)
+        remote_id = remote_rows[0].app_id
+        remote_value = (service.disk_share(remote_id, window) if kind == "totals"
+                        else service.series(remote_id, window))
+        client.settle(future, {
+            "kind": kind, "result": remote_value, "app_key": row.app_key,
+            "snapshot": DIGEST, "next_cursor": None,
+        })
+        router.drain()
+        _drain_until(router, lambda: router.part_state(kind, row.app_key, scope).state == "ok")
+        record = router.retained(kind, row.app_key, scope, window.end_mono_ns)
+        assert record is not None
+        measured = record.value
+        amount = (measured.task_total_bytes if kind == "totals" else
+                  sum(point.read_bytes + point.write_bytes for point in measured.points))
+        assert amount == 40, "detail replaced the admitted export contribution with a refused daemon source"
+        assert measured.window == window
+        assert record.provenance.snapshot is not None
+        assert record.provenance.local_bracket is not None
+        assert future in client.rejected
+    finally:
+        router.close()
+        local.connection.close()
+        imported.connection.close()
+        daemon.connection.close()
+
+
+def test_local_outcomes_share_settlement_for_frame_part_and_files(tmp_path):
+    """Every local variant publishes once through the sole settlement writer.
+
+    A real frame copy publishes all routing/file-availability evidence together,
+    a selected part publishes its exact Window and canonical digest, and a local
+    Files result publishes its unchanged table/coverage/served_gap_count. A
+    malformed worker association or evidence fails that owner alone before any
+    of its facts publish; stale drained outcomes change nothing.
+    """
+
+    frames = _file_frames(tmp_path)
+    client = _LocalCountingClient()
+    from live_overview_support import make_managed_router
+
+    router = make_managed_router(QueryService(frames.db), client, AppRegistry())
+
+    window = FILE_WINDOW
+    scope = retention_scope(FILE_APP, window)
+    other_window = Window("range", FILE_BOOT, 200 * NS, 300 * NS)
+    settlements: list[tuple[int, str, bool]] = []
+    settle_impl = router._settle
+
+    def settle_spy(token, outcome=None, *, retiring=False):
+        changed = settle_impl(token, outcome, retiring=retiring)
+        settlements.append((token.token_id, token.owner, changed))
+        return changed
+
+    router._settle = settle_spy
+    try:
+        # -- positive frame arm: every evidence field publishes atomically ---
+        router.prepare(window)
+        outcome = wait_worker(router)
+
+        assert isinstance(outcome, LocalFrameOutcome)
+        expected_ranking = [replace(row, app_id=router.registry.id_for(row.app_key))
+                            for row in outcome.ranking]
+        assert router.ready(window) is True
+        presentation = router.registry.id_for(FILE_APP)
+        assert router._ranking == expected_ranking
+        assert router.segments == outcome.segments
+        assert router.boundaries == outcome.boundaries
+        assert router._gap_ranges == list(outcome.gaps)
+        assert router._known_gap_ranges == list(outcome.known_gaps)
+        assert router._overlap_ranges == list(outcome.overlaps)
+        assert router._has_local_history is outcome.has_local_history
+        assert router._not_retained is outcome.not_retained
+        assert router._chronology_unproved is outcome.chronology_unproved
+        assert router._file_status.available is outcome.file_available
+        frame_token = router._frame.local_token
+        assert router._frame.local_settled is True
+        assert [entry for entry in settlements
+                if entry[0] == frame_token.token_id] == [
+                    (frame_token.token_id, "frame", True)]
+        assert client.queries == 0 and client.transports == 0
+        # A frame proves routing only: no eager first-subject/all-row detail.
+        assert router._worker_jobs == {} and router._unscheduled == {}
+
+        # -- positive selected-part arm: exact Window and canonical digest ---
+        router.select_detail(FILE_APP, window)
+        assert router.request_detail("totals", presentation, window).state == "pending"
+        _drain_until(router, lambda: router.part_state("totals", FILE_APP, scope).state
+                     != "pending")
+        state = router.part_state("totals", FILE_APP, scope)
+        assert state.state == "ok" and state.requested_window == window
+        record = router.retained("totals", FILE_APP, scope, window.end_mono_ns)
+        assert record is not None
+        assert record.provenance.measured_window == window
+        assert record.value.window == window
+        assert record.value.app_id == presentation
+        assert record.provenance.accepted_identity.data_digest == local_answer_digest(
+            "totals", FILE_APP, window, record.value)
+        assert [entry for entry in settlements
+                if entry[0] == state.request_id] == [
+                    (state.request_id, "detail", True)]
+        assert client.queries == 0 and client.transports == 0
+
+        # -- positive local Files arm: unchanged table/coverage/served gap ---
+        capture = router.sources.capture().result(timeout=15)
+        try:
+            expected = HistoryRouter._read_local_files(
+                capture, window, FILE_APP, presentation, "bytes_total", "desc", None)
+        finally:
+            router.sources.release_capture(capture.capture_id)
+        future = router.request_file_view(presentation, window, "bytes_total", "desc", None)
+        _drain_until(router, future.done)
+        view = future.result(timeout=0)
+        assert isinstance(view, FileViewResult)
+        assert view.table == expected.table
+        assert view.coverage == expected.coverage
+        assert view.served_gap_count == expected.served_gap_count
+        assert type(view.served_gap_count) is int and view.served_gap_count == 0
+        assert client.queries == 0 and client.transports == 0
+        assert router._worker_jobs == {}
+        files_calls = [entry for entry in settlements if entry[1] == "files"]
+        assert len(files_calls) == 1 and files_calls[0][2] is True
+        assert [entry for entry in settlements
+                if entry[0] == files_calls[0][0]] == files_calls
+
+        # -- malformed frame arms: association then routing evidence ---------
+        for label, field, value in (
+            ("worker", "worker_id", 9001),
+            ("request", "request", QueryRequest("ranking", Window("lifetime"))),
+            ("evidence", "boundaries", ((BOOT, 0, "gui", "gui"),)),
+        ):
+            token, settlement = _forged_frame_settlement(router, window, field, value)
+            assert router._settle(token, settlement) is True, label
+            # No routing evidence from the malformed outcome published.
+            assert router._ranking == [], label
+            assert router.segments == () and router.boundaries == (), label
+            assert router._file_status.available is False, label
+            assert router.view_state == "unavailable: local history evidence", label
+            assert router._frame.local_settled is False, label
+            assert [entry for entry in settlements
+                    if entry[0] == token.token_id] == [
+                        (token.token_id, "frame", True)], label
+            with pytest.raises(RequestRejected) as caught:
+                router.ready(window)
+            assert caught.value.reason == "invalid_result"
+
+        # A clean frame restores the supported readiness context the remaining
+        # arms need; the malformed frames changed only their own owner.
+        router.prepare(window)
+        assert wait_local(router) is not None
+        assert router.ready(window) is True
+
+        # -- malformed part arms: key, type, Window and digest ---------------
+        def malformed_part(field, value):
+            router.select_detail(FILE_APP, window)
+            assert router.request_detail("totals", presentation, window).state == "pending"
+            token, settlement = _collect_settlement(router)
+            assert token.owner == "detail"
+            assert isinstance(settlement, LocalSettlement)
+            assert settlement.capture is not None
+            binding = router._worker_bindings[token.token_id]
+            settlement = router._close_local_settlement(settlement, binding=binding)
+            forged = copy.copy(settlement.outcome)
+            if field == "window":
+                value_copy = copy.copy(forged.value)
+                object.__setattr__(value_copy, "window", value)
+                object.__setattr__(forged, "value", value_copy)
+            elif field == "snapshot_digest":
+                object.__setattr__(forged, "snapshot", replace(forged.snapshot, snapshot_digest=value))
+            else:
+                object.__setattr__(forged, field, value)
+            object.__setattr__(settlement, "outcome", forged)
+            return token, settlement
+
+        for label, field, value in (
+            ("snapshot", "snapshot_digest", "b" * 64),
+            ("key", "app_key", OTHER_KEY),
+            ("type", "value", series(1, window)),
+            ("window", "window", other_window),
+            ("digest", "data_digest", "b" * 64),
+        ):
+            token, settlement = malformed_part(field, value)
+            assert router._settle(token, settlement) is True, label
+            failed = router.part_state("totals", FILE_APP, scope)
+            assert failed.state == "failed" and failed.reason == "invalid_result", label
+            assert failed.requested_window == window, label
+            assert router.retained("totals", FILE_APP, scope, window.end_mono_ns) is None, label
+            assert [entry for entry in settlements
+                    if entry[0] == token.token_id] == [
+                        (token.token_id, "detail", True)], label
+            router._reap_background_worker(token.token_id)
+
+        # -- malformed Files arms: table, coverage and served evidence -------
+        def malformed_files(field, value):
+            future = router.request_file_view(
+                presentation, window, "bytes_total", "desc", None)
+            token, settlement = _collect_settlement(router)
+            assert token.owner == "files"
+            assert isinstance(settlement.outcome, LocalFilesOutcome)
+            forged = copy.copy(settlement.outcome)
+            object.__setattr__(forged, field, value)
+            object.__setattr__(settlement, "outcome", forged)
+            return future, token, settlement
+
+        ranking_before = list(router._ranking)
+        for label, field, value in (
+            ("table", "table", replace(expected.table, window=Window("lifetime"))),
+            ("coverage", "coverage", replace(expected.coverage, window=Window("lifetime"))),
+            ("served", "served_gap_count", -1),
+        ):
+            future, token, settlement = malformed_files(field, value)
+            assert router._settle(token, settlement) is True, label
+            with pytest.raises(RequestRejected) as caught:
+                future.result(timeout=0)
+            assert caught.value.reason == "invalid_result", label
+            assert router._not_retained is False, label
+            assert router.daemon_answer_error is None, label
+            assert router._ranking == ranking_before, label
+            assert [entry for entry in settlements
+                    if entry[0] == token.token_id] == [
+                        (token.token_id, "files", True)], label
+            router._reap_background_worker(token.token_id)
+        assert router._file_owners == {}
+
+        # -- a stale drained success and error publish nothing --------------
+        stale_token, stale_outcome, stale_settlement = None, None, None
+        router.prepare(window)
+        stale_outcome = wait_worker(router)
+
+        stale_token = router._frame.local_token
+        assert router.ready(window) is True
+        stale_settlement = router._local_settlement
+        router.prepare(window)
+        assert wait_local(router) is not None
+
+        before = (list(router._ranking), router.segments, router.boundaries,
+                  router._not_retained, router.view_state)
+        assert router._settle(stale_token, stale_settlement) is False
+        assert router._settle(
+            stale_token, LocalSettlement(stale_token.token_id,
+                                         error=ValueError("stale local copy"))) is False
+        assert (list(router._ranking), router.segments, router.boundaries,
+                router._not_retained, router.view_state) == before
+        assert client.queries == 0 and client.transports == 0
+    finally:
+        del router._settle
+        router.close()
+        frames.db.close()
+
+
+def _remote_files_page(window, *, rows=1, app_id=1):
+    """One structurally valid remote Files page for the scheduler arms."""
+
+    overflow = UnknownOwnerOverflow(window, "overflow_owner_unknown", 0, 0, 0, coverage())
+    row = FileRow(0, "alpha.txt", "resolved", False, "8:0", 11, 1, 1, 1, 17, 5, 22, BOOT, 1)
+    return FileTable(app_id, window, tuple(replace(row) for _ in range(rows)),
+                     "bytes_total", "desc", None, overflow, coverage())
+
+
+def test_ranking_readiness_excludes_all_detail_and_files_work(tmp_path):
+    """Ranking/ownership readiness is terminal before any held detail or Files.
+
+    Each arm holds exactly one independent dependency after the frame's ranking
+    and ownership evidence has settled: a remote series, remote totals, a real
+    local detail computation, a Files first page, a Files continuation or the
+    final file coverage. ``ready`` stays true and the held Future stays pending;
+    a successful frame never prefetches a subject's parts.
+    """
+
+    for index, arm in enumerate(
+            ("series", "totals", "local-detail", "files-page",
+             "files-continuation", "files-coverage")):
+        window = Window("since_boot", BOOT, end_mono_ns=140 * NS)
+        router = store = None
+        release = threading.Event()
+        try:
+            if arm == "local-detail":
+                local = _committed_store(
+                    tmp_path / f"ready-{index}.db", ((ALPHA, 17, 20),))
+                store = local
+                from live_overview_support import make_managed_router
+
+                router = make_managed_router(QueryService(local), _IdleClient(), AppRegistry())
+
+                router.prepare(window)
+                assert wait_local(router) is not None
+
+                assert router.ready(window) is True
+                assert router._worker_jobs == {} and router._unscheduled == {}
+                presentation = router.registry.id_for(ALPHA)
+                entered = threading.Event()
+                original = router._read_local_part
+
+                def held_part(*args, **kwargs):
+                    entered.set()
+                    assert release.wait(20), "the local detail worker was never released"
+                    return original(*args, **kwargs)
+
+                router._read_local_part = held_part
+                router.select_detail(ALPHA, window)
+                assert router.request_detail("series", presentation, window).state == "pending"
+                _drain_until(router, entered.is_set)
+                assert entered.is_set()
+                held = None
+                assert router.ready(window) is True
+                assert router._background_charge("detail") == 1
+                assert router.pending_work is True
+                release.set()
+                _drain_until(router, lambda: router._background_charge("detail") == 0)
+                continue
+
+            client = _BoundClient()
+            router, store = _empty_router(tmp_path, client, name=f"ready-{index}.db")
+            presentation = _remote_frame(router, client, window)
+            # A completed frame proves only ranking/ownership; no part exists.
+            assert router._worker_jobs == {} and router._unscheduled == {}
+            assert router._background_charge("detail") == 0
+
+            if arm in ("series", "totals"):
+                router.select_detail(KEY, window)
+                assert router.request_detail(arm, presentation, window).state == "pending"
+                held = client.only(arm)
+            else:
+                future = router.request_file_view(
+                    presentation, window, "bytes_total", "desc", None)
+                assert future.done() is False
+                first = client.only("files")
+                if arm == "files-page":
+                    held = first
+                elif arm == "files-continuation":
+                    client.settle(first, {
+                        "kind": "files", "result": _remote_files_page(window),
+                        "snapshot": DIGEST, "next_cursor": "opaque-page-2",
+                        "app_key": KEY,
+                    })
+                    assert router.ready(window) is True
+                    held = client.only("files")
+                    assert client.query_transport(held).request.cursor == "opaque-page-2"
+                else:
+                    client.settle(first, {
+                        "kind": "files", "result": _remote_files_page(window),
+                        "snapshot": DIGEST, "next_cursor": None, "app_key": KEY,
+                    })
+                    assert router.ready(window) is True
+                    held = client.only("coverage")
+                    continuation = client.query_transport(held).request
+                    assert continuation.kind == "coverage"
+                    assert continuation.coverage_kind == "file"
+
+            assert held.done() is False, arm
+            # The held dependency is not a readiness gate and is not settled by
+            # the readiness/drain path itself.
+            assert router.ready(window) is True, arm
+            assert router.ready(window) is True, arm
+            assert held.done() is False, arm
+            assert router.pending_work is True, arm
+        finally:
+            release.set()
+            if router is not None:
+                router.close()
+            if store is not None:
+                store.connection.close()
+
+
+def test_local_worker_capacity_counts_retired_jobs_and_keeps_frame_independent(tmp_path):
+    """The background ledger is bounded and the frame lane stays independent.
+
+    Two charged detail jobs and eight Files workers, retired jobs included,
+    fill the ten-job ceiling; repeated selection changes submit no eleventh
+    Future and keep at most one waiting successor per kind. Releasing one charge
+    admits exactly one eligible replacement, and a retired-but-running frame
+    keeps the frozen not-done gate closed instead of queueing a duplicate copy.
+    """
+
+    frames = _file_frames(tmp_path, "capacity.db")
+    from live_overview_support import make_managed_router
+
+    router = make_managed_router(QueryService(frames.db), _IdleClient(), AppRegistry())
+
+    window = FILE_WINDOW
+    release_detail = threading.Event()
+    detail_entered = threading.Event()
+    release_files = threading.Event()
+    files_entered = threading.Event()
+    frame_release = threading.Event()
+    frame_entered = threading.Event()
+    original_part = router._read_local_part
+    original_files = router._read_local_files
+    original_read = router._read_local
+
+    def held_part(*args, **kwargs):
+        detail_entered.set()
+        assert release_detail.wait(20), "the detail worker was never released"
+        return original_part(*args, **kwargs)
+
+    def held_files(*args, **kwargs):
+        files_entered.set()
+        assert release_files.wait(20), "the Files worker was never released"
+        return original_files(*args, **kwargs)
+
+    def held_frame(paths, window_arg, **kwargs):
+        frame_entered.set()
+        assert frame_release.wait(20), "the frame worker was never released"
+        return original_read(paths, window_arg, **kwargs)
+
+    router._read_local_part = held_part
+    router._read_local_files = held_files
+    submitted: list[object] = []
+    real_submit = router._background_executor.submit
+
+    def counted_submit(work, /, *args, **kwargs):
+        submitted.append(work)
+        return real_submit(work, *args, **kwargs)
+
+    router._background_executor.submit = counted_submit
+    try:
+        router.prepare(window)
+        assert wait_local(router) is not None
+
+        assert router.ready(window) is True
+        presentation = router.registry.id_for(FILE_APP)
+        assert router._worker_jobs == {} and router._background_charge("detail") == 0
+        assert router._frame_executor is not router._background_executor
+
+        # Two charged detail jobs for the selected lifetime.
+        router.select_detail(FILE_APP, window)
+        assert router.request_detail("series", presentation, window).state == "pending"
+        assert router.request_detail("totals", presentation, window).state == "pending"
+        from live_overview_support import wait_for_capture_admission
+        wait_for_capture_admission(router)
+        assert detail_entered.is_set()
+        assert router._background_charge("detail") == 2
+        assert len(submitted) == 2 and router._unscheduled == {}
+        router.prepare(window)
+        assert wait_local(router) is not None
+        assert router.ready(window) is True
+        assert not release_detail.is_set()
+        assert len(submitted) == 2
+
+        # Eight Files workers fill the Files budget and the ten-job ceiling.
+        # They queue behind the held detail worker; admission, not execution, is
+        # what the ledger bounds here.
+        files_futures = [
+            router.request_file_view(presentation, window, "bytes_total", "desc", None)
+            for _ in range(8)
+        ]
+        wait_for_capture_admission(router)
+        assert router._background_charge("files") == 8
+        assert len(router._worker_jobs) == 10
+        assert len(submitted) == 10
+
+        # Repeated selection changes retire owners but never grow the queue: the
+        # waiting current detail stays unscheduled with at most one successor.
+        for iteration in range(6):
+            key = FILE_ZERO if iteration % 2 == 0 else FILE_APP
+            forward = Window("since_boot", FILE_BOOT,
+                             end_mono_ns=FILE_HOUR_NS + (10 + iteration) * NS)
+            router.select_detail(key, forward)
+            state = router.request_detail(
+                "series", router.registry.id_for(key), forward)
+            assert state.state == "pending", iteration
+            assert len(submitted) == 10, iteration
+            assert len(router._worker_jobs) <= 10, iteration
+            assert router._background_charge("detail") <= 2, iteration
+            assert len(router._unscheduled) <= 1, iteration
+
+        # Releasing the charged detail jobs admits exactly one replacement, not
+        # an unbounded catch-up batch for every retired selection. The held Files
+        # workers keep the background lane busy, so the replacement stays queued
+        # on its own charge rather than running out of budget.
+        release_detail.set()
+        _drain_until(router, lambda: router._background_charge("detail") == 1)
+        wait_for_capture_admission(router)
+        assert len(submitted) == 11, "exactly one waiting detail was admitted"
+        assert router._background_charge("files") == 8
+        assert len(router._worker_jobs) == 9
+        assert router._unscheduled == {}
+
+        # The frame lane keeps its own single Future. A retired-but-running
+        # frame copy keeps the frozen not-done gate closed: no duplicate frame
+        # worker is queued behind it.
+        router._read_local = held_frame
+        frame_window = Window("range", FILE_BOOT, 0, FILE_HOUR_NS)
+        router.prepare(frame_window)
+        wait_for_capture_admission(router)
+        assert frame_entered.wait(10)
+        running = router._local_future
+        assert router.local_read_in_flight is True
+        router.invalidate()
+        assert router.local_read_in_flight is True
+        assert router._local_future is running
+        assert router._frame_executor._work_queue.qsize() == 0
+
+        def shell_gate(wanted):
+            if router.local_read_in_flight is not False:
+                return False
+            router.prepare(wanted)
+            return True
+
+        assert shell_gate(frame_window) is False
+        assert router._local_future is running
+        frame_release.set()
+        _drain_until(router, lambda: router.local_read_in_flight is False)
+        assert router.local_read_in_flight is False
+    finally:
+        release_detail.set()
+        release_files.set()
+        frame_release.set()
+        router.close()
+        frames.db.close()
+
+
+@pytest.mark.parametrize("journal_mode", ["DELETE", "WAL"])
+def test_transport_gap_observer_visibility_rejects_divergent_pair(
+        tmp_path, monkeypatch, journal_mode):
+    """A lock or a committed lookalike cannot replace the random pairing row."""
+    from appio.history_source import ManagedSourceRegistry, SourceAdmissionError
+    from appio.history_types import ManagedSourceSpec
+    from appio.iodclient import GapNotice
+    from live_overview_support import GapSqlHarness, LocalPositionStores
+
+    with LocalPositionStores(tmp_path, journal_modes={"local": journal_mode,
+                                                    "export": journal_mode}) as stores:
+        sql = GapSqlHarness(monkeypatch)
+        assert callable(getattr(ManagedSourceRegistry, "record_transport_gap", None))
+        spec = ManagedSourceSpec("local", "gui",
+            stores.paths["local"].as_uri() + "?mode=rw&cache=shared", ())
+        sql.observer_uri = stores.paths["export"].as_uri() + "?mode=ro&cache=shared"
+        third = sqlite3.connect(stores.paths["export"].as_uri() + "?mode=rw&cache=shared",
+                                uri=True, isolation_level=None)
+        for locked in (False, True):
+            sources = ManagedSourceRegistry(wake=lambda: None)
+            if locked:
+                third.execute("BEGIN IMMEDIATE")
+                third.execute("UPDATE boot SET started_wall=started_wall WHERE boot_id='boot-a'")
+            try:
+                with pytest.raises(SourceAdmissionError,
+                                   match="^gap writer binding is unprovable$"):
+                    sources.register(spec).result(timeout=10)
+                assert sources.registration_vector() == ()
+                assert stores.stores["local"].connection.execute(
+                    "SELECT boot_id FROM boot").fetchall() == [("boot-a",)]
+                assert stores.stores["local"].connection.execute(
+                    "SELECT count(*) FROM gap").fetchone() == (0,)
+            finally:
+                third.rollback()
+                sources.close()
+        third.close()
+
+        sql.observer_uri = None
+        sources = ManagedSourceRegistry(wake=lambda: None)
+        seen_nonces = []
+
+        def see_challenge(probe, statement, parameters):
+            if probe.role == "observer" and statement.startswith("SELECT boot_id,boot_order"):
+                assert probe.connection.execute("PRAGMA read_uncommitted").fetchone() == (1,)
+                nonce = parameters[0]
+                assert len(nonce) == 64
+                assert stores.writers["local"].execute(
+                    "SELECT 1 FROM boot WHERE boot_id=?", (nonce,)).fetchall() == []
+                seen_nonces.append(nonce)
+
+        sql.before_execute = see_challenge
+        try:
+            receipt = sources.register(spec).result(timeout=10)
+            assert len(seen_nonces) == 1
+            assert sources.observe().sources[0].registration_epoch == receipt.registration_epoch
+            sql.before_execute = lambda *args: None
+            notice = GapNotice("boot-a", 7, 1, 22 * NS, 23 * NS, "disconnect")
+            visibility_error = SourceAdmissionError(
+                "gap writer result is not visible to managed source")
+
+            def fail_visibility(probe, statement, parameters):
+                if probe.role == "observer" and "FROM gap" in statement:
+                    raise visibility_error
+
+            sql.before_execute = fail_visibility
+            with pytest.raises(SourceAdmissionError) as caught:
+                sources.record_transport_gap(notice).result(timeout=10)
+            assert caught.value is visibility_error
+            assert stores.stores["local"].connection.execute(
+                "SELECT count(*) FROM gap WHERE reason='gui_absent'").fetchone() == (1,)
+            sql.before_execute = lambda *args: None
+            retried = sources.record_transport_gap(notice).result(timeout=10)
+            assert retried.disposition == "duplicate"
+            assert len(seen_nonces) == 1
+        finally:
+            sources.close()
+            assert all(probe.closed.wait(5) for probe in sql.connections)
+
+
+@pytest.mark.parametrize("journal_mode", ["DELETE", "WAL"])
+def test_transport_gap_writer_registration_retirement_and_close(
+        tmp_path, monkeypatch, journal_mode):
+    """Both controls, incarnation retirement and actor-thread close are enforced."""
+    from appio.history_source import GapWriteResult, ManagedSourceRegistry, SourceAdmissionError
+    from appio.history_types import ManagedSourceSpec
+    from appio.iodclient import GapNotice
+    from live_overview_support import (GapSqlHarness, LocalPositionStores,
+                                       drain_transport_gaps, make_managed_router)
+
+    assert tuple(field.name for field in fields(GapWriteResult)) == (
+        "registration_epoch", "disposition", "boot_id", "from_mono_ns", "to_mono_ns")
+    result = GapWriteResult(1, "inserted", "boot-a", 0, 1)
+    with pytest.raises(FrozenInstanceError):
+        result.disposition = "duplicate"
+    for changes in ({"registration_epoch": True}, {"registration_epoch": 0},
+                    {"disposition": "other"}, {"boot_id": ""},
+                    {"from_mono_ns": True}, {"from_mono_ns": -1},
+                    {"to_mono_ns": 0}, {"to_mono_ns": 2**63}):
+        with pytest.raises(ValueError):
+            replace(result, **changes)
+    with LocalPositionStores(tmp_path, journal_modes={"local": journal_mode}) as stores:
+        sql = GapSqlHarness(monkeypatch)
+        checked = []
+        admitted_controls = False
+
+        def check_controls(probe, statement, parameters):
+            if (not admitted_controls or probe.role != "observer"
+                    or statement != "PRAGMA main.data_version"):
+                return
+            connection = probe.connection
+            assert connection.execute("PRAGMA query_only").fetchone() == (1,)
+            assert connection.execute("PRAGMA read_uncommitted").fetchone() == (0,)
+            for forbidden in ("PRAGMA query_only=OFF", "PRAGMA read_uncommitted=ON",
+                              "UPDATE boot SET started_wall=started_wall",
+                              "ATTACH ':memory:' AS forbidden"):
+                with pytest.raises(sqlite3.DatabaseError, match="not authorized"):
+                    connection.execute(forbidden)
+            connection.set_authorizer(None)
+            try:
+                with pytest.raises(sqlite3.OperationalError, match="readonly"):
+                    connection.execute("UPDATE boot SET started_wall=started_wall")
+            finally:
+                connection.set_authorizer(probe.authorizer)
+            checked.append(threading.get_ident())
+
+        sql.before_execute = check_controls
+        sources = ManagedSourceRegistry(wake=lambda: None)
+        spec = ManagedSourceSpec("local", "gui",
+            stores.paths["local"].as_uri() + "?mode=rw&cache=shared", ())
+        notice = GapNotice("boot-a", 7, 1, 22 * NS, 23 * NS, "disconnect")
+        try:
+            for unmanaged in (stores.stores["local"].connection, stores.services["local"]):
+                with pytest.raises(SourceAdmissionError, match="ManagedSourceSpec"):
+                    sources.register(unmanaged).result(timeout=0)
+            assert sources.registration_vector() == ()
+            admission = sources.register(spec)
+            assert admission.exception(timeout=10) is None, "valid primary pair was rejected"
+            first = admission.result(timeout=0)
+            admitted_controls = True
+            sources.observe_async().result(timeout=10)
+            assert checked and checked[0] != threading.get_ident()
+            writer, observer = sql.connections
+            assert writer.role == "writer" and observer.role == "observer"
+            assert writer.thread == observer.thread
+            assert observer.options["cached_statements"] == 0
+            with pytest.raises(sqlite3.ProgrammingError):
+                writer.connection.execute("SELECT 1")
+            with sql.hold("COMMIT") as barrier:
+                old = sources.record_transport_gap(notice)
+                barrier.wait()
+                queued = sources.record_transport_gap(replace(notice, from_mono_ns=24 * NS,
+                                                               to_mono_ns=25 * NS))
+                replacement = sources.replace("local", spec)
+                assert sources.registration_vector() == ()
+                assert not replacement.done()
+                barrier.release()
+                assert old.result(timeout=10).registration_epoch == first.registration_epoch
+                with pytest.raises(SourceAdmissionError, match="retired"):
+                    queued.result(timeout=10)
+                second = replacement.result(timeout=10)
+                assert second.registration_epoch > first.registration_epoch
+            with sql.hold("BEGIN IMMEDIATE") as barrier:
+                admitted = sources.record_transport_gap(replace(notice, from_mono_ns=26 * NS,
+                                                                 to_mono_ns=27 * NS))
+                barrier.wait()
+                shutdown_queued = sources.record_transport_gap(replace(notice, from_mono_ns=28 * NS,
+                                                                       to_mono_ns=29 * NS))
+                close_error = None
+                try:
+                    sources.close()
+                except sqlite3.ProgrammingError as error:
+                    close_error = error
+                assert close_error is None, "registry close accessed SQLite on the caller thread"
+                assert not admitted.done()
+                assert not sql.connections[-1].closed.is_set()
+                with pytest.raises(SourceAdmissionError, match="closed"):
+                    sources.record_transport_gap(notice).result(timeout=0)
+                barrier.release()
+                assert admitted.result(timeout=10).disposition == "inserted"
+                assert shutdown_queued.result(timeout=10).disposition == "inserted"
+            for probe in sql.connections:
+                assert probe.closed.wait(5)
+                assert probe.close_thread == probe.thread
+        finally:
+            sources.close()
+
+        # Drain an old writer completion after replacement through the router.
+        # The new incarnation must not be invalidated by that completion.
+        router = make_managed_router(stores.services["local"], _IdleClient(), AppRegistry())
+        sources = router._capture_provider
+        primary_spec = sources._active["local"].spec
+        invalidations = []
+        invalidate = router.invalidate
+
+        def observe_invalidation(**options):
+            invalidations.append(options)
+            invalidate(**options)
+
+        monkeypatch.setattr(router, "invalidate", observe_invalidation)
+        try:
+            with sql.hold("COMMIT") as barrier:
+                router.record_transport_gap(replace(notice, from_mono_ns=30 * NS,
+                                                     to_mono_ns=31 * NS))
+                barrier.wait()
+                replacement = sources.replace("local", primary_spec)
+                barrier.release()
+                replacement.result(timeout=10)
+                drain_transport_gaps(router)
+            assert invalidations == [], "retired gap invalidated the replacement epoch"
+        finally:
+            router.close()
+
+
+@pytest.mark.parametrize("mode", ["local", "remote"])
+def test_transport_gap_fence_error_and_later_gap_ordering(tmp_path, monkeypatch, mode):
+    """A preceding write gates the new owner and a later write retires it."""
+    from appio.iodclient import GapNotice
+    from live_overview_support import (GapSqlHarness, LocalPositionStores,
+        drain_transport_gaps, make_managed_router, wait_for_local_frame)
+
+    with LocalPositionStores(tmp_path) as stores:
+        sql = GapSqlHarness(monkeypatch)
+        client = _IdleClient() if mode == "local" else _BoundClient(boot="boot-a")
+        router = make_managed_router(stores.services["local"], client, AppRegistry())
+        notice = GapNotice("boot-a", 7, 1, 21 * NS, 22 * NS, "disconnect")
+        scope = Window("range", "boot-a", 10 * NS, 30 * NS)
+        capture = router._capture_provider.capture
+        captures = []
+
+        def record_capture():
+            captures.append(router._generation)
+            return capture()
+
+        monkeypatch.setattr(router._capture_provider, "capture", record_capture)
+        try:
+            with sql.hold("BEGIN IMMEDIATE") as barrier:
+                assert router.record_transport_gap(notice) is None
+                barrier.wait()
+                assert router.transport_issues == [notice]
+                router.prepare(scope)
+                generation = router._generation
+                if mode == "local":
+                    assert router.preparation_source(scope) is None
+                assert router.pending_work and not router.local_read_in_flight
+                assert not captures and not router._capture_jobs and not router._frame_jobs
+                if mode == "remote":
+                    assert not client.requests
+                assert router.drain() is False
+                barrier.release()
+                drain_transport_gaps(router)
+            assert captures == [generation]
+            assert router._generation == generation
+            outcome = wait_for_local_frame(router)
+            assert outcome.known_gaps == (("boot-a", 21 * NS, 22 * NS),)
+            if mode == "local":
+                assert router.preparation_source(scope) == outcome.snapshot.bracket.opening
+                assert router.ready(scope)
+            later = replace(notice, from_mono_ns=23 * NS, to_mono_ns=24 * NS)
+            router.record_transport_gap(later)
+            drain_transport_gaps(router)
+            assert router._generation == generation + 1
+            assert not router.ready(scope)
+            repeated = replace(notice, from_mono_ns=27 * NS, to_mono_ns=28 * NS)
+            prior_captures = len(captures)
+            with sql.hold("BEGIN IMMEDIATE") as barrier:
+                router.record_transport_gap(repeated)
+                barrier.wait()
+                router.prepare(scope)
+                fenced_generation = router._generation
+                router.record_transport_gap(repeated)
+                barrier.release()
+                drain_transport_gaps(router)
+            assert router._generation == fenced_generation + 1, "later duplicate entered an earlier fence"
+            assert len(captures) == prior_captures
+            if mode == "local":
+                sources = router._capture_provider
+                primary_spec = sources._active["local"].spec
+                invalidations = []
+                invalidate = router.invalidate
+
+                def observe_invalidation(**options):
+                    invalidations.append(options)
+                    invalidate(**options)
+
+                monkeypatch.setattr(router, "invalidate", observe_invalidation)
+                with sql.hold("COMMIT") as barrier:
+                    router.record_transport_gap(replace(notice, from_mono_ns=29 * NS,
+                                                         to_mono_ns=30 * NS))
+                    barrier.wait()
+                    replacement = sources.replace("local", primary_spec)
+                    barrier.release()
+                    replacement.result(timeout=10)
+                    drain_transport_gaps(router)
+                assert invalidations == [], "retired gap invalidated the replacement epoch"
+                actor = sources._active["local"].actor
+                with sql.hold("COMMIT") as barrier:
+                    router.record_transport_gap(replace(notice, from_mono_ns=25 * NS,
+                                                         to_mono_ns=26 * NS))
+                    barrier.wait()
+                    router.close()
+                    barrier.release()
+                    actor.closed.result(timeout=10)
+                router.drain()
+                assert not router.pending_work, "closed gap completion kept the poll charged"
+        finally:
+            router.close()

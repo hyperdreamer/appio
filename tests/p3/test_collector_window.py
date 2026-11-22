@@ -48,6 +48,14 @@ from appio.contracts import (
 from appio.file_runtime import FileAvailability
 from appio.history_export import ExportResult
 from appio.history_router import FileViewResult
+from appio.history_types import (
+    FrameProvenance,
+    LocalBracket,
+    LocalPosition,
+    LocalPositionVector,
+    RemotePosition,
+    SourcePosition,
+)
 from appio.setup_boundary import CommandResult
 from appio.setup_client import SetupReply
 from appio.ui import collector_window as cw
@@ -87,7 +95,14 @@ class FakeConnection:
 
 
 class FakeHistory:
-    """Router-shaped; the ready gate is flipped by the test, never implied."""
+    """Router-shaped; the ready gate is flipped by the test, never implied.
+
+    Source certification is explicit and controllable: ``source`` is the
+    observed ``SourcePosition`` (a local vector by default), ``prepare`` stores
+    the gate's capture, and ``become_ready`` publishes that generation's
+    certificate. ``drain`` reports a changed batch so notification order is
+    observable instead of implied by Window equality.
+    """
 
     def __init__(self, *, ready: bool = False, boot_id: str | None = BOOT, events=None):
         self.local = SimpleNamespace(connection=FakeConnection(boot_id))
@@ -95,6 +110,15 @@ class FakeHistory:
         self.actions: list[tuple] = []
         self.events = events if events is not None else []
         self.prepared: Window | None = None
+        self.prepared_sources: dict[Window, SourcePosition] = {}
+        self.certificates: dict[Window, FrameProvenance] = {}
+        self.source: SourcePosition = LocalPositionVector(
+            (LocalPosition("local", "gui", 1, 1, 0),)
+        )
+        self.source_reads = 0
+        self.drain_calls = 0
+        self.drain_changed = False
+        self.pending_work_flag = False
         self.ranking_calls: list[Window] = []
         self._ready = ready
         self.rows: list[object] = []
@@ -114,14 +138,66 @@ class FakeHistory:
         self.actions.append(("prepare", window))
         self.events.append(("prepare", window))
         self.prepared = window
+        # A new frame owner replaces the previous generation: its capture is
+        # the one the shell reads back, and no older certificate survives.
+        self.prepared_sources = {window: self.source}
+        self.certificates = {}
         self.view_state = "loading"
 
     def ready(self, window: Window) -> bool:
         return self._ready and window == self.prepared
 
+    def source_position(self) -> SourcePosition:
+        self.source_reads += 1
+        return self.source
+
+    def preparation_source(self, window: Window) -> SourcePosition | None:
+        return self.prepared_sources.get(window)
+
+    def frame_provenance(self, window: Window) -> FrameProvenance | None:
+        return self.certificates.get(window)
+
+    def drain(self) -> bool:
+        self.drain_calls += 1
+        changed = self.drain_changed
+        self.drain_changed = False
+        return changed
+
+    @property
+    def pending_work(self) -> bool:
+        return self.pending_work_flag
+
+    def advance_source(self) -> None:
+        """Move the observed source without touching the requested Window."""
+
+        if isinstance(self.source, RemotePosition):
+            self.source = RemotePosition(
+                self.source.boot_id, self.source.iod_epoch, self.source.seq + 1
+            )
+            return
+        source = self.source.sources[0]
+        self.source = LocalPositionVector(
+            (replace(source, total_changes=source.total_changes + 1),)
+        )
+
+    def _certify(self, window: Window) -> None:
+        source = self.prepared_sources.get(window)
+        if source is None:
+            return
+        bracket = (
+            LocalBracket(source, source)
+            if isinstance(source, LocalPositionVector)
+            else None
+        )
+        self.certificates[window] = FrameProvenance(
+            1, window, source, source, bracket, True
+        )
+
     def become_ready(self):
         self._ready = True
         self.view_state = "complete"
+        if self.prepared is not None:
+            self._certify(self.prepared)
 
     def ranking(self, window: Window, metric: str):
         self.ranking_reads += 1
@@ -1669,7 +1745,10 @@ def test_collector_window_wires_stall_caption_to_real_files_view(qtbot, tmp_path
     runtime.consume(*frames.tick(0))
     runtime.consume(*frames.tick(H))
 
-    history = HistoryRouter(QueryService(frames.db), IdleClient(), AppRegistry())
+    from live_overview_support import make_managed_router
+
+    history = make_managed_router(QueryService(frames.db), IdleClient(), AppRegistry())
+
     now = [H - 1]
     window = CollectorWindow(
         ControlledCoordinator(), history, ControlledSetup(OFF),
@@ -1682,6 +1761,7 @@ def test_collector_window_wires_stall_caption_to_real_files_view(qtbot, tmp_path
     release = threading.Event()
     try:
         window._tick_target()
+        qtbot.waitUntil(lambda: (window._tick_target(), window._pending is not None)[1], timeout=5000)
         first = window._pending
         assert first is not None
         qtbot.waitUntil(lambda: history.ready(first), timeout=5000)
@@ -1697,13 +1777,15 @@ def test_collector_window_wires_stall_caption_to_real_files_view(qtbot, tmp_path
         entered = threading.Event()
         original_read = history._read_local
 
-        def held_read(paths, requested):
+        def held_read(paths, requested, **kwargs):
             entered.set()
             assert release.wait(5), "local history read was not released"
-            return original_read(paths, requested)
+            return original_read(paths, requested, **kwargs)
 
         monkeypatch.setattr(history, "_read_local", held_read)
         window.show_window(first)
+        from live_overview_support import wait_for_capture_admission
+        wait_for_capture_admission(history)
         assert entered.wait(2)
         now[0] += STALL_BUDGET_NS
         window._poll_history()
@@ -1727,7 +1809,7 @@ def test_collector_window_wires_stall_caption_to_real_files_view(qtbot, tmp_path
         frames.db.close()
 
 
-@pytest.mark.parametrize("change", ["time", "boot"])
+@pytest.mark.parametrize("change", ["source", "boot"])
 def test_pending_history_retains_a_until_applied_before_b(qtbot, change):
     window, coordinator, history, setup = build(
         qtbot, facts=ON, history=ControlledHistory())
@@ -1739,9 +1821,12 @@ def test_pending_history_retains_a_until_applied_before_b(qtbot, change):
     assert window._displayed is None
     assert len(history.actions) == 1
 
-    # Advance the requested scope without retiring the pending preparation.
-    if change == "time":
+    # Advance the due source without retiring the pending preparation. An
+    # endpoint-only clock advance is expressly not a replacement trigger; a
+    # source position change is.
+    if change == "source":
         window._clock_ns = lambda: END + RAW_BUCKET_NS // 2
+        history.advance_source()
         advanced = Window(kind="since_boot", boot_id=BOOT, end_mono_ns=END + RAW_BUCKET_NS)
     else:
         history.local.connection.boot_id = "next-boot"
@@ -2259,7 +2344,10 @@ def test_real_history_router_gates_rendering_until_ready(qtbot, tmp_path):
     store = AppIoStore(tmp_path / "history.db")
     store.start_boot(BOOT, 1, 0, 1000.0, "gui")
     store.connection.commit()
-    history = HistoryRouter(QueryService(store), IdleClient(), AppRegistry())
+    from live_overview_support import make_managed_router
+
+    history = make_managed_router(QueryService(store), IdleClient(), AppRegistry())
+
     coordinator = FakeCoordinator()
     setup = FakeSetup(OFF)
     window = CollectorWindow(coordinator, history, setup,
@@ -2271,16 +2359,19 @@ def test_real_history_router_gates_rendering_until_ready(qtbot, tmp_path):
     try:
         window.refresh()
         requested = Window(kind="since_boot", boot_id=BOOT, end_mono_ns=END)
+        qtbot.waitUntil(lambda: (window.refresh(), window._pending == requested)[1], timeout=5000)
         # The requested scope is pending; no displayed alias exists yet.
         assert window._pending == requested
         assert window._target == requested
         assert window._prepared is None
         if not window.history_visible:
             assert "loading" in window.history_state.text()
-        qtbot.waitUntil(lambda: window.history_visible is True, timeout=5000)
+        qtbot.waitUntil(lambda: (window.apply_ready_frame(), window.history_visible)[1], timeout=5000)
         assert window._prepared == requested
         assert history.ready(window._prepared)
-        assert window.history_state.text() == ""
+        # An applied but empty ranking is a settled panel, never an indefinite
+        # loading/live claim (status row 6c).
+        assert window.history_state.text() == "no applications observed"
     finally:
         history.close()
         store.connection.close()
@@ -2424,13 +2515,16 @@ def test_window_keeps_in_flight_history_for_the_same_scope(qtbot, tmp_path, monk
         return client.state.verified and client.state.answering
 
     qtbot.waitUntil(prime_client, timeout=1500)
-    history = HistoryRouter(QueryService(local), client, AppRegistry())
+    from live_overview_support import make_managed_router
+
+    history = make_managed_router(QueryService(local), client, AppRegistry())
+
     read_local = history._read_local
 
-    def slow_local_snapshot(*args):
+    def slow_local_snapshot(*args, **kwargs):
         # Model a loaded history worker; the daemon itself answers immediately.
         stopping.wait(0.18)
-        return read_local(*args)
+        return read_local(*args, **kwargs)
 
     monkeypatch.setattr(history, "_read_local", slow_local_snapshot)
     history_ref.append(history)
@@ -2666,6 +2760,9 @@ class ControlledHistory(FakeHistory):
         self.registry = SimpleNamespace(id_for=lambda key: 2 if key == "file:beta" else 3)
         self.file_apps: list[tuple[str, str, int]] = []
         self.local.file_applications = self._file_applications
+        #: Test control: a readiness read normally publishes the generation's
+        #: certificate; the uncertified-race arm installs its own instead.
+        self.certify_on_ready = True
 
     @property
     def local_read_in_flight(self):
@@ -2686,12 +2783,18 @@ class ControlledHistory(FakeHistory):
             raise self.prepare_failures.pop(0)
 
     def ready(self, window: Window) -> bool:
-        return window in self.ready_windows
+        is_ready = window in self.ready_windows
+        if is_ready and self.certify_on_ready:
+            # The router publishes a terminal generation's certificate by the
+            # time readiness reports true; mirror that single promotion here.
+            self._certify(window)
+        return is_ready
 
     def become_ready(self, window: Window) -> None:
         self.prepared = window
         self.ready_windows.add(window)
         self.view_state = "ready"
+        self._certify(window)
 
     def request_file_view(self, app_id, window, sort, direction, search):
         self.file_requests.append((app_id, window, sort, direction, search))
@@ -2768,6 +2871,73 @@ def controlled_build(qtbot, *, facts=OFF, ready=False, setup=None, history=None,
     return window, coordinator, history, setup
 
 
+class PublicHistoryProvider:
+    """Expose the public injected-history surface without fake gate fields."""
+
+    _public = frozenset({
+        "client", "local", "registry", "view_state", "prepare", "ready",
+        "source_position", "preparation_source", "frame_provenance", "drain",
+        "pending_work", "local_read_in_flight", "ranking", "file_source_status",
+        "request_file_view", "disk_share", "series", "invalidate", "close",
+    })
+
+    def __init__(self, backing):
+        self._backing = backing
+
+    def __getattr__(self, name):
+        if name not in self._public:
+            raise AttributeError(name)
+        return getattr(self._backing, name)
+
+
+def test_injected_public_ready_contract_binds_files_to_applied_frame(qtbot):
+    backing = ControlledHistory(ready=True)
+    provider = PublicHistoryProvider(backing)
+    assert all(not hasattr(provider, name) for name in ("ready_windows", "prepared", "_ready", "_frame"))
+    window, _, _, _ = controlled_build(qtbot, history=provider)
+    window._timer.stop()
+    window._poll_timer.stop()
+    try:
+        window.refresh()
+        assert window._displayed is not None
+        assert window.view is not None
+        assert window.files_view._window == window._displayed
+    finally:
+        window.shutdown()
+
+
+@pytest.mark.parametrize("outcome", ["false", "error"])
+def test_injected_public_ready_false_or_error_does_not_sync_files(qtbot, monkeypatch, outcome):
+    backing = ControlledHistory(ready=True)
+    provider = PublicHistoryProvider(backing)
+    window, _, _, _ = controlled_build(qtbot, history=provider)
+    window._timer.stop()
+    window._poll_timer.stop()
+    try:
+        window.refresh()
+        displayed = window._displayed
+        assert displayed is not None
+        assert window.files_view._window == displayed
+        readiness_calls = []
+        sync_calls = []
+
+        def unavailable_ready(checked_window):
+            readiness_calls.append(checked_window)
+            if outcome == "error":
+                raise RuntimeError("readiness unavailable")
+            return False
+
+        monkeypatch.setattr(backing, "ready", unavailable_ready)
+        monkeypatch.setattr(window.files_view, "set_window", sync_calls.append)
+        assert window._history_ready(displayed) is False
+        window._sync_files()
+        assert readiness_calls and all(checked == displayed for checked in readiness_calls)
+        assert sync_calls == []
+        assert window.files_view._window == displayed
+    finally:
+        window.shutdown()
+
+
 def settle_probe(qtbot, window, *, after):
     qtbot.waitUntil(lambda: window.facts_applied > after, timeout=2000)
 
@@ -2826,7 +2996,7 @@ def test_replacement_keeps_frame_and_eventually_displays_new_scope(qtbot):
     assert window._pending == scope_window(boot="boot-2")
     assert window.view is host
     assert window.history_visible
-    assert "updating" in window.history_state.text()
+    assert "no applications observed" == window.history_state.text()
     apply_scope(window, history, window._pending)
     assert window._prepared == scope_window(boot="boot-2")
 
@@ -2982,8 +3152,9 @@ def test_retired_pending_preparation_is_replaced_once(qtbot):
 def test_prepare_failure_after_loading_keeps_frame_closed_and_retries_on_later_tick(
     real_files_shell, monkeypatch, owner, boundary, resolution
 ):
-    import sqlite3
-    from appio.query import QueryService
+    from appio.history_source import SourceAdmissionError
+    from appio.history_types import ManagedSourceSpec
+    from live_overview_support import wait_for_local_frame
 
     shell = real_files_shell
     window, history = shell.window, shell.history
@@ -2999,50 +3170,58 @@ def test_prepare_failure_after_loading_keeps_frame_closed_and_retries_on_later_t
 
     monkeypatch.setattr(history, "prepare", record)
     history.invalidate()
-    memory = None
-    try:
-        with monkeypatch.context() as failure:
-            if boundary == "transaction":
-                shell.frames.db.execute("BEGIN")
-                message = "uncommitted transaction"
-            elif boundary == "memory_source":
-                memory = sqlite3.connect(":memory:")
-                history._sources["memory"] = (QueryService(memory), "gui")
-                message = "file-backed SQLite"
-            else:
-                def reject(*_args, **_kwargs):
-                    raise RuntimeError("synthetic submit refusal")
-                failure.setattr(history._executor, "submit", reject)
-                message = "synthetic submit refusal"
-            if owner == "clock":
-                window.refresh()
-            else:
-                with pytest.raises((ValueError, RuntimeError), match=message):
-                    window.show_window(target)
-            assert history.view_state == "loading"
-            assert window._pending is None
-            marker = window._prepare_retry
-            assert marker.owner == owner and marker.window == target
-            assert message in window._prepare_error
-            assert not shell.view._scope_ready
-            assert window._displayed == displayed
-            assert files_snapshot(shell.view) == snapshot
-            assert window.apply_ready_frame() is False
-            assert calls == [target]
-            if owner == "explicit":
-                window._tick_target()
-                assert calls == [target] and window._prepare_retry is marker
-            else:
-                # A repeated clock failure renews, rather than consumes, its marker.
-                window._tick_target()
-                assert calls == [target, target]
-                assert window._prepare_retry is not marker
-    finally:
-        if shell.frames.db.in_transaction:
-            shell.frames.db.rollback()
-        if memory is not None:
-            history._sources.pop("memory")
-            memory.close()
+    def await_failure():
+        deadline = time.monotonic() + 5
+        while window._prepare_retry is None:
+            window.apply_ready_frame()
+            assert time.monotonic() < deadline, "managed preparation failure was not delivered"
+            time.sleep(0.001)
+
+    with monkeypatch.context() as failure:
+        if boundary == "transaction":
+            actor = history.sources._active["local"].actor
+            def reject_observation():
+                raise ValueError("history source has an uncommitted transaction")
+            failure.setattr(actor, "_observe", reject_observation)
+            message = "uncommitted transaction"
+        elif boundary == "memory_source":
+            invalid = ManagedSourceSpec("memory", "iod", ":memory:", ())
+            def reject_capture():
+                return history.sources.register(invalid)
+            failure.setattr(history.sources, "capture", reject_capture)
+            message = "absolute file URI"
+        else:
+            def reject(*_args, **_kwargs):
+                raise RuntimeError("synthetic submit refusal")
+            failure.setattr(history._frame_executor, "submit", reject)
+            message = "synthetic submit refusal"
+        if owner == "clock":
+            window.refresh()
+        else:
+            window.show_window(target)
+        await_failure()
+        assert history.view_state in ("loading", "unavailable: local history evidence")
+        assert window._pending is None
+        marker = window._prepare_retry
+        assert marker.owner == owner and marker.window == target
+        assert message in window._prepare_error
+        assert not shell.view._scope_ready
+        assert window._displayed == displayed
+        assert files_snapshot(shell.view) == snapshot
+        assert window.apply_ready_frame() is False
+        assert calls == [target]
+        if owner == "explicit":
+            window._tick_target()
+            assert calls == [target] and window._prepare_retry is marker
+        else:
+            window._tick_target()
+            await_failure()
+            assert calls == [target, target]
+            assert window._prepare_retry is not marker
+    # A coalesced actor observation may still carry the injected failure.
+    pending_observation = history.sources.observe_async()
+    pending_observation.exception(timeout=5)
+    history.sources.observe_async().result(timeout=5)
     previous_calls = len(calls)
     if resolution == "no_target":
         with monkeypatch.context() as no_target:
@@ -3070,7 +3249,7 @@ def test_prepare_failure_after_loading_keeps_frame_closed_and_retries_on_later_t
     assert calls[-1] == target and window._pending == target
     assert window._prepare_retry is None and window._prepare_error is None
     assert window.error_label.text() == ""
-    history._local_future.result(timeout=5)
+    wait_for_local_frame(history)
     assert window.apply_ready_frame()
     assert window._displayed == target
 
@@ -3477,6 +3656,445 @@ def test_close_during_probe_drops_all_late_effects(qtbot, monkeypatch):
         setup.release.set()
 
 
+@pytest.mark.parametrize("phase", ["success", "admission", "router", "coordinator", "setup", "window", "refresh"])
+def test_transport_gap_startup_and_callback_shutdown_order(qapp, tmp_path, monkeypatch, phase):
+    import sqlite3
+    from PyQt6.QtCore import QEventLoop, QTimer
+    from PyQt6 import QtWidgets
+    from appio import history_source, iodclient, store as store_module
+    from appio.contracts import Window as HistoryWindow
+
+    original_store = store_module.AppIoStore
+    original_registry = history_source.ManagedSourceRegistry
+    original_router = cw.HistoryRouter
+    bootstraps, registries, clients, windows = [], [], [], []
+    actor_registrations, gap_writers, database_locks, registration_locks = [], [], [], []
+    events, uncaught, pre_admission_checks = [], [], []
+    owner_thread = threading.get_ident()
+    original_error = ValueError(f"{phase} startup failed")
+    registration_retry_entered = threading.Event()
+    release_registration_retry = threading.Event()
+    registration_lock_held = threading.Event()
+    writer_retry_entered = threading.Event()
+    release_writer_retry = threading.Event()
+    writer_lock_held = threading.Event()
+    loop = QEventLoop()
+
+    class Application:
+        def processEvents(self):
+            qapp.processEvents()
+
+        def setDesktopFileName(self, name):
+            pass
+
+        def exec(self):
+            QTimer.singleShot(0, inspect_before_admission)
+            QTimer.singleShot(2000, loop.quit)
+            loop.exec()
+            return 1 if phase != "success" else 0
+
+        def exit(self, code=0):
+            events.append(("exit", code))
+            loop.quit()
+
+        def quit(self):
+            self.exit()
+
+    application = Application()
+    monkeypatch.setattr(QtWidgets, "QApplication", SimpleNamespace(instance=lambda: application))
+
+    def bootstrap(path):
+        result = original_store(path)
+        raw_connection = result.connection
+
+        class ObservedBootstrapConnection:
+            def execute(self, *args, **kwargs):
+                return raw_connection.execute(*args, **kwargs)
+
+            def close(self):
+                events.append(("bootstrap_close", threading.get_ident()))
+                raw_connection.close()
+
+            def __getattr__(self, name):
+                return getattr(raw_connection, name)
+
+        result.connection = ObservedBootstrapConnection()
+        bootstraps.append(result)
+        return result
+
+    def registry(**kwargs):
+        wake_callback = kwargs["wake"]
+
+        def observed_wake():
+            events.append(("source_wake", threading.get_ident()))
+            wake_callback()
+
+        def retry_wait(delay):
+            if registration_lock_held.is_set():
+                events.append(("registration_retry", threading.get_ident()))
+                registration_retry_entered.set()
+                release_registration_retry.wait(3)
+                if phase == "admission":
+                    raise sqlite3.OperationalError("synthetic primary pairing failure")
+                return
+            if writer_lock_held.is_set():
+                events.append(("gap_writer_wait", threading.get_ident()))
+                writer_retry_entered.set()
+                release_writer_retry.wait(3)
+            else:
+                time.sleep(delay)
+
+        options = dict(kwargs)
+        options["wake"] = observed_wake
+        options["retry_wait"] = retry_wait
+        result = original_registry(**options)
+        register = result.register
+        close = result.close
+        blocker = sqlite3.connect(str(tmp_path / "startup.db"), timeout=0)
+        blocker.execute("BEGIN IMMEDIATE")
+        registration_locks.append(blocker)
+        registration_lock_held.set()
+
+        def observed_register(spec):
+            future = register(spec)
+            actor_registrations.append(future)
+            future.add_done_callback(
+                lambda _done: events.append(("actor_future_done", threading.get_ident())))
+            return future
+
+        def observed_close():
+            events.append(("registry_close", threading.get_ident()))
+            close()
+
+        result.register = observed_register
+        result.close = observed_close
+        registries.append(result)
+        return result
+
+    def inspect_before_admission():
+        if not registration_retry_entered.is_set():
+            QTimer.singleShot(1, inspect_before_admission)
+            return
+        forbidden = {"client", "router", "window", "pump", "prepare"}
+        activity = [event for event in events if event[0] in forbidden]
+        pre_admission_checks.append((
+            bool(actor_registrations and not actor_registrations[0].done()),
+            not activity,
+            registration_retry_entered.is_set(),
+            threading.get_ident(),
+        ))
+        release_primary_lock()
+
+    def release_primary_lock():
+        events.append(("registration_lock_release", threading.get_ident()))
+        for blocker in registration_locks:
+            if blocker.in_transaction:
+                blocker.execute("ROLLBACK")
+            blocker.close()
+        registration_locks.clear()
+        registration_lock_held.clear()
+        release_registration_retry.set()
+
+    def primary_admitted():
+        return bool(
+            actor_registrations
+            and actor_registrations[0].done()
+            and actor_registrations[0].exception() is None
+        )
+
+    class Client:
+        state = iodclient.ClientState()
+        def __init__(self, *args, **kwargs):
+            events.append(("client", primary_admitted()))
+            self.on_gap = kwargs["on_gap"]
+            self.clock = kwargs["clock_ns"]
+            clients.append(self)
+        def close(self):
+            events.append(("client_close", threading.get_ident()))
+            self.on_gap(iodclient.GapNotice(
+                "startup-boot", 1, 2, 1, 2, "disconnect"))
+        def pump(self):
+            events.append(("pump", primary_admitted(), threading.get_ident()))
+
+    def router(*args, **kwargs):
+        events.append(("router", threading.get_ident(), primary_admitted()))
+        if phase == "router":
+            raise original_error
+        instance = original_router(*args, **kwargs)
+        prepare = instance.prepare
+        record_transport_gap = instance.record_transport_gap
+        close = instance.close
+
+        def observed_prepare(window):
+            events.append(("prepare", primary_admitted(), threading.get_ident()))
+            return prepare(window)
+
+        def observed_gap(notice):
+            events.append(("gap_submit", threading.get_ident()))
+            record_transport_gap(notice)
+            future = instance._gap_writes[-1].future
+            gap_writers.append(future)
+            future.add_done_callback(lambda _done: events.append((
+                "gap_writer_done", bool(windows and windows[-1].closed),
+                threading.get_ident())))
+
+        def observed_close():
+            events.append(("router_close", threading.get_ident()))
+            close()
+
+        instance.prepare = observed_prepare
+        instance.record_transport_gap = observed_gap
+        instance.close = observed_close
+        return instance
+
+    class Coordinator:
+        resume_handover = None
+        def __init__(self, **kwargs):
+            if phase == "coordinator":
+                raise original_error
+            self.client = kwargs["client"]
+        def close(self):
+            events.append(("coordinator_close", threading.get_ident()))
+            self.client.close()
+
+    def setup(**kwargs):
+        if phase == "setup":
+            raise original_error
+        return object()
+
+    class Window:
+        def __init__(self, coordinator, history, setup, **kwargs):
+            events.append(("window", threading.get_ident()))
+            try:
+                bootstraps[0].connection.execute("SELECT 1")
+            except sqlite3.ProgrammingError:
+                events.append(("bootstrap_closed", True, threading.get_ident()))
+            else:
+                events.append(("bootstrap_closed", False, threading.get_ident()))
+            if phase == "window":
+                raise original_error
+            self.coordinator, self.history = coordinator, history
+            self.clock = kwargs["age_clock_ns"]
+            self.refreshes = self.polls = 0
+            self.closed = False
+            self.late_touches = 0
+            windows.append(self)
+        def show(self):
+            pass
+        def refresh(self):
+            if self.closed:
+                self.late_touches += 1
+            self.refreshes += 1
+            if phase == "refresh":
+                raise original_error
+            self.coordinator.client.pump()
+            if phase == "success":
+                blocker = sqlite3.connect(str(args.db), timeout=0)
+                blocker.execute("BEGIN IMMEDIATE")
+                database_locks.append(blocker)
+                writer_lock_held.set()
+            self.history.prepare(HistoryWindow("since_boot", BOOT, end_mono_ns=END))
+            # A real actor completion after startup must only arm polling.
+            registries[0].observe_async()
+        def _arm_poll(self):
+            if self.closed:
+                self.late_touches += 1
+                return
+            self.polls += 1
+            QTimer.singleShot(0, loop.quit)
+        def shutdown(self):
+            self.closed = True
+            events.append(("window_shutdown", threading.get_ident()))
+            self.coordinator.close()
+            if phase == "success":
+                writer_retry_entered.wait(1)
+            self.history.close()
+
+    monkeypatch.setattr(store_module, "AppIoStore", bootstrap)
+    monkeypatch.setattr(history_source, "ManagedSourceRegistry", registry)
+    monkeypatch.setattr(iodclient, "IodClient", Client)
+    monkeypatch.setattr(cw, "HistoryRouter", router)
+    monkeypatch.setattr(cw, "CollectorCoordinator", Coordinator)
+    monkeypatch.setattr(cw, "SetupClient", setup)
+    monkeypatch.setattr(cw, "CollectorWindow", Window)
+    def exception_hook(kind, error, traceback):
+        uncaught.append(error)
+        application.exit(91)
+    monkeypatch.setattr(cw.sys, "excepthook", exception_hook)
+    args = SimpleNamespace(db=tmp_path / "startup.db", interval=1, proc_root="/fixture", cgroup_root="/fixture")
+    try:
+        if phase == "success":
+            assert cw.run_interactive(args) == 0
+            assert windows[0].refreshes == 1
+            assert windows[0].polls >= 1
+            assert windows[0].clock is clients[0].clock
+            assert gap_writers
+            assert writer_retry_entered.wait(2)
+            assert not gap_writers[0].done()
+        else:
+            with pytest.raises(Exception) as caught:
+                cw.run_interactive(args)
+            expected_error = (
+                actor_registrations[0].exception()
+                if phase == "admission" else original_error
+            )
+            assert caught.value is expected_error
+            assert ("exit", 1) in events
+    finally:
+        for blocker in database_locks:
+            if blocker.in_transaction:
+                blocker.execute("ROLLBACK")
+            blocker.close()
+        for blocker in registration_locks:
+            if blocker.in_transaction:
+                blocker.execute("ROLLBACK")
+            blocker.close()
+        registration_locks.clear()
+        registration_lock_held.clear()
+        release_registration_retry.set()
+        release_writer_retry.set()
+
+    if phase == "success":
+        gap_writers[0].result(timeout=5)
+        qapp.processEvents()
+        assert any(name == "gap_writer_done" and closed
+                   for name, closed, *_ in events)
+        assert windows[0].closed
+        assert windows[0].late_touches == 0
+        shutdown = [name for name, *_ in events if name in {
+            "window_shutdown", "coordinator_close", "client_close",
+            "router_close", "registry_close",
+        }]
+        assert shutdown[:4] == [
+            "window_shutdown", "coordinator_close", "client_close", "router_close",
+        ]
+        assert shutdown[4:] and all(name == "registry_close" for name in shutdown[4:])
+        assert shutdown.index("client_close") < shutdown.index("registry_close")
+    assert uncaught == []
+    assert pre_admission_checks
+    assert all(pending and no_activity and retrying and thread == owner_thread
+               for pending, no_activity, retrying, thread in pre_admission_checks)
+    assert actor_registrations and actor_registrations[0].done()
+    if phase == "admission":
+        assert actor_registrations[0].exception() is not None
+    else:
+        assert actor_registrations[0].exception() is None
+    assert any(event[0] == "source_wake" and event[1] != owner_thread
+               for event in events)
+    assert all(event[1] for event in events if event[0] == "client")
+    assert all(event[2] for event in events if event[0] == "router")
+    assert all(event[1] for event in events if event[0] in ("pump", "prepare"))
+    assert all(event[1] and event[2] == owner_thread
+               for event in events if event[0] == "bootstrap_closed")
+    assert [event[1] for event in events if event[0] == "bootstrap_close"] == [owner_thread]
+    assert all(event[1] == owner_thread for event in events
+               if event[0] in ("router", "window", "coordinator_close", "client_close",
+                               "router_close", "registry_close", "window_shutdown"))
+    assert registries[0]._closed
+    assert not registries[0].registration_vector()
+    if clients:
+        assert any(event[0] == "client_close" for event in events)
+
+
+def test_ordinary_refresh_retries_failed_gap_once(real_files_shell, monkeypatch):
+    import sqlite3
+    from appio.iodclient import GapNotice
+    from live_overview_support import drain_transport_gaps
+
+    shell = real_files_shell
+    sources = shell.history.sources
+    write = sources.record_transport_gap
+    attempts = []
+    def fail_once(notice):
+        attempts.append(notice)
+        if len(attempts) == 1:
+            future = Future()
+            future.set_exception(sqlite3.OperationalError("synthetic gap failure"))
+            return future
+        return write(notice)
+    monkeypatch.setattr(sources, "record_transport_gap", fail_once)
+    notice = GapNotice("boot-A", 1, 1, 1, 2, "disconnect")
+    shell.history.record_transport_gap(notice)
+    drain_transport_gaps(shell.history)
+    assert shell.history.gap_persistence_error is not None
+    shell.window._poll_history()
+    assert len(attempts) == 1
+    shell.window.refresh()
+    drain_transport_gaps(shell.history)
+    assert attempts == [notice, notice]
+    assert shell.history.gap_persistence_error is None
+
+
+@pytest.mark.parametrize("journal_mode", ["DELETE", "WAL"])
+def test_transport_gap_callback_persists_before_frame_capture(qtbot, tmp_path, monkeypatch, journal_mode):
+    """A real bounded wire callback returns while the actor fences preparation."""
+    from appio.ipc_models import StreamCursor
+    from appio.ipc_protocol import encode_frame
+    from appio.iodclient import AppRegistry
+    from live_overview_support import (GapSqlHarness, LocalPositionStores,
+        drain_transport_gaps, make_managed_router, wait_for_local_frame)
+    from live_overview_transport import QueryTransportHarness
+    from tests.p3.test_iodclient import gap_frame
+
+    with LocalPositionStores(tmp_path, journal_modes={"local": journal_mode}) as stores:
+        sql = GapSqlHarness(monkeypatch)
+        peer = QueryTransportHarness(cursor=None)
+        history_ref = []
+        peer.client._on_gap = lambda notice: history_ref[0].record_transport_gap(notice)
+        history = make_managed_router(stores.services["local"], peer.client, AppRegistry())
+        history_ref.append(history)
+        shell, _, _, _ = controlled_build(qtbot, history=history, pump=peer.pump)
+        shell._timer.stop()
+        shell._poll_timer.stop()
+        captures = []
+        capture = history._capture_provider.capture
+
+        def capture_after_gap():
+            captures.append(stores.stores["local"].connection.execute(
+                "SELECT count(*) FROM gap WHERE reason='gui_absent'").fetchone()[0])
+            return capture()
+
+        monkeypatch.setattr(history._capture_provider, "capture", capture_after_gap)
+        scope = Window("range", "boot-a", 10 * 10**9, 30 * 10**9)
+        try:
+            with sql.hold("BEGIN IMMEDIATE") as barrier:
+                peer.server.sendall(encode_frame(gap_frame(previous=None,
+                    current=StreamCursor("boot-a", 7, 1), start=21 * 10**9, end=22 * 10**9)))
+                peer.pump()
+                assert len(history.transport_issues) == 1
+                assert history.transport_issues[0].from_mono_ns == 21 * 10**9
+                barrier.wait()
+                shell.show_window(scope)
+                assert shell._pending == scope
+                assert captures == [] and peer.query_frames == []
+                assert not history.local_read_in_flight and history.pending_work
+                shell._poll_history()
+                assert shell._pending == scope and captures == []
+                barrier.release()
+                drain_transport_gaps(history)
+            assert captures == [1]
+            outcome = wait_for_local_frame(history)
+            assert outcome.known_gaps == (("boot-a", 21 * 10**9, 22 * 10**9),)
+            assert history.preparation_source(scope) == outcome.snapshot.bracket.opening
+            assert shell.apply_ready_frame(context="poll")
+            assert shell._displayed == scope
+            assert shell._pending_source is None
+            assert shell._displayed_certified is True
+            assert shell._displayed_source == outcome.snapshot.bracket.opening
+            generation = history._generation
+            rows = stores.stores["local"].connection.execute("SELECT count(*) FROM gap").fetchone()
+            peer.server.close()
+            peer.client.pump()
+            assert history.transport_issues[-1].from_mono_ns is None
+            drain_transport_gaps(history)
+            assert history._generation == generation
+            assert stores.stores["local"].connection.execute("SELECT count(*) FROM gap").fetchone() == rows
+        finally:
+            shell.shutdown()
+            for server in peer.servers:
+                server.close()
+
+
 @pytest.fixture
 def real_files_shell(qtbot, tmp_path, monkeypatch):
     from dataclasses import replace
@@ -3487,6 +4105,7 @@ def real_files_shell(qtbot, tmp_path, monkeypatch):
     from appio.history_router import HistoryRouter
     from appio.iodclient import AppRegistry
     from appio.query import QueryService
+    from live_overview_support import make_managed_router, wait_for_local_frame
     from tests.p3.test_iodclient import Harness
     from tests.p4.test_file_runtime import Frames, event
 
@@ -3501,7 +4120,7 @@ def real_files_shell(qtbot, tmp_path, monkeypatch):
     runtime.consume(*frames.tick(0))
     runtime.consume(*frames.tick(FILE_HOUR_NS, amount=200))
     harness = Harness()
-    history = HistoryRouter(QueryService(frames.db), harness.client, AppRegistry())
+    history = make_managed_router(QueryService(frames.db), harness.client, AppRegistry())
     harness.client._on_gap = history.record_transport_gap
     harness.client.pump()
     window, coordinator, _, setup = controlled_build(qtbot, history=history)
@@ -3511,14 +4130,26 @@ def real_files_shell(qtbot, tmp_path, monkeypatch):
     monkeypatch.setattr(window, "_submit_probe", lambda **_kwargs: False)
     target = Window("since_boot", "boot-A", end_mono_ns=FILE_HOUR_NS)
     window.show_window(target)
-    history._local_future.result(timeout=5)
+    wait_for_local_frame(history)
     assert window.apply_ready_frame()
     view = window.files_view
-    qtbot.waitUntil(lambda: view.last_result is not None, timeout=5000)
+
+    def pumped(predicate):
+        # Files pages, frame ranking and lazy detail all settle through the
+        # router's scheduler, which the console's own poll drains and pumps.
+        # Both timers are stopped in this fixture, so the wait drives exactly
+        # that production entry point instead of assuming a direct callback.
+        def probe():
+            window._poll_history()
+            return predicate()
+
+        return probe
+
+    qtbot.waitUntil(pumped(lambda: view.last_result is not None), timeout=5000)
     window.open_files_unavailable()
     view.set_sort("bytes_r", "asc")
     view.search_field.setText("alpha")
-    qtbot.waitUntil(lambda: not view._outstanding, timeout=5000)
+    qtbot.waitUntil(pumped(lambda: not view._outstanding and not history.pending_work), timeout=5000)
     assert view.model.rowCount() == 24
     view.table.setFixedHeight(100)
     qtbot.wait(10)
@@ -3556,25 +4187,43 @@ class HeldFileDelivery:
         history, view = shell.history, shell.view
         read = history._read_local_files
 
-        def held(*args):
+        def held(*args, **kwargs):
             self.started.set()
             assert self.release.wait(5), "file worker not released"
-            return read(*args)
+            # The scheduler admits its Files worker with its token binding, so
+            # the wrapper forwards the worker id/request keywords untouched.
+            return read(*args, **kwargs)
 
+        deliver = view._deliver
         def capture(generation, future):
+            if future is not getattr(self, "future", None) or generation != self.generation:
+                return deliver(generation, future)
             self.transient_at_settlement.append(view._transient)
             self.payloads.append((generation, future))
             self.delivered.set()
 
         monkeypatch.setattr(history, "_read_local_files", held)
         monkeypatch.setattr(view, "_deliver", capture)
+        from live_overview_support import wait_for_capture_admission
+
+        charged = set(history._worker_jobs)
         view.request_refresh()
+        wait_for_capture_admission(history)
         assert self.started.wait(1)
+        admitted = set(history._worker_jobs) - charged
+        self.worker_future = history._worker_jobs[next(iter(admitted))][1]
         self.future = next(iter(history._file_jobs))
         self.generation = view._generation
         self.history_generation = history._generation
         self.requests = len(view.requests)
         self.snapshot = files_snapshot(view)
+
+    def settle_worker(self):
+        """Release the held worker and wait for its terminal executor outcome."""
+
+        self.release.set()
+        assert self.worker_future is not None
+        self.worker_future.result(timeout=5)
 
     def win_cancellation(self, monkeypatch, *, synchronous=False):
         history, view = self.shell.history, self.shell.view
@@ -3582,22 +4231,30 @@ class HeldFileDelivery:
 
         def after_generation_bump():
             assert history._generation > self.history_generation
-            self.release.set()
+            # The worker wins the race: it has already finished before the
+            # cancellation runs. Its outcome waits in the router's completion
+            # queue, and the cancellation retires the delivery that a removed
+            # direct callback used to settle.
+            self.settle_worker()
+            cancel()
             assert self.delivered.wait(2), "worker did not settle before cancellation"
             if synchronous:
                 view._on_delivered(self.payloads[0])
-            cancel()
 
         monkeypatch.setattr(history, "_cancel_file_requests", after_generation_bump)
 
     def replay(self):
+        # A terminal worker is collected by the owner's drain, which is the
+        # scheduler's replacement for the removed per-job completion callback.
+        self.settle_worker()
+        self.shell.history.drain()
         assert self.delivered.wait(2)
         self.shell.view._on_delivered(self.payloads[0])
 
 
 def invalidate_shell(shell, route, monkeypatch, *, defer_tick=True):
     window, history, coordinator = shell.window, shell.history, shell.coordinator
-    if defer_tick and route not in ("clock_prepare", "explicit_prepare"):
+    if defer_tick and route not in ("source_prepare", "explicit_prepare"):
         monkeypatch.setattr(window, "_tick_target", lambda: None)
     if route in ("pump", "healthy_pump"):
         if route == "pump":
@@ -3608,6 +4265,10 @@ def invalidate_shell(shell, route, monkeypatch, *, defer_tick=True):
             shell.harness.eof()
         window._pump = shell.harness.client.pump
         window.refresh()
+        if route == "pump":
+            from live_overview_support import drain_transport_gaps
+            with shell.view.transient_scope():
+                drain_transport_gaps(history)
     elif route in ("reconcile", "tick_local", "healthy_tick"):
         if route != "healthy_tick":
             coordinator.invalidate_on = route
@@ -3625,10 +4286,17 @@ def invalidate_shell(shell, route, monkeypatch, *, defer_tick=True):
                               "seq": frames.seq,
                               "cutoff_mono_ns": frames.state.checkpoint_mono_ns}}))
         assert len(shell.owner._exports) == 1, window.error_label.text()
-        assert len(history._sources) == 2
-    elif route == "clock_prepare":
-        shell.target = Window("since_boot", "boot-A",
-            end_mono_ns=shell.target.end_mono_ns + RAW_BUCKET_NS)
+        registration = next(iter(shell.owner._export_registrations.values()))
+        registration.result(timeout=10)
+        with shell.view.transient_scope(retire_on_exit=True):
+            history.drain()
+        assert len(history.sources.registration_vector()) == 2
+    elif route == "source_prepare":
+        # Commit to the shared main database, then consume this actor's fresh observation.
+        frames = shell.frames
+        frames.db.execute("UPDATE boot SET started_wall=started_wall+1 WHERE boot_id='boot-A'")
+        frames.db.commit()
+        history.sources.observe_async().result(timeout=10)
         window._clock_ns = lambda: shell.target.end_mono_ns - 1
         window._tick_target()
     elif route == "explicit_prepare":
@@ -3638,13 +4306,17 @@ def invalidate_shell(shell, route, monkeypatch, *, defer_tick=True):
 
 
 def apply_replacement(shell):
+    from live_overview_support import wait_for_local_frame
+
     window, history, view = shell.window, shell.history, shell.view
     if window._pending is None:
         # Call the class driver because the default-invalidator tests defer the
         # instance driver until after their pre-next-tick delivery observation.
+        if window._retry_after is not None:
+            window._clock_ns = lambda: window._retry_after
         CollectorWindow._tick_target(window)
     assert window._pending == shell.target
-    history._local_future.result(timeout=5)
+    wait_for_local_frame(history)
     assert window.apply_ready_frame()
     assert not view._transient and view._scope_ready
 
@@ -3679,7 +4351,7 @@ def test_disable_export_import_preserves_files_through_add_source(real_files_she
 
 
 @pytest.mark.parametrize("route", ["pump", "reconcile", "tick_local", "quiesce", "import",
-                                    "clock_prepare", "explicit_prepare"])
+                                    "source_prepare", "explicit_prepare"])
 def test_worker_wins_cancellation_delivery_is_transient_while_pending(
     real_files_shell, monkeypatch, route
 ):
@@ -3700,7 +4372,7 @@ def test_worker_wins_cancellation_delivery_is_transient_while_pending(
 
 
 @pytest.mark.parametrize("route", ["pump", "reconcile", "tick_local", "quiesce", "import",
-    "clock_prepare", "explicit_prepare", "healthy_pump", "healthy_tick"])
+    "source_prepare", "explicit_prepare", "healthy_pump", "healthy_tick"])
 def test_transient_scope_exit_retires_worker_delivery_before_next_target_tick(
     real_files_shell, monkeypatch, route
 ):
@@ -3721,7 +4393,7 @@ def test_transient_scope_exit_retires_worker_delivery_before_next_target_tick(
         held.win_cancellation(monkeypatch)
         invalidate_shell(shell, route, monkeypatch)
         assert not shell.view._transient
-        if route not in ("clock_prepare", "explicit_prepare"):
+        if route not in ("source_prepare", "explicit_prepare"):
             assert shell.view._scope_ready  # SR-1: readiness has not closed yet.
             assert shell.window._pending is None
         assert shell.view._generation > held.generation
@@ -3771,6 +4443,34 @@ def test_late_retired_file_delivery_after_ready_is_dropped_and_requeried_once(
         assert len(shell.view.requests) == held.requests + 1
     finally:
         held.release.set()
+
+
+def test_files_page_admitted_after_application_settles_without_a_new_frame(
+    real_files_shell, qtbot
+):
+    """An applied frame still has to collect the Files work it admitted.
+
+    Every Files page is a scheduler slot, so nothing completes it straight from
+    a worker callback any more. Application keeps the poll armed while the
+    router holds work, and an apply call drains that work even with no pending
+    frame. Without the drain the page would stay outstanding and the table
+    would never leave its loading state.
+    """
+
+    shell = real_files_shell
+    window, history, view = shell.window, shell.history, shell.view
+    assert window._pending is None and window._displayed is not None
+    before = len(view.requests)
+    view.set_sort("bytes_w", "asc")
+    assert len(view.requests) == before + 1
+    assert view._outstanding and history.pending_work
+
+    # No replacement frame is due; only the router's settled page remains.
+    qtbot.waitUntil(
+        lambda: (window.apply_ready_frame(), not view._outstanding)[1], timeout=5000
+    )
+    assert view.last_result is not None
+    assert view.last_request.sort == "bytes_w"
 
 
 # Task 4 review regressions. Each M-number names the review ledger mutation
@@ -4857,3 +5557,1385 @@ def test_nonanswering_probe_cannot_verify_period_after_history_promotion(qtbot):
     assert window.pending_period_seconds == 5
     assert window.settings.sample_period_status.text() == (
         "Sampling period not reported by this collector.")
+
+
+def test_typed_refusal_transitions_own_category_and_preserve_frame(qtbot):
+    from appio.ui.render_model import PresentationRefusal
+
+    window, _, history, _ = controlled_build(qtbot)
+    window._timer.stop()
+    now = [END - RAW_BUCKET_NS // 2]
+    window._clock_ns = lambda: now[0]
+    window._tick_target()
+    first = window._pending
+    assert first is not None
+    apply_scope(window, history, first)
+    assert window._displayed == first
+    ranking_reads = history.ranking_reads
+    launch = Window("launch", BOOT, launch_id=1)
+    launch_text = (
+        "Launch window disabled: device and file activity are not stored per launch."
+    )
+    refusal_error = WindowUnavailableError("launch_attribution", launch_text)
+
+    # A shell prepare precheck refusal is typed, keeps the last applied frame,
+    # creates no pending/floor/PrepareRetry and rethrows through the seam.
+    history.prepare_failures.extend([refusal_error, refusal_error])
+    with pytest.raises(WindowUnavailableError):
+        window.show_window(launch)
+    record = window._presentation_refusal
+    assert isinstance(record, PresentationRefusal)
+    assert (record.origin, record.window, record.reason) == (
+        "shell_prepare",
+        launch,
+        "launch_attribution",
+    )
+    assert record.text == str(refusal_error)
+    assert window.error_label.text() == str(refusal_error)
+    assert window._displayed == first
+    assert window._pending is None and window._pending_since is None
+    assert window._prepare_retry is None and window._retry_after is None
+    assert history.ranking_reads == ranking_reads
+    attempts = list(history.prepare_calls)
+    assert attempts[-1] == launch
+
+    # The ordinary deferred tick re-encounters the same typed refusal and
+    # preserves category, Window, text and frame; it never clears it.
+    with pytest.raises(WindowUnavailableError):
+        window._tick_target()
+    assert window._presentation_refusal == record
+    assert window.error_label.text() == str(refusal_error)
+    assert window._displayed == first
+    assert len(history.prepare_calls) == len(attempts) + 1
+    assert history.prepare_calls[-1] == launch
+
+    # An operational preparation failure supersedes only the shell_prepare
+    # refusal; the frozen seam owns the PrepareRetry/error widget.
+    supported = Window("since_boot", BOOT, end_mono_ns=END + RAW_BUCKET_NS)
+    history.prepare_failures.append(OSError("disk read failed"))
+    with pytest.raises(OSError, match="disk read failed"):
+        window.show_window(supported)
+    assert window._presentation_refusal is None
+    retry = window._prepare_retry
+    assert retry is not None and retry.owner == "explicit"
+    assert retry.window == supported
+    assert window._prepare_error == "appio: disk read failed"
+    assert window._displayed == first
+    assert window._retry_after is None
+
+    # The named retry is the only retry seam; acceptance clears the operational
+    # marker and its own mirrored error, not a detached label.
+    window.show_window(supported)
+    assert history.prepare_calls[-1] == supported
+    assert window._pending == supported and window._prepare_retry is None
+    assert window.error_label.text() == ""
+    apply_scope(window, history, supported)
+    assert window._displayed == supported
+
+    # A direct set_window refusal emits direct_view to the shell before the
+    # supported adoption; the shell's retained _displayed never recreates it.
+    view = window.view
+    assert view is not None
+    reads_before_direct = history.ranking_reads
+    view.set_window(launch)
+    direct = window._presentation_refusal
+    assert isinstance(direct, PresentationRefusal)
+    assert (direct.origin, direct.window, direct.reason, direct.text) == (
+        "direct_view",
+        launch,
+        "launch_attribution",
+        str(refusal_error),
+    )
+    assert view.overview_age.isHidden() is True
+    assert window._displayed == supported
+    assert history.ranking_reads == reads_before_direct
+
+    # A supported shell request does not clear a direct_view refusal; only the
+    # supported view adoption does.
+    adopted = Window("since_boot", BOOT, end_mono_ns=END + 2 * RAW_BUCKET_NS)
+    window.show_window(adopted)
+    assert window._pending == adopted
+    assert window._presentation_refusal == direct
+    apply_scope(window, history, adopted)
+    assert window._presentation_refusal is None
+    assert window._displayed == adopted
+
+    # The frozen no-target reset clears the typed presentation state too.
+    view.set_window(launch)
+    assert window._presentation_refusal is not None
+    window._deferred_target = None
+    window._deferred_origin = None
+    window._current_window = lambda *_args: None
+    window._tick_target()
+    assert window._presentation_refusal is None
+    assert window._displayed is None
+
+
+# ---------------------------------------------------------------------------
+# Task 12: source-driven preparation, continued drain and one composer
+# ---------------------------------------------------------------------------
+
+
+def _remote_client(*, generation: int = 2, epoch: int = 7, seq: int = 3):
+    """A verified answering remote observation with an explicit generation."""
+
+    from appio.ipc_models import StreamCursor
+
+    return SimpleNamespace(
+        state=SimpleNamespace(
+            verified=True,
+            answering=True,
+            cursor=StreamCursor(BOOT, epoch, seq),
+        ),
+        generation=generation,
+    )
+
+
+@pytest.mark.parametrize("mode", ["local", "remote"])
+def test_unchanged_certified_local_or_remote_source_is_quiescent(qtbot, mode, tmp_path):
+    """Only the endpoint-free scope and the certified source permit a prepare."""
+
+    history = ControlledHistory(ready=True)
+    if mode == "remote":
+        history.client = _remote_client()
+        history.source = RemotePosition(BOOT, 7, 3)
+    window, _, history, _ = controlled_build(qtbot, history=history)
+    window._timer.stop()
+    window._poll_timer.stop()
+    recovery = [END - RAW_BUCKET_NS // 2]
+    window._clock_ns = lambda: recovery[0]
+
+    window._tick_target()
+    first = window._pending
+    assert first is not None
+    assert history.prepare_calls == [first]
+    first_source = history.prepared_sources[first]
+    assert first_source == history.source
+    history.become_ready(first)
+    assert window.apply_ready_frame(now=recovery[0]) is True
+    assert window._displayed == first
+    assert window._displayed_certified is True
+    assert window._displayed_source == first_source
+
+    # Repeated endpoint-only ticks in both modes issue no prepare. The larger
+    # unqueried Window is a target, never an applied frame.
+    for _ in range(3):
+        recovery[0] += RAW_BUCKET_NS
+        window._tick_target(now=recovery[0])
+        assert window.apply_ready_frame(now=recovery[0]) is False
+        assert window._pending is None
+    assert history.prepare_calls == [first]
+    assert window._displayed == first
+    # Neither the applied frame nor the desired target adopts the unqueried
+    # larger endpoint while the certified source is unchanged.
+    assert window._target == first
+    assert window._displayed_certified is True
+
+    # A source change is exactly one gated replacement, never one per tick.
+    history.advance_source()
+    window._tick_target(now=recovery[0])
+    assert len(history.prepare_calls) == 2
+    replacement = window._pending
+    assert replacement is not None
+    assert history.prepared_sources[replacement] == history.source
+    assert window.apply_ready_frame(now=recovery[0]) is False
+    history.become_ready(replacement)
+    assert window.apply_ready_frame(now=recovery[0]) is True
+    assert window._displayed == replacement
+    assert window._displayed_source == history.source
+
+    # An explicit request may requery the identical Window/source; afterwards
+    # the unchanged certified source is quiescent again.
+    window.show_window(replacement)
+    assert len(history.prepare_calls) == 3
+    explicit = window._pending
+    assert explicit is not None
+    history.become_ready(explicit)
+    assert window.apply_ready_frame(now=recovery[0]) is True
+    assert window._displayed == replacement
+    window._tick_target(now=recovery[0])
+    assert len(history.prepare_calls) == 3
+    assert window._pending is None
+
+    # A same-authority sequence/counter advance preserves view detail memory; a
+    # mode/connection/boot/epoch or registration change resets it exactly once,
+    # synchronously before the next adoption/notification.
+    view = window.view
+    assert view is not None
+    epoch_before = view._exact_authority_epoch
+    history.advance_source()
+    window._tick_target(now=recovery[0])
+    assert view._exact_authority_epoch == epoch_before
+    advanced = window._pending
+    assert advanced is not None
+    history.become_ready(advanced)
+    assert window.apply_ready_frame(now=recovery[0]) is True
+    if mode == "remote":
+        history.client.generation += 1
+        history.advance_source()
+    else:
+        source = history.source.sources[0]
+        history.source = LocalPositionVector(
+            (replace(source, registration_epoch=source.registration_epoch + 1),)
+        )
+    window._tick_target(now=recovery[0])
+    assert view._exact_authority_epoch == epoch_before + 1
+    # A repeated observation under the same new authority never resets again.
+    window.apply_ready_frame(now=recovery[0])
+    assert view._exact_authority_epoch == epoch_before + 1
+
+    if mode == "local":
+        from appio.history_types import retention_scope
+        from appio.iodclient import AppRegistry, ClientState
+        from live_overview_support import Clock, LocalPositionStores, make_managed_router, wait_for_local_frame
+
+        with LocalPositionStores(tmp_path) as stores:
+            age = Clock(10**9)
+            router = make_managed_router(stores.services["local"],
+                SimpleNamespace(state=ClientState()), AppRegistry(), clock_ns=age)
+            exact = Window("since_boot", "boot-a", end_mono_ns=20 * 10**9)
+            key = "unit:alpha.service"
+            scope = retention_scope(key, exact)
+            try:
+                router.prepare(exact)
+                wait_for_local_frame(router)
+                assert router.ready(exact)
+                assert router.frame_provenance(exact).certified
+                router.select_detail(key, exact)
+                app_id = router.registry.id_for(key)
+                router.request_detail("totals", app_id, exact)
+                qtbot.waitUntil(lambda: (router.drain(), router.part_state("totals", key, scope).state == "ok")[1])
+                accepted = router.retained("totals", key, scope, exact.end_mono_ns)
+                assert accepted.provenance.first_seen_at_ns == 10**9
+                age.advance_ns(2 * 10**9)
+                router.request_detail("totals", app_id, exact)
+                qtbot.waitUntil(lambda: (router.drain(), router.part_state("totals", key, scope).state == "ok")[1])
+                repeated = router.retained("totals", key, scope, exact.end_mono_ns)
+                assert repeated.provenance.accepted_identity == accepted.provenance.accepted_identity
+                assert repeated.provenance.first_seen_at_ns == 10**9, "identical local identity was restamped"
+            finally:
+                router.close()
+
+
+def test_certificate_from_another_router_generation_does_not_advance_displayed_source(qtbot):
+    history = ControlledHistory()
+    history._generation = 4
+    window, _, history, _ = controlled_build(qtbot, history=history)
+    window._timer.stop()
+    window._poll_timer.stop()
+    window.show_window(scope_window())
+    history.become_ready(scope_window())
+    assert history.frame_provenance(scope_window()).generation != history._generation
+    assert window.apply_ready_frame()
+    assert window._displayed == scope_window()
+    assert window._displayed_source is None
+    assert window._displayed_certified is False
+
+
+def test_pending_source_advances_coalesce_without_retiring_detail(qtbot):
+    """Multiple source advances while pending coalesce into one replacement."""
+
+    history = ControlledHistory()
+    history.rows = [app_total()]
+    window, _, history, _ = controlled_build(qtbot, history=history)
+    window._timer.stop()
+    window._poll_timer.stop()
+    window._clock_ns = lambda: END - RAW_BUCKET_NS // 2
+    view = window.view
+    assert view is not None
+    window._tick_target()
+    first = window._pending
+    assert first is not None
+    first_source = history.prepared_sources[first]
+    epoch_before = view._exact_authority_epoch
+    selections = []
+    original_select = view._detail_service.select_detail
+
+    def select(app_key, scope):
+        selections.append((app_key, scope))
+        return original_select(app_key, scope)
+
+    view._detail_service.select_detail = select
+
+    # Same-authority advances while the nonretired preparation is pending
+    # coalesce: no new prepare, no retirement, no detail reset.
+    for _ in range(3):
+        history.advance_source()
+        window._tick_target()
+    assert history.prepare_calls == [first]
+    assert window._pending == first
+    assert window._retry_after is None
+    assert window._pending_source == first_source
+    assert view._exact_authority_epoch == epoch_before
+    assert selections == []
+
+    # Only frame ranking promotes the proved displayed source, and it promotes
+    # the generation's captured source, not the newer coalesced one.
+    history.become_ready(first)
+    assert window.apply_ready_frame() is True
+    assert window._displayed == first
+    assert window._displayed_source == first_source
+    assert window._displayed_certified is True
+    assert window._pending_source is None
+    view.refresh_measurements()
+    assert window._displayed_source == first_source
+
+    # After application the latest due source prepares exactly once.
+    latest = history.source
+    window._tick_target()
+    assert len(history.prepare_calls) == 2
+    replacement = window._pending
+    assert replacement is not None
+    assert history.prepared_sources[replacement] == latest
+    assert window._displayed == first
+    history.become_ready(replacement)
+    assert window.apply_ready_frame() is True
+    assert window._displayed == replacement
+    assert window._displayed_source == latest
+
+    # Same source, same scope: quiescent again.
+    window._tick_target()
+    assert len(history.prepare_calls) == 2
+
+    # An uncertified generation never promotes its source: the flag clears and
+    # the last proved displayed token stays as a token, not as certification.
+    history.advance_source()
+    window._tick_target()
+    uncertified = window._pending
+    assert uncertified is not None
+    newest = history.source
+    following = LocalPositionVector((
+        replace(newest.sources[0], total_changes=newest.sources[0].total_changes + 1),
+    ))
+    history.become_ready(uncertified)
+    history.certificates[uncertified] = FrameProvenance(
+        1, uncertified, newest, None, LocalBracket(newest, following), False
+    )
+    history.certify_on_ready = False
+    assert window.apply_ready_frame() is True
+    assert window._displayed == uncertified
+    assert window._displayed_certified is False
+    assert window._displayed_source == latest
+    assert window._pending_source is None
+
+
+def test_recovery_transition_ownership_survives_source_driven_trigger(qtbot):
+    """Source-driven replacement keeps every frozen recovery owner intact."""
+
+    now = [END - RAW_BUCKET_NS // 2]
+    history = CountingControlledHistory(ready=True)
+    window, coordinator, history, _ = controlled_build(qtbot, history=history)
+    window._timer.stop()
+    window._poll_timer.stop()
+    window._clock_ns = lambda: now[0]
+    window._tick_target()
+    first = window._pending
+    assert first is not None
+    history.become_ready(first)
+    assert window.apply_ready_frame(now=now[0]) is True
+    assert window._displayed_certified is True
+
+    # The frozen queued-reader gate still blocks a due source.
+    history.local_read_busy = True
+    history.advance_source()
+    calls = len(history.prepare_calls)
+    window._tick_target()
+    assert len(history.prepare_calls) == calls
+    assert window._pending is None
+    assert window._displayed == first
+    history.local_read_busy = False
+
+    # With the reader free, the latest due source prepares once through the
+    # existing gate.
+    window._tick_target()
+    replacement = window._pending
+    assert replacement is not None
+    assert len(history.prepare_calls) == calls + 1
+
+    # A same-source probe observation never reconciles while preparation is
+    # pending: the frozen delta predicate still owns that decision.
+    window._facts = OFF
+    window._probe_ticket = 1
+    window._setup_generation = 0
+    reconciles = len(coordinator.reconciles)
+    window._apply_facts(cw.ProbePayload(OFF, None, 1, 0))
+    assert len(coordinator.reconciles) == reconciles
+    assert window._pending == replacement
+
+    # Retirement is the frozen owner: one floor, one deferred target, no
+    # inline replacement.
+    history.view_state = "unavailable: authority changed"
+    retired_at = now[0]
+    window._tick_target()
+    assert window._pending is None
+    assert window._pending_source is None
+    assert window._retry_after == retired_at + PENDING_BUDGET_NS
+    assert window._deferred_target == replacement
+    assert len(history.prepare_calls) == calls + 1
+    now[0] = window._retry_after - 1
+    window._tick_target()
+    assert len(history.prepare_calls) == calls + 1
+    now[0] = window._retry_after
+    window._tick_target()
+    assert len(history.prepare_calls) == calls + 2
+    pending = window._pending
+    assert pending is not None
+    history.become_ready(pending)
+    assert window.apply_ready_frame(now=now[0]) is True
+
+    # The explicit retry marker is still owned by `_submit_prepare`: a source
+    # advance never consumes or retries it from the target tick.
+    history.prepare_failures.append(OSError("disk read failed"))
+    with pytest.raises(OSError, match="disk read failed"):
+        window.show_window(window._displayed)
+    marker = window._prepare_retry
+    assert marker is not None and marker.owner == "explicit"
+    assert window._prepare_error == "appio: disk read failed"
+    calls = len(history.prepare_calls)
+    history.advance_source()
+    window._tick_target()
+    assert window._prepare_retry is marker
+    assert len(history.prepare_calls) == calls
+
+    # `_refresh_after_apply` keeps its sole consume site at the end of apply.
+    window.show_window(window._displayed)
+    retried = window._pending
+    assert retried is not None
+    assert window._prepare_retry is None
+    invalidations = history.invalidations
+    window._refresh_after_apply = True
+    history.become_ready(retried)
+    assert window.apply_ready_frame(now=now[0]) is True
+    assert window._refresh_after_apply is False
+    assert history.invalidations == invalidations + 1
+    assert window.apply_ready_frame(now=now[0]) is False
+    assert history.invalidations == invalidations + 1
+
+
+def test_no_frame_poll_drains_details_and_files_and_notifies_immediately(
+    qtbot, monkeypatch
+):
+    """A settled batch reaches the view from the poll, never from the 1 s tick."""
+
+    now = [END - RAW_BUCKET_NS // 2]
+    history = ControlledHistory()
+    window, _, history, _ = controlled_build(qtbot, history=history)
+    window._timer.stop()
+    window._poll_timer.stop()
+    window._clock_ns = lambda: now[0]
+    window._tick_target()
+    first = window._pending
+    history.become_ready(first)
+    assert window.apply_ready_frame(now=now[0]) is True
+    assert window._pending is None
+    view = window.view
+    assert view is not None
+
+    events: list[tuple] = []
+    original_notify = view.refresh_measurements
+    monkeypatch.setattr(
+        view, "refresh_measurements", lambda: events.append(("notify",)) or original_notify()
+    )
+    original_drain = history.drain
+
+    def drain() -> bool:
+        events.append(("drain", history.pending_work_flag))
+        return original_drain()
+
+    monkeypatch.setattr(history, "drain", drain)
+    monkeypatch.setattr(
+        window, "_current_window", lambda *_args: pytest.fail("poll computed a target")
+    )
+    ranking_reads = history.ranking_reads
+    prepare_calls = len(history.prepare_calls)
+
+    # A completed detail/Files batch is applied and notified before any tick.
+    history.pending_work_flag = True
+    history.drain_changed = True
+    assert window.apply_ready_frame(now=now[0], context="poll") is False
+    assert events == [("drain", True), ("notify",)]
+    assert history.ranking_reads == ranking_reads
+    assert len(history.prepare_calls) == prepare_calls
+    assert window._pending is None
+    assert window._poll_timer.isActive()
+
+    # A held expired slot keeps the same pump armed.
+    window._poll_history()
+    assert window._poll_timer.isActive()
+    # Poll stops only once no frame, detail or Files work remains.
+    history.pending_work_flag = False
+    window._poll_history()
+    assert not window._poll_timer.isActive()
+    assert events[0] == ("drain", True)
+
+    # A changed batch is drained even when no public work bit remains set: the
+    # notification is the owner-thread delivery, not a second query.
+    history.drain_changed = True
+    assert window.apply_ready_frame(now=now[0], context="poll") is False
+    assert events[-2:] == [("drain", False), ("notify",)]
+
+    # Admission after application arms the same pump: the view's measurement
+    # signal and the Files state-change handler both route to `_arm_poll`.
+    history.pending_work_flag = True
+    window._poll_timer.stop()
+    view.measurement_work_requested.emit()
+    assert window._poll_timer.isActive()
+    window._poll_timer.stop()
+    window.files_view.state_changed.emit("files")
+    assert window._poll_timer.isActive()
+    history.pending_work_flag = False
+    window._poll_timer.stop()
+
+    # A deferred target alone arms nothing and authorises no poll submission.
+    deferred = scope_window(END + RAW_BUCKET_NS)
+    window._deferred_target = deferred
+    window._deferred_origin = "clock"
+    calls = len(history.prepare_calls)
+    assert window.apply_ready_frame(now=now[0], context="poll") is False
+    assert len(history.prepare_calls) == calls
+    assert window._deferred_target == deferred
+    window._poll_history()
+    assert not window._poll_timer.isActive()
+    assert window._deferred_target == deferred
+
+    # A still-owned explicit PrepareRetry stays owned and unconsumed.
+    marker = cw.PrepareRetry(deferred, "explicit", now[0])
+    window._prepare_retry = marker
+    window._prepare_error = "appio: disk read failed"
+    assert window.apply_ready_frame(now=now[0], context="poll") is False
+    assert window._prepare_retry is marker
+    assert window._prepare_error == "appio: disk read failed"
+    assert len(history.prepare_calls) == calls
+    window._update_overview_status(now[0])
+    assert window.history_state.text() == "appio: disk read failed"
+
+
+def _deferred_fixture(qtbot, *, ready: bool = False):
+    history = ControlledHistory(ready=ready)
+    window, _, history, _ = controlled_build(qtbot, history=history)
+    window._timer.stop()
+    window._poll_timer.stop()
+    now = [END - RAW_BUCKET_NS // 2]
+    window._clock_ns = lambda: now[0]
+    deferred = scope_window(END + RAW_BUCKET_NS)
+    window._deferred_target = deferred
+    window._deferred_origin = "clock"
+    return window, history, now, deferred
+
+
+def _recovery_fields(window) -> tuple:
+    return (
+        window._pending,
+        window._pending_source,
+        window._deferred_target,
+        window._deferred_origin,
+        window._prepare_retry,
+        window._prepare_error,
+        window._retry_after,
+        window._stalled,
+    )
+
+
+def test_no_frame_deferred_apply_uses_ordinary_gate_but_poll_never_submits(qtbot):
+    """Only an ordinary apply may run the deferred target gate, exactly once."""
+
+    # Free gate: exactly one ordinary prepare, zero poll prepares, at most one
+    # immediate apply.
+    window, history, now, deferred = _deferred_fixture(qtbot)
+    events: list[tuple] = []
+    view = window.view
+    original_notify = view.refresh_measurements
+    original_drain = history.drain
+    monkeypatch = pytest.MonkeyPatch()
+    try:
+        monkeypatch.setattr(
+            view, "refresh_measurements",
+            lambda: events.append(("notify",)) or original_notify(),
+        )
+
+        def drain() -> bool:
+            events.append(("drain",))
+            return original_drain()
+
+        monkeypatch.setattr(history, "drain", drain)
+        history.drain_changed = True
+        assert window.apply_ready_frame(now=now[0], context="poll") is False
+        assert events == [("drain",), ("notify",)]
+        assert len(history.prepare_calls) == 0
+        assert window._deferred_target == deferred
+        history.drain_changed = True
+        assert window.apply_ready_frame(now=now[0], context="ordinary") is False
+        assert len(history.prepare_calls) == 1
+        assert history.prepare_calls == [deferred]
+        assert window._pending == deferred
+        assert window._deferred_target == deferred
+        # Every context drains and notifies a completed detail batch first.
+        assert events[2:] == [("drain",), ("notify",)]
+    finally:
+        monkeypatch.undo()
+        window.shutdown()
+
+    # Immediately ready registration: the same ordinary call applies once.
+    window, history, now, deferred = _deferred_fixture(qtbot, ready=True)
+    try:
+        history.ready_windows.add(deferred)
+        assert window.apply_ready_frame(now=now[0], context="ordinary") is True
+        assert window._displayed == deferred
+        assert history.prepare_calls == [deferred]
+        assert window.apply_ready_frame(now=now[0], context="ordinary") is False
+        assert len(history.prepare_calls) == 1
+    finally:
+        window.shutdown()
+
+    # Held frame Future: both contexts prepare zero and preserve the request.
+    window, history, now, deferred = _deferred_fixture(qtbot)
+    try:
+        window._pending = scope_window()
+        window._pending_since = now[0]
+        before = _recovery_fields(window)
+        assert window.apply_ready_frame(now=now[0], context="poll") is False
+        assert window.apply_ready_frame(now=now[0], context="ordinary") is False
+        assert history.prepare_calls == []
+        assert _recovery_fields(window) == before
+    finally:
+        window.shutdown()
+
+    # Future floor: both contexts prepare zero and preserve floor/request.
+    window, history, now, deferred = _deferred_fixture(qtbot)
+    try:
+        window._retry_after = now[0] + 1_000_000_001
+        before = _recovery_fields(window)
+        assert window.apply_ready_frame(now=now[0], context="poll") is False
+        assert window.apply_ready_frame(now=now[0], context="ordinary") is False
+        assert history.prepare_calls == []
+        assert _recovery_fields(window) == before
+        assert window._retry_after == now[0] + 1_000_000_001
+        # An expired floor with an idle reader: ordinary prepares once, poll
+        # still submits nothing and leaves the request deferred.
+        now[0] = window._retry_after
+        assert window.apply_ready_frame(now=now[0], context="poll") is False
+        assert history.prepare_calls == []
+        assert window._deferred_target == deferred
+        assert window.apply_ready_frame(now=now[0], context="ordinary") is False
+        assert history.prepare_calls == [deferred]
+        assert window._pending == deferred
+    finally:
+        window.shutdown()
+
+    # Explicit PrepareRetry: zero prepares in both contexts, marker preserved.
+    window, history, now, deferred = _deferred_fixture(qtbot)
+    try:
+        marker = cw.PrepareRetry(deferred, "explicit", now[0])
+        window._prepare_retry = marker
+        window._prepare_error = "appio: disk read failed"
+        before = _recovery_fields(window)
+        assert window.apply_ready_frame(now=now[0], context="poll") is False
+        assert window.apply_ready_frame(now=now[0], context="ordinary") is False
+        assert history.prepare_calls == []
+        assert _recovery_fields(window) == before
+    finally:
+        window.shutdown()
+
+
+def _status_case_inputs(case):
+    from appio.contracts import LAUNCH_WINDOW_MESSAGE, RANGE_TOO_LONG_MESSAGE
+    from appio.history_types import AcceptedIdentity, AnswerProvenance, retention_scope
+    from appio.ui.render_model import MeasurementStatus, PresentationRefusal
+
+    window = scope_window()
+    key = "unit:alpha.service"
+    answer = AnswerProvenance("totals", key, retention_scope(key, window), window,
+        AcceptedIdentity("totals", key, window, "b" * 64), 38 * 10**9, None, None)
+    absent = MeasurementStatus(False, False, "absent", "absent", None, None, ())
+    values = replace(absent, has_displayed_values=True, share_state="ok", displayed_answers=(answer,))
+    peak = replace(absent, displayed_answers=(replace(answer, kind="ranking",
+        accepted_identity=AcceptedIdentity("ranking", key, window, "a" * 64)),))
+    pending = replace(absent, share_state="pending")
+    failed = replace(absent, share_state="failed", share_reason="share_bad")
+    refusal = PresentationRefusal("shell_prepare", Window("launch", BOOT, launch_id=7),
+                                 "launch_attribution", LAUNCH_WINDOW_MESSAGE)
+    age = "oldest answer 2 s ago"
+    definitions = {
+        "S01": ({"refusal": refusal, "measurement": values, "any_work": True}, "1", LAUNCH_WINDOW_MESSAGE, age),
+        "S02": ({"refusal": replace(refusal, origin="direct_view"), "prepare_error": "appio: disk read failed"}, "1", LAUNCH_WINDOW_MESSAGE, None),
+        "S03": ({"refusal": replace(refusal, reason="unsupported_window", text=RANGE_TOO_LONG_MESSAGE), "measurement": values}, "1", RANGE_TOO_LONG_MESSAGE, age),
+        "S04": ({"prepare_error": "appio: disk read failed", "measurement": values, "any_work": True}, "2", "appio: disk read failed", age),
+        "S05": ({"busy": True, "retry_after": 40 * 10**9, "view_state": "unavailable", "measurement": values}, "3", "history read has not completed (unavailable); the reader is still busy", age),
+        "S06": ({"busy": True, "view_state": "loading", "any_work": True}, "3", "history read has not completed (loading); the reader is still busy", None),
+        "S07": ({"retry_after": 41_000_000_001, "view_state": "unavailable", "measurement": values}, "4", "history read has not completed (unavailable); retrying in 2 s", age),
+        "S08": ({"has_frame": False, "has_target": False, "has_sample": False}, "5a", "waiting for the first sample", None),
+        "S09": ({"has_frame": False, "view_state": "loading", "any_work": True}, "5b", "loading history (loading)", None),
+        "S10": ({"measurement": values, "any_work": True}, "6a", "updating (ready)", age),
+        "S11": ({"measurement": values, "any_work": True, "view_state": "loading"}, "6a", "updating (loading)", age),
+        "S12": ({"measurement": values}, "6b", "live", age),
+        "S13": ({"measurement": replace(absent, ranking_empty=True), "any_work": True}, "6c", "no applications observed", None),
+        "S14": ({"measurement": pending}, "6d", "loading measurements (ready)", None),
+        "S15": ({"measurement": replace(pending, series_state="failed", series_reason="series_bad")}, "6d", "loading measurements (ready)", None),
+        "S16": ({"measurement": replace(failed, series_state="failed", series_reason="series_bad")}, "6e", "measurements unavailable: share_bad", None),
+        "S17": ({"measurement": replace(absent, series_state="failed", series_reason="series_bad")}, "6e", "measurements unavailable: series_bad", None),
+        "S18": ({"measurement": replace(failed, series_state="ok")}, "6e", "measurements unavailable: share_bad", None),
+        "S19": ({}, "6f", "", None),
+        "S20": ({"measurement": replace(peak, share_state="pending")}, "6d", "loading measurements (ready)", age),
+        "S21": ({"measurement": peak}, "6f", "", age),
+    }
+    overrides, row, text, age_text = definitions[case]
+    inputs = dict(refusal=None, prepare_error=None, busy=False, retry_after=None,
+        now_ns=40 * 10**9, has_frame=True, has_target=True, has_sample=True,
+        any_work=False, view_state="ready", measurement=absent, age_now_ns=40 * 10**9)
+    inputs.update(overrides)
+    return inputs, (row, text, age_text)
+
+
+def _assert_status_case(qtbot, monkeypatch, case):
+    from appio.ui.render_model import _choose_overview_status
+
+    inputs, expected = _status_case_inputs(case)
+    choice = _choose_overview_status(**inputs)
+    assert (choice.row, choice.text, choice.age_text) == expected, case
+    window, _, history, _ = controlled_build(qtbot)
+    window._timer.stop()
+    window._poll_timer.stop()
+    view = window.view
+    history.view_state = inputs["view_state"]
+    history.pending_work_flag = inputs["any_work"]
+    history.local_read_busy = inputs["busy"]
+    window._displayed = scope_window() if inputs["has_frame"] else None
+    window._target = scope_window() if inputs["has_target"] else None
+    window._pending = scope_window() if not inputs["has_frame"] and inputs["has_sample"] else None
+    window._stalled = inputs["busy"]
+    window._retry_after = inputs["retry_after"]
+    window._presentation_refusal = inputs["refusal"]
+    window._prepare_error = inputs["prepare_error"]
+    if inputs["prepare_error"]:
+        window._prepare_retry = cw.PrepareRetry(scope_window(), "explicit", 2 * 10**9)
+    calls = []
+    choose = cw._choose_overview_status
+    monkeypatch.setattr(cw, "_choose_overview_status", lambda **kw: calls.append(kw) or choose(**kw))
+    monkeypatch.setattr(view, "measurement_status", lambda: inputs["measurement"])
+    monkeypatch.setattr(window, "_age_clock_ns", lambda: inputs["age_now_ns"])
+    before = _recovery_fields(window)
+    counts = (list(history.prepare_calls), history.ranking_reads, list(history.file_requests))
+    try:
+        window._update_overview_status(inputs["now_ns"])
+        assert len(calls) == 1
+        assert window.history_state.text() == expected[1]
+        assert window.history_state.isHidden() == (expected[1] == "")
+        assert view.overview_age.isHidden() == (expected[2] is None)
+        if expected[2] is not None:
+            assert view.overview_age.text() == expected[2]
+        assert _recovery_fields(window) == before
+        assert (list(history.prepare_calls), history.ranking_reads, list(history.file_requests)) == counts
+    finally:
+        window.shutdown()
+        monkeypatch.setattr(cw, "_choose_overview_status", choose)
+
+
+@pytest.mark.parametrize("case", [f"S{number:02d}" for number in range(1, 22)])
+def test_live_status_tree_selects_exactly_one_reachable_row(qtbot, monkeypatch, case):
+    _assert_status_case(qtbot, monkeypatch, case)
+
+
+@pytest.mark.parametrize("case", ["S08", "S09"])
+def test_live_status_initial_frame_pending(qtbot, monkeypatch, case):
+    _assert_status_case(qtbot, monkeypatch, case)
+
+
+def test_live_status_first_and_retry_details_pending_without_peak(qtbot, monkeypatch):
+    for case in ("S14", "S12", "S16", "S14"):
+        _assert_status_case(qtbot, monkeypatch, case)
+
+
+@pytest.mark.parametrize("case", ["S18", "S19"])
+def test_live_status_unsupported_lifetime_and_unranked_subject_are_settled(qtbot, monkeypatch, case):
+    _assert_status_case(qtbot, monkeypatch, case)
+
+
+@pytest.mark.parametrize("case", ["S01", "S02", "S03", "S04"])
+def test_live_status_refusal_and_operational_error_precedence(qtbot, monkeypatch, case):
+    _assert_status_case(qtbot, monkeypatch, case)
+
+
+def test_live_status_early_retirement_expired_floor_still_busy(qtbot, monkeypatch):
+    _assert_status_case(qtbot, monkeypatch, "S05")
+    window, history, now, deferred = _deferred_fixture(qtbot)
+    try:
+        history.local_read_busy = True
+        window._retry_after = now[0]
+        window._stalled = True
+        window.show_window(deferred)
+        assert history.prepare_calls == []
+        assert window._deferred_target == deferred
+        assert window._retry_after == now[0]
+        assert window.history_state.text().endswith("the reader is still busy")
+    finally:
+        window.shutdown()
+
+
+@pytest.mark.parametrize("case", ["S01", "S05", "S07", "S10", "S12", "S21", "S06", "S08", "S14"])
+def test_age_label_survives_busy_retry_refusal_and_idle_status(qtbot, monkeypatch, case):
+    _assert_status_case(qtbot, monkeypatch, case)
+
+
+def test_clock_only_age_update_issues_no_queries_or_reacceptance(qtbot, monkeypatch):
+    inputs, _expected = _status_case_inputs("S12")
+    window, _, history, _ = controlled_build(qtbot)
+    window._timer.stop()
+    window._poll_timer.stop()
+    now = [40 * 10**9]
+    window._displayed = scope_window()
+    history.view_state = "ready"
+    view = window.view
+    monkeypatch.setattr(view, "measurement_status", lambda: inputs["measurement"])
+    monkeypatch.setattr(window, "_age_clock_ns", lambda: now[0])
+    before = _recovery_fields(window)
+    counts = (list(history.prepare_calls), history.ranking_reads, list(history.file_requests))
+    widgets = view._total_chart, view._donut, view._share_bars
+    try:
+        window._update_overview_status(now[0])
+        assert view.overview_age.text() == "oldest answer 2 s ago"
+        now[0] += 10**9
+        window._update_overview_status(now[0])
+        assert view.overview_age.text() == "oldest answer 3 s ago"
+        assert window.history_state.text() == "live"
+        assert _recovery_fields(window) == before
+        assert widgets == (view._total_chart, view._donut, view._share_bars)
+        assert (list(history.prepare_calls), history.ranking_reads, list(history.file_requests)) == counts
+        assert inputs["measurement"].displayed_answers[0].first_seen_at_ns == 38 * 10**9
+    finally:
+        window.shutdown()
+
+
+@pytest.mark.parametrize("trace", ["shell_refusal", "operational_retry", "direct_refusal"])
+def test_refusal_presentation_lifecycle_preserves_age_and_recovery_owners(qtbot, monkeypatch, trace):
+    from appio.contracts import LAUNCH_WINDOW_MESSAGE
+    from appio.history_types import AcceptedIdentity
+    from live_overview_support import Clock, IdentityExactOnlyQuery, series, share, total
+
+    history = ControlledHistory()
+    age = Clock(0)
+    service = IdentityExactOnlyQuery([total(1, "unit:alpha.service")])
+    key = "unit:alpha.service"
+    a = Window("since_boot", BOOT, end_mono_ns=20 * 10**9)
+    b = Window("since_boot", BOOT, end_mono_ns=30 * 10**9)
+    launch = Window("launch", BOOT, launch_id=7)
+    service.set_share(a, share(1, a))
+    service.set_series(a, series(1, a))
+    service.identities[("totals", key, a)] = AcceptedIdentity("totals", key, a, "b" * 64)
+    service.identities[("series", key, a)] = AcceptedIdentity("series", key, a, "c" * 64)
+    for name in ("ranking", "disk_share", "series", "exact_answer_identity"):
+        monkeypatch.setattr(history, name, getattr(service, name), raising=False)
+    window, _, _, _ = controlled_build(qtbot, history=history)
+    window._timer.stop()
+    window._poll_timer.stop()
+    view = window.view
+    view._clock_ns = age
+    view._detail_service._clock_ns = age
+    window._age_clock_ns = age
+    window._clock_ns = age
+    view.set_window(a)
+    window._displayed = window._target = a
+    history.view_state = "ready"
+    prepare = history.prepare
+    attempts = []
+
+    def guarded_prepare(requested):
+        attempts.append(requested)
+        if requested.kind == "launch":
+            raise WindowUnavailableError("launch_attribution", LAUNCH_WINDOW_MESSAGE)
+        return prepare(requested)
+
+    monkeypatch.setattr(history, "prepare", guarded_prepare)
+    try:
+        age.ns = 2 * 10**9
+        if trace == "shell_refusal":
+            with pytest.raises(WindowUnavailableError):
+                window.show_window(launch)
+            assert attempts == [launch] and history.prepare_calls == []
+            assert window._presentation_refusal.origin == "shell_prepare"
+            assert window.history_state.text() == LAUNCH_WINDOW_MESSAGE
+            assert view.overview_age.text() == "oldest answer 2 s ago"
+            age.ns = 3 * 10**9
+            with pytest.raises(WindowUnavailableError):
+                window._tick_target(now=age())
+            assert attempts == [launch, launch]
+            age.ns = 4 * 10**9
+            calls = dict(service.calls)
+            view.refresh_measurements()
+            window._update_overview_status(age())
+            assert service.calls == calls
+            assert view.overview_age.text() == "oldest answer 4 s ago"
+            age.ns = 5 * 10**9
+            service.set_pending("series", 1, b)
+            service.set_pending("totals", 1, b)
+            window.show_window(b)
+            assert attempts == [launch, launch, b]
+            assert history.prepare_calls == [b]
+            assert window._presentation_refusal is None
+            assert window.history_state.text() == "updating (loading)"
+            age.ns = 6 * 10**9
+            history.become_ready(b)
+            history.pending_work_flag = True
+            assert window.apply_ready_frame(now=age())
+            assert window.history_state.text() == "updating (ready)"
+            assert view.overview_age.text() == "oldest answer 6 s ago"
+            age.ns = 7 * 10**9
+            service.set_share(b, share(1, b))
+            service.set_series(b, series(1, b))
+            for kind in ("totals", "series"):
+                service.identities[(kind, key, b)] = AcceptedIdentity(kind, key, b, "d" * 64)
+            view.refresh()
+            history.pending_work_flag = False
+            window._update_overview_status(age())
+            assert window.history_state.text() == "live"
+            assert view.overview_age.text() == "oldest answer 0 s ago"
+        elif trace == "operational_retry":
+            history.prepare_failures.append(OSError("disk read failed"))
+            with pytest.raises(OSError, match="disk read failed"):
+                window.show_window(b)
+            marker = window._prepare_retry
+            assert marker == cw.PrepareRetry(b, "explicit", 2 * 10**9)
+            assert window.history_state.text() == "appio: disk read failed"
+            assert window._retry_after is None
+            age.ns = 3 * 10**9
+            window._tick_target(now=age())
+            window.apply_ready_frame(now=age(), context="poll")
+            assert attempts == [b]
+            assert window._prepare_retry is marker
+            age.ns = 4 * 10**9
+            window.show_window(b)
+            assert attempts == [b, b]
+            assert window._prepare_retry is None
+            assert window.history_state.text() == "updating (loading)"
+            assert view.overview_age.text() == "oldest answer 4 s ago"
+        else:
+            view.set_window(launch)
+            window._update_overview_status(age())
+            assert window._presentation_refusal.origin == "direct_view"
+            assert window.history_state.text() == LAUNCH_WINDOW_MESSAGE
+            assert view.overview_age.isHidden()
+            calls = dict(service.calls)
+            view.refresh_measurements()
+            window._update_overview_status(age())
+            assert service.calls == calls
+            assert attempts == []
+            age.ns = 4 * 10**9
+            view.set_window(a)
+            window._update_overview_status(age())
+            assert window._presentation_refusal is None
+            assert window.history_state.text() == "live"
+            assert view.overview_age.text() == "oldest answer 0 s ago"
+            assert window._retry_after is None and window._prepare_retry is None
+    finally:
+        window.shutdown()
+
+
+def test_native_composition_binds_one_age_clock_domain(qtbot, tmp_path):
+    """Real client/router/view/composer share one MONOTONIC age clock only."""
+
+    from appio.history_router import HistoryRouter
+    from appio.iodclient import (
+        NO_ANSWER_NS,
+        REQUEST_LIFETIME_NS,
+        AppRegistry,
+    )
+    from appio.query import QueryService
+    from appio.store import AppIoStore
+    from live_overview_support import Clock, total, make_managed_router, wait_for_local_frame
+    from live_overview_transport import QueryTransportHarness
+
+    key = "unit:alpha.service"
+    age = Clock(ns=5_000_000_000)
+    recovery = Clock(ns=age.ns + 300_000_000_000)
+    assert recovery.ns - age.ns == 300_000_000_000
+    transport = QueryTransportHarness(
+        boot_id=BOOT, cursor=RemotePosition(BOOT, 7, 3), clock=age
+    )
+    transport.stream(4)
+    store = AppIoStore(tmp_path / "native-composition.db")
+    store.start_boot(BOOT, 1, 0, 1000.0, "gui")
+    store.connection.commit()
+    router = make_managed_router(QueryService(store), transport.client, AppRegistry(), clock_ns=age)
+
+    coordinator = ControlledCoordinator()
+    coordinator.history = router
+    window = CollectorWindow(
+        coordinator,
+        router,
+        ControlledSetup(OFF),
+        clock_ns=recovery,
+        age_clock_ns=age,
+        pump=transport.pump,
+        refresh_interval_ms=1000,
+    )
+    qtbot.addWidget(window)
+    qtbot.addWidget(window.settings)
+    window.show()
+    window._timer.stop()
+    window._poll_timer.stop()
+    try:
+        view = window.view
+        assert view is not None
+        # One age clock reaches the client, router, embedded view and composer;
+        # the shell's BOOTTIME recovery clock stays separate.
+        assert transport.client._clock_ns is age
+        assert router._clock_ns is age
+        assert window._age_clock_ns is age
+        assert window._clock_ns is recovery
+        assert view._clock_ns is age
+
+        window._tick_target(now=recovery())
+        pending = window._pending
+        assert pending is not None
+        transport.pump()
+        _token, future = router._occupant
+        assert router._local_future is not None
+        assert wait_for_local_frame(router) is not None
+        transport.reply(future, [total(17, key, peak=1024)], snapshot="a" * 64)
+        assert router.ready(pending) is True
+        assert window.apply_ready_frame(now=recovery()) is True
+        assert view.measurement_status().displayed_answers
+        assert view.overview_age.text() == "oldest answer 0 s ago"
+
+        # One second of the age clock moves only the age label.
+        age.advance_ns(1_000_000_000)
+        window._update_overview_status(recovery())
+        assert view.overview_age.text() == "oldest answer 1 s ago"
+
+        # A recovery-only advance changes the retry floor text, never the age.
+        window._retry_after = recovery() + 1_000_000_001
+        window._update_overview_status(recovery())
+        assert window.history_state.text().endswith("retrying in 2 s")
+        recovery.advance_ns(1_000_000_000)
+        window._update_overview_status(recovery())
+        assert window.history_state.text().endswith("retrying in 1 s")
+        assert view.overview_age.text() == "oldest answer 1 s ago"
+        # The floor is a BOOTTIME instant: the age clock can never arm it.
+        assert window._retry_after > age()
+
+        # Router retirement deadline: the same age clock decides the
+        # request-specific silence deadline. A dedicated real router holds one
+        # ranking request past its wire expiry so no successor can mask the
+        # occupied slot.
+        deadline_store = AppIoStore(tmp_path / "native-router-deadline.db")
+        deadline_store.start_boot(BOOT, 1, 0, 1000.0, "gui")
+        deadline_store.connection.commit()
+        deadline_transport = QueryTransportHarness(
+            boot_id=BOOT, cursor=RemotePosition(BOOT, 7, 3), clock=age
+        )
+        deadline_transport.stream(4)
+        deadline_router = make_managed_router(
+            QueryService(deadline_store),
+            deadline_transport.client,
+            AppRegistry(),
+            clock_ns=age,
+        )
+
+        deadline_window = Window("since_boot", BOOT, end_mono_ns=pending.end_mono_ns)
+        deadline_router.prepare(deadline_window)
+        deadline_transport.pump()
+        _deadline_token, ranking_future = deadline_router._occupant
+        assert deadline_router._local_future is not None
+        wait_for_local_frame(deadline_router)
+        state = deadline_transport.client.query_transport(ranking_future)
+        issued = state.issued_at_ns
+        assert issued == age()
+        deadline = issued + REQUEST_LIFETIME_NS + NO_ANSWER_NS
+        # A BOOTTIME instant is already past this deadline, which cannot settle
+        # or release the request by itself.
+        assert recovery() > deadline
+        assert ranking_future.done() is False
+        age.ns = issued + REQUEST_LIFETIME_NS - 1
+        deadline_transport.stream(5)
+        assert ranking_future.done() is False
+        age.ns = issued + REQUEST_LIFETIME_NS
+        deadline_transport.stream(6)
+        assert ranking_future.done() is True
+        deadline_router.drain()
+        # Expired but before the silence deadline: the occupant stays and the
+        # connection remains usable for a correlated late answer.
+        assert deadline_router._occupant is not None
+        assert (
+            deadline_transport.client.query_transport(ranking_future).phase
+            == "expired"
+        )
+        age.ns = deadline - 1
+        deadline_transport.stream(7)
+        deadline_router.drain()
+        assert deadline_router._occupant is not None
+        assert (
+            deadline_transport.client.query_transport(ranking_future).phase
+            == "expired"
+        )
+        # At equality the router retires the still-expired connection once.
+        age.ns = deadline
+        deadline_router.drain()
+        assert deadline_router._occupant is None
+        assert (
+            deadline_transport.client.query_transport(ranking_future).phase
+            == "lost"
+        )
+        deadline_router.close()
+        deadline_store.connection.close()
+    finally:
+        window.shutdown()
+        store.connection.close()
+
+
+@pytest.mark.parametrize("schedule", ["before-first-drain", "after-first-drain"])
+def test_real_local_detail_completion_is_not_consumed_by_readiness_without_notification(
+    qtbot, tmp_path, monkeypatch, schedule
+):
+    """A local series answer completed by ready() still reaches the Overview.
+
+    The control queues it before the poll's first drain. The treatment queues
+    it immediately after that drain returns, so displayed-frame readiness in
+    status rendering owns its completion.
+    """
+
+    from appio.handover import baseline_seed
+    from appio.history_router import HistoryRouter
+    from appio.history_types import retention_scope
+    from appio.iodclient import AppRegistry, ClientState
+    from appio.procs import AppKeyInputs, IoReadOutcome, ProcessIdentity, StableProcRecord
+    from appio.query import QueryService
+    from appio.sampler import TickInput, aggregate_tick
+    from appio.store import AppIoStore
+
+    key = "exe:/usr/bin/alpha"
+    ns = 1_000_000_000
+    store = AppIoStore(tmp_path / f"readiness-{schedule}.db")
+    store.start_boot(BOOT, 1, 0, 1000.0, "gui")
+    store.connection.execute(
+        "INSERT INTO app VALUES (?,?,?,NULL,0,0,'user')", (17, key, "alpha")
+    )
+    store.connection.commit()
+    store.start_collector("gui", BOOT, 100 * ns)
+    state = None
+    for seq, at in ((0, 100), (1, 110)):
+        amount = 20
+        process = StableProcRecord(
+            ProcessIdentity(BOOT, 410, 100), 1, 1000, key, "/fixture",
+            AppKeyInputs("/fixture", "alpha"),
+            IoReadOutcome("readable", (100 + seq * amount,) * 4, None, None),
+        )
+        observation = TickInput(
+            BOOT, "gui", 1, seq, at * ns, (1000 + at) * ns, (process,), ()
+        )
+        frame, state = (
+            baseline_seed(observation)
+            if seq == 0
+            else aggregate_tick(state, observation)
+        )
+        store.record_tick(frame, state)
+
+    class IdleClient:
+        state = ClientState()
+
+        def query(self, request):
+            raise AssertionError(f"local history issued a remote query: {request.kind}")
+
+    from live_overview_support import make_managed_router, wait_for_local_frame, wait_for_capture_admission
+
+    history = make_managed_router(QueryService(store), IdleClient(), AppRegistry())
+
+    window = CollectorWindow(
+        ControlledCoordinator(), history, ControlledSetup(OFF),
+        clock_ns=lambda: 140 * ns,
+    )
+    qtbot.addWidget(window)
+    qtbot.addWidget(window.settings)
+    window.show()
+    window._timer.stop()
+    window._poll_timer.stop()
+
+    release_series = threading.Event()
+    series_entered = threading.Event()
+    series_worker: dict[str, object] = {}
+    queued = threading.Condition()
+    queued_count = [0]
+    completion_queue = history._completed
+
+    class WatchedCompletionQueue:
+        def put(self, item):
+            result = completion_queue.put(item)
+            with queued:
+                queued_count[0] += 1
+                queued.notify_all()
+            return result
+
+        def get_nowait(self):
+            return completion_queue.get_nowait()
+
+        def empty(self):
+            return completion_queue.empty()
+
+        def qsize(self):
+            return completion_queue.qsize()
+
+        def wait_for_puts(self, expected):
+            with queued:
+                return queued.wait_for(lambda: queued_count[0] >= expected, timeout=2)
+
+        def reset_put_count(self):
+            with queued:
+                queued_count[0] = 0
+
+    history._completed = WatchedCompletionQueue()
+    original_part = history._read_local_part
+
+    def held_series(paths, request, **kwargs):
+        series_entered.set()
+        assert release_series.wait(30), "the held local detail worker was not released"
+        return original_part(paths, request, **kwargs)
+
+    monkeypatch.setattr(history, "_read_local_part", held_series)
+    try:
+        target = Window("since_boot", BOOT, end_mono_ns=140 * ns)
+        assert window._submit_prepare(target, "explicit", now=140 * ns)
+        assert history._local_future is not None
+        wait_for_local_frame(history)
+        assert window.apply_ready_frame(now=140 * ns) is True
+        from live_overview_support import wait_for_capture_admission
+        wait_for_capture_admission(history)
+        history._completed.reset_put_count()
+        view = window.view
+        assert view is not None and view._subject_app_id is not None
+        assert series_entered.wait(5)
+        series_token = history._detail.live["series"]
+        series_worker.update(id=series_token.token_id, request=series_token.request,
+                             app_key=series_token.request.app_key)
+        worker_id = series_worker["id"]
+        series_future = history._worker_jobs[worker_id][1]
+        assert series_future is not None
+        detail_futures = [
+            future for owner, future in history._worker_jobs.values()
+            if owner == "detail" and future is not None
+        ]
+        assert len(detail_futures) == 2
+        totals_future = next(future for future in detail_futures if future is not series_future)
+
+        notifications = []
+        original_refresh = view.refresh_measurements
+
+        def counted_refresh():
+            notifications.append(True)
+            return original_refresh()
+
+        monkeypatch.setattr(view, "refresh_measurements", counted_refresh)
+        token_id_before = history._next_token_id
+        generation_before = history._generation
+
+        if schedule == "before-first-drain":
+            release_series.set()
+            series_future.result(timeout=10)
+            totals_future.result(timeout=10)
+            assert history._completed.wait_for_puts(2)
+        else:
+            original_drain = history.drain
+            drains = 0
+
+            def drain_then_release_series():
+                nonlocal drains
+                drains += 1
+                changed = original_drain()
+                if drains == 1:
+                    assert changed is False, "detail work completed before the treatment drain"
+                    release_series.set()
+                    series_future.result(timeout=10)
+                    totals_future.result(timeout=10)
+                    assert history._completed.wait_for_puts(2)
+                return changed
+
+            monkeypatch.setattr(history, "drain", drain_then_release_series)
+
+        window._poll_timer.stop()
+        window._poll_history()
+        if schedule == "after-first-drain":
+            assert notifications == []
+            assert history.pending_work is True
+            assert window._poll_timer.isActive(), window.error_label.text()
+            window._poll_history()
+        assert history.pending_work is False
+        assert history.part_state(
+            "series", series_worker["app_key"],
+            retention_scope(series_worker["app_key"], series_worker["request"].window),
+        ).state == "ok"
+        assert len(notifications) == 1
+        assert not window._poll_timer.isActive()
+        # Notifications remain retained-only: they admit no detail, ranking or
+        # frame work and preserve the one embedded composer/view.
+        assert history._next_token_id == token_id_before
+        assert history._generation == generation_before
+        assert window.view is view
+        assert view._exact_adapter is None  # the real router owns retained detail
+    finally:
+        release_series.set()
+        window.shutdown()
+        store.connection.close()
+
+
+def test_remote_view_authority_includes_registered_local_identities(qtbot):
+    """Remote cursor stability does not hide local registration replacement."""
+
+    history = ControlledHistory(ready=True)
+    history.client = _remote_client(generation=4, epoch=9, seq=12)
+    history.source = RemotePosition(BOOT, 9, 12)
+    history._sources = {"local": object()}
+    identities = {"local": LocalPosition("local", "gui", 3, 7, 11)}
+    history._local_vector = lambda: LocalPositionVector(tuple(
+        sorted(identities.values(), key=lambda position: position.name.encode("utf-8"))
+    ))
+    window, _, history, _ = controlled_build(qtbot, history=history)
+    window._timer.stop()
+    window._poll_timer.stop()
+    window._clock_ns = lambda: END - RAW_BUCKET_NS // 2
+    try:
+        window._tick_target()
+        pending = window._pending
+        assert pending is not None
+        history.become_ready(pending)
+        assert window.apply_ready_frame() is True
+        view = window.view
+        assert view is not None
+        initial_epoch = view._exact_authority_epoch
+        prepare_count = len(history.prepare_calls)
+
+        # Source sequence and local counters advance under unchanged registered
+        # identities; neither retires exact-only observations.
+        history.source = RemotePosition(BOOT, 9, 13)
+        identities["local"] = replace(
+            identities["local"], data_version=8, total_changes=12
+        )
+        window._tick_target()
+        assert view._exact_authority_epoch == initial_epoch
+        assert len(history.prepare_calls) == prepare_count + 1
+        pending = window._pending
+        assert pending is not None
+        history.become_ready(pending)
+        assert window.apply_ready_frame() is True
+        prepare_count = len(history.prepare_calls)
+        stable_epoch = view._exact_authority_epoch
+
+        # Registration additions/removals and same-name rebinds are authority
+        # changes even while the remote cursor itself remains fixed.
+        fixed_remote = history.source
+        history._sources["imported"] = object()
+        identities["imported"] = LocalPosition("imported", "iod", 1, 2, 3)
+        window._tick_target()
+        assert history.source == fixed_remote
+        assert view._exact_authority_epoch == stable_epoch + 1
+        assert len(history.prepare_calls) == prepare_count
+        window._tick_target()
+        assert view._exact_authority_epoch == stable_epoch + 1
+
+        del history._sources["imported"]
+        del identities["imported"]
+        window._tick_target()
+        assert view._exact_authority_epoch == stable_epoch + 2
+        assert len(history.prepare_calls) == prepare_count
+        identities["local"] = LocalPosition("local", "iod", 4, 8, 12)
+        window._tick_target()
+        assert view._exact_authority_epoch == stable_epoch + 3
+        assert len(history.prepare_calls) == prepare_count
+    finally:
+        window.shutdown()

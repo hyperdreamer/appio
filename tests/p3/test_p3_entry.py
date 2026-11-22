@@ -148,15 +148,29 @@ def test_offscreen_is_applied_before_the_interactive_branch(tmp_path, monkeypatc
 
 def test_interactive_composition_forwards_a_pending_handover_to_the_factory(tmp_path, monkeypatch, qapp):
     """The shipped entry must use the coordinator's incoming handover seam."""
+    from PyQt6.QtCore import Qt
     from PyQt6.QtWidgets import QApplication
+    import threading
+    import time
     from appio.ui import collector_window
 
-    class Signal:
-        def emit(self):
-            pass
+    original_wake = collector_window._wake_object
+    owner_thread = threading.get_ident()
+    connections = []
+    emissions = []
+    deliveries = []
 
-        def connect(self, callback):
-            pass
+    class Signal:
+        def __init__(self):
+            self.wake = original_wake()
+
+        def emit(self):
+            emissions.append(threading.get_ident())
+            self.wake.woke.emit()
+
+        def connect(self, callback, connection_type):
+            connections.append(connection_type)
+            self.wake.woke.connect(callback, connection_type)
 
     class Client:
         def __init__(self, *args, **kwargs):
@@ -170,6 +184,7 @@ def test_interactive_composition_forwards_a_pending_handover_to_the_factory(tmp_
 
     class Collector:
         def __init__(self, **kwargs):
+            deliveries.append(threading.get_ident())
             calls.append(kwargs)
             self.source = kwargs["source"]
             self.baseline_only = kwargs["baseline_only"]
@@ -188,6 +203,7 @@ def test_interactive_composition_forwards_a_pending_handover_to_the_factory(tmp_
 
     class Window:
         def __init__(self, coordinator, history, setup, **kwargs):
+            deliveries.append(threading.get_ident())
             holder["coordinator"] = coordinator
             holder["history"] = history
             coordinator.resume_handover = offer
@@ -199,11 +215,24 @@ def test_interactive_composition_forwards_a_pending_handover_to_the_factory(tmp_
         def refresh(self):
             pass
 
+        def _arm_poll(self):
+            deliveries.append(threading.get_ident())
+            holder["history"].drain()
+
         def shutdown(self):
             holder["coordinator"].close()
             holder["history"].close()
 
-    monkeypatch.setattr(QApplication, "exec", lambda self: 0)
+    def run_event_loop(application):
+        deadline = time.monotonic() + 10
+        while not calls:
+            application.processEvents()
+            assert time.monotonic() < deadline, "queued primary admission did not reach the factory"
+            time.sleep(0.001)
+        holder["history"].drain()
+        return 0
+
+    monkeypatch.setattr(QApplication, "exec", run_event_loop)
     monkeypatch.setattr("appio.iodclient.IodClient", Client)
     monkeypatch.setattr(collector_window, "LiveCollector", Collector)
     monkeypatch.setattr(collector_window, "CollectorWindow", Window)
@@ -217,6 +246,9 @@ def test_interactive_composition_forwards_a_pending_handover_to_the_factory(tmp_
     assert len(calls) == 1
     assert calls[0]["baseline_only"] is False
     assert calls[0]["resume_handover"] is offer
+    assert connections == [Qt.ConnectionType.QueuedConnection] * 2
+    assert emissions and any(thread != owner_thread for thread in emissions)
+    assert deliveries and set(deliveries) == {owner_thread}
 
 
 def test_interactive_composition_construction_is_deferred_to_the_factory(tmp_path):

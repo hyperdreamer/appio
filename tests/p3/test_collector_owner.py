@@ -214,6 +214,7 @@ def test_owner_thread_and_reentrant_callbacks_cannot_race_the_writer(tmp_path):
 
 
 def test_export_is_opened_read_only_and_must_match_its_checkpoint(tmp_path):
+    import sqlite3
     from test_history_router import source, router, BOOT, NS
     from appio.history_export import ExportResult
     local, _ = source(tmp_path / "local.db")
@@ -226,10 +227,32 @@ def test_export_is_opened_read_only_and_must_match_its_checkpoint(tmp_path):
     before = (tmp_path / "export.db").read_bytes()
     owner.accept_export(export)
     assert owner.resume_handover is not None
-    exported = next(service for name, (service, _) in history._sources.items() if name != "local")
-    assert exported.connection.execute("PRAGMA query_only").fetchone()[0] == 1
-    with pytest.raises(Exception, match="readonly"):
-        exported.connection.execute("DELETE FROM sample")
+    next(iter(owner._export_registrations.values())).result(timeout=10)
+    assert history.sources.registration_vector()
+    export_name = next(iter(owner._export_registrations))
+    export_registration = next(
+        (item for item in history.sources.registration_vector()
+         if item[0] == export_name),
+        None,
+    )
+    assert export_registration is not None
+    assert export_registration[1] == "iod"
+    export_receipt = owner._export_registrations[export_name].result(timeout=10)
+    assert export_receipt.registration_epoch == export_registration[2]
+
+    def contains_connection(value):
+        if isinstance(value, sqlite3.Connection):
+            return True
+        if isinstance(value, dict):
+            return any(contains_connection(key) or contains_connection(item)
+                       for key, item in value.items())
+        if isinstance(value, (list, tuple, set, frozenset)):
+            return any(contains_connection(item) for item in value)
+        return False
+
+    coordinator_state = tuple(vars(owner).values()) + tuple(
+        future.result(timeout=10) for future in owner._export_registrations.values())
+    assert not contains_connection(coordinator_state)
     assert (tmp_path / "export.db").read_bytes() == before
     with pytest.raises(ValueError, match="checkpoint"):
         owner.accept_export(replace(export, cutoff_mono_ns=129*NS))

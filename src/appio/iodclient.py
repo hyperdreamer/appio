@@ -55,14 +55,17 @@ import os
 import select
 import socket
 import time
+import weakref
 from collections import OrderedDict, deque
 from collections.abc import Callable, Mapping
 from concurrent.futures import Future
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
-from .contracts import FileCoverage, FileTable, Window, WindowUnavailableError
+from .contracts import DiskShare, FileCoverage, FileTable, Series, Window, WindowUnavailableError
+from .history_types import RemotePosition
+from .history_validation import validate_query_result
 from .identity import validate_app_key
 from .iod_history import from_wire
 from .ipc_models import (
@@ -93,6 +96,7 @@ __all__ = [
     "MAX_RETIRED_BOOTS",
     "NO_ANSWER_NS",
     "NS",
+    "QueryTransportState",
     "RemoteError",
     "REQUEST_LIFETIME_NS",
     "RequestRejected",
@@ -263,6 +267,100 @@ class ClientState:
     pending_activation: bool | None = None
     last_error: str | None = None
     file_diagnostic: str | None = None
+
+
+_TRANSPORT_PHASES: tuple[str, ...] = (
+    "not_sent",
+    "active",
+    "expired",
+    "terminal",
+    "lost",
+)
+
+
+def _nonnegative_integer(value: object, field: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"{field} must be a non-negative integer")
+    return value
+
+
+@dataclass(frozen=True)
+class QueryTransportState:
+    """One returned query Future's observed transport lifetime.
+
+    This is an in-process observation only: it is never serialized, is not part
+    of protocol 1, and adds no field to a wire or durable record. A caller uses
+    it to distinguish a request that is still on the wire from one that has a
+    real terminal outcome, an unanswered tombstone, or a detached connection.
+
+    ``not_sent`` carries neither a request id nor an issue instant, because no
+    daemon job exists. ``active``, ``expired`` and ``lost`` are always sent and
+    never carry an answered source. ``terminal`` is either a cache hit (no id,
+    no issue instant, the cached answer's original source) or a consumed daemon
+    envelope; a successful remote answer is its original issue source, never a
+    source captured at reply time.
+    """
+
+    request: QueryRequest
+    connection_generation: int
+    request_id: str | None
+    phase: Literal["not_sent", "active", "expired", "terminal", "lost"]
+    issued_at_ns: int | None
+    issued_source: RemotePosition | None
+    answered_source: RemotePosition | None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.request, QueryRequest):
+            raise ValueError("transport.request must be a QueryRequest")
+        _nonnegative_integer(self.connection_generation, "transport.connection_generation")
+        phase = self.phase
+        if isinstance(phase, bool) or not isinstance(phase, str) or phase not in _TRANSPORT_PHASES:
+            raise ValueError(
+                f"transport.phase must be one of {', '.join(_TRANSPORT_PHASES)}, got {phase!r}"
+            )
+        request_id = self.request_id
+        if request_id is not None:
+            if not isinstance(request_id, str) or request_id == "":
+                raise ValueError("transport.request_id must be a nonempty string or None")
+            try:
+                request_id.encode("utf-8")
+            except UnicodeEncodeError:
+                raise ValueError("transport.request_id must be UTF-8 encodable") from None
+        issued_at = self.issued_at_ns
+        if issued_at is not None:
+            _nonnegative_integer(issued_at, "transport.issued_at_ns")
+        for name, source in (
+            ("issued_source", self.issued_source),
+            ("answered_source", self.answered_source),
+        ):
+            if source is None:
+                continue
+            if not isinstance(source, RemotePosition):
+                raise ValueError(f"transport.{name} must be a RemotePosition or None")
+            # Revalidate instead of trusting a forged frozen record.
+            RemotePosition.__post_init__(source)
+
+        if phase == "not_sent":
+            if request_id is not None or issued_at is not None:
+                raise ValueError("a not_sent transport carries no request id or issue instant")
+            if self.issued_source is not None or self.answered_source is not None:
+                raise ValueError("a not_sent transport carries no source")
+            return
+        if (request_id is None) != (issued_at is None):
+            raise ValueError("a sent transport carries both its request id and issue instant")
+        if request_id is None and phase != "terminal":
+            raise ValueError("only a terminal cache hit is an un-sent transport")
+        if phase in ("active", "expired", "lost"):
+            if self.answered_source is not None:
+                raise ValueError(f"a transport in phase {phase} carries no answered source")
+            return
+        # phase == "terminal"
+        if request_id is None:
+            if self.issued_source is not None:
+                raise ValueError("an un-sent cache hit invents no issue source")
+            return
+        if self.answered_source is not None and self.answered_source != self.issued_source:
+            raise ValueError("an answered source is the original issue source")
 
 
 class AppRegistry:
@@ -601,6 +699,61 @@ def _bounded_detail(text: object) -> str:
     return rendered if len(rendered) <= _MAX_DETAIL else rendered[:_MAX_DETAIL] + "…"
 
 
+_WINDOW_FIELDS: tuple[str, ...] = (
+    "kind",
+    "boot_id",
+    "start_mono_ns",
+    "end_mono_ns",
+    "launch_id",
+)
+
+
+def _normalized_request(query: Mapping[str, Any]) -> QueryRequest:
+    """Rebuild the immutable request from the validated wire/default values.
+
+    ``_query_wire`` has already validated the complete query frame, so this
+    reconstruction cannot change a selector: default fields that the selector
+    does not use were refused unless they were exactly their wire default.
+    """
+
+    window_wire = query["window"]
+    window = Window(**{name: window_wire.get(name) for name in _WINDOW_FIELDS})
+    return QueryRequest(
+        kind=query["kind"],
+        window=window,
+        app_key=query.get("app_key"),
+        metric=query.get("metric", _SELECTOR_DEFAULTS["metric"]),
+        sort=query.get("sort", _SELECTOR_DEFAULTS["sort"]),
+        direction=query.get("direction", _SELECTOR_DEFAULTS["direction"]),
+        search=query.get("search"),
+        cursor=query.get("cursor"),
+        limit=query.get("limit", _SELECTOR_DEFAULTS["limit"]),
+        coverage_kind=query.get("coverage_kind", _SELECTOR_DEFAULTS["coverage_kind"]),
+    )
+
+
+_IssuedCursor = tuple[str, int, int]
+_CacheKey = tuple[str, _IssuedCursor | None]
+
+
+def _cursor_token(source: RemotePosition | None) -> _IssuedCursor | None:
+    if source is None:
+        return None
+    return (source.boot_id, source.iod_epoch, source.seq)
+
+
+def _cache_key(query: Mapping[str, Any], source: RemotePosition | None) -> _CacheKey:
+    """The canonical complete query plus the whole issue cursor.
+
+    The sequence is part of the key on purpose: an answer read at ``seq`` cannot
+    be served after the daemon has committed ``seq + 1``. ``None`` models a
+    connection with no cursor at all, which cannot certify a remote position.
+    """
+
+    canonical = json.dumps(query, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return (canonical, _cursor_token(source))
+
+
 def _verify_production_paths(path: Path) -> None:
     """Production path check: ``root:appio`` directory and socket, via ``lstat``."""
 
@@ -640,9 +793,36 @@ def _connected(sock: socket.socket) -> bool:
 
 
 @dataclass
+class _Transport:
+    """Mutable binding of one returned Future to its transport lifetime."""
+
+    request: QueryRequest
+    generation: int
+    phase: str
+    request_id: str | None = None
+    issued_at_ns: int | None = None
+    issued_source: RemotePosition | None = None
+    answered_source: RemotePosition | None = None
+    cache_key: _CacheKey | None = None
+    cache_version: int | None = None
+
+    def state(self) -> QueryTransportState:
+        return QueryTransportState(
+            request=self.request,
+            connection_generation=self.generation,
+            request_id=self.request_id,
+            phase=self.phase,  # type: ignore[arg-type]
+            issued_at_ns=self.issued_at_ns,
+            issued_source=self.issued_source,
+            answered_source=self.answered_source,
+        )
+
+
+@dataclass
 class _Pending:
     future: Future[dict]
-    key: tuple[str, str]
+    binding: _Transport
+    key: _CacheKey
     generation: int
     deadline_ns: int
 
@@ -651,6 +831,9 @@ class _Pending:
 class _Cached:
     value: dict[str, Any]
     size: int
+    request: QueryRequest
+    answered_source: RemotePosition | None
+    version: int
 
 
 class IodClient:
@@ -729,8 +912,13 @@ class IodClient:
         self._settled_pending = False
 
         self._pending: dict[str, _Pending] = {}
-        self._cache: OrderedDict[tuple[str, str], _Cached] = OrderedDict()
+        self._tombstones: dict[str, _Pending] = {}
+        self._transports: weakref.WeakKeyDictionary[Future[dict], _Transport] = (
+            weakref.WeakKeyDictionary()
+        )
+        self._cache: OrderedDict[_CacheKey, _Cached] = OrderedDict()
         self._cached_bytes = 0
+        self._cache_version = 0
         self._gap_keys: OrderedDict[tuple[Any, ...], None] = OrderedDict()
         self._refused = 0
         self._duplicates = 0
@@ -822,7 +1010,10 @@ class IodClient:
 
         Every outcome — cache hit, refusal, daemon error, timeout — is delivered
         through the returned future, so a Qt slot can connect to it and return.
-        A malformed selector is a programming error and raises immediately.
+        The Future is bound to its immutable normalized request before any
+        immediate outcome settles it, so even a callback that runs synchronously
+        observes the exact selector and transport lifetime. A malformed selector
+        is a programming error and raises immediately.
         """
 
         future: Future[dict] = Future()
@@ -834,42 +1025,82 @@ class IodClient:
         try:
             query = _query_wire(request)
         except WindowUnavailableError as error:
+            self._bind(future, request, "not_sent")
             future.set_exception(RequestRejected(error.reason, str(error)))
             return future
         except ProtocolError as error:
+            self._bind(future, request, "not_sent")
             future.set_exception(RequestRejected(error.reason, _bounded_detail(error)))
             return future
+        normalized = _normalized_request(query)
         if self._closed:
+            self._bind(future, normalized, "not_sent")
             future.set_exception(ClientClosed("client_closed"))
             return future
         if not (self._peer_verified and self._status_ok) or self._sock is None:
+            self._bind(future, normalized, "not_sent")
             future.set_exception(ClientUnavailable("daemon_unavailable"))
             return future
         now = self._clock_ns()
+        generation = self._generation
         self._expire(now)
+        # A completion callback may have closed the client or retired the socket
+        # while the expiry settled. Re-verify authoritatively before admitting a
+        # send: _send() would otherwise silently strand the request on no socket
+        # while reporting an active wire issue to its owner.
+        if self._closed:
+            self._bind(future, normalized, "not_sent")
+            future.set_exception(ClientClosed("client_closed"))
+            return future
+        if (
+            self._generation != generation
+            or not (self._peer_verified and self._status_ok)
+            or self._sock is None
+        ):
+            self._bind(future, normalized, "not_sent")
+            future.set_exception(ClientUnavailable("daemon_unavailable"))
+            return future
         if len(self._pending) >= self.max_pending:
             self._refused += 1
+            self._bind(future, normalized, "not_sent")
             future.set_exception(RequestRejected("too_many_requests", f"at most {self.max_pending}"))
             return future
-        # The key is the *complete* request plus the committed remote generation.
-        # Presentation IDs never appear here, and a result read under an older
-        # boot/epoch is unreachable rather than "still valid": its key can never
-        # be reconstructed again, and the byte budget evicts the entry whole.
-        key = (
-            json.dumps(query, sort_keys=True, separators=(",", ":"), ensure_ascii=False),
-            self._generation_token(),
-        )
+        # The key is the *complete* request plus the *whole* issue cursor. An
+        # answer read at one sequence becomes unreachable once the daemon commits
+        # the next one, and a cursor-less connection cannot certify a source.
+        source = self._current_source()
+        key = _cache_key(query, source)
         cached = self._cache.get(key)
+        if cached is not None:
+            cached = self._usable_cache_entry(key, query, cached)
         if cached is not None:
             self._cache.move_to_end(key)
             self._hits += 1
+            binding = self._bind(
+                future,
+                cached.request,
+                "terminal",
+                answered_source=cached.answered_source,
+            )
+            binding.cache_key = key
+            binding.cache_version = cached.version
             _settle(future, value=dict(cached.value))
             return future
 
         request_id = f"q{self._generation}-{self._sequence}"
         self._sequence += 1
+        binding = self._bind(
+            future,
+            normalized,
+            "active",
+            request_id=request_id,
+            issued_at_ns=now,
+            issued_source=source,
+        )
+        binding.cache_key = key
         self._pending[request_id] = _Pending(
             future=future,
+            binding=binding,
             key=key,
             generation=self._generation,
             deadline_ns=now + REQUEST_LIFETIME_NS,
@@ -884,13 +1115,136 @@ class IodClient:
         )
         return future
 
+    # -- transport observation --------------------------------------------- #
+
+    def query_transport(self, future: Future[dict]) -> QueryTransportState:
+        """The observed transport lifetime of one Future returned by :meth:`query`.
+
+        This is a synchronous, non-sending read. An unrelated Future was never
+        returned by this client, so asking about it is a programming error.
+        """
+
+        return self._transport_for(future).state()
+
+    def retire_query_connection(self, future: Future[dict]) -> bool:
+        """Drop the connection that still carries this sent request, or refuse.
+
+        Returns True only for a currently active/expired sent request on this
+        connection. A terminal, never-sent, already-lost or stale-generation
+        Future returns False and can never disturb a newer socket. Retirement
+        closes/detaches the socket before any successor can be sent, fails the
+        other current work exactly as the existing drop path does, clears the
+        closed connection's cache authority and keeps backoff/reverification.
+        """
+
+        binding = self._transport_for(future)
+        if binding.phase not in ("active", "expired"):
+            return False
+        if binding.request_id is None or binding.issued_at_ns is None:
+            return False
+        if binding.generation != self._generation or self._sock is None:
+            return False
+        self._drop(self._clock_ns(), "daemon_not_answering")
+        self._drop_cache()
+        return True
+
+    def reject_query_result(self, future: Future[dict]) -> None:
+        """Evict exactly the cache entry version this Future produced or hit.
+
+        A known uncached/evicted outcome and an entry that has since been
+        replaced under the same key are no-ops: this seam never removes a newer
+        answer, drops transport or publishes anything.
+        """
+
+        binding = self._transport_for(future)
+        key = binding.cache_key
+        version = binding.cache_version
+        if key is None or version is None:
+            return
+        cached = self._cache.get(key)
+        if cached is None or cached.version != version:
+            return
+        self._cache.pop(key, None)
+        self._cached_bytes -= cached.size
+
+    def _bind(
+        self,
+        future: Future[dict],
+        request: QueryRequest,
+        phase: str,
+        **fields: Any,
+    ) -> _Transport:
+        """Bind one Future to its immutable request *before* any settlement."""
+
+        binding = _Transport(
+            request=request,
+            generation=self._generation,
+            phase=phase,
+            **fields,
+        )
+        self._transports[future] = binding
+        return binding
+
+    def _transport_for(self, future: Future[dict]) -> _Transport:
+        if not isinstance(future, Future):
+            raise ValueError("a concurrent.futures.Future is required")
+        binding = self._transports.get(future)
+        if binding is None:
+            raise ValueError("this Future is not bound to a client query")
+        return binding
+
+    def _current_source(self) -> RemotePosition | None:
+        """Capture the verified cursor once, at issue time.
+
+        A connection with no cursor has no position to prove, so a source stays
+        ``None`` rather than being invented from a later reply.
+        """
+
+        authority = self._tracker.authority
+        cursor = self._tracker.current
+        if authority is None or cursor is None:
+            # ``current`` survives begin_connection() as resume knowledge, and a
+            # re-verified status that proves no cursor leaves authority unset.
+            # That retained cursor is not evidence this connection can answer at.
+            return None
+        if (cursor.boot_id, cursor.iod_epoch) != authority:
+            return None
+        return RemotePosition(cursor.boot_id, cursor.iod_epoch, cursor.seq)
+
+    def _usable_cache_entry(
+        self,
+        key: _CacheKey,
+        query: Mapping[str, Any],
+        cached: _Cached,
+    ) -> _Cached | None:
+        """Revalidate one cached entry; a corrupted/misassociated entry is evicted.
+
+        The stored original request and pure selector validity are rechecked, and
+        the entry must still name the cursor in its own key: an older answer can
+        never certify a newer requested source.
+        """
+
+        try:
+            validate_query_result(cached.request, cached.value)
+            if _query_wire(cached.request) != query:
+                raise ValueError("the cached entry names a different query")
+            if _cursor_token(cached.answered_source) != key[1]:
+                raise ValueError("the cached entry cannot certify this cursor")
+        except (TypeError, ValueError, ProtocolError):
+            self._cache.pop(key, None)
+            self._cached_bytes -= cached.size
+            return None
+        return cached
+
     def close(self) -> None:
         """Stop the session: fail outstanding work and stop reconnecting."""
 
         if self._closed:
             return
         self._closed = True
-        self._fail_pending(ClientClosed("client_closed"))
+        # Detach the carrying socket before any settlement callback can run, so
+        # a reentrant observer never sees a "lost" request on a still-open peer
+        # that has not seen EOF.
         self._discard(self._sock)
         self._sock = None
         self._decoder = None
@@ -900,6 +1254,7 @@ class IodClient:
         self._peer_verified = False
         self._status_ok = False
         self._subscribed = False
+        self._fail_pending(ClientClosed("client_closed"))
         # The owner asked for this, so the link is not "failing": reporting the
         # last transport fault after a deliberate close would be a lie.
         self._last_error = None
@@ -1160,11 +1515,29 @@ class IodClient:
         request_id = message.get("request_id")
         pending = self._pending.pop(request_id, None) if isinstance(request_id, str) else None
         if pending is None:
+            if self._reap_tombstone(request_id):
+                return
             self._stale_results += 1
             return
         if pending.generation != self._generation:
+            # The carrying connection is gone: this envelope cannot answer the
+            # request, so the binding is lost and nothing may be decoded/cached.
+            pending.binding.phase = "lost"
             self._stale_results += 1
             _settle(pending.future, error=ConnectionLost("stale_connection"))
+            return
+        assert isinstance(request_id, str)
+        if not self._association_intact(request_id, pending):
+            # Pure selector validation proves the response shape for whatever
+            # request the binding currently names; it cannot prove that binding
+            # is still the one this envelope answers. A current contradiction is
+            # terminal and must never reach the cache.
+            pending.binding.phase = "terminal"
+            _settle(
+                pending.future,
+                error=RequestRejected("invalid_result", "invalid_result"),
+            )
+            self._settled_pending = True
             return
         # Bound the decoded payload (the accounting part of the frame), so a
         # daemon that packs an oversized answer behind a small envelope is still
@@ -1179,6 +1552,7 @@ class IodClient:
         except (TypeError, ValueError):  # pragma: no cover - validated upstream
             size = self.max_response_bytes + 1
         if size > self.max_response_bytes:
+            pending.binding.phase = "terminal"
             _settle(
                 pending.future,
                 error=RequestRejected("response_too_large", f"the result is {size} bytes"),
@@ -1188,6 +1562,7 @@ class IodClient:
         try:
             result = from_wire(payload, app_ids=self._apps.id_for, result_kind=kind)
         except (KeyError, TypeError, ValueError) as error:
+            pending.binding.phase = "terminal"
             _settle(pending.future, error=RemoteError("invalid_result", _bounded_detail(error)))
             return
         meta = payload[0] if isinstance(payload, list) and payload and isinstance(payload[0], dict) else payload
@@ -1198,21 +1573,100 @@ class IodClient:
             "snapshot": snapshot,
             "next_cursor": meta.get("next_cursor") if isinstance(meta, Mapping) else None,
         }
-        if isinstance(result, (FileTable, FileCoverage)):
+        if isinstance(result, (FileTable, FileCoverage, DiskShare, Series)):
             # Presentation IDs are private to this decoder, not the router's
             # registry. Preserve the validated external identity for binding.
             value["app_key"] = self._apps.key_for(result.app_id)
-        self._cache_put(pending.key, value, size)
+        try:
+            # Cache admission (D05): validate the full response against the
+            # immutable normalized request before any entry or Future success.
+            validate_query_result(pending.binding.request, value)
+        except ValueError:
+            pending.binding.phase = "terminal"
+            _settle(
+                pending.future,
+                error=RequestRejected("invalid_result", "invalid_result"),
+            )
+            self._settled_pending = True
+            return
+        pending.binding.phase = "terminal"
+        pending.binding.answered_source = pending.binding.issued_source
+        if pending.future.cancelled():
+            # The owner has given up on this Future, so its answer must not be
+            # inserted on that owner's behalf. The consumed envelope is still a
+            # terminal wire outcome, which releases the real transport slot.
+            self._settled_pending = True
+            return
+        version = self._cache_put(
+            pending.key,
+            value,
+            size,
+            request=pending.binding.request,
+            answered_source=pending.binding.issued_source,
+        )
+        if version is not None:
+            pending.binding.cache_key = pending.key
+            pending.binding.cache_version = version
         _settle(pending.future, value=dict(value))
         self._settled_pending = True
+
+    def _association_intact(self, request_id: str, pending: _Pending) -> bool:
+        """True only when this pending entry still names the request it issued.
+
+        The retained issue evidence is the wire canonical request, the whole
+        issue cursor, and the generation the connection had at send time. The
+        bound Future must still be associated with this same mutable binding.
+        """
+
+        binding = pending.binding
+        if self._transports.get(pending.future) is not binding:
+            return False
+        if binding.request_id != request_id:
+            return False
+        if binding.generation != pending.generation:
+            return False
+        try:
+            if _cache_key(_query_wire(binding.request), binding.issued_source) != pending.key:
+                return False
+        except (TypeError, ValueError, ProtocolError):
+            return False
+        return True
+
+    def _reap_tombstone(self, request_id: object) -> bool:
+        """Consume an expired request's tombstone on its late terminal envelope.
+
+        The Future is already failed, so the only effect is the transport
+        observation: a late answer or error closes the correlation without a
+        second settlement, without a cache insertion and without resurrecting a
+        success. Returning True means this envelope was correlated, so it must
+        not be reported as connection-wide fault text.
+        """
+
+        if not isinstance(request_id, str):
+            return False
+        tombstone = self._tombstones.pop(request_id, None)
+        if tombstone is None:
+            return False
+        if tombstone.generation == self._generation:
+            tombstone.binding.phase = "terminal"
+        self._settled_pending = True
+        return True
 
     def _apply_error(self, message: Mapping[str, Any]) -> None:
         request_id = message.get("request_id")
         pending = self._pending.pop(request_id, None) if isinstance(request_id, str) else None
         error = RemoteError(str(message["reason"]), str(message["message"]))
         if pending is not None:
+            if pending.generation != self._generation:
+                pending.binding.phase = "lost"
+                self._stale_results += 1
+                _settle(pending.future, error=ConnectionLost("stale_connection"))
+                return
+            pending.binding.phase = "terminal"
             _settle(pending.future, error=error)
             self._settled_pending = True
+            return
+        if self._reap_tombstone(request_id):
             return
         self._last_error = error.reason
         self._stale_results += 1
@@ -1226,7 +1680,18 @@ class IodClient:
             if now >= pending.deadline_ns
         ]
         for request_id, pending in expired:
+            # An earlier candidate's timeout callback may have retired the
+            # connection; _fail_pending already published this binding lost and
+            # removed it. Never turn that lost work back into an expired
+            # tombstone just because this list was captured before the callback.
+            if self._pending.get(request_id) is not pending:
+                continue
             self._pending.pop(request_id, None)
+            # Keep the correlation tombstone past Future failure: the daemon job
+            # is not proven terminated, and a late envelope must still be
+            # consumed/released without a second settlement or cache insertion.
+            pending.binding.phase = "expired"
+            self._tombstones[request_id] = pending
             self._settled_pending = True
             _settle(
                 pending.future,
@@ -1243,9 +1708,20 @@ class IodClient:
 
     def _fail_pending(self, error: Exception) -> None:
         pending = list(self._pending.values())
+        tombstones = list(self._tombstones.values())
         self._pending.clear()
+        self._tombstones.clear()
         if pending:
             self._settled_pending = True
+        # Publish every loss before the first reentrant callback runs: a sibling
+        # whose socket is already detached must never be observed as still wire-
+        # active by the first Future's completion callback.
+        for entry in pending:
+            entry.binding.phase = "lost"
+        # The socket that could answer a tombstoned request is gone, so no late
+        # envelope can reach it; retire those bindings as lost as well.
+        for tombstone in tombstones:
+            tombstone.binding.phase = "lost"
         for entry in pending:
             _settle(entry.future, error=_clone(error))
 
@@ -1278,29 +1754,44 @@ class IodClient:
 
     # -- cache ------------------------------------------------------------- #
 
-    def _generation_token(self) -> str:
-        authority = self._tracker.authority
-        return "" if authority is None else f"{authority[0]}|{authority[1]}"
-
-    def _cache_put(self, key: tuple[str, str], value: dict[str, Any], size: int) -> None:
+    def _cache_put(
+        self,
+        key: _CacheKey,
+        value: dict[str, Any],
+        size: int,
+        *,
+        request: QueryRequest,
+        answered_source: RemotePosition | None,
+    ) -> int | None:
         """Store one successful read-through answer, or nothing at all.
 
         Entries carry the decoded P1 records, so a cached hit still exposes the
         coverage overlay that travelled with the answer; failures are never
         cached, which is why a hit can never present an error or a missing file
-        source as an empty-but-complete result.
+        source as an empty-but-complete result. Each entry also retains the
+        original normalized request and answered source, plus a unique version
+        so a later owner rejection evicts only its own entry.
         """
 
         if size > self.cache_bytes:
-            return
+            return None
         existing = self._cache.pop(key, None)
         if existing is not None:
             self._cached_bytes -= existing.size
         while self._cache and self._cached_bytes + size > self.cache_bytes:
             _, evicted = self._cache.popitem(last=False)
             self._cached_bytes -= evicted.size
-        self._cache[key] = _Cached(value=value, size=size)
+        self._cache_version += 1
+        version = self._cache_version
+        self._cache[key] = _Cached(
+            value=value,
+            size=size,
+            request=request,
+            answered_source=answered_source,
+            version=version,
+        )
         self._cached_bytes += size
+        return version
 
     def _drop_cache(self) -> None:
         self._cache.clear()
@@ -1356,7 +1847,9 @@ def _settle(future: Future, *, value: dict | None = None, error: Exception | Non
     A GUI may cancel a query when the operator navigates away. ``Future.set_result``
     on a cancelled future raises ``InvalidStateError``, which would escape from
     ``pump`` and break the single-threaded driver, so a caller that has given up is
-    simply left alone while the answer is still cached for the next identical read.
+    simply left alone. Its consumed answer is not cached on its behalf (A14/A15),
+    so the next identical read issues a real query rather than resurrecting data
+    nobody asked for.
     """
 
     if future.done():

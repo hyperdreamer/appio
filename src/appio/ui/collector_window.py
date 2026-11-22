@@ -32,7 +32,7 @@ import threading
 import time
 from typing import TYPE_CHECKING, Callable, Literal
 
-from PyQt6.QtCore import QObject, Qt, QTimer, pyqtSignal
+from PyQt6.QtCore import QObject, Qt, QTimer, pyqtSignal, pyqtSlot
 from PyQt6.QtWidgets import (
     QCheckBox,
     QDialog,
@@ -59,6 +59,12 @@ from ..collector_owner import CollectorCoordinator, GuiLease, ServiceFacts, deci
 from ..contracts import RAW_BUCKET_NS, Window, WindowUnavailableError
 from ..history_export import ExportResult
 from ..history_router import HistoryRouter
+from ..history_types import (
+    FrameProvenance,
+    LocalPositionVector,
+    RemotePosition,
+    SourcePosition,
+)
 from ..iodclient import ClientState
 from ..ipc_models import validate_server_message
 from ..ipc_protocol import FrameDecoder, MAX_OUTBOUND, ProtocolError, encode_frame
@@ -68,6 +74,12 @@ from ..setup_boundary import CommandResult
 from ..setup_client import SetupClient, SetupReply, first_stderr_line
 from .files_view import STATE_UNAVAILABLE as FILES_STATE_UNAVAILABLE
 from .files_view import FilesView
+from .render_model import (
+    MeasurementStatus,
+    OverviewStatusChoice,
+    PresentationRefusal,
+    _choose_overview_status,
+)
 
 if TYPE_CHECKING:
     from .main_window import AppIoWindow
@@ -567,14 +579,22 @@ class CollectorWindow(QMainWindow):
         setup: SetupClient,
         *,
         clock_ns: Callable[[], int] | None = None,
+        age_clock_ns: Callable[[], int] = time.monotonic_ns,
         pump: Callable[[], None] | None = None,
         refresh_interval_ms: int = 1000,
     ) -> None:
         super().__init__()
+        if not callable(age_clock_ns):
+            raise ValueError("age_clock_ns must be callable")
         self.coordinator = coordinator
         self.history = history
         self.setup = setup
+        #: Two clocks, never interchanged: ``_clock_ns`` is the BOOTTIME
+        #: window/recovery domain; ``_age_clock_ns`` is the MONOTONIC
+        #: age/acceptance/transport domain shared with the client, router and
+        #: embedded view (§9.1).
         self._clock_ns = clock_ns or (lambda: time.clock_gettime_ns(time.CLOCK_BOOTTIME))
+        self._age_clock_ns = age_clock_ns
         self._pump = pump
         self._facts: ServiceFacts | None = None
         self._facts_applied = 0
@@ -596,6 +616,7 @@ class CollectorWindow(QMainWindow):
         self._target: Window | None = None
         self._displayed: Window | None = None
         self._pending: Window | None = None
+        self._pending_origin: Literal["clock", "explicit"] = "clock"
         self._pending_since: int | None = None
         self._stalled = False
         self._retry_after: int | None = None
@@ -605,6 +626,23 @@ class CollectorWindow(QMainWindow):
         self._invalidated = False
         self._prepare_retry: PrepareRetry | None = None
         self._prepare_error: str | None = None
+        #: Source certification (§6.1). ``_pending_source`` is the router's
+        #: captured requested source for the admitted generation; the
+        #: displayed pair is promoted only by a certified applied frame.
+        self._pending_source: SourcePosition | None = None
+        self._displayed_source: SourcePosition | None = None
+        self._displayed_certified: bool = False
+        #: Last observed view-authority identity (mode/connection/boot/epoch or
+        #: local registration), without the cursor sequence or counters.
+        self._view_authority: tuple | None = None
+        #: The shell's typed refusal category for its embedded Overview. The
+        #: view emits direct_view on a refusal/adoption; a shell prepare
+        #: precheck sets shell_prepare in the frozen seam.
+        self._presentation_refusal: PresentationRefusal | None = None
+        #: Which typed owner last wrote the shared setup-error widget: the
+        #: frozen PrepareRetry seam, a presentation refusal, or neither. Never
+        #: inferred from the text.
+        self._error_owner: Literal["prepare_retry", "presentation_refusal"] | None = None
         self._closed = False
         self.state_text = COLLECTOR_STATE_UNAVAILABLE
 
@@ -677,13 +715,21 @@ class CollectorWindow(QMainWindow):
         self.error_label.setVisible(False)
         outer.addWidget(self.error_label)
 
-        self._view = AppIoWindow(self.history, files_view=FilesView(self.history))
+        self._view = AppIoWindow(
+            self.history,
+            files_view=FilesView(self.history),
+            clock_ns=self._age_clock_ns,
+        )
         self._view.setObjectName("console_view")
+        self._view.measurement_work_requested.connect(self._arm_poll)
         self.files_view = self._view.files_view
         self.files_message = self._view.files_message
         self.files_open_settings = self._view.files_open_settings
         self.history_state = self._view.history_state
         self.files_view.state_changed.connect(self._render_files_message)
+        self._view.presentation_refusal_changed.connect(
+            self._on_presentation_refusal_changed
+        )
         # The persistent console can be taller than a small desktop. Preserve
         # each panel's useful minimum size, but scroll instead of growing the
         # top-level shell beyond its requested 620-pixel height.
@@ -701,7 +747,9 @@ class CollectorWindow(QMainWindow):
         self.settings.switch.clicked.connect(self._on_switch_clicked)
         self.settings.sample_period_apply.clicked.connect(self._on_sampling_apply)
         self.settings.sample_period_spin.valueChanged.connect(self._on_sampling_edited)
-        self.settings.sample_period_spin.lineEdit().textEdited.connect(self._on_sampling_edited)
+        sample_period_editor = self.settings.sample_period_spin.lineEdit()
+        if sample_period_editor is not None:
+            sample_period_editor.textEdited.connect(self._on_sampling_edited)
         self.banner_open_settings.clicked.connect(self._open_settings_default)
         self.files_open_settings.clicked.connect(self._open_settings_default)
         self._render_files_message()
@@ -740,8 +788,26 @@ class CollectorWindow(QMainWindow):
     # -- Files ownership --------------------------------------------------
 
     def _history_ready(self, window: Window | None) -> bool:
+        """Observe native published readiness or an injected provider's contract.
+
+        HistoryRouter.ready() drains worker completions before returning. A
+        status refresh cannot own that drain because the shell would lose the
+        changed bit needed to notify the Overview. Read the router's published
+        gate state here; other providers expose readiness through ready(window).
+        """
+
         if window is None:
             return False
+        if isinstance(self.history, HistoryRouter):
+            frame = getattr(self.history, "_frame", None)
+            return bool(
+                getattr(self.history, "_window", None) == window
+                and getattr(self.history, "_ready", False)
+                and frame is not None
+                and not getattr(frame, "retired", False)
+                and getattr(frame, "error", None) is None
+                and getattr(self.history, "_frame_error", None) is None
+            )
         try:
             return bool(self.history.ready(window))
         except Exception:
@@ -781,6 +847,31 @@ class CollectorWindow(QMainWindow):
         # applied frame there is no numeric Files surface to show. Pending
         # replacement windows retain the previously displayed table.
         self.files_view.setVisible(self._displayed is not None)
+        # A Files request that starts after application arms the same poll; a
+        # deferred target alone never does.
+        self._arm_poll()
+
+    def _on_presentation_refusal_changed(self, record: object) -> None:
+        """Consume the embedded view's typed refusal/adoption observation."""
+
+        if record is None:
+            self._presentation_refusal = None
+            if self._error_owner == "presentation_refusal":
+                self._clear_error()
+            return
+        if not isinstance(record, PresentationRefusal):
+            raise ValueError(
+                "presentation refusal must be a PresentationRefusal or None"
+            )
+        PresentationRefusal.__post_init__(record)
+        self._presentation_refusal = record
+        if (
+            record.origin == "direct_view"
+            and self._error_owner == "presentation_refusal"
+        ):
+            # A newly typed direct refusal replaces the prior refusal category;
+            # its shell error mirror is no longer the operative text.
+            self._clear_error()
 
     def _sync_files(self, *, request: bool = False) -> None:
         window = self._displayed
@@ -805,6 +896,9 @@ class CollectorWindow(QMainWindow):
             if self._pump is not None:
                 with self.files_view.transient_scope():
                     self._pump()
+            retry_gaps = getattr(self.history, "retry_transport_gaps", None)
+            if callable(retry_gaps):
+                retry_gaps()
             self._tick_target()
             applied = self.apply_ready_frame()
             if (
@@ -827,7 +921,7 @@ class CollectorWindow(QMainWindow):
             if not self._busy:
                 self._submit_probe()
         except WindowUnavailableError as error:
-            self._show_error(str(error) or type(error).__name__)
+            self._show_refusal_error(error)
         except Exception as error:
             self._show_error(f"appio: {str(error) or type(error).__name__}")
 
@@ -870,39 +964,75 @@ class CollectorWindow(QMainWindow):
                 self._prepare_retry = None
                 self._prepare_error = None
                 self._clear_error()
+            # The frozen no-target presentation reset clears the typed refusal
+            # as well; no other recovery field gains a writer here.
+            if self._presentation_refusal is not None:
+                self._presentation_refusal = None
+                if self._error_owner == "presentation_refusal":
+                    self._clear_error()
             self._displayed = None
+            # A no-target construction cannot certify anything: the last proved
+            # source token and its flag clear with the displayed frame.
+            self._displayed_source = None
+            self._displayed_certified = False
             self._pending_since = None
             self._invalidated = False
             self.files_view.set_updating_scope(None)
             self.files_view.set_scope_ready(True)
-            self.history_state.setText("waiting for the first sample")
-            self.history_state.setVisible(True)
             self._view.show_overview_status("waiting for the first sample", keep_frame=False)
-            self.files_view.set_stalled(False, "")
-            self._poll_timer.stop()
+            self._update_overview_status(now)
+            self._poll_stop_if_idle()
             self._sync_files()
             return
 
         retrying_clock = retry is not None and retry.owner == "clock"
-        needs_prepare = (
-            self._displayed is None
-            or self._invalidated
-            or retrying_clock
-            or self._deferred_target is not None
-            or self._stalled
-            or self._retry_after is not None
-            or wanted != self._displayed
-        )
+        source_aware = callable(getattr(self.history, "source_position", None))
+        if source_aware:
+            # Only the endpoint-free retention scope and the certified source
+            # decide replacement; a later since-boot clock endpoint alone is
+            # not a reason to query the larger window (§6.1).
+            current_source = self._observe_source()
+            scope_changed = (
+                self._displayed is not None
+                and self._frame_scope(wanted) != self._frame_scope(self._displayed)
+            )
+            source_moved = (
+                not self._displayed_certified
+                or self._displayed_source is None
+                or current_source is None
+                or current_source != self._displayed_source
+            )
+            needs_prepare = (
+                self._displayed is None
+                or self._invalidated
+                or retrying_clock
+                or self._deferred_target is not None
+                or self._stalled
+                or self._retry_after is not None
+                or scope_changed
+                or source_moved
+            )
+        else:
+            needs_prepare = (
+                self._displayed is None
+                or self._invalidated
+                or retrying_clock
+                or self._deferred_target is not None
+                or self._stalled
+                or self._retry_after is not None
+                or wanted != self._displayed
+            )
         if not needs_prepare:
             self.files_view.set_scope_ready(True)
             self.files_view.set_updating_scope(None)
             if self._history_ready(self._displayed):
                 self.files_view.flush_refresh()
-            self._render_files_message()
-            self.history_state.setText("")
-            self.history_state.setVisible(False)
-            self.files_view.set_stalled(False, "")
-            self._poll_timer.stop()
+            # Nothing is due, so the desired scope is exactly the applied one:
+            # a later clock bucket is never carried as an unqueried target (and
+            # never marked applied either).
+            self._target = self._displayed
+            self._update_overview_status(now)
+            self._poll_stop_if_idle()
             return
 
         self.files_view.set_updating_scope(wanted)
@@ -911,7 +1041,7 @@ class CollectorWindow(QMainWindow):
         candidate = self._target if self._target is not None else wanted
         if not self._submit_prepare(candidate, "clock", now=now):
             self._show_pending_status(now)
-            self._poll_timer.stop()
+            self._poll_stop_if_idle()
 
     def _retire_pending(self, now: int) -> None:
         if self._pending is None:
@@ -922,47 +1052,193 @@ class CollectorWindow(QMainWindow):
                 self._deferred_origin = "clock"
             self._deferred_target = wanted
         self._pending = None
+        # No callback promotes a source token on its own: retirement clears
+        # pending_source with the pending frame it belonged to.
+        self._pending_source = None
         self._pending_since = None
         self._retry_after = now + PENDING_BUDGET_NS
         self._invalidated = self._displayed is not None
-        self._poll_timer.stop()
         self._show_pending_status(now)
+        self._poll_stop_if_idle()
+
+    # -- one status composer and independent age (§9) ---------------------
+
+    def _compose_overview_status_choice(
+        self, now_ns: int, age_now_ns: int
+    ) -> OverviewStatusChoice:
+        """Snapshot shell-owned inputs and delegate to the one pure tree.
+
+        ``now_ns`` is the BOOTTIME recovery instant (rows 3-4); the age label
+        alone consumes ``age_now_ns`` from the MONOTONIC age clock. Composition
+        issues no query, prepare, admission or recovery write.
+        """
+
+        retry = self._prepare_retry
+        stall_eligible = self._stalled or self._retry_after is not None
+        busy = (
+            stall_eligible
+            and getattr(self.history, "local_read_in_flight", False) is True
+        )
+        any_work = self._pending is not None or bool(
+            getattr(self.history, "pending_work", False)
+        )
+        view = self._view
+        if view is not None:
+            measurement = view.measurement_status()
+            if self._displayed is None:
+                # No applied frame renders no measured dependency: a hidden
+                # overview body cannot contribute a displayed age (§9.1/§9.3).
+                measurement = replace(
+                    measurement,
+                    has_displayed_values=False,
+                    ranking_empty=False,
+                    displayed_answers=(),
+                )
+        else:  # pragma: no cover - the embedded console always exists
+            measurement = MeasurementStatus(
+                False, False, "absent", "absent", None, None, ()
+            )
+        has_frame = self._displayed is not None
+        has_target = self._target is not None
+        return _choose_overview_status(
+            refusal=self._presentation_refusal,
+            prepare_error=self._prepare_error if retry is not None else None,
+            busy=busy,
+            retry_after=self._retry_after,
+            now_ns=now_ns,
+            has_frame=has_frame,
+            has_target=has_target,
+            # A sample exists once a frame generation is admitted; a merely
+            # computed target has not observed one yet (§9.2 row 5a).
+            has_sample=self._pending is not None,
+            any_work=any_work,
+            view_state=str(self.history.view_state),
+            measurement=measurement,
+            age_now_ns=age_now_ns,
+        )
+
+    def _compose_overview_status(self, now_ns: int) -> str:
+        """Text-only wrapper; captures one age instant for the whole choice."""
+
+        return self._compose_overview_status_choice(now_ns, self._age_clock_ns()).text
+
+    def _update_overview_status(self, now_ns: int) -> None:
+        """Set status and age from one choice; one age-clock read per call."""
+
+        choice = self._compose_overview_status_choice(now_ns, self._age_clock_ns())
+        self.history_state.setText(choice.text)
+        self.history_state.setVisible(choice.text != "")
+        # Only the frozen stall rows override the Files updating caption;
+        # clearing restores the ordinary caption without a query.
+        if choice.row in ("3", "4"):
+            self.files_view.set_stalled(True, choice.text)
+        else:
+            self.files_view.set_stalled(False, "")
+        if self._view is not None:
+            self._view.show_overview_age(choice.age_text)
+        self._render_files_message()
 
     def _show_pending_status(self, now: int | None = None) -> None:
         now = self._clock_ns() if now is None else now
-        view_state = str(self.history.view_state)
-        if self._displayed is None:
-            text = f"loading history ({view_state})"
-        else:
-            text = f"updating ({view_state})"
-
-        stall_eligible = self._stalled or self._retry_after is not None
-        local_read_in_flight = getattr(self.history, "local_read_in_flight", False)
-        if stall_eligible and local_read_in_flight is True:
-            text = (
-                f"history read has not completed ({view_state}); "
-                "the reader is still busy"
-            )
-        elif self._retry_after is not None and now < self._retry_after:
-            remaining = self._retry_after - now
-            seconds = (remaining + 1_000_000_000 - 1) // 1_000_000_000
-            text = (
-                f"history read has not completed ({view_state}); "
-                f"retrying in {seconds} s"
-            )
-
-        self.history_state.setText(text)
-        self.history_state.setVisible(True)
-        if stall_eligible and text.startswith("history read has not completed"):
-            self.files_view.set_stalled(True, text)
-        else:
-            self.files_view.set_stalled(False, "")
-        self._render_files_message()
+        self._update_overview_status(now)
 
     def _arm_poll(self) -> None:
-        waiting = self._pending is not None or getattr(self.history, "pending_work", False)
-        if waiting and not self._poll_timer.isActive():
-            self._poll_timer.start()
+        timer = getattr(self, "_poll_timer", None)
+        waiting = self._pending is not None or bool(
+            getattr(self.history, "pending_work", False)
+        )
+        if timer is not None and waiting and not timer.isActive():
+            timer.start()
+
+    def _poll_stop_if_idle(self) -> None:
+        """Stop the pump only when no frame, detail or Files work remains."""
+
+        if self._pending is not None or getattr(self.history, "pending_work", False):
+            self._arm_poll()
+        else:
+            self._poll_timer.stop()
+
+    # -- source observation and view authority (§6.1) --------------------
+
+    @staticmethod
+    def _frame_scope(window: Window) -> tuple:
+        """Subject-independent frame retention scope (§2.1 without app_key)."""
+
+        if window.kind == "range":
+            return ("range", window.boot_id, window.start_mono_ns, window.end_mono_ns)
+        if window.kind == "since_boot":
+            return ("since_boot", window.boot_id)
+        return (window.kind,)
+
+    def _observe_source(self) -> SourcePosition | None:
+        """Observe the current source once; reset the view on authority change.
+
+        Mode, connection generation, boot and collector epoch (or the local
+        registration identity) are the view authority. The remote sequence and
+        local data-version/change counters are ordinary source advances and must
+        not reset detail memory.
+        """
+
+        observe = getattr(self.history, "source_position", None)
+        if not callable(observe):
+            return None
+        try:
+            position = observe()
+        except Exception:
+            return None
+        self._reconcile_view_authority(position)
+        return position
+
+    def _reconcile_view_authority(self, position: SourcePosition) -> None:
+        if isinstance(position, RemotePosition):
+            generation = getattr(getattr(self.history, "client", None), "generation", 0)
+            local_vector = getattr(self.history, "_local_vector", None)
+            if callable(local_vector):
+                registrations = local_vector()
+                if not isinstance(registrations, LocalPositionVector):
+                    raise TypeError("history local identity vector has an invalid shape")
+                local_identity = tuple(
+                    (source.name, source.owner, source.registration_epoch)
+                    for source in registrations.sources
+                )
+            else:
+                local_identity = None
+            authority: tuple | None = (
+                "remote", generation, position.boot_id, position.iod_epoch,
+                local_identity,
+            )
+        elif isinstance(position, LocalPositionVector):
+            authority = (
+                "local",
+                tuple(
+                    (source.name, source.owner, source.registration_epoch)
+                    for source in position.sources
+                ),
+            )
+        else:  # pragma: no cover - SourcePosition is a closed union
+            authority = None
+        if authority is None:
+            return
+        if self._view_authority is not None and authority != self._view_authority:
+            # Synchronously before any notification or adoption: an old exact
+            # lifetime can never be resumed under the new authority.
+            if self._view is not None:
+                self._view.reset_query_authority()
+        self._view_authority = authority
+
+    def _drain_history(self) -> bool:
+        """Collect settled router work on the owner thread; never query.
+
+        A ready frame is settled through ``ready``; Files pages and lazy detail
+        finish on the shared scheduler and are only published by an owner
+        drain. The shell's history service is structural, so a service that
+        reports no pending work has nothing to collect.
+        """
+
+        drain = getattr(self.history, "drain", None)
+        if callable(drain):
+            return bool(drain())
+        return False
 
     def _submit_prepare(
         self, wanted: Window, origin: Literal["clock", "explicit"], *, now: int | None = None
@@ -989,61 +1265,158 @@ class CollectorWindow(QMainWindow):
                 self.history.prepare(wanted)
         except WindowUnavailableError as error:
             self._pending = None
+            self._pending_source = None
             self._pending_since = None
             self._prepare_retry = None
             self._prepare_error = None
-            self._show_error(str(error) or type(error).__name__)
+            text = str(error) or type(error).__name__
+            record = PresentationRefusal(
+                "shell_prepare", wanted, error.reason, text
+            )
+            if (
+                self._presentation_refusal is not None
+                and self._presentation_refusal.origin == "direct_view"
+            ):
+                # A direct refusal stays until a supported view adoption and
+                # still wins row 1; its exact text remains decisive.
+                record = self._presentation_refusal
+            else:
+                self._presentation_refusal = record
+            self._show_error(record.text)
+            self._error_owner = "presentation_refusal"
             self._show_pending_status(now)
             self._poll_timer.stop()
             self._render_files_message()
             raise
         except Exception as error:
-            self._pending = None
-            self._pending_since = None
-            self._prepare_retry = PrepareRetry(wanted, origin, now)
-            self._prepare_error = f"appio: {str(error) or type(error).__name__}"
-            self._show_error(self._prepare_error)
-            self._show_pending_status(now)
-            self._poll_timer.stop()
-            self._render_files_message()
+            self._record_prepare_failure(wanted, origin, now, error)
             if origin == "explicit":
                 raise
             return False
 
         self._pending = wanted
+        self._pending_origin = origin
+        # Read the gate's exact stored capture; never recapture the cursor or
+        # local vector independently in the shell (§6.1).
+        capture = getattr(self.history, "preparation_source", None)
+        self._pending_source = capture(wanted) if callable(capture) else None
         self._pending_since = now
         self._stalled = False
         self._retry_after = None
         self._prepare_retry = None
         self._prepare_error = None
-        if retry_error is not None and self.error_label.text() == retry_error:
+        # A gated supported acceptance clears a prior shell_prepare refusal and
+        # only its own mirrored error widget. A direct_view refusal persists.
+        if (
+            self._presentation_refusal is not None
+            and self._presentation_refusal.origin == "shell_prepare"
+        ):
+            self._presentation_refusal = None
+            if self._error_owner == "presentation_refusal":
+                self._clear_error()
+        if retry_error is not None and self._error_owner == "prepare_retry":
             self._clear_error()
         self._show_pending_status(now)
         self._arm_poll()
         return True
 
-    def apply_ready_frame(self, *, now: int | None = None) -> bool:
+    def _record_prepare_failure(self, wanted: Window, origin: Literal["clock", "explicit"],
+                                now: int, error: Exception) -> None:
+        self._pending = None
+        self._pending_source = None
+        self._pending_since = None
+        if (self._presentation_refusal is not None
+                and self._presentation_refusal.origin == "shell_prepare"):
+            self._presentation_refusal = None
+        self._prepare_retry = PrepareRetry(wanted, origin, now)
+        self._prepare_error = f"appio: {str(error) or type(error).__name__}"
+        self._show_error(self._prepare_error)
+        self._error_owner = "prepare_retry"
+        self._show_pending_status(now)
+        self._poll_timer.stop()
+        self._render_files_message()
+
+    def apply_ready_frame(
+        self, *, now: int | None = None, context: Literal["ordinary", "poll"] = "ordinary"
+    ) -> bool:
+        """Drain once, then apply at most one ready frame in the shown order."""
+
         if self._closed:
             return False
+        if context not in ("ordinary", "poll"):
+            raise ValueError("apply context must be ordinary or poll")
+        now = self._clock_ns() if now is None else now
+        # (1) Framework details, Files pages and lazy detail all settle through
+        # the router's one scheduler. Settling never issues a query; a changed
+        # batch reaches the view before any later refresh and status/age are
+        # composed even on early returns.
+        changed = self._drain_history()
+        if self._pending is not None and self._pending_source is None:
+            capture = getattr(self.history, "preparation_source", None)
+            if callable(capture):
+                self._pending_source = capture(self._pending)
+        self._observe_source()
+        if changed:
+            self._notify_measurements()
+        if self._pending is not None and isinstance(self.history, HistoryRouter):
+            error = self.history._take_preparation_error(self._pending)
+            if error is not None:
+                self._record_prepare_failure(self._pending, self._pending_origin, now, error)
+                return False
+        self._update_overview_status(now)
+        # (2) A pending frame retired underneath us: the frozen retirement owns
+        # the floor and no replacement is submitted inline.
+        if self._pending is not None and self._history_retired():
+            self._retire_pending(now)
+            self._update_overview_status(now)
+            return False
+        # (3) A still-owned explicit PrepareRetry is never consumed here.
         if self._prepare_retry is not None and self._prepare_retry.owner == "explicit":
             return False
-        now = self._clock_ns() if now is None else now
-        if self._pending is None and self._deferred_target is not None:
+        # (4) No pending frame: only an ordinary call with a deferred target may
+        # run the established target gate. Poll computes no target at all.
+        if self._pending is None:
+            if context != "ordinary" or self._deferred_target is None:
+                return False
             self._tick_target(now=now)
             if self._pending is None:
                 return False
-        if self._pending is None:
-            return False
+        # (5) A live pending frame: frozen budget/readiness, then one apply.
         if self._history_retired():
             self._retire_pending(now)
+            self._update_overview_status(now)
             return False
         if self._pending_since is not None and now - self._pending_since >= PENDING_BUDGET_NS:
             self._stalled = True
-        if self.history.ready(self._pending):
-            self._apply_frame()
+        # Read the owner-published gate state after the drain above. Calling
+        # HistoryRouter.ready() here would pump a second batch and discard its
+        # changed bit before the notification seam. Non-router test providers
+        # retain their readiness contract (some also publish their certificate
+        # from that read).
+        ready = (
+            self._history_ready(self._pending)
+            if isinstance(self.history, HistoryRouter)
+            else bool(self.history.ready(self._pending))
+        )
+        if ready:
+            self._apply_frame(now=now)
+            self._update_overview_status(now)
             return True
-        self._show_pending_status(now)
+        if self._history_retired():
+            # Readiness can drain an authority transition: use the frozen
+            # retirement arm exactly as step 2, never an inline replacement.
+            self._retire_pending(now)
+            self._update_overview_status(now)
+            return False
+        self._update_overview_status(now)
         return False
+
+    def _notify_measurements(self) -> None:
+        """Query-free notification target for a settled batch (§6.3)."""
+
+        view = self._view
+        if view is not None:
+            view.refresh_measurements()
 
     def show_window(self, window: Window) -> None:
         if self._closed:
@@ -1055,7 +1428,7 @@ class CollectorWindow(QMainWindow):
         if retry is not None and (retry.owner != "explicit" or retry.window != window):
             self._prepare_retry = None
             self._prepare_error = None
-            if self.error_label.text().startswith("appio: "):
+            if self._error_owner == "prepare_retry":
                 self._clear_error()
 
         self.files_view.set_updating_scope(window)
@@ -1066,12 +1439,34 @@ class CollectorWindow(QMainWindow):
             self._show_pending_status(now)
             self._render_files_message()
 
-    def _apply_frame(self) -> None:
+    def _apply_frame(self, *, now: int | None = None) -> None:
         window = self._pending
         if window is None:
             return
+        now = self._clock_ns() if now is None else now
+        # Read the completed certificate for this exact generation and compare
+        # it with the gate's captured pending source. Only a certified, matching
+        # frame ranking promotes the proved displayed source; otherwise the last
+        # proved token is retained while the new frame is explicitly uncertified.
+        provenance: FrameProvenance | None = None
+        lookup = getattr(self.history, "frame_provenance", None)
+        if callable(lookup) and self._pending_source is not None:
+            provenance = lookup(window)
+        certified = (
+            provenance is not None
+            and provenance.generation == getattr(self.history, "_generation", provenance.generation)
+            and provenance.window == window
+            and provenance.certified is True
+            and provenance.requested_source == self._pending_source
+        )
+        if certified:
+            self._displayed_source = self._pending_source
+            self._displayed_certified = True
+        else:
+            self._displayed_certified = False
         self._displayed = window
         self._pending = None
+        self._pending_source = None
         self._pending_since = None
         self._stalled = False
         self._retry_after = None
@@ -1084,40 +1479,44 @@ class CollectorWindow(QMainWindow):
         self._show_ready(window)
         self.files_view.flush_refresh()
         self.files_view.set_updating_scope(None)
-        self._render_files_message()
-        self.files_view.set_stalled(False, "")
+        self._update_overview_status(now)
         if self._refresh_after_apply:
             with self.files_view.transient_scope():
                 self._refresh_after_apply = False
                 self.history.invalidate()
-        self._poll_timer.stop()
+        # Application does not end router work: the adoption above may have
+        # admitted Files pages or lazy detail. Stop the poll only when nothing
+        # is left to pump and drain, as the frozen stop rule requires.
+        self._poll_stop_if_idle()
 
     def _poll_history(self) -> None:
-        if self._closed or (self._pending is None and not getattr(self.history, "pending_work", False)):
+        if self._closed:
+            self._poll_timer.stop()
+            return
+        if self._pending is None and not getattr(self.history, "pending_work", False):
             self._poll_timer.stop()
             return
         now = self._clock_ns()
         try:
-            # The transport only advances when something pumps it. The periodic
-            # refresh does, 5 s apart -- so a frame made of several requests used
-            # to outlive the daemon's commit interval and be discarded as a
-            # different snapshot. The poll owns the pump while a frame is pending.
+            # The transport only advances when something pumps it. The poll owns
+            # the pump while any frame, detail or Files work is outstanding.
             if self._pump is not None:
                 with self.files_view.transient_scope():
                     self._pump()
-            applied = self.apply_ready_frame(now=now)
-            if not applied and self._pending is None and not getattr(self.history, "pending_work", False):
+            self.apply_ready_frame(now=now, context="poll")
+            self._update_overview_status(now)
+            if self._pending is None and not getattr(self.history, "pending_work", False):
                 self._poll_timer.stop()
+            else:
+                self._arm_poll()
         except WindowUnavailableError as error:
-            self._show_error(str(error) or type(error).__name__)
+            self._show_refusal_error(error)
         except Exception as error:
             self._show_error(f"appio: {str(error) or type(error).__name__}")
 
     def _show_ready(self, window: Window) -> None:
         view = self._ensure_view()
         view.set_window(window)
-        self.history_state.setText("")
-        self.history_state.setVisible(False)
         self._sync_files(request=False)
 
     def _ensure_view(self, window: Window | None = None) -> "AppIoWindow":
@@ -1125,7 +1524,11 @@ class CollectorWindow(QMainWindow):
         if self._view is None:
             from .main_window import AppIoWindow
 
-            self._view = AppIoWindow(self.history, files_view=self.files_view)
+            self._view = AppIoWindow(
+                self.history,
+                files_view=self.files_view,
+                clock_ns=self._age_clock_ns,
+            )
         return self._view
 
     def _hide_view(self) -> None:
@@ -1191,10 +1594,21 @@ class CollectorWindow(QMainWindow):
     def _show_error(self, message: str) -> None:
         self.error_label.setText(message)
         self.error_label.setVisible(True)
+        self._error_owner = None
+
+    def _show_refusal_error(self, error: WindowUnavailableError) -> None:
+        """Keep a typed refusal's exact text when the seam rethrows it."""
+
+        if self._presentation_refusal is not None:
+            self._show_error(self._presentation_refusal.text)
+            self._error_owner = "presentation_refusal"
+            return
+        self._show_error(str(error) or type(error).__name__)
 
     def _clear_error(self) -> None:
         self.error_label.setText("")
         self.error_label.setVisible(False)
+        self._error_owner = None
 
     def _current_window(self, now_ns: int | None = None) -> Window | None:
         client = getattr(self.history, "client", None)
@@ -1205,15 +1619,21 @@ class CollectorWindow(QMainWindow):
                 return None
             boot_id = cursor.boot_id
         else:
-            connection = getattr(getattr(self.history, "local", None), "connection", None)
-            if connection is None:
-                return None
-            row = connection.execute(
-                "SELECT boot_id FROM boot ORDER BY boot_order DESC LIMIT 1"
-            ).fetchone()
-            if row is None or not row[0]:
-                return None
-            boot_id = str(row[0])
+            lookup = getattr(self.history, "_local_boot", None)
+            if callable(lookup):
+                boot_id = lookup()
+                if boot_id is None:
+                    return None
+            else:
+                connection = getattr(getattr(self.history, "local", None), "connection", None)
+                if connection is None:
+                    return None
+                row = connection.execute(
+                    "SELECT boot_id FROM boot ORDER BY boot_order DESC LIMIT 1"
+                ).fetchone()
+                if row is None or not row[0]:
+                    return None
+                boot_id = str(row[0])
         now = self._clock_ns() if now_ns is None else now_ns
         end = (now // RAW_BUCKET_NS + 1) * RAW_BUCKET_NS
         return Window(kind="since_boot", boot_id=boot_id, end_mono_ns=end)
@@ -1334,7 +1754,7 @@ class CollectorWindow(QMainWindow):
             ):
                 self.files_view.flush_refresh()
         except WindowUnavailableError as error:
-            self._show_error(str(error) or type(error).__name__)
+            self._show_refusal_error(error)
         except Exception as error:
             self._show_error(f"appio: {str(error) or type(error).__name__}")
 
@@ -1572,6 +1992,10 @@ class CollectorWindow(QMainWindow):
         if self._closed:
             return
         self._closed = True
+        # Closing is the frozen presentation reset: the typed refusal and its
+        # widget ownership leave with the shell.
+        self._presentation_refusal = None
+        self._error_owner = None
         for timer in (self._timer, self._poll_timer):
             timer.stop()
         for dialog in (self.consent, self.choice, self.restart_confirmation, self.settings):
@@ -1743,66 +2167,139 @@ def run_interactive(args) -> int:
 
     from PyQt6.QtWidgets import QApplication
 
+    from ..history_source import ManagedSourceRegistry
+    from ..history_types import ManagedSourceSpec
     from ..iodclient import AppRegistry, IodClient
-    from ..query import QueryService
     from ..store import AppIoStore
 
     application = QApplication.instance() or QApplication([sys.argv[0]])
     application.setDesktopFileName("appio")
 
+    # ONE age/acceptance clock is shared by the client's transport deadlines,
+    # the router's acceptance stamps and the composer's age instant. The
+    # shell's BOOTTIME clock stays untouched for Window/recovery deadlines.
+    age_clock_ns = time.monotonic_ns
+
     database_path = Path(args.db)
     store = AppIoStore(database_path)
-    local_service = QueryService(store)
     registry = AppRegistry()
-    wake = _wake_object()
-    router_holder: dict[str, HistoryRouter] = {}
+    client_wake = _wake_object()
+    source_wake = _wake_object()
+    sources = ManagedSourceRegistry(wake=source_wake.woke.emit)
+    primary_spec = ManagedSourceSpec(
+        "local", "gui", database_path.absolute().as_uri() + "?mode=rw&cache=shared", ())
+    registration = sources.register(primary_spec)
+    client = router = coordinator = window = None
+    startup_error: BaseException | None = None
+    bootstrap_open = True
+    startup_finished = False
+
+    def close_bootstrap() -> None:
+        nonlocal bootstrap_open
+        if bootstrap_open:
+            bootstrap_open = False
+            store.connection.close()
+
+    def close_resources() -> None:
+        nonlocal client, router, coordinator, window
+        try:
+            if window is not None:
+                closing, window = window, None
+                closing.shutdown()
+                coordinator = client = router = None
+            else:
+                try:
+                    if coordinator is not None:
+                        closing, coordinator = coordinator, None
+                        closing.close()
+                        client = None
+                    elif client is not None:
+                        closing, client = client, None
+                        closing.close()
+                finally:
+                    if router is not None:
+                        closing, router = router, None
+                        closing.close()
+        finally:
+            sources.close()
+            close_bootstrap()
 
     def on_gap(notice) -> None:
-        router = router_holder.get("router")
         if router is not None:
             router.record_transport_gap(notice)
 
-    client = IodClient(SOCKET_PATH, on_gap=on_gap, on_change=wake.woke.emit)
-    router = HistoryRouter(local_service, client, registry)
-    router_holder["router"] = router
+    def start_after_registration() -> None:
+        nonlocal client, router, coordinator, window, startup_finished, startup_error
+        if startup_finished or not registration.done():
+            return
+        startup_finished = True
+        try:
+            registration.result()
+            close_bootstrap()
+            client = IodClient(SOCKET_PATH, on_gap=on_gap, on_change=client_wake.woke.emit,
+                               clock_ns=age_clock_ns)
+            router = HistoryRouter(sources, client, registry, clock_ns=age_clock_ns)
 
-    def local_factory() -> LiveCollector:
-        # The coordinator's lazy factory owns the decision to collect locally.
-        # An accepted export is a pending incoming handover, not a reason to
-        # discard the persisted cutoff and start a fresh baseline.
-        offer = coordinator.resume_handover
-        return LiveCollector(
-            proc_root=args.proc_root,
-            cgroup_root=args.cgroup_root,
-            database_path=database_path,
-            source="gui",
-            baseline_only=offer is None,
-            resume_handover=offer,
-        )
+            def local_factory() -> LiveCollector:
+                if coordinator is None:
+                    raise RuntimeError("collector coordinator is not initialized")
+                offer = coordinator.resume_handover
+                return LiveCollector(
+                    proc_root=args.proc_root,
+                    cgroup_root=args.cgroup_root,
+                    database_path=database_path,
+                    source="gui",
+                    baseline_only=offer is None,
+                    resume_handover=offer,
+                )
 
-    coordinator = CollectorCoordinator(
-        local_factory=local_factory,
-        client=client,
-        history=router,
-        lease=GuiLease(_gui_lease_path()),
-        clock=SystemClock(),
-    )
-    window = CollectorWindow(
-        coordinator,
-        router,
-        SetupClient(launch=_launch_helper, probe=production_probe),
-        pump=client.pump,
-        refresh_interval_ms=max(1, int(round(args.interval * 1000))),
-    )
-    # Scheduled through the event loop, never called from inside pump(): the
-    # client emits while it is still decoding frames, so a direct slot would
-    # re-enter pump(). A zero-delay timer is that hand-off -- every settled reply
-    # is one event-loop turn, not one poll interval.
-    wake.woke.connect(lambda: QTimer.singleShot(0, window.refresh))
-    window.show()
-    window.refresh()
+            coordinator = CollectorCoordinator(
+                local_factory=local_factory,
+                client=client,
+                history=router,
+                lease=GuiLease(_gui_lease_path()),
+                clock=SystemClock(),
+            )
+            window = CollectorWindow(
+                coordinator,
+                router,
+                SetupClient(launch=_launch_helper, probe=production_probe),
+                age_clock_ns=age_clock_ns,
+                pump=client.pump,
+                refresh_interval_ms=max(1, int(round(args.interval * 1000))),
+            )
+            window.show()
+            window.refresh()
+        except BaseException as error:
+            startup_error = error
+            try:
+                close_resources()
+            except Exception:
+                pass
+            finally:
+                application.exit(1)
+
+    class SourceDelivery(QObject):
+        @pyqtSlot()
+        def receive(self) -> None:
+            if window is None:
+                start_after_registration()
+            else:
+                window._arm_poll()
+
+        @pyqtSlot()
+        def refresh_client(self) -> None:
+            if window is not None:
+                window.refresh()
+
+    delivery = SourceDelivery()
+    source_wake.woke.connect(delivery.receive, Qt.ConnectionType.QueuedConnection)
+    client_wake.woke.connect(delivery.refresh_client, Qt.ConnectionType.QueuedConnection)
+    registration.add_done_callback(lambda _completed: source_wake.woke.emit())
     try:
-        return application.exec()
+        exit_code = application.exec()
     finally:
-        window.shutdown()
-        store.connection.close()
+        close_resources()
+    if startup_error is not None:
+        raise startup_error
+    return exit_code
