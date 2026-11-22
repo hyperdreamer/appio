@@ -980,6 +980,10 @@ class HistoryRouter:
         #: One wire occupant and its priority-stable queue (§5.1).
         self._queue: list[_QueueEntry] = []
         self._occupant: tuple[RequestToken, Future] | None = None
+        #: The Future and actual cursor provenance bound when a queued token is
+        #: issued. Admission source remains separate for frame certification.
+        self._remote_futures: dict[int, Future] = {}
+        self._remote_issue_sources: dict[int, RemotePosition | None] = {}
         self._admission_serial = 0
         #: Settlement guards: a token settles exactly once, and a publication
         #: retired token can never publish even if its Future completes.
@@ -1019,6 +1023,11 @@ class HistoryRouter:
         self._completed: queue.SimpleQueue = queue.SimpleQueue()
         #: Charged background submissions, keyed by their admitted worker id.
         self._worker_jobs: dict[int, tuple[str, Future | None]] = {}
+        #: A settlement has been removed from the owner queue, but its worker
+        #: Future may still be running while queue publication returns. The
+        #: charge remains in ``_worker_jobs`` with a None Future until this map
+        #: reaches terminal completion.
+        self._drained_futures: dict[int, Future] = {}
         #: Legacy Files submissions carry no request token or queued settlement,
         #: so only these terminal charges may be reaped at a later admission.
         #: A helper token's binding stays until its settlement is drained.
@@ -1384,7 +1393,11 @@ class HistoryRouter:
         if settlement.outcome is None or capture is None or binding.snapshot is None:
             raise ValueError("a local settlement requires its admitted capture")
         snapshot = _validate_worker_snapshot(settlement.outcome.snapshot)
-        if snapshot != binding.snapshot or _capture_provenance(capture) != snapshot:
+        capture_snapshot = _capture_provenance(capture)
+        if (snapshot.capture_id != binding.snapshot.capture_id
+                or capture_snapshot.capture_id != binding.snapshot.capture_id):
+            raise ValueError("a local settlement answered another capture")
+        if snapshot != binding.snapshot or capture_snapshot != snapshot:
             raise ValueError("a local settlement answered another snapshot")
         return settlement
 
@@ -1518,9 +1531,13 @@ class HistoryRouter:
         preserves it here; only cancellation or completion leaves the ledger.
         """
 
-        for worker_id, (_owner, future) in tuple(self._worker_jobs.items()):
-            if future is not None and future.done():
+        for worker_id, future in tuple(self._drained_futures.items()):
+            if future.done():
                 self._reap_background_worker(worker_id)
+        if self._closed:
+            for worker_id, (_owner, job_future) in tuple(self._worker_jobs.items()):
+                if job_future is not None and job_future.done():
+                    self._reap_background_worker(worker_id)
 
     def _reap_terminal_legacy_files(self) -> None:
         """Reap completed legacy Files charges, which have no queued settlement.
@@ -1558,6 +1575,7 @@ class HistoryRouter:
 
         if self._worker_jobs.pop(worker_id, None) is None:
             return
+        self._drained_futures.pop(worker_id, None)
         self._release_worker_capture(worker_id)
         self._worker_bindings.pop(worker_id, None)
         self._files_bindings.pop(worker_id, None)
@@ -2189,7 +2207,12 @@ class HistoryRouter:
             if worker_id in self._frame_jobs:
                 future = self._frame_jobs[worker_id]
             else:
-                future = self._worker_jobs[worker_id][1]
+                future = self._drained_futures.get(worker_id)
+                if future is None:
+                    entry = self._worker_jobs.get(worker_id)
+                    if entry is None or entry[1] is None:
+                        raise RuntimeError("a captured worker has no terminal Future")
+                    future = entry[1]
             future.add_done_callback(
                 lambda completed, sources=sources, capture_id=capture_id:
                     sources.release_capture(capture_id))
@@ -2591,6 +2614,7 @@ class HistoryRouter:
         # administrative settlement arm before any obsolete answer is read.
         if self._cancel_file_requests():
             changed = True
+        self._ranking_stamps.clear()
         return changed
 
     # -- scope-owned detail lifecycle (§§2.4, 3.1-3.2) --------------------- #
@@ -2598,7 +2622,7 @@ class HistoryRouter:
     @staticmethod
     def _scope_family(scope: RetentionScope) -> tuple:
         if len(scope) == 5:
-            return (scope[0], "range", scope[2], scope[3])
+            return (scope[0], "range", scope[2], scope[3], scope[4])
         if len(scope) == 3:
             return (scope[0], "since_boot", scope[2])
         return (scope[0], scope[1])
@@ -2606,7 +2630,8 @@ class HistoryRouter:
     @staticmethod
     def _window_family(app_key: str, window: Window) -> tuple:
         if window.kind == "range":
-            return (app_key, "range", window.boot_id, window.start_mono_ns)
+            return (app_key, "range", window.boot_id,
+                    window.start_mono_ns, window.end_mono_ns)
         if window.kind == "since_boot":
             return (app_key, "since_boot", window.boot_id)
         return (app_key, window.kind)
@@ -2645,6 +2670,7 @@ class HistoryRouter:
                 return self._settle(token, retiring=True)
         self._detail = None
         self._applied_window = None
+        self._ranking_stamps.clear()
         return False
 
     def select_detail(self, app_key: str | None, window: Window | None) -> None:
@@ -2657,6 +2683,7 @@ class HistoryRouter:
 
         if app_key is None and window is None:
             self._retire_detail_lifetime()
+            self._ranking_stamps.clear()
             return
         if app_key is None or window is None:
             raise ValueError("select_detail needs both the subject and the applied window")
@@ -2951,7 +2978,8 @@ class HistoryRouter:
         self._not_retained = self._chronology_unproved = False
         self._daemon_answer_error = None
         self._frame_error = None
-        self._ranking_stamps = {}
+        if self._detail is None:
+            self._ranking_stamps.clear()
         self.view_state = "loading"
         epoch = self._primary_registration_epoch()
         fence = tuple(item for item in self._gap_writes
@@ -3040,9 +3068,16 @@ class HistoryRouter:
     def ranking_provenance(self, app_key: str, window: Window) -> AnswerProvenance | None:
         key = _canonical_app_key(app_key)
         frame = self._frame
-        if frame is None or frame.window != window or frame.certificate is None:
-            return None
-        return frame.ranking_provenance.get(key)
+        if frame is not None and frame.window == window and frame.certificate is not None:
+            return frame.ranking_provenance.get(key)
+        applied = self._applied_ranking_provenance.get(key)
+        lifetime = self._detail
+        if (applied is not None and lifetime is not None
+                and lifetime.app_key == key
+                and self._applied_window == window
+                and applied.measured_window == window):
+            return applied
+        return None
 
     # -- the sole owner-side settlement writer (§3.4) ---------------------- #
 
@@ -3194,6 +3229,7 @@ class HistoryRouter:
         lifetime.successors.clear()
         self._detail = None
         self._applied_window = None
+        self._ranking_stamps.clear()
         return True
 
     def _reject_token(self, token: RequestToken, outcome: SettlementInput | None,
@@ -3271,6 +3307,10 @@ class HistoryRouter:
 
     def _settle_remote(self, token: RequestToken, settlement: RemoteSettlement) -> bool:
         future = settlement.future
+        bound_future = self._remote_futures.get(token.token_id)
+        if bound_future is not future:
+            return self._reject_token(
+                token, settlement, RequestRejected("invalid_result", "invalid_result"))
         try:
             state = self.client.query_transport(future)
         except Exception:
@@ -3283,7 +3323,10 @@ class HistoryRouter:
             return self._reject_token(
                 token, settlement, RequestRejected("invalid_result", "invalid_result"))
         cache_hit = state.phase == "terminal" and state.request_id is None
-        if not cache_hit and state.issued_source != token.requested_source:
+        issue_source = self._remote_issue_sources.get(token.token_id)
+        if cache_hit:
+            issue_source = state.answered_source
+        elif issue_source != state.issued_source:
             return self._reject_token(
                 token, settlement, RequestRejected("invalid_result", "invalid_result"))
         if state.phase not in ("terminal", "expired", "lost"):
@@ -3326,7 +3369,7 @@ class HistoryRouter:
                 return self._reject_token(
                     token, settlement, RequestRejected("invalid_result", "invalid_result"))
             answered = state.answered_source
-            if answered is None or answered != token.requested_source:
+            if answered is None or answered != issue_source:
                 return self._reject_token(
                     token, settlement, RequestRejected("invalid_result", "invalid_result"))
             lifetime = self._detail
@@ -3423,8 +3466,11 @@ class HistoryRouter:
                 raise ValueError("a local outcome answered another worker")
             snapshot = _validate_worker_snapshot(outcome.snapshot)
             capture_snapshot = _capture_provenance(capture)
-            if (binding_snapshot is None or snapshot != binding_snapshot
-                    or capture_snapshot != snapshot):
+            if (binding_snapshot is None
+                    or capture_snapshot.capture_id != binding_snapshot.capture_id
+                    or snapshot.capture_id != binding_snapshot.capture_id):
+                raise ValueError("a local outcome answered another capture")
+            if snapshot != binding_snapshot or capture_snapshot != snapshot:
                 raise ValueError("a local outcome answered another snapshot")
             sources = getattr(self, "_capture_provider", None)
             if sources is not None:
@@ -3715,6 +3761,16 @@ class HistoryRouter:
                 self._settle(entry.token, None)
                 continue
             self._occupant = (entry.token, future)
+            self._remote_futures[entry.token.token_id] = future
+            try:
+                state = self.client.query_transport(future)
+            except Exception:
+                issue_source = None
+            else:
+                issue_source = state.issued_source
+                if state.phase == "terminal" and state.request_id is None:
+                    issue_source = state.answered_source
+            self._remote_issue_sources[entry.token.token_id] = issue_source
             return
 
     def _collect_remote(self) -> bool:
@@ -3755,6 +3811,8 @@ class HistoryRouter:
                                    or state.phase in ("terminal", "not_sent", "lost"))
         if release:
             self._occupant = None
+            self._remote_futures.pop(token.token_id, None)
+            self._remote_issue_sources.pop(token.token_id, None)
         return changed
 
     def _collect_local_frame(self) -> bool:
@@ -3896,7 +3954,15 @@ class HistoryRouter:
                 self._reap_background_worker(token.token_id)
                 continue
             changed |= self._settle(token, settlement)
-            self._reap_background_worker(token.token_id)
+            entry = self._worker_jobs.get(token.token_id)
+            if entry is None:
+                continue
+            future = entry[1]
+            if future is None or future.done():
+                self._reap_background_worker(token.token_id)
+            else:
+                self._drained_futures[token.token_id] = future
+                self._worker_jobs[token.token_id] = (entry[0], None)
         return changed
 
     def _admit_successors(self) -> None:
@@ -3948,6 +4014,7 @@ class HistoryRouter:
         changed |= self._collect_local_frame()
         self._reap_terminal_frame_workers()
         changed |= self._collect_local_workers()
+        self._reap_terminal_background_workers()
         changed |= self._collect_remote()
         changed |= self._finish_frame_if_terminal()
         self._schedule_unscheduled()

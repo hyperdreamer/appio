@@ -193,10 +193,16 @@ def _error_text(error: BaseException) -> str:
 
 
 def _window_family(app_key: str, window: Window) -> tuple:
-    """The identity of one live detail lifetime: subject, tag, boot and start."""
+    """The identity of one live detail lifetime: subject, tag, boot, bounds."""
 
     if window.kind == "range":
-        return (app_key, "range", window.boot_id, window.start_mono_ns)
+        return (
+            app_key,
+            "range",
+            window.boot_id,
+            window.start_mono_ns,
+            window.end_mono_ns,
+        )
     if window.kind == "since_boot":
         return (app_key, "since_boot", window.boot_id)
     return (app_key, window.kind)
@@ -206,7 +212,7 @@ def _scope_family(scope: RetentionScope) -> tuple:
     """The same lifetime identity derived from a retention-scope tuple."""
 
     if len(scope) == 5:
-        return (scope[0], "range", scope[2], scope[3])
+        return (scope[0], "range", scope[2], scope[3], scope[4])
     if len(scope) == 3:
         return (scope[0], "since_boot", scope[2])
     return (scope[0], scope[1])

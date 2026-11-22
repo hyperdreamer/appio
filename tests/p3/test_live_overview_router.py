@@ -3584,6 +3584,216 @@ def _totals_response(key=KEY, *, window, value=None, snapshot=DIGEST, kind="tota
     return response
 
 
+def test_range_end_change_retires_router_and_exact_adapter_lifetimes(tmp_path):
+    from appio.ui.main_window import _ExactDetailAdapter
+    from live_overview_support import ExactOnlyQuery
+
+    client = _BoundClient()
+    router, store = _empty_router(tmp_path, client, name="range-end.db")
+    window_a = Window("range", BOOT, 0, 140 * NS)
+    window_b = Window("range", BOOT, 0, 180 * NS)
+    try:
+        app_id = _remote_frame(router, client, window_a)
+        router.select_detail(KEY, window_a)
+        router.request_detail("totals", app_id, window_a)
+        client.settle(client.only("totals"), _totals_response(window=window_a))
+        router.drain()
+        assert router.retained(
+            "totals", KEY, retention_scope(KEY, window_a), window_a.end_mono_ns
+        ) is not None
+        lifetime_id = router._detail.lifetime_id
+        router.select_detail(KEY, window_b)
+        assert router._detail.lifetime_id != lifetime_id, (
+            "same-start range end change reused the router lifetime"
+        )
+        assert router.retained(
+            "totals", KEY, retention_scope(KEY, window_b), window_b.end_mono_ns
+        ) is None, "router retained range A under range B"
+    finally:
+        router.close()
+        store.connection.close()
+
+    service = ExactOnlyQuery([total(1, KEY)])
+    service.set_share(window_a, share(1, window_a))
+    service.set_pending("totals", 1, window_b)
+    adapter = _ExactDetailAdapter(service, clock_ns=Clock(), authority_epoch=1)
+    adapter.capture_ranking(service.ranking(window_a, "total_bytes"), window_a)
+    adapter.select_detail(KEY, window_a)
+    assert adapter.request_detail("totals", 1, window_a).state == "ok"
+    adapter.capture_ranking(service.ranking(window_b, "total_bytes"), window_b)
+    adapter.select_detail(KEY, window_b)
+    assert adapter.request_detail("totals", 1, window_b).state == "pending"
+    adapter_record = adapter.retained(
+        "totals", KEY, retention_scope(KEY, window_b), window_b.end_mono_ns
+    )
+    assert adapter_record is None, "exact-only adapter retained range A under range B"
+
+
+def test_reaccepted_router_ranking_identity_preserves_stamp(tmp_path):
+    client = _BoundClient(clock=Clock(NS))
+    router, store = _empty_router(tmp_path, client, name="ranking-stamp.db")
+    window = Window("since_boot", BOOT, end_mono_ns=140 * NS)
+    try:
+        _remote_frame(router, client, window)
+        router.select_detail(KEY, window)
+        first = router.ranking_provenance(KEY, window)
+        assert first is not None
+        client.clock.advance_ns(2 * NS)
+        _remote_frame(router, client, window)
+        second = router.ranking_provenance(KEY, window)
+        assert second is not None
+        assert second.accepted_identity == first.accepted_identity
+        assert second.first_seen_at_ns == first.first_seen_at_ns, (
+            "identical accepted ranking identity was restamped"
+        )
+    finally:
+        router.close()
+        store.connection.close()
+
+
+def test_remote_settlement_requires_original_bound_future(tmp_path):
+    client = _BoundClient()
+    router, store = _empty_router(tmp_path, client, name="foreign-future.db")
+    window = Window("since_boot", BOOT, end_mono_ns=140 * NS)
+    try:
+        app_id = _remote_frame(router, client, window)
+        router.select_detail(KEY, window)
+        router.request_detail("totals", app_id, window)
+        token, bound_future = router._occupant
+        foreign = client.query(token.request)
+        response = _totals_response(window=window)
+        client.settle(foreign, response)
+        assert not bound_future.done()
+        assert router._settle(
+            token, RemoteSettlement(foreign, response=foreign.result())
+        ) is True
+        state = router.part_state("totals", KEY, retention_scope(KEY, window))
+        assert state.state == "failed" and state.reason == "invalid_result", (
+            "a same-selector foreign Future published for the current token"
+        )
+    finally:
+        router.close()
+        store.connection.close()
+
+
+def test_applied_ranking_provenance_survives_pending_replacement(tmp_path, qtbot):
+    from appio.ui.main_window import AppIoWindow
+    from appio.ui.render_model import oldest_answer_age
+
+    client = _BoundClient()
+    router, store = _empty_router(tmp_path, client, name="ranking-view.db")
+    window_a = Window("since_boot", BOOT, end_mono_ns=140 * NS)
+    window_b = Window("since_boot", BOOT, end_mono_ns=150 * NS)
+    view = None
+    try:
+        router.prepare(window_a)
+        wait_local(router)
+        client.settle(client.only("ranking"), {
+            "kind": "ranking",
+            "result": [total(17, KEY, peak=12)],
+            "snapshot": DIGEST,
+            "next_cursor": None,
+        })
+        assert router.ready(window_a)
+        view = AppIoWindow(router, clock_ns=client.clock)
+        qtbot.addWidget(view)
+        view.set_window(window_a)
+        original = view._overview_model.ranking_provenance
+        assert original is not None and original.accepted_identity is not None
+        assert oldest_answer_age(
+            view.measurement_status().displayed_answers, client.clock()
+        ) == "oldest answer 0 s ago"
+        router.prepare(window_b)
+        assert router.frame_provenance(window_b) is None
+        view.refresh_measurements()
+        current = view._overview_model.ranking_provenance
+        assert current == original, "pending replacement discarded applied ranking provenance"
+    finally:
+        if view is not None:
+            view.close()
+        router.close()
+        store.connection.close()
+
+
+def test_background_future_stays_charged_until_terminal_drain(tmp_path, monkeypatch):
+    import queue
+    from live_overview_support import (
+        LocalPositionStores,
+        make_managed_router,
+        wait_for_capture_admission,
+    )
+
+    with LocalPositionStores(tmp_path) as stores:
+        router = make_managed_router(
+            stores.services["local"], _IdleClient(), AppRegistry()
+        )
+        window = Window("range", "boot-a", 10 * NS, 20 * NS)
+        entered = threading.Event()
+        release_compute = threading.Event()
+        queued = threading.Event()
+        release_put = threading.Event()
+        inner = queue.SimpleQueue()
+        original = router._read_local_part
+        held_future = None
+        token_id = None
+
+        class CompletionQueue:
+            def put(self, item):
+                inner.put(item)
+                queued.set()
+                assert release_put.wait(10), "completion publication was not released"
+
+            def get_nowait(self):
+                return inner.get_nowait()
+
+            def empty(self):
+                return inner.empty()
+
+        def held_computation(*args, **kwargs):
+            entered.set()
+            assert release_compute.wait(10), "detail computation was not released"
+            return original(*args, **kwargs)
+
+        try:
+            router.prepare(window)
+            wait_local(router)
+            assert router.ready(window)
+            row = router.ranking(window, "total_bytes")[0]
+            router.select_detail(row.app_key, window)
+            monkeypatch.setattr(router, "_completed", CompletionQueue())
+            monkeypatch.setattr(router, "_read_local_part", held_computation)
+            router.request_detail("totals", row.app_id, window)
+            wait_for_capture_admission(router)
+            assert entered.wait(5)
+            token_id, (_, held_future) = next(iter(router._worker_jobs.items()))
+            release_compute.set()
+            assert queued.wait(5)
+            router.drain()
+            assert router.retained(
+                "totals", row.app_key,
+                retention_scope(row.app_key, window), window.end_mono_ns
+            ) is not None
+            assert token_id in router._worker_jobs
+            router.request_detail("totals", row.app_id, window)
+            router.request_detail("series", row.app_id, window)
+            wait_for_capture_admission(router)
+            actual_futures = [held_future] + [
+                future for _, future in router._worker_jobs.values() if future is not None
+            ]
+            assert sum(not future.done() for future in actual_futures) <= 2, (
+                "the detail lane exceeded its two-Future bound"
+            )
+        finally:
+            release_compute.set()
+            release_put.set()
+            if held_future is not None:
+                held_future.result(timeout=5)
+            router.drain()
+            if token_id is not None:
+                assert token_id not in router._worker_jobs
+            router.close()
+
+
 def _file_coverage(window):
     """One complete file-coverage envelope, for a wrong-variant coverage arm."""
 
@@ -3691,6 +3901,9 @@ def test_settlement_rejects_each_selector_shape_or_binding_violation(tmp_path):
                 frame.owner_id, 500 + serial[0], frame.authority,
                 frame.requested_source)
             future = client.query(request)
+            transport = client.query_transport(future)
+            router._remote_futures[token.token_id] = future
+            router._remote_issue_sources[token.token_id] = transport.issued_source
             client.settle(future, {
                 "kind": "coverage", "result": result, "snapshot": DIGEST,
                 "next_cursor": None,
@@ -4667,6 +4880,60 @@ def _forged_frame_settlement(router, window, field, value):
     object.__setattr__(forged, field, value)
     object.__setattr__(settlement, "outcome", forged)
     return token, settlement
+
+
+@pytest.mark.parametrize("kind", ["detail", "files"], ids=["detail", "files"])
+def test_local_settlement_rejects_self_consistent_foreign_capture(tmp_path, kind):
+    from appio.history_router import _capture_provenance
+    from live_overview_support import make_managed_router
+
+    frames = _file_frames(tmp_path, f"foreign-capture-{kind}.db")
+    router = make_managed_router(
+        QueryService(frames.db), _LocalCountingClient(), AppRegistry()
+    )
+    other = None
+    outward = None
+    try:
+        window = FILE_WINDOW
+        router.prepare(window)
+        wait_local(router)
+        assert router.ready(window)
+        app_id = router.registry.id_for(FILE_APP)
+        if kind == "detail":
+            router.select_detail(FILE_APP, window)
+            router.request_detail("totals", app_id, window)
+        else:
+            outward = router.request_file_view(
+                app_id, window, "bytes_total", "desc", None
+            )
+        token, original = _collect_settlement(router)
+        assert original.error is None and original.capture is not None
+        other = router.sources.capture().result(timeout=15)
+        assert other.capture_id != original.capture.capture_id
+        assert other.opening == original.capture.opening
+        assert other.snapshot_digest == original.capture.snapshot_digest
+        outcome = replace(
+            original.outcome, snapshot=_capture_provenance(other)
+        )
+        supplied = LocalSettlement(token.token_id, capture=other, outcome=outcome)
+        assert router._settle(token, supplied) is True
+        if kind == "detail":
+            state = router.part_state(
+                "totals", FILE_APP, retention_scope(FILE_APP, window)
+            )
+            assert state.state == "failed" and state.reason == "invalid_result", (
+                "foreign internally consistent capture published under original worker binding"
+            )
+        else:
+            assert outward is not None
+            with pytest.raises(RequestRejected) as caught:
+                outward.result(timeout=0)
+            assert caught.value.reason == "invalid_result"
+    finally:
+        if other is not None:
+            router.sources.release_capture(other.capture_id)
+        router.close()
+        frames.db.close()
 
 
 def test_failed_record_cannot_be_revived_by_pending_retry(tmp_path, qtbot):
